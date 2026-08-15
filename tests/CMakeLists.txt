@@ -1540,6 +1540,11 @@ add_test(NAME raz-package-manager
     --linker ${CMAKE_CXX_COMPILER})
 set_tests_properties(raz-package-manager PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
+# Official GitHub-backed registry defaults and one-argument package-add syntax.
+add_test(NAME raz-official-registry
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check-official-registry.py)
+set_tests_properties(raz-official-registry PROPERTIES TIMEOUT 30)
+
 # Registry resolution, semver selection, integrity checks, and deterministic package-store reuse.
 add_test(NAME raz-registry-package-store
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check-registry-package-store.py

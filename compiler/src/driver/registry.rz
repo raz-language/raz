@@ -794,6 +794,67 @@ fn registry_resolve_and_apply(i64 alias, i64 al, i64 name, i64 nl, i64 con, i64 
   return s;
 }
 
+fn package_add_official_registry_command(i64 spec, i64 sl) -> i64 {
+  if (sl <= 0) {
+    return 55;
+  }
+
+  i64 name = raz_rt_stage1_arena_create(4096);
+  i64 constraint = raz_rt_stage1_arena_create(256);
+
+  if (name == 0 || constraint == 0) {
+    return 40;
+  }
+
+  i64 at = 0;
+
+  while (at < sl && raz_rt_stage1_arena_get(spec, at) != 64) {
+    at += 1;
+  }
+
+  i64 nl = at;
+  i64 cl = 0;
+
+  if (nl <= 0 || nl > 4096) {
+    return 55;
+  }
+
+  i64 i = 0;
+
+  while (i < nl) {
+    raz_rt_stage1_arena_set(name, i, raz_rt_stage1_arena_get(spec, i));
+    i += 1;
+  }
+
+  if (at < sl) {
+    cl = sl - at - 1;
+    if (cl <= 0 || cl > 256) {
+      return 55;
+    }
+    i = 0;
+    while (i < cl) {
+      raz_rt_stage1_arena_set(constraint, i, raz_rt_stage1_arena_get(spec, at + 1 + i));
+      i += 1;
+    }
+  } else {
+    // No version means latest stable version accepted by the v1 resolver.
+    i64 any[7] = [62, 61, 48, 46, 48, 46, 48];
+
+    cl = 7;
+    i = 0;
+    while (i < cl) {
+      raz_rt_stage1_arena_set(constraint, i, any[i]);
+      i += 1;
+    }
+  }
+
+  i64 result = registry_resolve_and_apply(name, nl, name, nl, constraint, cl, true);
+
+  raz_rt_stage1_arena_destroy(name);
+  raz_rt_stage1_arena_destroy(constraint);
+  return result;
+}
+
 fn package_add_registry_command(i64 alias, i64 al, i64 spec, i64 sl) -> i64 {
   i64 n = raz_rt_stage1_arena_create(4096);
   i64 c = raz_rt_stage1_arena_create(256);
@@ -1510,8 +1571,34 @@ fn package_publish_command() -> i64 {
   i64 local = raz_rt_stage1_arena_create(8192);
   i64 lkey[24] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 80, 85, 66, 76, 73, 83, 72, 95, 68, 73, 82];
   i64 ll = registry_env_ascii(&lkey, 24, local, 8192);
+  bool prepared_submission = false;
 
-  if (ll> 0) {
+  // The official GitHub registry is immutable and PR-driven, so an ordinary
+  // `raz publish` prepares a repository-shaped submission locally. Custom
+  // registry servers remain supported when RAZ_REGISTRY_URL is explicit.
+  if (ll <= 0) {
+    i64 remote = raz_rt_stage1_arena_create(8192);
+    i64 rkey[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
+    i64 rl = registry_env_ascii(&rkey, 16, remote, 8192);
+
+    raz_rt_stage1_arena_destroy(remote);
+    if (rl <= 0) {
+      i64 staging[14] = [46, 47, 46, 114, 97, 122, 45, 112, 117, 98, 108, 105, 115, 104];
+
+      i64 si = 0;
+      while (si < 14) {
+        raz_rt_stage1_arena_set(local, si, staging[si]);
+        si += 1;
+      }
+      ll = 14;
+      prepared_submission = true;
+      if (raz_rt_stage1_create_dir_ascii(local, ll) != 0) {
+        return 65;
+      }
+    }
+  }
+
+  if (ll > 0) {
     i64 package_dir = raz_rt_stage1_arena_create(8192);
     i64 target = raz_rt_stage1_arena_create(8192);
     i64 pc = 0;
@@ -1660,9 +1747,15 @@ fn package_publish_command() -> i64 {
     raz_rt_stage1_arena_destroy(textct);
   }
 
-  i64 msg[10] = [80, 117, 98, 108, 105, 115, 104, 101, 100, 32];
+  if (prepared_submission) {
+    i64 msg[9] = [80, 114, 101, 112, 97, 114, 101, 100, 32];
 
-  cli_write(&msg, 10);
+    cli_write(&msg, 9);
+  } else {
+    i64 msg[10] = [80, 117, 98, 108, 105, 115, 104, 101, 100, 32];
+
+    cli_write(&msg, 10);
+  }
   cli_write_arena(name, nl);
 
   i64 at[1] = [64];

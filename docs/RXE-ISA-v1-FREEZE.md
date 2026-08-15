@@ -20,7 +20,7 @@
 - Callable selectors are recomputed from name hash + ABI + complete parameter/return metadata; selector collisions are invalid.
 - Export records must match their target callable descriptors and remain canonically selector-sorted.
 - Canonical basic-block metadata must exactly partition functions and contain only in-function successors.
-- Serialized RXE must pass independent decode + semantic validation + byte-identical re-encode.
+- Serialized RXE must successfully complete independent decode, semantic validation, and byte-identical re-encode verification.
 
 ## Frozen opcode semantics
 

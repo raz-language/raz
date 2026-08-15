@@ -1,26 +1,24 @@
 # Raz
 
-Raz is a statically typed native programming language for systems and application development. It combines explicit low-level control with ownership and borrowing, deterministic resource management, generics, traits, pattern matching, closures, compile-time evaluation, structured async support, and a modern project toolchain.
+**Raz** is a statically typed systems and application programming language built around native performance, explicit control, memory safety, deterministic resource management, and a practical project toolchain.
 
-**Language design and development: Mario Vinciguerra.**
+Raz combines ownership and borrowing with generics, traits, pattern matching, closures, compile-time evaluation, structured async programming, deterministic builds, and multiple code-generation targets. The production compiler is written in Raz and uses a shared HIR/MIR pipeline so language semantics stay independent from backend implementation details.
 
-The production compiler is written in Raz. Source is lowered through typed HIR and backend-neutral MIR, then compiled by either **Forge**, the default native backend, or the Raz-written **LLVM backend**.
+**Language design: Mario Vinciguerra.**
 
-**MIR Phase 2 is complete:** executable MIR is structurally verified, optimized through a backend-neutral pass pipeline, and independently checked for initialization, moves, partial moves, projection-aware loans, non-lexical loan regions, and reborrow provenance before either backend may consume it.
+## Language highlights
 
-## Highlights
-
-- Native compilation with Forge or LLVM.
-- Ownership, moves, shared references, mutable references, lifetime checks, partial moves, and deterministic destruction.
-- Structs, payload enums, tuples, fixed arrays, slices, references, raw pointers, and function pointers.
-- Generic functions and types, trait bounds, associated types/constants, supertraits, static dispatch, and object-safe dynamic dispatch.
-- Exhaustive pattern matching.
-- Closures with immutable, mutable, and once-only capture semantics.
-- Const functions, const generics, compile-time assertions, layout queries, and selected reflection.
-- `async fn`, `spawn`, and `await` with ownership checks across suspension points.
-- Typed collections, iterators, filesystem/process APIs, sockets, buffering, codecs, JSON, HTTP, and TLS integration.
-- Deterministic package graphs, lockfiles, semantic-version registry resolution, HTTP/HTTPS registry mirrors, deterministic `.dpk` archives, authenticated publishing, integrity verification, and a shared content-addressed package store.
-- Built-in project commands for build, run, check, test, lint, formatting, documentation, and package management.
+- **Native by default** — compile through Forge or LLVM to platform-native objects and executables.
+- **Ownership and borrowing** — moves, shared references, mutable references, non-lexical loan analysis, partial moves, reborrows, and deterministic destruction.
+- **Expressive type system** — structs, payload enums, tuples, arrays, slices, references, raw pointers, and function pointers.
+- **Generics and traits** — bounds, associated types and constants, supertraits, static dispatch, and object-safe dynamic dispatch.
+- **Pattern matching** — exhaustive matching over supported enum and value patterns.
+- **Closures** — immutable, mutable, and once-only capture semantics.
+- **Compile-time programming** — const functions, const generics, compile-time assertions, layout queries, and selected reflection.
+- **Structured async** — `async fn`, `spawn`, `await`, futures, cancellation, and ownership checks across suspension points.
+- **Systems standard library** — collections, iterators, filesystem and process APIs, synchronization, sockets, codecs, JSON, HTTP, and TLS integration.
+- **Deterministic project model** — manifests, lockfiles, module fingerprints, incremental caches, content-addressed native linking, and reproducible recursive self-hosting.
+- **Built-in package management** — semantic-version resolution, deterministic `.dpk` archives, integrity verification, offline caching, mirrors, signing, and the official GitHub-backed package registry.
 
 ## A quick look
 
@@ -97,7 +95,7 @@ fn sum() -> i64 {
 
 ## Projects
 
-A normal project contains a `raz.toml` manifest and source under `src/`.
+A Raz project uses `raz.toml` for package metadata and keeps source under `src/`.
 
 ```text
 hello/
@@ -106,7 +104,7 @@ hello/
     main.rz
 ```
 
-Create one with:
+Create and run a project:
 
 ```text
 raz new hello
@@ -127,7 +125,7 @@ raz doc
 raz clean
 ```
 
-Inspect the toolchain with:
+Inspect the installed toolchain:
 
 ```text
 raz --help
@@ -137,108 +135,157 @@ raz backends
 raz targets
 ```
 
-## Backends
+## Compiler architecture
 
-Forge is the default backend:
+The production compiler is self-hosted and organized as independent Raz modules under `compiler/src/`.
 
 ```text
-raz build --backend=forge
-raz forge source.rz output.fir
-raz forge --forge-native source.rz output.obj
+Raz source
+   │
+   ▼
+Parser + semantic analysis
+   │
+   ▼
+Typed HIR
+   │
+   ▼
+Verified MIR
+   │
+   ├──────────────┬──────────────┬──────────────┐
+   ▼              ▼              ▼              ▼
+ Forge           LLVM           WASM            RXE
+ native          native         .wasm           .rxe
 ```
 
-LLVM is available explicitly:
+MIR is the backend-neutral semantic boundary. Ownership cleanup, call signatures, aggregate layout, async state, globals, and reference behavior are decided before backend emission.
+
+### Forge
+
+Forge is Raz's default native backend. It provides typed SSA verification, optimization, machine lowering, ABI lowering, register allocation, instruction encoding, and deterministic ELF/COFF object emission. The self-hosted compiler talks to Forge in-process through the audited Forge bridge.
+
+### LLVM
+
+The LLVM backend is implemented in Raz and emits LLVM IR from the same verified MIR used by Forge. External LLVM/Clang tools can then produce objects and executables for supported targets.
+
+### WebAssembly
+
+The WASM backend emits WebAssembly from verified MIR, including deterministic runtime memory handling, WASI integration, async/future support, SIMD coverage, and ABI validation.
+
+### RXE
+
+RXE (Raz Executable) is Raz's deterministic bytecode format. It provides a compact verified executable image with canonical instructions, callable metadata, aggregate layouts, module fingerprints, exports, and a serialized control-flow directory.
+
+See [Backends](docs/backends.md), [WASM ABI](docs/WASM-ABI-v1.md), and [RXE](docs/RXE.md).
+
+## Package management
+
+The official package registry is the public [`raz-language/packages`](https://github.com/raz-language/packages) repository. Normal package commands require no registry configuration.
 
 ```text
-raz build --backend=llvm
-raz llvm --emit=llvm source.rz output.ll
-raz llvm --emit=obj --opt=3 source.rz output.obj
-raz llvm --emit=exe source.rz app.exe
-```
-
-Both backends consume the same HIR/MIR language semantics.
-
-## Packages
-
-Path dependencies can be added directly:
-
-```text
-raz add math ../math
-```
-
-Registry dependencies use semantic-version constraints:
-
-```text
-raz add json registry:json@^1.2.0
+raz add json
+raz add http@^2.1.0
 raz update
 raz lock
 raz metadata
 raz graph
 ```
 
-Registry packages are integrity-checked and materialized into a shared content-addressed store. Raz uses `RAZ_PACKAGE_STORE` when set, otherwise `RAZ_HOME/store`, then `~/.raz/store` (or `%USERPROFILE%\.raz\store` on Windows). Set `RAZ_OFFLINE=1` to require already-cached, integrity-valid registry packages. `raz pack` creates deterministic `.dpk` archives and `raz publish` supports HTTP/HTTPS or filesystem registries, Bearer authentication, and an optional detached-signature header.
+Path dependencies are also supported:
+
+```text
+raz add math ../math
+```
+
+Registry packages are integrity-checked and stored in a shared content-addressed cache. `RAZ_OFFLINE=1` requires already-cached, integrity-valid package content. Private registries and mirrors remain available through environment configuration.
+
+Create a deterministic package archive with:
+
+```text
+raz pack
+```
+
+Prepare a package for the official GitHub registry with:
+
+```text
+raz publish
+```
+
+This creates a `.raz-publish/` submission containing the package archive and registry index record. Published package versions in the official registry are immutable.
 
 See [Package management](docs/PACKAGE-MANAGEMENT.md).
 
-## Build the compiler
+## Standard library
 
-### Portable bootstrap
+The standard library is written primarily in Raz and lives under:
 
-The all-stage bootstrap is driven by Python and supports Windows, Linux, and macOS. It configures the native host toolchain, builds the Raz-written compiler, recursively rebuilds Stages 2 through 4, smoke-tests each compiler, and verifies byte-identical fixed-point output.
+```text
+library/core/     language foundations
+library/alloc/    allocation-backed data structures
+library/std/      operating-system and application APIs
+library/platform/ target-specific interfaces
+```
 
-Windows:
+Native C++ code is restricted to permanent host and ABI boundaries such as allocation primitives, raw memory operations, filesystem/process access, sockets, TLS, platform queries, cryptographic engines, and backend bridges. Higher-level policy belongs in Raz.
+
+## Building Raz
+
+Raz uses a small native bootstrap seed to build the self-hosted compiler and verify deterministic recursive compiler generation.
+
+### Windows
 
 ```powershell
 ./bootstrap.bat
 ```
 
-Linux/macOS:
+### Linux and macOS
 
 ```sh
 ./bootstrap.sh
 ```
 
-Use `--clean`, `--run-tests`, `--jobs N`, `--host-preset release`, and `--bootstrap-profile debug|release` as needed. The Windows launcher also accepts the previous PowerShell-style spellings such as `-Clean` and `-Jobs 16`.
+Useful bootstrap options include `--clean`, `--run-tests`, `--jobs N`, `--host-preset release`, and `--bootstrap-profile debug|release`.
 
-### CMake
+The native host components can also be built directly with CMake:
 
 ```text
 cmake --preset release
 cmake --build --preset release
 ```
 
-See [Self-hosting](docs/SELF-HOSTING.md) and [Windows bootstrap notes](docs/WINDOWS-ALL-STAGES-BUILD.md).
+See [Self-hosting](docs/SELF-HOSTING.md) and [Windows bootstrap](docs/WINDOWS-ALL-STAGES-BUILD.md).
 
 ## Repository layout
 
 ```text
-compiler/   Raz-written compiler
+compiler/   self-hosted Raz compiler
 library/    Raz standard library
-src/        frozen native bootstrap/runtime boundaries and vendored Forge
+src/        native bootstrap, runtime boundaries, and Forge
 examples/   language and backend examples
 tests/      conformance and integration tests
-docs/       language, toolchain, backend, and architecture documentation
-scripts/    build, qualification, and packaging utilities
+docs/       language, toolchain, backend, and architecture reference
+scripts/    build, verification, qualification, and packaging utilities
 ```
 
 ## Documentation
 
-- [Language server and IDE integration](docs/LANGUAGE-SERVER.md)
-- [CLI and diagnostics](docs/CLI.md)
-
 Start with [docs/README.md](docs/README.md).
 
-Key references:
+Core references:
 
 - [Raz Made Easy](docs/Raz_Made_Easy_1.0.0.md)
 - [Language specification](docs/LANGUAGE-SPECIFICATION.md)
+- [Stable language scope](docs/STABLE-LANGUAGE-SCOPE.md)
 - [CLI reference](docs/CLI.md)
 - [Package management](docs/PACKAGE-MANAGEMENT.md)
 - [Toolchain specification](docs/TOOLCHAIN-SPECIFICATION.md)
 - [Compiler architecture](docs/ARCHITECTURE.md)
+- [MIR](docs/MIR.md)
 - [Backends](docs/backends.md)
-
+- [Language server](docs/LANGUAGE-SERVER.md)
+- [Formatting](docs/FORMATTING.md)
 
 ## License
 
-Raz is licensed under the [Apache License 2.0](LICENSE). Maintained source/build/script files carry SPDX `Apache-2.0` headers, and Forge retains its nested Apache-2.0 license for independent redistribution. See [Licensing](docs/LICENSING.md) and [NOTICE](NOTICE).
+Raz is licensed under the [Apache License 2.0](LICENSE). Maintained source, build, and script files carry SPDX `Apache-2.0` headers. Forge retains its nested Apache-2.0 license for independent redistribution.
+
+See [Licensing](docs/LICENSING.md) and [NOTICE](NOTICE).

@@ -13,7 +13,7 @@ The documentation describes the current Raz 1.0 language and toolchain.
 
 - [CLI reference](CLI.md) — compiler and project commands.
 - [Toolchain specification](TOOLCHAIN-SPECIFICATION.md) — project, backend, artifact, and reproducibility contracts.
-- [Package management](PACKAGE-MANAGEMENT.md) — dependencies, HTTP/HTTPS registry resolution, mirrors, lockfiles, the shared package store, and offline operation.
+- [Package management](PACKAGE-MANAGEMENT.md) — the GitHub-backed official registry, dependencies, private registries, mirrors, lockfiles, the shared package store, and offline operation.
 - [Backends](backends.md) — Forge and LLVM backend behavior.
 
 ## Understand the implementation

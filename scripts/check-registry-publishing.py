@@ -54,6 +54,20 @@ def main():
     run([compiler,'pack','first.dpk'],publisher,env); run([compiler,'pack','second.dpk'],publisher,env)
     assert (publisher/'first.dpk').read_bytes()==(publisher/'second.dpk').read_bytes(), 'pack output is not deterministic'
 
+    github_env=env.copy()
+    for key in ('RAZ_REGISTRY_URL','RAZ_REGISTRY_PUBLISH_DIR','RAZ_REGISTRY_TOKEN','RAZ_REGISTRY_SIGNATURE'):
+        github_env.pop(key,None)
+    first=run([compiler,'publish'],publisher,github_env)
+    assert first.stdout.startswith('Prepared widget@1.4.0 '), first.stdout
+    staged=publisher/'.raz-publish/packages/widget/1.4.0.dpk'
+    staged_index=publisher/'.raz-publish/index.txt'
+    assert staged.is_file() and staged_index.is_file()
+    first_bytes=staged.read_bytes(); first_index=staged_index.read_bytes()
+    second=run([compiler,'publish'],publisher,github_env)
+    assert second.stdout==first.stdout, (first.stdout,second.stdout)
+    assert staged.read_bytes()==first_bytes, 'repeated GitHub submission changed package archive'
+    assert staged_index.read_bytes()==first_index, 'repeated GitHub submission changed index metadata'
+
     registry=work/'registry'; registry.mkdir()
     RegistryHandler.root=registry
     server=ThreadingHTTPServer(('127.0.0.1',0),RegistryHandler); port=server.server_address[1]

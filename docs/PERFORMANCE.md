@@ -55,9 +55,10 @@ Prefer representative application benchmarks over isolated syntax microbenchmark
 
 Performance patches should improve a general mechanism rather than recognize one benchmark shape.
 
-## Current optimization priorities
+## Optimization principles
 
-The largest remaining standard-library opportunities are described in `STANDARD-LIBRARY-PERFORMANCE.md`. Backend work should focus on broadly useful Forge improvements such as scalar optimization, alias-aware memory promotion, instruction selection, register allocation, code layout, vectorization opportunities, and target expansion rather than frontend-specific special cases.
+Compiler and library optimization should target broadly useful mechanisms such as scalar simplification, alias-aware memory promotion, instruction selection, register allocation, code layout, vectorization, batching, allocation behavior, and target-aware lowering. Benchmark-specific source patterns are not part of the optimization contract.
+
 ## Generic-heavy incremental builds
 
 Generated generic specializations use deterministic module ownership before native object emission. Structurally identical copies produced by multiple modules are kept in exactly one owner module and referenced externally from the others. This allows generic-heavy applications to retain per-module native object caching instead of collapsing to an aggregate object. Conflicting definitions still take the conservative fallback path.
@@ -70,10 +71,6 @@ source timestamps or merely whether a compiler worker ran. Module object cache s
 tracks separate input and object-content fingerprints. Re-emitting an object with
 identical bytes keeps the existing object file and does not dirty the link. Dependency
 archives and native runtime/Forge/OpenSSL libraries are likewise content fingerprinted,
-with a metadata-keyed digest cache to keep hot no-op builds cheap. On the 20-module
-generic-heavy application used by the release regression, a fully fresh build remains
-about 60 ms in the current Linux test environment after the digest cache is warm.
-
-This is deliberately not a platform-specific partial/incremental linker: when any actual
+with a metadata-keyed digest cache to keep hot no-op builds cheap. This is deliberately not a platform-specific partial/incremental linker: when any actual
 link-input byte or linker configuration changes, Raz invokes the system linker normally.
 That preserves byte-for-byte clean-build semantics across Linux and Windows.

@@ -62,6 +62,7 @@ raz doc <file.rz> [output.md]
 ## Package commands
 
 ```text
+raz add <package>[@<constraint>]
 raz add <alias> <path>
 raz add <alias> registry:<name>@<constraint>
 raz remove <alias>
@@ -74,9 +75,9 @@ raz pack [output.dpk]
 raz publish
 ```
 
-`raz pack` creates a deterministic `.dpk` archive from the current package. `raz publish` publishes that archive plus registry metadata to an HTTP/HTTPS or filesystem registry. Bearer authentication uses `RAZ_REGISTRY_TOKEN`; private registries may also require the optional `RAZ_REGISTRY_SIGNATURE` detached-signature hook.
+`raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `.raz-publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
 
-See [Package management](PACKAGE-MANAGEMENT.md) for local/network registries, mirror fallback, package archives, publishing, the shared content-addressed store, lockfiles, and offline behavior.
+See [Package management](PACKAGE-MANAGEMENT.md) for the official registry, private registries, mirror fallback, package archives, publishing, the shared content-addressed store, lockfiles, and offline behavior.
 
 ### `raz keygen [prefix]`
 

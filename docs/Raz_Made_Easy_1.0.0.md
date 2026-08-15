@@ -2,7 +2,7 @@
 
 **Raz 1.0.0 - A practical guide to the Raz systems programming language**
 
-Language design and development by **Mario Vinciguerra**.
+Language design by **Mario Vinciguerra**.
 
 Raz is a statically typed native systems programming language built for predictable performance, deterministic resource management, ownership safety, and direct control over native software. Raz 1.0 lowers source through typed HIR and backend-neutral MIR, then dispatches to either Forge, the default bundled native backend, or the Raz-written LLVM IR backend. Forge emits native objects in-process; the LLVM backend emits textual LLVM IR in Raz and uses an external Clang/LLVM toolchain when native objects or executables are requested.
 
@@ -93,7 +93,7 @@ Useful project commands include:
 | `raz graph` | Show the dependency graph |
 | `raz metadata` | Print package metadata |
 | `raz pack` | Create a deterministic `.dpk` package archive |
-| `raz publish` | Publish the current package to a registry |
+| `raz publish` | Prepare a submission for the official registry, or publish to an explicit private registry |
 | `raz lock` | Regenerate `raz.lock` |
 | `raz registry` | Inspect registry resolution |
 | `raz doctor` | Inspect the local toolchain environment |
@@ -680,7 +680,7 @@ Most packages use deterministic source discovery. Packages such as the compiler 
 
 `raz.lock` records the resolved package graph and manifest fingerprints deterministically. Registry dependencies retain their semantic-version constraints separately, while the project manifest points at the verified package-store entry selected for the current resolution.
 
-Registry packages are fetched from a local snapshot or an HTTP/HTTPS registry, with optional mirror fallback, then materialized into a shared content-addressed store. Set `RAZ_PACKAGE_STORE` or `RAZ_HOME` to choose the store location, or `RAZ_OFFLINE=1` to require a cached registry snapshot and an already-present, integrity-valid store entry. `raz pack` creates deterministic `.dpk` archives; `raz publish` can publish to filesystem or HTTP/HTTPS registries and supports Bearer authentication plus an optional detached-signature header for private-registry policy.
+Official registry packages resolve from the GitHub-backed [`raz-language/packages`](https://github.com/raz-language/packages) repository, with local snapshots, private HTTP/HTTPS registries, and mirror fallback still supported. Registry packages are materialized into a shared content-addressed store. Set `RAZ_PACKAGE_STORE` or `RAZ_HOME` to choose the store location, or `RAZ_OFFLINE=1` to require a cached registry snapshot and an already-present, integrity-valid store entry. `raz add foo` and `raz add foo@^1.2.0` use the official registry. `raz pack` creates deterministic `.dpk` archives; ordinary `raz publish` prepares a `.raz-publish/` submission for the GitHub registry, while explicit private registries retain filesystem or HTTP/HTTPS publishing.
 
 ---
 
@@ -732,7 +732,7 @@ The standard library stays close enough to host primitives that servers and runt
 
 Networking foundations include TCP, UDP, DNS, nonblocking mode, endpoint inspection, timeouts, socket buffer tuning, exact reads, send-all operations, and readiness-driven async building blocks.
 
-The performance rule for I/O-heavy software is to avoid unnecessary crossings and allocations. Raz 1.0 therefore provides low-level primitives, while the next standard-library performance layer should add reusable buffered I/O, vectored/scatter-gather operations, buffer pools, framed byte builders, and more platform-specialized event-loop paths behind stable Raz APIs.
+The performance rule for I/O-heavy software is to avoid unnecessary crossings and allocations. Raz 1.0 exposes low-level primitives as stable building blocks; buffering, vectored/scatter-gather I/O, buffer pools, framed byte builders, and specialized event-loop policy belong in Raz library layers rather than hidden native shims.
 
 For filesystem workloads, synchronous and asynchronous foundations are both present. Application code should pick the model that matches its workload instead of assuming async is always faster.
 
@@ -958,7 +958,7 @@ Raz 1.0 is intended to make native systems programming direct: explicit where th
 
 ## Credits
 
-**Raz language design and development:** Mario Vinciguerra.
+**Raz language design:** Mario Vinciguerra.
 
 **Forge backend:** [Ascension Digital Technologies / Forge](https://github.com/Ascension-Digital-Technologies/Forge). Forge is a separate project and is vendored under its own Apache-2.0 license when included with Raz.
 

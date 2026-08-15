@@ -78,4 +78,4 @@ The wasm32 SIMD target uses standardized `v128` instructions. The shared Raz `co
 
 The following are ABI-breaking without an explicit compatibility mechanism: changing reference tag ranges; changing the two reserved global indices; changing the 64-byte future header or field offsets; changing aggregate slot width; changing closure object slot ordering; changing slice slot ordering; changing guest-visible preopen routing semantics; changing the meaning of callable table indices; or moving static data below the reserved low-memory boundary.
 
-Adding new imports, SIMD operations, internal helper functions, optimization passes, or omitted dead sections is ABI-compatible when existing observable layouts and calling conventions remain unchanged.
+Adding new imports, SIMD operations, internal helper functions, optimization transforms, or omitted dead sections is ABI-compatible when existing observable layouts and calling conventions remain unchanged.

@@ -23,11 +23,11 @@ Reference provenance is also validated through aggregate returns. Direct borrows
 
 ## Self-hosted MIR 2.0 layout
 
-The Raz-written compiler owns MIR as a dedicated subsystem rather than as an extension of HIR. `compiler/src/mir/core/model.rz` owns `MirModule`, `core/builder.rz` owns construction primitives, `lowering.rz` performs semantic HIR-to-MIR lowering, `analysis/cfg.rz` exposes backend-neutral control-flow queries, `verify/verifier.rz` provides the structural verification boundary, `transform/pipeline.rz` is the single pass-manager choke point, and `interpreter.rz` consumes MIR for execution and qualification. Normal compilation calls `run_mir_pipeline` before execution or backend emission.
+The Raz-written compiler owns MIR as a dedicated subsystem rather than as an extension of HIR. `compiler/src/mir/core/model.rz` owns `MirModule`, `core/builder.rz` owns construction primitives, `lowering.rz` performs semantic HIR-to-MIR lowering, `analysis/cfg.rz` exposes backend-neutral control-flow queries, `verify/verifier.rz` provides the structural verification boundary, `transform/pipeline.rz` owns the ordered MIR transformation pipeline, and `interpreter.rz` consumes MIR for execution and qualification. Normal compilation calls `run_mir_pipeline` before execution or backend emission.
 
 See `docs/MIR.md` for the MIR verification, ownership, and optimization contract.
 
-The remaining lowering unit deliberately keeps expression lowering, lexical cleanup, and statement lowering together because those operations currently form a recursive cluster. Future MIR passes should break that cycle through explicit lowering context APIs rather than introducing circular module imports. Forge and LLVM remain consumers of the same verified MIR.
+Expression lowering, lexical cleanup, and statement lowering share one lowering unit because they form a recursive semantic cluster. Explicit lowering-context APIs keep that cluster acyclic at the module boundary, while Forge and LLVM remain consumers of the same verified MIR.
 
 ## Verified MIR ownership firewall
 
@@ -49,7 +49,7 @@ See `docs/SEMANTIC-QUERIES.md` for the query identity and invalidation contract.
 
 The production frontend is the **Raz-written Stage 2 compiler** under `compiler`. It owns project loading and the compiler semantics required for the production compiler.
 
-The production compiler is organized into responsibility-based semantic Raz modules under `compiler/src/`. Each file has an explicit compiler namespace/import edge and normal project builds compile the modules independently through the package graph. `compiler/bootstrap-source-order.txt` is not a production ordering contract; it is frozen seed metadata used only when Stage 0 must reconstruct Stage 1. The final `src/main.rz` module contains process/phase orchestration; lexer, HIR, MIR, Forge emission, LLVM emission, backend selection, and project loading remain independent source units.
+The production compiler is organized into responsibility-based semantic Raz modules under `compiler/src/`. Each file has an explicit compiler namespace/import edge and normal project builds compile the modules independently through the package graph. `compiler/bootstrap-source-order.txt` is not a production ordering contract; it is frozen seed metadata used only when Stage 0 must reconstruct Stage 1. The final `src/main.rz` module contains process and pipeline orchestration; lexer, HIR, MIR, Forge emission, LLVM emission, backend selection, and project loading remain independent source units.
 
 `src/bootstrap/compiler` is the **frozen native bootstrap seed** used only to create the first Raz-written compiler and exercise bootstrap compatibility. It is not a second production language implementation and does not receive new language semantics for feature parity. The lexer/parser/semantic/HIR/MIR/lowering seed is pinned by `scripts/stage0-semantic-freeze.sha256`; `raz-stage0-semantic-freeze` fails if those sources drift. Intentional changes are limited to bootstrap-compatibility repairs needed to keep building the canonical Raz compiler.
 
@@ -61,9 +61,9 @@ Recursive bootstrap is a permanent release invariant. Stage 1 produces Stage 2 a
 
 Forge is the default production backend and lives under `src/forge` as the canonical C++ Forge 2.0 library. The short-lived Raz rewrite has been removed. Forge owns typed SSA verification, optimization, machine IR, ABI lowering, register allocation, instruction encoding, JIT infrastructure, and deterministic ELF/COFF object emission.
 
-The self-hosted compiler links Forge **in-process** through the audited `raz_forge_bridge` boundary. Forge C API v14 now exposes structured construction for aggregates, globals, functions, exact block/value names, parameters, target features, and generic operations with operands, successors, source ranges, alignment, and attributes, plus the existing `O0/O1/O2/O3/Os/Oz` optimization and COFF/ELF object-emission APIs. No production `forge-codegen` subprocess is required.
+The self-hosted compiler links Forge **in-process** through the audited `raz_forge_bridge` boundary. Forge C API v14 exposes structured construction for aggregates, globals, functions, exact block/value names, parameters, target features, and generic operations with operands, successors, source ranges, alignment, and attributes, plus the existing `O0/O1/O2/O3/Os/Oz` optimization and COFF/ELF object-emission APIs. No production `forge-codegen` subprocess is required.
 
-Migration from textual FIR to structured construction is incremental. Raz MIR now lowers directly into C API v14 for scalar code, aggregates/arrays, references/slices, function pointers, target features, globals, and native TLS. The parser-free path supports integer/`f32`/`f64` functions, native scalar stack locals, mutable-parameter spills, direct internal and external calls, C/platform ABI metadata and `@link_name`, arithmetic, floating-point division, numeric casts, numeric comparisons, selects, loops, jumps, branches, MIR block arguments, returns, and scalar integer module storage. Forge optimization can promote eligible local stack slots through its normal scalar pipeline. The optional `.fir` output is generated independently for diagnostics and fixed-point comparison and is not consumed by this structured path. Only remaining async/runtime-heavy MIR families continue through the proven in-memory FIR parse compatibility path while those families are migrated, preserving full language coverage without moving Raz semantics into C++.
+Raz MIR lowers directly into Forge C API v14 for scalar code, aggregates and arrays, references and slices, function pointers, target features, globals, and native TLS. The structured path supports integer/`f32`/`f64` functions, native scalar stack locals, mutable-parameter spills, direct internal and external calls, C/platform ABI metadata and `@link_name`, arithmetic, floating-point division, numeric casts, numeric comparisons, selects, loops, jumps, branches, MIR block arguments, returns, and scalar integer module storage. Forge optimization can promote eligible local stack slots through its normal scalar pipeline. Optional `.fir` output is generated independently for diagnostics and fixed-point comparison. Async/runtime-heavy MIR families use the verified in-memory FIR compatibility path, preserving full language coverage without moving Raz semantics into C++.
 
 ### LLVM
 
@@ -77,7 +77,7 @@ See `docs/backends.md` for the detailed backend contract and qualification corpu
 
 `src/runtime` is the permanent narrow native boundary for services that must cross into the host OS or ABI. The production standard library lives under `library/core`, `library/alloc`, and `library/std` and is written in Raz. Target-specific unavoidable extensions belong under `library/platform`; unstable APIs belong under `library/experimental`.
 
-The release workflow audits the self-hosted compiler's native helper use against `scripts/native-boundary-allowlist.txt`. The Forge entry is a backend-library ABI bridge, not a language-semantic shim. LLVM's current native-output orchestration uses the process-launch boundary; its planned library integration follows the same principle.
+The release workflow audits the self-hosted compiler's native helper use against `scripts/native-boundary-allowlist.txt`. The Forge entry is a backend-library ABI bridge, not a language-semantic shim. LLVM native-output orchestration uses the process-launch boundary and follows the same native-boundary policy.
 
 ## Determinism
 
@@ -91,7 +91,7 @@ The production runtime is intentionally **primitive-first**. High-level policy i
 
 The Raz standard library owns composition above those primitives. In particular, channels, latch/semaphore/barrier/once policy, cancellation, task scopes, worker scheduling, async file/socket jobs, reactor watches, timers, rich future composition, recursive filesystem create/remove, whole-file read/write policy, and socket send-all/receive-exact loops are implemented in `.rz`.
 
-The self-host compiler now has **zero Stage-1-specific native ABI**. Arena storage, references, ASCII/byte repacking, process/environment/stdio adapters, socket/TLS adaptation, whole-file I/O, absolute lexical path normalization, recursive source/tree discovery, recursive copy/create/remove, tool-adapter packing, host-platform adaptation, and Ed25519 arena packing all live in Raz. C++ exposes only generic host/runtime primitives (allocation, files/directories, processes, sockets/TLS, platform queries, and raw byte-oriented crypto). Stage 1 is therefore a Raz compatibility/data-model layer, not a native runtime concept. New compiler semantics are implemented in Raz. Stage 0 is frozen at the bootstrap contract and must shrink or remain stable rather than track production feature parity.
+The self-host compiler has **zero Stage-1-specific native ABI**. Arena storage, references, ASCII/byte repacking, process/environment/stdio adapters, socket/TLS adaptation, whole-file I/O, absolute lexical path normalization, recursive source/tree discovery, recursive copy/create/remove, tool-adapter packing, host-platform adaptation, and Ed25519 arena packing all live in Raz. C++ exposes only generic host/runtime primitives (allocation, files/directories, processes, sockets/TLS, platform queries, and raw byte-oriented crypto). Stage 1 is therefore a Raz compatibility/data-model layer, not a native runtime concept. Compiler semantics are implemented in Raz. Stage 0 is frozen at the bootstrap contract and must shrink or remain stable rather than track production feature parity.
 
 ## Native source organization
 
@@ -158,6 +158,6 @@ This preserves ordinary strong-definition diagnostics: same-named functions with
 
 ## MIR analysis and ownership firewall
 
-Stage 1+ routes executable semantics through a verified MIR pipeline before the Forge, LLVM, or interpreter consumers run. MIR now owns a basic-block graph, reusable dataflow sets, use/last-use information, dominance queries, and explicit place/reference/drop facts. HIR remains the authority for borrow legality while those rules migrate incrementally to CFG-aware MIR analyses; native backends do not implement ownership policy.
+The self-host compiler routes executable semantics through a verified MIR pipeline before Forge, LLVM, RXE, WASM, or interpreter consumers run. MIR owns a basic-block graph, reusable dataflow sets, use/last-use information, dominance queries, and explicit place/reference/drop facts. HIR remains the authority for source-level borrow legality, while MIR analyses provide backend-neutral control-flow and ownership facts; native backends do not implement ownership policy.
 
-The first production MIR transforms are deliberately instruction-index stable: equal-target conditional branches are canonicalized and literal scalar operations are folded in place. Physical dead-code removal is deferred until a single remapping pass can rewrite instruction-index register identities safely.
+MIR transforms preserve instruction-index identity where required: equal-target conditional branches are canonicalized and literal scalar operations are folded in place. Transformations that physically remove instructions use a single remapping transform so instruction-index register identities remain valid.

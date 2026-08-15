@@ -14,7 +14,7 @@ Release qualification compares the native compiler objects from the recursive ge
 
 ## Source ordering
 
-The compiler source is split into semantic modules under `compiler/src/`. Production Stage 1+ development uses explicit module namespaces/imports and the normal package graph. `compiler/bootstrap-source-order.txt` defines only the deterministic seed order used to create the disposable Stage 0 → Stage 1 legacy view; it does not govern normal compiler builds. `src/main.rz` remains the final entrypoint.
+The compiler source is split into semantic modules under `compiler/src/`. Production Stage 1+ builds use explicit module namespaces/imports and the normal package graph. `compiler/bootstrap-source-order.txt` defines only the deterministic seed order used to create the disposable Stage 0 → Stage 1 legacy view; it does not govern normal compiler builds. `src/main.rz` remains the final entrypoint.
 
 ## Native boundary
 

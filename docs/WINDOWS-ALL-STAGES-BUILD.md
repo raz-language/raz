@@ -7,11 +7,11 @@ Raz includes a Windows bootstrap driver that builds and retains every compiler g
 - Windows 10/11
 - CMake 3.24+
 - Ninja
-- Visual Studio 2022 Build Tools or Visual Studio 2022 with **Desktop development with C++** (MSVC toolset + Windows SDK)
+- Visual Studio 2022 Build Tools or Visual Studio 2022 with the **C++ desktop workload** (MSVC toolset + Windows SDK)
 - Optional LLVM/Clang installation; the script can use `clang-cl`, `cl`, or `clang++`
 - PowerShell 5.1+ or PowerShell 7+
 
-The bootstrap now initializes the Visual Studio C++ environment itself, so it can be launched from a normal Command Prompt or PowerShell window. It validates the selected compiler with a real C++20 standard-library compile before configuring Raz and discards a stale host CMake build when its cached compiler does not match the validated compiler.
+The bootstrap initializes the Visual Studio C++ environment itself, so it can be launched from a normal Command Prompt or PowerShell window. It validates the selected compiler with a real C++20 standard-library compile before configuring Raz and discards a stale host CMake build when its cached compiler does not match the validated compiler.
 
 ## One-command build
 

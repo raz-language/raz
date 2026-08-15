@@ -1,4 +1,13 @@
 # Changelog
+
+### Official GitHub-backed package registry
+
+- Made `raz-language/packages` the zero-configuration official Raz package registry, fetched from its raw `main` index over HTTPS.
+- Added shorthand `raz add <package>` and `raz add <package>@<constraint>` while retaining explicit aliases, path dependencies, private registries, mirrors, and offline package-store reuse.
+- Changed ordinary `raz publish` to prepare an immutable `.raz-publish/packages/<name>/<version>.dpk` GitHub submission; explicit HTTP/HTTPS and filesystem registries retain direct publishing.
+- Excluded `.raz-publish/` from deterministic package trees so repeated submission generation remains byte-stable.
+- Added official-registry regression coverage and extended registry publishing/package-store tests for shorthand resolution and repeatable GitHub submissions.
+
 - Added stable module identities and module-owned HIR/MIR function views as the foundation for module-granular incremental serialization and code generation.
 
 ### Persistent self-host incremental build state

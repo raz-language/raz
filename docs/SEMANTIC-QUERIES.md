@@ -70,7 +70,7 @@ The compiler persists incremental state under the package-local `.raz/cache`
 directory. Persistent state is an optimization only: deleting the directory must
 never change program semantics.
 
-The persistent layer currently stores:
+The persistent layer stores:
 
 - a versioned whole-build key derived from complete source contents and backend
   configuration;

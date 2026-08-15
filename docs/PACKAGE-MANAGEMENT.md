@@ -14,35 +14,27 @@ Raz validates the dependency manifest, updates `[dependencies]`, and regenerates
 
 ## Registry dependencies
 
-Raz supports either a local registry snapshot or a network registry.
+The official Raz registry is the public [`raz-language/packages`](https://github.com/raz-language/packages) repository. No registry configuration is required for normal package use.
 
-For a local snapshot, set:
-
-```text
-RAZ_REGISTRY_INDEX=/path/to/index.txt
-```
-
-For a network registry, set a base URL:
+Add the latest compatible stable package with:
 
 ```text
-RAZ_REGISTRY_URL=https://packages.example.com
+raz add json
 ```
 
-Raz requests `index.txt` from that base. Optional mirrors are supplied as a semicolon-separated list:
+Or supply a semantic-version constraint directly:
 
 ```text
-RAZ_REGISTRY_MIRRORS=https://mirror-a.example.com;https://mirror-b.example.com
+raz add json@^1.2.0
 ```
 
-The primary registry is tried first, followed by mirrors in order. HTTP and HTTPS are supported; HTTPS uses Raz's verified TLS client transport.
-
-Each index record contains a package name, semantic version, package source, and complete package-tree checksum. Package sources may be local directories, absolute HTTP/HTTPS archive URLs, or paths relative to the registry base.
+The explicit registry form remains available when an alias differs from the package name:
 
 ```text
-raz add json registry:json@^1.2.0
+raz add my-json registry:json@^1.2.0
 ```
 
-Supported constraints are:
+Raz fetches `index.txt` from the official raw GitHub registry and resolves package archive paths relative to that repository. Supported constraints are:
 
 - exact: `1.2.3`
 - caret: `^1.2.0`
@@ -50,6 +42,26 @@ Supported constraints are:
 - minimum: `>=1.2.0`
 
 The highest compatible version is selected deterministically.
+
+For tests, air-gapped environments, or local snapshots, set:
+
+```text
+RAZ_REGISTRY_INDEX=/path/to/index.txt
+```
+
+For a private or alternate network registry, override the official base URL:
+
+```text
+RAZ_REGISTRY_URL=https://packages.example.com
+```
+
+Optional mirrors are supplied as a semicolon-separated list:
+
+```text
+RAZ_REGISTRY_MIRRORS=https://mirror-a.example.com;https://mirror-b.example.com
+```
+
+The primary registry is tried first, followed by mirrors in order. HTTP and HTTPS are supported; HTTPS uses Raz's verified TLS client transport. Each index record contains a package name, semantic version, package source, and complete package-tree checksum. Package sources may be local directories, absolute HTTP/HTTPS archive URLs, or paths relative to the registry base.
 
 ## Package archives
 
@@ -122,11 +134,29 @@ The default output is `<name>-<version>.dpk`. You can choose another output path
 raz pack dist/widget-1.2.3.dpk
 ```
 
-`pack` excludes generated project state (`.git/`, `.raz/`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). The archive uses the same full-tree content hash used by the package store and registry verifier.
+`pack` excludes generated project state (`.git/`, `.raz/`, `.raz-publish/`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). The archive uses the same full-tree content hash used by the package store and registry verifier.
 
 ## Publishing
 
-Publish the current package to an HTTP/HTTPS registry:
+The official registry is GitHub-backed and published versions are immutable. From a package directory, run:
+
+```text
+raz publish
+```
+
+When neither `RAZ_REGISTRY_URL` nor `RAZ_REGISTRY_PUBLISH_DIR` is set, Raz validates and packs the current package and creates a repository-shaped submission under:
+
+```text
+.raz-publish/
+  index.txt
+  packages/
+    <name>/
+      <version>.dpk
+```
+
+The generated archive can be copied into [`raz-language/packages`](https://github.com/raz-language/packages), the index regenerated/validated there, and submitted by pull request. A package path already present on the registry's `main` branch is immutable; fixes require a new semantic version.
+
+Private registries remain supported. Publish directly to an HTTP/HTTPS registry with:
 
 ```text
 RAZ_REGISTRY_URL=https://packages.example.com \
@@ -135,22 +165,20 @@ RAZ_REGISTRY_SIGNATURE=<detached-signature> \
 raz publish
 ```
 
-Publishing uses idempotent `PUT` requests for the archive and version metadata. `RAZ_REGISTRY_TOKEN`, when set, is sent as a Bearer authorization token. `RAZ_REGISTRY_SIGNATURE`, when set, is sent as `X-Raz-Signature`; this is a detached-signature hook so private registries can enforce their own signing algorithm and trust policy. The published metadata includes the package name, semantic version, archive location, and complete package-tree hash.
-
 For a filesystem registry, set:
 
 ```text
 RAZ_REGISTRY_PUBLISH_DIR=/srv/raz-registry raz publish
 ```
 
-Raz writes the archive under `packages/<name>/<version>.dpk` and updates `index.txt`. Re-publishing the same name/version replaces that index entry instead of adding a duplicate.
+The explicit private-registry paths retain the existing authenticated/idempotent publishing protocol.
 
 ### Publishing environment
 
-- `RAZ_REGISTRY_URL` — primary HTTP/HTTPS registry base URL.
+- `RAZ_REGISTRY_URL` — override the official GitHub registry with a primary HTTP/HTTPS registry base URL.
 - `RAZ_REGISTRY_TOKEN` — optional Bearer token used by `raz publish`.
 - `RAZ_REGISTRY_SIGNATURE` — optional detached signature sent as `X-Raz-Signature` during publishing.
-- `RAZ_REGISTRY_PUBLISH_DIR` — filesystem registry destination for local/private registries.
+- `RAZ_REGISTRY_PUBLISH_DIR` — filesystem registry destination for local/private registries; when unset with no URL override, `raz publish` writes `.raz-publish/`.
 - `RAZ_REGISTRY_MIRRORS` — ordered fallback registry bases for package consumption.
 - `RAZ_PACKAGE_STORE` — explicit content-addressed package store.
 - `RAZ_HOME` — Raz home directory; its `store/` subdirectory is used when no explicit store is configured.

@@ -47,7 +47,8 @@ def main():
     run([c,'update'],app,env); assert '/store/' in (app/'raz.toml').read_text().replace('\\','/'); lock=(app/'raz.lock').read_bytes(); assert b'version = "1.9.0"' in lock
     stable=hashlib.sha256(lock).hexdigest();run([c,'update'],app,env);assert hashlib.sha256((app/'raz.lock').read_bytes()).hexdigest()==stable
     run([c,'remove','widget'],app,env); assert 'widget@^1.2.0' not in (app/'.raz.registry').read_text(); before=(app/'raz.toml').read_text();run([c,'update'],app,env);assert (app/'raz.toml').read_text()==before
-    run([c,'add','widget','registry:widget@^1.2.0'],app,env)
+    run([c,'add','widget@^1.2.0'],app,env)
+    assert 'widget@^1.2.0' in (app/'.raz.registry').read_text(), 'official registry shorthand was not tracked'
     # Stored packages remain usable offline even if the registry source disappears.
     manifest_text=(app/'raz.toml').read_text(); dep_line=next(line for line in manifest_text.splitlines() if line.strip().startswith('widget =')); selected_rel=dep_line.split('=',1)[1].strip().strip(chr(34)); selected_store=Path(selected_rel).resolve()
     shutil.rmtree(reg/'widget-1_9_0', ignore_errors=True)

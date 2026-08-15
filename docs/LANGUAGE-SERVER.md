@@ -54,6 +54,6 @@ The current server also exposes:
 - document highlights;
 - selection ranges.
 
-Hover, completion, document/workspace symbols, definition, references, rename, signature help, inlay hints, document highlights, and semantic tokens now consume the compiler-owned semantic index built from the parsed syntax tree and enriched HIR types. Local symbol identity is scope-aware, so shadowed variables are not conflated during references or rename. Open-buffer global symbols can also participate in cross-document navigation and rename.
+Hover, completion, document/workspace symbols, definition, references, rename, signature help, inlay hints, document highlights, and semantic tokens consume the compiler-owned semantic index built from the parsed syntax tree and enriched HIR types. Local symbol identity is scope-aware, so shadowed variables are not conflated during references or rename. Open-buffer global symbols can also participate in cross-document navigation and rename.
 
 The semantic-token legend distinguishes keywords, functions, types, variables, parameters, properties, enum members, and namespaces. `auto` local inlay hints use the type inferred by semantic analysis rather than text heuristics.
