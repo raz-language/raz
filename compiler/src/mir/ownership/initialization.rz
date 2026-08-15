@@ -1,0 +1,87 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_ownership_initialization;
+public import raz_compiler_mir_ownership_places;
+// CFG-local ownership state. initialized is a MUST property: a local is
+// initialized at a join only when every continuing predecessor initializes it.
+public struct MirLocalState {
+  i64 initialized;
+  i64 moved;
+  i64 count;
+}
+
+fn init_mir_local_state(MirLocalState&mut state, i64 count) -> bool {
+  state.count = count;
+  state.initialized = raz_rt_stage1_arena_create(count + 1);
+  state.moved = raz_rt_stage1_arena_create(count + 1);
+  if (state.initialized == 0 || state.moved == 0) {
+    if (state.initialized != 0) {
+      raz_rt_stage1_arena_destroy(state.initialized);
+    }
+    if (state.moved != 0) {
+      raz_rt_stage1_arena_destroy(state.moved);
+    }
+    return false;
+  }
+
+  i64 slot = 0;
+
+  while (slot < count) {
+    raz_rt_stage1_arena_set(state.initialized, slot, 0);
+    raz_rt_stage1_arena_set(state.moved, slot, 0);
+    slot += 1;
+  }
+  return true;
+}
+
+fn destroy_mir_local_state(MirLocalState&mut state) {
+  raz_rt_stage1_arena_destroy(state.initialized);
+  raz_rt_stage1_arena_destroy(state.moved);
+}
+
+fn mir_local_state_copy(MirLocalState&mut destination, MirLocalState& source) {
+  i64 slot = 0;
+
+  while (slot < destination.count && slot < source.count) {
+    raz_rt_stage1_arena_set(
+    destination.initialized,
+    slot,
+    raz_rt_stage1_arena_get(source.initialized, slot),
+    );
+    raz_rt_stage1_arena_set(destination.moved, slot, raz_rt_stage1_arena_get(source.moved, slot));
+    slot += 1;
+  }
+}
+
+fn mir_local_state_store(MirLocalState&mut state, i64 slot) -> bool {
+  if (slot < 0 || slot >= state.count) {
+    return false;
+  }
+  raz_rt_stage1_arena_set(state.initialized, slot, 1);
+  raz_rt_stage1_arena_set(state.moved, slot, 0);
+  return true;
+}
+
+fn mir_local_state_move(MirLocalState&mut state, i64 slot) -> bool {
+  if (slot < 0 || slot >= state.count) {
+    return false;
+  }
+  if (
+  raz_rt_stage1_arena_get(state.initialized, slot) == 0 ||
+  raz_rt_stage1_arena_get(state.moved, slot) != 0
+  ) {
+    return false;
+  }
+  raz_rt_stage1_arena_set(state.moved, slot, 1);
+  return true;
+}
+
+fn mir_local_state_readable(MirLocalState& state, i64 slot) -> bool {
+  return (
+  slot >= 0 &&
+  slot < state.count &&
+  raz_rt_stage1_arena_get(state.initialized, slot) != 0 &&
+  raz_rt_stage1_arena_get(state.moved, slot) == 0
+  );
+}

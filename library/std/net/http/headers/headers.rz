@@ -1,0 +1,183 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::http::headers;
+import alloc::string;
+import core::bytes;
+import std::net::http;
+/// Reusable validated HTTP field block. Values are serialized once at add()
+/// time so request/response hot paths can append the entire block in one copy.
+public struct HeaderBlock {
+    String bytes;
+    i64 fields;
+}
+
+public fn new() -> HeaderBlock {
+    return HeaderBlock {
+        bytes: alloc::string::with_capacity(256),
+        fields: 0
+    };
+}
+
+public fn with_capacity(i64 capacity) -> HeaderBlock {
+    return HeaderBlock {
+        bytes: alloc::string::with_capacity(capacity),
+        fields: 0
+    };
+}
+
+public fn clear(HeaderBlock&mut block) {
+    alloc::string::clear(&mut block.bytes);
+    block.fields = 0;
+}
+
+public fn len(HeaderBlock& block) -> i64 {
+    return block.fields;
+}
+
+public fn byte_length(HeaderBlock& block) -> i64 {
+    return alloc::string::len(&block.bytes);
+}
+
+public fn view(HeaderBlock& block) -> BytesView {
+    return BytesView {
+        data: alloc::string::data_ptr(&block.bytes),
+        length: alloc::string::len(&block.bytes),
+    };
+}
+
+public fn add(HeaderBlock&mut block, usize name, i64 name_length, usize value, i64 value_length) -> bool {
+    i64 original = alloc::string::len(&block.bytes);
+
+    if (!std::net::http::append_header(&mut block.bytes, name, name_length, value, value_length)) {
+        alloc::string::truncate(&mut block.bytes, original);
+        return false;
+    }
+    block.fields += 1;
+    return true;
+}
+
+public fn append_to(HeaderBlock& block, String&mut output) -> bool {
+    return alloc::string::append_bytes(
+        output,
+        alloc::string::data_ptr(&block.bytes),
+        alloc::string::len(&block.bytes),
+    );
+}
+
+fn lower(i64 byte) -> i64 {
+    if (byte >= 65 && byte <= 90) {
+        return byte + 32;
+    }
+    return byte;
+}
+
+fn name_host(BytesView name) -> bool {
+    return (
+        name.length == 4 &&
+        lower(core::bytes::load_u8(name.data)) == 104 &&
+        lower(core::bytes::load_u8(name.data + 1)) == 111 &&
+        lower(core::bytes::load_u8(name.data + 2)) == 115 &&
+        lower(core::bytes::load_u8(name.data + 3)) == 116
+    );
+}
+
+fn name_connection(BytesView name) -> bool {
+    if (name.length != 10) {
+        return false;
+    }
+
+    i64 expected[10] = [99, 111, 110, 110, 101, 99, 116, 105, 111, 110];
+    i64 i = 0;
+
+    while (i<10) {
+        if (lower(core::bytes::load_u8(name.data + i)) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn name_content_length(BytesView name) -> bool {
+    if (name.length != 14) {
+        return false;
+    }
+
+    i64 expected[14] = [99, 111, 110, 116, 101, 110, 116, 45, 108, 101, 110, 103, 116, 104];
+    i64 i = 0;
+
+    while (i<14) {
+        if (lower(core::bytes::load_u8(name.data + i)) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn name_transfer_encoding(BytesView name) -> bool {
+    if (name.length != 17) {
+        return false;
+    }
+
+    i64 expected[17] = [116, 114, 97, 110, 115, 102, 101, 114, 45, 101, 110, 99, 111, 100, 105, 110, 103];
+    i64 i = 0;
+
+    while (i<17) {
+        if (lower(core::bytes::load_u8(name.data + i)) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Managed client/server framing owns these fields. Rejecting duplicates keeps
+/// framing unambiguous and prevents callers from accidentally creating request
+/// smuggling primitives through a convenience API.
+public fn safe_for_managed_framing(HeaderBlock& block) -> bool {
+    HeaderIterator iterator = std::net::http::headers(view(block));
+
+    HeaderView field = HeaderView {
+        name: BytesView {
+            data: 0, length: 0
+        }, value: BytesView {
+            data: 0, length: 0
+        }
+    };
+    while (std::net::http::next_header(&mut iterator, &mut field)) {
+        if (
+            name_host(field.name) ||
+            name_connection(field.name) ||
+            name_content_length(field.name) ||
+            name_transfer_encoding(field.name)
+        ) {
+            return false;
+        }
+    }
+    return std::net::http::headers_valid(&iterator);
+}
+
+public fn find(HeaderBlock& block, usize name, i64 name_length, BytesView&mut output) -> bool {
+    if (name_length <= 0 || name == 0) {
+        return false;
+    }
+
+    HeaderIterator iterator = std::net::http::headers(view(block));
+
+    HeaderView field = HeaderView {
+        name: BytesView {
+            data: 0, length: 0
+        }, value: BytesView {
+            data: 0, length: 0
+        }
+    };
+    while (std::net::http::next_header(&mut iterator, &mut field)) {
+        if (std::net::http::bytes_equal_ascii_case(field.name, name, name_length)) {
+            *output = field.value;
+            return true;
+        }
+    }
+    return false;
+}

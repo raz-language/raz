@@ -1,0 +1,572 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_wasm_memory;
+public import raz_compiler_backend_wasm_writer;
+// Raz-owned linear-memory ABI. Aggregate MIR storage is represented as an i64
+// byte offset into wasm linear memory. Every MIR aggregate slot occupies eight
+// bytes so scalar values, handles, references, and nested aggregate pointers
+// share one deterministic representation. Global 0 is the module bump pointer.
+fn wasm_memory_register_local(MirModule& mir, i64 function_index, i64 instruction) -> i64 {
+    i64 parameters = raz_rt_stage1_arena_get(mir.function_parameter_counts, function_index);
+    i64 locals = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    return parameters + locals + wasm_register_ordinal(mir, function_index, instruction);
+}
+
+fn wasm_memory_frame_local(MirModule& mir, i64 function_index, i64 slot) -> i64 {
+    return raz_rt_stage1_arena_get(mir.function_parameter_counts, function_index) + slot;
+}
+
+fn wasm_memory_global_reference_base() -> i64 {
+    return -1048577;
+}
+
+fn wasm_memory_slot_size() -> i64 {
+    return 8;
+}
+
+fn wasm_memory_static_base() -> i64 {
+    return 1024;
+}
+
+fn wasm_memory_align_slot(i64 value) -> i64 {
+    i64 mask = wasm_memory_slot_size() - 1;
+
+    return (value + mask) & ~mask;
+}
+
+fn wasm_memory_strings_equal(
+    Source& source,
+    MirModule& mir,
+    i64 left_instruction,
+    i64 right_instruction,
+) -> bool {
+    i64 left_length = raz_rt_stage1_arena_get(mir.op_b, left_instruction);
+    i64 right_length = raz_rt_stage1_arena_get(mir.op_b, right_instruction);
+
+    if (left_length != right_length) {
+        return false;
+    }
+
+    i64 left_offset = raz_rt_stage1_arena_get(mir.op_a, left_instruction);
+    i64 right_offset = raz_rt_stage1_arena_get(mir.op_a, right_instruction);
+    i64 index = 0;
+
+    while (index < left_length) {
+        if (source_byte(source, left_offset + index) != source_byte(source, right_offset + index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn wasm_memory_string_is_first(Source& source, MirModule& mir, i64 instruction) -> bool {
+    i64 ip = 0;
+
+    while (ip < instruction) {
+        if (
+            raz_rt_stage1_arena_get(mir.opcodes, ip) == 42 &&
+            wasm_memory_strings_equal(source, mir, ip, instruction)
+        ) {
+            return false;
+        }
+        ip += 1;
+    }
+    return true;
+}
+
+fn wasm_memory_string_address(Source& source, MirModule& mir, i64 instruction) -> i64 {
+    i64 address = wasm_memory_static_base();
+    i64 ip = 0;
+
+    while (ip < instruction) {
+        if (raz_rt_stage1_arena_get(mir.opcodes, ip) == 42 && wasm_memory_string_is_first(source, mir, ip)) {
+            if (wasm_memory_strings_equal(source, mir, ip, instruction)) {
+                return address;
+            }
+            address += raz_rt_stage1_arena_get(mir.op_b, ip) + 1;
+        }
+        ip += 1;
+    }
+    return address;
+}
+
+fn wasm_memory_heap_base(Source& source, MirModule& mir) -> i64 {
+    i64 address = wasm_memory_static_base();
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (
+            raz_rt_stage1_arena_get(mir.opcodes, ip) == 42 &&
+            wasm_memory_string_is_first(source, mir, ip)
+        ) {
+            address += raz_rt_stage1_arena_get(mir.op_b, ip) + 1;
+        }
+        ip += 1;
+    }
+    return wasm_memory_align_slot(address);
+}
+
+fn wasm_memory_minimum_pages(Source& source, MirModule& mir) -> i64 {
+    i64 bytes = wasm_memory_heap_base(source, mir);
+    i64 pages = (bytes + 65535) >> 16;
+
+    if (pages < 1) {
+        return 1;
+    }
+    return pages;
+}
+
+fn wasm_memory_emit_address_i64(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 base_instruction,
+    i64 index_instruction,
+) {
+    wasm_local_get(out, wasm_memory_register_local(mir, function_index, base_instruction));
+    wasm_local_get(out, wasm_memory_register_local(mir, function_index, index_instruction));
+    wasm_u8(out, 66);
+    wasm_i64(out, wasm_memory_slot_size());
+    wasm_u8(out, 126);
+    // i64.mul
+    wasm_u8(out, 124);
+    // i64.add
+}
+
+fn wasm_memory_emit_address(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 base_instruction,
+    i64 index_instruction,
+) {
+    wasm_memory_emit_address_i64(out, mir, function_index, base_instruction, index_instruction);
+    wasm_u8(out, 167);
+    // i32.wrap_i64
+}
+
+fn wasm_memory_constant_slot_offset(MirModule& mir, i64 index_instruction) -> i64 {
+    if (
+        index_instruction < 0 ||
+        index_instruction >= mir.instruction_count ||
+        raz_rt_stage1_arena_get(mir.opcodes, index_instruction) != 1 ||
+        primitive_type_is_float(raz_rt_stage1_arena_get(mir.op_types, index_instruction))
+    ) {
+        return -1;
+    }
+
+    i64 index = raz_rt_stage1_arena_get(mir.op_a, index_instruction);
+
+    if (index < 0 || index > 536870911) {
+        return -1;
+    }
+    return index * wasm_memory_slot_size();
+}
+
+fn wasm_memory_emit_load(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 base_instruction,
+    i64 index_instruction,
+) {
+    i64 offset = wasm_memory_constant_slot_offset(mir, index_instruction);
+
+    if (offset >= 0) {
+        wasm_local_get(out, wasm_memory_register_local(mir, function_index, base_instruction));
+        wasm_u8(out, 167);
+        // i32.wrap_i64
+        wasm_u8(out, 41);
+        wasm_u32(out, 3);
+        wasm_u32(out, offset);
+        return;
+    }
+    wasm_memory_emit_address(out, mir, function_index, base_instruction, index_instruction);
+    wasm_u8(out, 41);
+    // i64.load align=8 offset=0
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+}
+
+fn wasm_memory_emit_store(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 base_instruction,
+    i64 index_instruction,
+    i64 value_instruction,
+) {
+    i64 offset = wasm_memory_constant_slot_offset(mir, index_instruction);
+
+    if (offset >= 0) {
+        wasm_local_get(out, wasm_memory_register_local(mir, function_index, base_instruction));
+        wasm_u8(out, 167);
+        // i32.wrap_i64
+        wasm_local_get(out, wasm_memory_register_local(mir, function_index, value_instruction));
+        wasm_u8(out, 55);
+        wasm_u32(out, 3);
+        wasm_u32(out, offset);
+        return;
+    }
+    wasm_memory_emit_address(out, mir, function_index, base_instruction, index_instruction);
+    wasm_local_get(out, wasm_memory_register_local(mir, function_index, value_instruction));
+    wasm_u8(out, 55);
+    // i64.store align=8 offset=0
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+}
+
+fn wasm_memory_emit_element_reference(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 base_instruction,
+    i64 index_instruction,
+) {
+    wasm_memory_emit_address_i64(out, mir, function_index, base_instruction, index_instruction);
+}
+
+fn wasm_memory_emit_local_reference(ForgeWriter&mut out, i64 slot) {
+    // Heap addresses are non-negative. Local references use -(slot+1), keeping
+    // them disjoint without requiring a shadow stack for addressable wasm locals.
+    wasm_u8(out, 66);
+    wasm_i64(out, -slot - 1);
+}
+
+fn wasm_memory_emit_reference_load(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 reference_instruction,
+    i64 result_instruction,
+) {
+    i64 reference_local = wasm_memory_register_local(mir, function_index, reference_instruction);
+    i64 result_local = wasm_memory_register_local(mir, function_index, result_instruction);
+    i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    wasm_u8(out, 66);
+    wasm_i64(out, 0);
+    wasm_local_set(out, result_local);
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 66);
+    wasm_i64(out, wasm_memory_global_reference_base());
+    wasm_u8(out, 87);
+    // i64.le_s => module-global reference tag.
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+
+    i64 global_index = 0;
+
+    while (global_index < mir.global_count) {
+        wasm_local_get(out, reference_local);
+        wasm_u8(out, 66);
+        wasm_i64(out, wasm_memory_global_reference_base() - global_index);
+        wasm_u8(out, 81);
+        wasm_u8(out, 4);
+        wasm_u8(out, 64);
+        wasm_u8(out, 35);
+        wasm_u32(out, global_index + 1);
+        wasm_local_set(out, result_local);
+        wasm_u8(out, 11);
+        global_index += 1;
+    }
+    wasm_u8(out, 5);
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 66);
+    wasm_i64(out, 0);
+    wasm_u8(out, 83);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+
+    i64 slot = 0;
+
+    while (slot < local_count) {
+        wasm_local_get(out, reference_local);
+        wasm_u8(out, 66);
+        wasm_i64(out, -slot - 1);
+        wasm_u8(out, 81);
+        wasm_u8(out, 4);
+        wasm_u8(out, 64);
+        wasm_local_get(out, wasm_memory_frame_local(mir, function_index, slot));
+        wasm_local_set(out, result_local);
+        wasm_u8(out, 11);
+        slot += 1;
+    }
+    wasm_u8(out, 5);
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 41);
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+    wasm_local_set(out, result_local);
+    wasm_u8(out, 11);
+    wasm_u8(out, 11);
+}
+
+fn wasm_memory_emit_reference_store(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 reference_instruction,
+    i64 value_instruction,
+) {
+    i64 reference_local = wasm_memory_register_local(mir, function_index, reference_instruction);
+    i64 value_local = wasm_memory_register_local(mir, function_index, value_instruction);
+    i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 66);
+    wasm_i64(out, wasm_memory_global_reference_base());
+    wasm_u8(out, 87);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+
+    i64 global_index = 0;
+
+    while (global_index < mir.global_count) {
+        wasm_local_get(out, reference_local);
+        wasm_u8(out, 66);
+        wasm_i64(out, wasm_memory_global_reference_base() - global_index);
+        wasm_u8(out, 81);
+        wasm_u8(out, 4);
+        wasm_u8(out, 64);
+        wasm_local_get(out, value_local);
+        wasm_u8(out, 36);
+        wasm_u32(out, global_index + 1);
+        wasm_u8(out, 11);
+        global_index += 1;
+    }
+    wasm_u8(out, 5);
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 66);
+    wasm_i64(out, 0);
+    wasm_u8(out, 83);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+
+    i64 slot = 0;
+
+    while (slot < local_count) {
+        wasm_local_get(out, reference_local);
+        wasm_u8(out, 66);
+        wasm_i64(out, -slot - 1);
+        wasm_u8(out, 81);
+        wasm_u8(out, 4);
+        wasm_u8(out, 64);
+        wasm_local_get(out, value_local);
+        wasm_local_set(out, wasm_memory_frame_local(mir, function_index, slot));
+        wasm_u8(out, 11);
+        slot += 1;
+    }
+    wasm_u8(out, 5);
+    wasm_local_get(out, reference_local);
+    wasm_u8(out, 167);
+    wasm_local_get(out, value_local);
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+    wasm_u8(out, 11);
+    wasm_u8(out, 11);
+}
+
+fn wasm_memory_emit_ensure_capacity(ForgeWriter&mut out) {
+    // required_pages = ((heap_end - 1) >> 16) + 1. This form avoids the
+    // heap_end+65535 overflow that occurs near the wasm32 4 GiB ceiling.
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 69);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_u8(out, 0);
+    wasm_u8(out, 11);
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 65);
+    wasm_i64(out, 1);
+    wasm_u8(out, 107);
+    wasm_u8(out, 65);
+    wasm_i64(out, 16);
+    wasm_u8(out, 118);
+    wasm_u8(out, 65);
+    wasm_i64(out, 1);
+    wasm_u8(out, 106);
+    wasm_u8(out, 63);
+    wasm_u8(out, 0);
+    wasm_u8(out, 75);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 65);
+    wasm_i64(out, 1);
+    wasm_u8(out, 107);
+    wasm_u8(out, 65);
+    wasm_i64(out, 16);
+    wasm_u8(out, 118);
+    wasm_u8(out, 65);
+    wasm_i64(out, 1);
+    wasm_u8(out, 106);
+    wasm_u8(out, 63);
+    wasm_u8(out, 0);
+    wasm_u8(out, 107);
+    // memory.grow 0. A failed growth returns -1; trap at the allocation
+    // boundary immediately instead of publishing an unusable pointer.
+    wasm_u8(out, 64);
+    wasm_u8(out, 0);
+    wasm_u8(out, 65);
+    wasm_i64(out, -1);
+    wasm_u8(out, 70);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_u8(out, 0);
+    wasm_u8(out, 11);
+    wasm_u8(out, 11);
+}
+
+fn wasm_memory_emit_allocate(
+    ForgeWriter&mut out,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+    i64 slot_count,
+) -> bool {
+    if (slot_count < 0 || slot_count > 536870911) {
+        return false;
+    }
+
+    i64 byte_count = slot_count * wasm_memory_slot_size();
+
+    // Materialize the old bump pointer as the aggregate handle.
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 173);
+    wasm_local_set(out, wasm_memory_register_local(mir, function_index, instruction));
+    // Advance in i64 first so wrap past the wasm32 address-space ceiling is
+    // detected before truncating the new frontier back to i32.
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 173);
+    wasm_u8(out, 66);
+    wasm_i64(out, byte_count);
+    wasm_u8(out, 124);
+    wasm_u8(out, 66);
+    wasm_i64(out, 4294967295);
+    wasm_u8(out, 86);
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_u8(out, 0);
+    wasm_u8(out, 11);
+    wasm_u8(out, 35);
+    wasm_u32(out, 0);
+    wasm_u8(out, 65);
+    wasm_i64(out, byte_count);
+    wasm_u8(out, 106);
+    wasm_u8(out, 36);
+    wasm_u32(out, 0);
+    wasm_memory_emit_ensure_capacity(out);
+    return true;
+}
+
+fn wasm_emit_memory_section(ForgeWriter&mut module, Source& source, MirModule& mir) -> bool {
+    ForgeWriter section;
+
+    writer_init(&mut section);
+    if (section.failed) {
+        return false;
+    }
+    wasm_u32(&mut section, 1);
+    wasm_u32(&mut section, 0);
+    // limits: minimum only
+    wasm_u32(&mut section, wasm_memory_minimum_pages(source, mir));
+    wasm_section(module, 5, &section);
+
+    bool success = !section.failed && !module.failed;
+
+    writer_destroy(&mut section);
+    return success;
+}
+
+fn wasm_emit_memory_global_section(ForgeWriter&mut module, Source& source, MirModule& mir) -> bool {
+    ForgeWriter section;
+
+    writer_init(&mut section);
+    if (section.failed) {
+        return false;
+    }
+    wasm_u32(&mut section, 1);
+    wasm_u8(&mut section, 127);
+    // i32
+    wasm_u8(&mut section, 1);
+    // mutable
+    wasm_u8(&mut section, 65);
+    // i32.const
+    wasm_i64(&mut section, wasm_memory_heap_base(source, mir));
+    wasm_u8(&mut section, 11);
+    // end initializer
+    wasm_section(module, 6, &section);
+
+    bool success = !section.failed && !module.failed;
+
+    writer_destroy(&mut section);
+    return success;
+}
+
+fn wasm_emit_data_section(ForgeWriter&mut module, Source& source, MirModule& mir) -> bool {
+    ForgeWriter section;
+    i64 count = 0;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (
+            raz_rt_stage1_arena_get(mir.opcodes, ip) == 42 &&
+            wasm_memory_string_is_first(source, mir, ip)
+        ) {
+            count += 1;
+        }
+        ip += 1;
+    }
+    if (count == 0) {
+        return true;
+    }
+    writer_init(&mut section);
+    if (section.failed) {
+        return false;
+    }
+    wasm_u32(&mut section, count);
+    ip = 0;
+    while (ip < mir.instruction_count) {
+        if (
+            raz_rt_stage1_arena_get(mir.opcodes, ip) == 42 &&
+            wasm_memory_string_is_first(source, mir, ip)
+        ) {
+            i64 offset = raz_rt_stage1_arena_get(mir.op_a, ip);
+            i64 length = raz_rt_stage1_arena_get(mir.op_b, ip);
+            i64 address = wasm_memory_string_address(source, mir, ip);
+
+            wasm_u32(&mut section, 0);
+            // active segment, memory 0
+            wasm_u8(&mut section, 65);
+            wasm_i64(&mut section, address);
+            wasm_u8(&mut section, 11);
+            wasm_u32(&mut section, length + 1);
+
+            i64 index = 0;
+
+            while (index < length) {
+                wasm_u8(&mut section, source_byte(source, offset + index));
+                index += 1;
+            }
+            wasm_u8(&mut section, 0);
+        }
+        ip += 1;
+    }
+    wasm_section(module, 11, &section);
+
+    bool success = !section.failed && !module.failed;
+
+    writer_destroy(&mut section);
+    return success;
+}

@@ -1,0 +1,254 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::encoding::base64;
+import core::bytes;
+import core::result;
+
+public enum Base64Error {
+    InvalidLength,
+    InvalidByte,
+    InvalidPadding,
+    OutputFull,
+}
+
+public fn encoded_length(i64 input_length) -> i64 {
+    if (input_length < 0 || input_length > 6917529027641081853) {
+        return -1;
+    }
+
+    i64 groups = (input_length + 2) / 3;
+
+    if (groups > 2305843009213693951) {
+        return -1;
+    }
+    return groups * 4;
+}
+
+fn alphabet_byte(i64 value, bool url_safe) -> i64 {
+    if (value < 26) {
+        return 65 + value;
+    }
+    if (value < 52) {
+        return 97 + value - 26;
+    }
+    if (value < 62) {
+        return 48 + value - 52;
+    }
+    if (value == 62) {
+        if (url_safe) {
+            return 45;
+        }
+        return 43;
+    }
+    if (url_safe) {
+        return 95;
+    }
+    return 47;
+}
+
+fn decode_value(i64 byte, bool url_safe) -> i64 {
+    if (byte >= 65 && byte <= 90) {
+        return byte - 65;
+    }
+    if (byte >= 97 && byte <= 122) {
+        return byte - 97 + 26;
+    }
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48 + 52;
+    }
+    if ((!url_safe && byte == 43) || (url_safe && byte == 45)) {
+        return 62;
+    }
+    if ((!url_safe && byte == 47) || (url_safe && byte == 95)) {
+        return 63;
+    }
+    return -1;
+}
+
+fn encode_impl(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+    bool url_safe,
+) -> Result<i64, Base64Error> {
+    i64 required = encoded_length(input_length);
+
+    if (required < 0) {
+        return Result<i64, Base64Error>::Error(Base64Error::InvalidLength);
+    }
+    if ((input_length > 0 && input == 0) || output_capacity < required || (required > 0 && output == 0)) {
+        return Result<i64, Base64Error>::Error(Base64Error::OutputFull);
+    }
+
+    i64 source = 0;
+    i64 destination = 0;
+
+    while (source < input_length) {
+        i64 remaining = input_length - source;
+        i64 a = core::bytes::load_u8(input + source);
+        i64 b = 0;
+        i64 c = 0;
+
+        if (remaining > 1) {
+            b = core::bytes::load_u8(input + source + 1);
+        }
+        if (remaining > 2) {
+            c = core::bytes::load_u8(input + source + 2);
+        }
+        core::bytes::store_u8(output + destination, alphabet_byte((a >> 2) & 63, url_safe));
+        core::bytes::store_u8(
+            output + destination + 1,
+            alphabet_byte(((a & 3) << 4) | ((b >> 4) & 15), url_safe),
+        );
+        if (remaining > 1) {
+            core::bytes::store_u8(
+                output + destination + 2,
+                alphabet_byte(((b & 15) << 2) | ((c >> 6) & 3), url_safe),
+            );
+        } else {
+            core::bytes::store_u8(output + destination + 2, 61);
+        }
+        if (remaining > 2) {
+            core::bytes::store_u8(output + destination + 3, alphabet_byte(c & 63, url_safe));
+        } else {
+            core::bytes::store_u8(output + destination + 3, 61);
+        }
+        source += 3;
+        destination += 4;
+    }
+    return Result<i64, Base64Error>::Ok(required);
+}
+
+public fn encode(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+) -> Result<i64, Base64Error> {
+    return encode_impl(input, input_length, output, output_capacity, false);
+}
+
+public fn encode_url(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+) -> Result<i64, Base64Error> {
+    return encode_impl(input, input_length, output, output_capacity, true);
+}
+
+fn decoded_size(usize input, i64 input_length) -> Result<i64, Base64Error> {
+    if (input_length < 0 || (input_length % 4) != 0 || (input_length > 0 && input == 0)) {
+        return Result<i64, Base64Error>::Error(Base64Error::InvalidLength);
+    }
+    if (input_length == 0) {
+        return Result<i64, Base64Error>::Ok(0);
+    }
+
+    i64 padding = 0;
+
+    if (core::bytes::load_u8(input + input_length - 1) == 61) {
+        padding += 1;
+    }
+    if (input_length >= 2 && core::bytes::load_u8(input + input_length - 2) == 61) {
+        padding += 1;
+    }
+    return Result<i64, Base64Error>::Ok((input_length / 4) * 3 - padding);
+}
+
+fn decode_impl(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+    bool url_safe,
+) -> Result<i64, Base64Error> {
+    i64 required = decoded_size(input, input_length)?;
+
+    if (output_capacity < required || (required > 0 && output == 0)) {
+        return Result<i64, Base64Error>::Error(Base64Error::OutputFull);
+    }
+
+    i64 source = 0;
+    i64 destination = 0;
+
+    while (source < input_length) {
+        i64 a_raw = core::bytes::load_u8(input + source);
+        i64 b_raw = core::bytes::load_u8(input + source + 1);
+        i64 c_raw = core::bytes::load_u8(input + source + 2);
+        i64 d_raw = core::bytes::load_u8(input + source + 3);
+        i64 a = decode_value(a_raw, url_safe);
+        i64 b = decode_value(b_raw, url_safe);
+
+        if (a < 0 || b < 0) {
+            return Result<i64, Base64Error>::Error(Base64Error::InvalidByte);
+        }
+
+        bool final_group = source + 4 == input_length;
+        bool c_padding = c_raw == 61;
+        bool d_padding = d_raw == 61;
+
+        if ((c_padding || d_padding) && !final_group) {
+            return Result<i64, Base64Error>::Error(Base64Error::InvalidPadding);
+        }
+        if (c_padding && !d_padding) {
+            return Result<i64, Base64Error>::Error(Base64Error::InvalidPadding);
+        }
+
+        i64 c = 0;
+        i64 d = 0;
+
+        if (!c_padding) {
+            c = decode_value(c_raw, url_safe);
+            if (c < 0) {
+                return Result<i64, Base64Error>::Error(Base64Error::InvalidByte);
+            }
+        }
+        if (!d_padding) {
+            d = decode_value(d_raw, url_safe);
+            if (d < 0) {
+                return Result<i64, Base64Error>::Error(Base64Error::InvalidByte);
+            }
+        }
+        if (c_padding && (b & 15) != 0) {
+            return Result<i64, Base64Error>::Error(Base64Error::InvalidPadding);
+        }
+        if (d_padding && !c_padding && (c & 3) != 0) {
+            return Result<i64, Base64Error>::Error(Base64Error::InvalidPadding);
+        }
+        if (destination < required) {
+            core::bytes::store_u8(output + destination, (a << 2) | (b >> 4));
+            destination += 1;
+        }
+        if (!c_padding && destination < required) {
+            core::bytes::store_u8(output + destination, ((b & 15) << 4) | (c >> 2));
+            destination += 1;
+        }
+        if (!d_padding && destination < required) {
+            core::bytes::store_u8(output + destination, ((c & 3) << 6) | d);
+            destination += 1;
+        }
+        source += 4;
+    }
+    return Result<i64, Base64Error>::Ok(destination);
+}
+
+public fn decode(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+) -> Result<i64, Base64Error> {
+    return decode_impl(input, input_length, output, output_capacity, false);
+}
+
+public fn decode_url(
+    usize input,
+    i64 input_length,
+    usize output,
+    i64 output_capacity,
+) -> Result<i64, Base64Error> {
+    return decode_impl(input, input_length, output, output_capacity, true);
+}

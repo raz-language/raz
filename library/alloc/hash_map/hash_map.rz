@@ -1,0 +1,310 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::hash_map;
+// Open-addressed i64-key map with fixed-size raw values and tombstone reuse.
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+
+public struct RawHashMap {
+    usize keys;
+    usize values;
+    usize states;
+    i64 length;
+    i64 capacity;
+    i64 value_size;
+    i64 tombstones;
+}
+
+fn hash_map_hash(i64 key) -> i64 {
+    i64 mixed = key ^ (key >> 33);
+
+    mixed = mixed ^ (mixed << 11);
+    if (mixed < 0) {
+        mixed = -(mixed + 1);
+    }
+    return mixed;
+}
+
+fn hash_map_growth_threshold(i64 capacity) -> i64 {
+    // ceil(capacity * 0.7) without overflowing a signed 64-bit multiply.
+    return (capacity / 10) * 7 + ((capacity % 10) * 7 + 9) / 10;
+}
+
+fn hash_map_allocate(i64 value_size, i64 capacity) -> RawHashMap {
+    if (value_size <= 0) {
+        return RawHashMap {
+            keys: 0,
+            values: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            value_size: value_size,
+            tombstones: 0
+        };
+    }
+    if (capacity < 8) {
+        capacity = 8;
+    }
+    if (capacity > 1152921504606846975 || value_size > 9223372036854775807 / capacity) {
+        return RawHashMap {
+            keys: 0,
+            values: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            value_size: value_size,
+            tombstones: 0
+        };
+    }
+
+    usize keys = raz_rt_alloc(capacity*8);
+    usize values = raz_rt_alloc(capacity*value_size);
+    usize states = raz_rt_alloc(capacity);
+
+    if (keys == 0 || values == 0 || states == 0) {
+        raz_rt_dealloc(keys);
+        raz_rt_dealloc(values);
+        raz_rt_dealloc(states);
+        return RawHashMap {
+            keys: 0,
+            values: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            value_size: value_size,
+            tombstones: 0
+        };
+    }
+    raz_rt_fill(states, 0, capacity);
+    return RawHashMap {
+        keys: keys,
+        values: values,
+        states: states,
+        length: 0,
+        capacity: capacity,
+        value_size: value_size,
+        tombstones: 0,
+    };
+}
+
+public fn raw_hash_map_create(i64 value_size, i64 capacity) -> RawHashMap {
+    return hash_map_allocate(value_size, capacity);
+}
+
+public fn raw_hash_map_len(RawHashMap& map) -> i64 {
+    return map.length;
+}
+
+public fn raw_hash_map_capacity(RawHashMap& map) -> i64 {
+    return map.capacity;
+}
+
+public fn raw_hash_map_is_empty(RawHashMap& map) -> bool {
+    return map.length == 0;
+}
+
+fn hash_map_find_slot(RawHashMap& map, i64 key, bool insertion) -> i64 {
+    if (map.capacity <= 0) {
+        return -1;
+    }
+
+    i64 slot = hash_map_hash(key) % map.capacity;
+    i64 tomb = -1;
+    i64 scanned = 0;
+
+    while (scanned<map.capacity) {
+        i64 state = raz_rt_load_u8(map.states + slot);
+
+        if (state == 0) {
+            if (insertion && tomb >= 0) {
+                return tomb;
+            }
+            if (insertion) {
+                return slot;
+            }
+            return -1;
+        }
+        if (state == 2) {
+            if (insertion && tomb<0) {
+                tomb = slot;
+            }
+        } else if (raz_rt_volatile_load_i64(map.keys + slot*8) == key) {
+            return slot;
+        }
+        slot = (slot + 1) % map.capacity;
+        scanned += 1;
+    }
+    return tomb;
+}
+
+fn hash_map_insert_no_grow(RawHashMap&mut map, i64 key, usize source) -> bool {
+    if (source == 0) {
+        return false;
+    }
+
+    i64 slot = hash_map_find_slot(map, key, true);
+
+    if (slot<0) {
+        return false;
+    }
+
+    i64 state = raz_rt_load_u8(map.states + slot);
+
+    if (state == 1) {
+        raz_rt_copy(map.values + slot*map.value_size, source, map.value_size);
+        return true;
+    }
+    if (state == 2) {
+        map.tombstones -= 1;
+    }
+    raz_rt_volatile_store_i64(map.keys + slot*8, key);
+    raz_rt_copy(map.values + slot*map.value_size, source, map.value_size);
+    raz_rt_store_u8(map.states + slot, 1);
+    map.length += 1;
+    return true;
+}
+
+public fn raw_hash_map_reserve(RawHashMap&mut map, i64 required) -> bool {
+    if (required<0) {
+        return false;
+    }
+
+    i64 wanted = map.capacity;
+
+    if (wanted<8) {
+        wanted = 8;
+    }
+    while (required >= hash_map_growth_threshold(wanted)) {
+        if (wanted> 576460752303423487) {
+            return false;
+        }
+        wanted *= 2;
+    }
+    if (wanted == map.capacity && map.tombstones*4 < map.capacity) {
+        return true;
+    }
+
+    RawHashMap replacement = hash_map_allocate(map.value_size, wanted);
+
+    if (replacement.capacity == 0) {
+        return false;
+    }
+
+    i64 slot = 0;
+
+    while (slot<map.capacity) {
+        if (raz_rt_load_u8(map.states + slot) == 1) {
+            hash_map_insert_no_grow(
+                &mut replacement,
+                raz_rt_volatile_load_i64(map.keys + slot*8),
+                map.values + slot*map.value_size,
+            );
+        }
+        slot += 1;
+    }
+    raz_rt_dealloc(map.keys);
+    raz_rt_dealloc(map.values);
+    raz_rt_dealloc(map.states);
+    map.keys = replacement.keys;
+    map.values = replacement.values;
+    map.states = replacement.states;
+    map.length = replacement.length;
+    map.capacity = replacement.capacity;
+    map.tombstones = 0;
+    replacement.keys = 0;
+    replacement.values = 0;
+    replacement.states = 0;
+    return true;
+}
+
+public fn raw_hash_map_contains_key(RawHashMap& map, i64 key) -> bool {
+    return hash_map_find_slot(map, key, false) >= 0;
+}
+
+public fn raw_hash_map_value_address(RawHashMap& map, i64 key) -> usize {
+    i64 slot = hash_map_find_slot(map, key, false);
+
+    if (slot<0) {
+        return 0;
+    }
+    return map.values + slot*map.value_size;
+}
+
+public fn raw_hash_map_get_raw(RawHashMap& map, i64 key, usize output) -> bool {
+    if (output == 0) {
+        return false;
+    }
+
+    usize address = raw_hash_map_value_address(map, key);
+
+    if (address == 0) {
+        return false;
+    }
+    raz_rt_copy(output, address, map.value_size);
+    return true;
+}
+
+public fn raw_hash_map_insert_raw(RawHashMap&mut map, i64 key, usize source) -> bool {
+    if (source == 0) {
+        return false;
+    }
+
+    i64 existing = hash_map_find_slot(map, key, false);
+
+    if (existing >= 0) {
+        raz_rt_copy(map.values + existing*map.value_size, source, map.value_size);
+        return true;
+    }
+    if (!raw_hash_map_reserve(map, map.length + 1)) {
+        return false;
+    }
+    return hash_map_insert_no_grow(map, key, source);
+}
+
+public fn raw_hash_map_remove(RawHashMap&mut map, i64 key, usize output) -> bool {
+    i64 slot = hash_map_find_slot(map, key, false);
+
+    if (slot<0) {
+        return false;
+    }
+    if (output != 0) {
+        raz_rt_copy(output, map.values + slot*map.value_size, map.value_size);
+    }
+    raz_rt_store_u8(map.states + slot, 2);
+    map.length -= 1;
+    map.tombstones += 1;
+    return true;
+}
+
+public fn raw_hash_map_clear(RawHashMap&mut map) {
+    if (map.capacity> 0) {
+        raz_rt_fill(map.states, 0, map.capacity);
+    }
+    map.length = 0;
+    map.tombstones = 0;
+}
+
+public fn raw_hash_map_destroy(RawHashMap&mut map) {
+    raz_rt_dealloc(map.keys);
+    raz_rt_dealloc(map.values);
+    raz_rt_dealloc(map.states);
+    map.keys = 0;
+    map.values = 0;
+    map.states = 0;
+    map.length = 0;
+    map.capacity = 0;
+    map.tombstones = 0;
+}
+
+impl Drop for RawHashMap {
+    fn drop(RawHashMap&mut self) {
+        raw_hash_map_destroy(self);
+    }
+}

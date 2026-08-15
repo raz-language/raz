@@ -1,0 +1,40 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+execute_process(
+ COMMAND "${FORGE_CODEGEN}" "${INPUT}" --stats
+ RESULT_VARIABLE status
+ OUTPUT_VARIABLE output
+ ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+ message(FATAL_ERROR "forge-codegen failed (${status}): ${error}")
+endif()
+string(REGEX MATCH "bytes=([0-9]+)" _bytes_match "${output}")
+set(encoded_bytes "${CMAKE_MATCH_1}")
+string(REGEX MATCH "spill-stores-deferred=([0-9]+)" _deferred_match "${output}")
+set(deferred_stores "${CMAKE_MATCH_1}")
+string(REGEX MATCH "bytes-before-store-elim=([0-9]+)" _before_match "${output}")
+set(before_bytes "${CMAKE_MATCH_1}")
+string(REGEX MATCH "spill-cache-preserved-instructions=([0-9]+)" _preserved_match "${output}")
+set(preserved_instructions "${CMAKE_MATCH_1}")
+string(REGEX MATCH "rematerialized-values=([0-9]+)" _remat_match "${output}")
+set(rematerialized_values "${CMAKE_MATCH_1}")
+if(encoded_bytes STREQUAL "" OR deferred_stores STREQUAL "" OR before_bytes STREQUAL "" OR preserved_instructions STREQUAL "" OR rematerialized_values STREQUAL "")
+ message(FATAL_ERROR "missing code-quality metrics in output:\n${output}")
+endif()
+if(encoded_bytes GREATER MAX_ENCODED_BYTES)
+ message(FATAL_ERROR "encoded-byte regression: ${encoded_bytes} > ${MAX_ENCODED_BYTES}")
+endif()
+if(deferred_stores LESS MIN_DEFERRED_STORES)
+ message(FATAL_ERROR "deferred-store regression: ${deferred_stores} < ${MIN_DEFERRED_STORES}")
+endif()
+if(rematerialized_values LESS MIN_REMATERIALIZED_VALUES)
+ message(FATAL_ERROR "rematerialization regression: ${rematerialized_values} < ${MIN_REMATERIALIZED_VALUES}")
+endif()
+if(before_bytes LESS encoded_bytes)
+ message(FATAL_ERROR "invalid before/after byte metrics: ${before_bytes} < ${encoded_bytes}")
+endif()
+if(preserved_instructions LESS MIN_PRESERVED_INSTRUCTIONS)
+ message(FATAL_ERROR "spill-cache preservation regression: ${preserved_instructions} < ${MIN_PRESERVED_INSTRUCTIONS}")
+endif()
+message(STATUS "Forge code quality: bytes=${encoded_bytes}/${MAX_ENCODED_BYTES}, deferred-stores=${deferred_stores}, rematerialized=${rematerialized_values}, preserved=${preserved_instructions}, before=${before_bytes}")

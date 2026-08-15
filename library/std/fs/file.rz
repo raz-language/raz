@@ -1,0 +1,248 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::file;
+import core::result;
+import std::io::error;
+// Streaming file handles. The host runtime owns only OS handle operations;
+// buffering, policy and lifecycle live in Raz.
+extern fn raz_rt_file_open(usize path, i64 length, i64 flags) -> usize;
+extern fn raz_rt_file_read(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_file_seek(usize handle, i64 offset, i64 origin) -> i64;
+extern fn raz_rt_file_tell(usize handle) -> i64;
+extern fn raz_rt_file_flush(usize handle) -> i64;
+extern fn raz_rt_file_eof(usize handle) -> i64;
+extern fn raz_rt_file_close(usize handle);
+public const i64 read_flag = 1;
+public const i64 write_flag = 2;
+public const i64 append_flag = 4;
+public const i64 create_flag = 8;
+public const i64 truncate_flag = 16;
+
+public struct File {
+    usize handle;
+}
+
+public fn open_with_flags(usize path, i64 length, i64 flags) -> File {
+    return File {
+        handle: raz_rt_file_open(path, length, flags)
+    };
+}
+
+public fn open_read(usize path, i64 length) -> File {
+    return open_with_flags(path, length, read_flag);
+}
+
+public fn create(usize path, i64 length) -> File {
+    return open_with_flags(path, length, write_flag | create_flag | truncate_flag);
+}
+
+public fn open_read_write(usize path, i64 length, bool create_if_missing) -> File {
+    i64 flags = read_flag | write_flag;
+
+    if (create_if_missing) {
+        flags |= create_flag;
+    }
+    return open_with_flags(path, length, flags);
+}
+
+public fn open_append(usize path, i64 length) -> File {
+    return open_with_flags(path, length, write_flag | append_flag | create_flag);
+}
+
+public fn valid(File& file) -> bool {
+    return file.handle != 0;
+}
+
+public fn read(File&mut file, usize output, i64 capacity) -> i64 {
+    if (file.handle == 0) {
+        return -1;
+    }
+    return raz_rt_file_read(file.handle, output, capacity);
+}
+
+public fn write(File&mut file, usize data, i64 size) -> i64 {
+    if (file.handle == 0) {
+        return -1;
+    }
+    return raz_rt_file_write(file.handle, data, size);
+}
+
+public fn write_all(File&mut file, usize data, i64 size) -> bool {
+    if (size < 0 || file.handle == 0) {
+        return false;
+    }
+
+    i64 written = 0;
+
+    while (written < size) {
+        i64 count = raz_rt_file_write(file.handle, data + written, size - written);
+
+        if (count <= 0) {
+            return false;
+        }
+        written += count;
+    }
+    return true;
+}
+
+public fn seek(File&mut file, i64 offset, i64 origin) -> bool {
+    if (file.handle == 0) {
+        return false;
+    }
+    return raz_rt_file_seek(file.handle, offset, origin) == 1;
+}
+
+public fn seek_start(File&mut file, i64 offset) -> bool {
+    return seek(file, offset, 0);
+}
+
+public fn seek_current(File&mut file, i64 offset) -> bool {
+    return seek(file, offset, 1);
+}
+
+public fn seek_end(File&mut file, i64 offset) -> bool {
+    return seek(file, offset, 2);
+}
+
+public fn position(File& file) -> i64 {
+    if (file.handle == 0) {
+        return -1;
+    }
+    return raz_rt_file_tell(file.handle);
+}
+
+public fn flush(File&mut file) -> bool {
+    return file.handle != 0 && raz_rt_file_flush(file.handle) == 1;
+}
+
+public fn eof(File& file) -> bool {
+    return file.handle != 0 && raz_rt_file_eof(file.handle) == 1;
+}
+
+public fn close(File&mut file) {
+    if (file.handle != 0) {
+        raz_rt_file_close(file.handle);
+        file.handle = 0;
+    }
+}
+
+impl Drop for File {
+    fn drop(File&mut self) {
+        close(self);
+    }
+}
+
+/// Open a file with structured failure information.
+public fn try_open_with_flags(usize path, i64 length, i64 flags) -> Result<File, IoError> {
+    usize handle = raz_rt_file_open(path, length, flags);
+
+    if (handle == 0) {
+        return Result<File, IoError>::Error(last_error(IoOperation::Open));
+    }
+    return Result<File, IoError>::Ok(File {
+        handle: handle
+    }
+    );
+}
+
+public fn try_open_read(usize path, i64 length) -> Result<File, IoError> {
+    return try_open_with_flags(path, length, read_flag);
+}
+
+public fn try_create(usize path, i64 length) -> Result<File, IoError> {
+    return try_open_with_flags(path, length, write_flag | create_flag | truncate_flag);
+}
+
+public fn try_open_read_write(usize path, i64 length, bool create_if_missing) -> Result<File, IoError> {
+    i64 flags = read_flag | write_flag;
+
+    if (create_if_missing) {
+        flags |= create_flag;
+    }
+    return try_open_with_flags(path, length, flags);
+}
+
+public fn try_open_append(usize path, i64 length) -> Result<File, IoError> {
+    return try_open_with_flags(path, length, write_flag | append_flag | create_flag);
+}
+
+public fn try_read(File&mut file, usize output, i64 capacity) -> Result<i64, IoError> {
+    if (file.handle == 0 || capacity < 0) {
+        return Result<i64, IoError>::Error(error_with_code(IoOperation::Read, -1));
+    }
+
+    i64 count = raz_rt_file_read(file.handle, output, capacity);
+
+    if (count < 0) {
+        return Result<i64, IoError>::Error(last_error(IoOperation::Read));
+    }
+    return Result<i64, IoError>::Ok(count);
+}
+
+public fn try_write(File&mut file, usize data, i64 size) -> Result<i64, IoError> {
+    if (file.handle == 0 || size < 0) {
+        return Result<i64, IoError>::Error(error_with_code(IoOperation::Write, -1));
+    }
+
+    i64 count = raz_rt_file_write(file.handle, data, size);
+
+    if (count < 0) {
+        return Result<i64, IoError>::Error(last_error(IoOperation::Write));
+    }
+    return Result<i64, IoError>::Ok(count);
+}
+
+/// Writes the complete buffer. The `?` converts Result<i64, IoError> into
+/// Result<bool, IoError>, exercising Raz's shared-error-channel propagation.
+public fn try_write_all(File&mut file, usize data, i64 size) -> Result<bool, IoError> {
+    if (file.handle == 0 || size < 0) {
+        return Result<bool, IoError>::Error(error_with_code(IoOperation::Write, -1));
+    }
+
+    i64 written = 0;
+
+    while (written < size) {
+        i64 count = try_write(file, data + written, size - written)?;
+
+        if (count <= 0) {
+            return Result<bool, IoError>::Error(error_with_code(IoOperation::Write, -1));
+        }
+        written += count;
+    }
+    return Result<bool, IoError>::Ok(true);
+}
+
+public fn try_seek(File&mut file, i64 offset, i64 origin) -> Result<bool, IoError> {
+    if (file.handle == 0) {
+        return Result<bool, IoError>::Error(error_with_code(IoOperation::Seek, -1));
+    }
+    if (raz_rt_file_seek(file.handle, offset, origin) != 1) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Seek));
+    }
+    return Result<bool, IoError>::Ok(true);
+}
+
+public fn try_position(File& file) -> Result<i64, IoError> {
+    if (file.handle == 0) {
+        return Result<i64, IoError>::Error(error_with_code(IoOperation::Seek, -1));
+    }
+
+    i64 position = raz_rt_file_tell(file.handle);
+
+    if (position < 0) {
+        return Result<i64, IoError>::Error(last_error(IoOperation::Seek));
+    }
+    return Result<i64, IoError>::Ok(position);
+}
+
+public fn try_flush(File&mut file) -> Result<bool, IoError> {
+    if (file.handle == 0) {
+        return Result<bool, IoError>::Error(error_with_code(IoOperation::Flush, -1));
+    }
+    if (raz_rt_file_flush(file.handle) != 1) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Flush));
+    }
+    return Result<bool, IoError>::Ok(true);
+}

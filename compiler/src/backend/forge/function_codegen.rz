@@ -1,0 +1,1499 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_forge_function_codegen;
+public import raz_compiler_backend_forge_globals_codegen;
+import raz_compiler_backend_forge_codegen;
+import raz_compiler_driver_project;
+// Forge scalar/function lowering from the Pass C verified backend.
+// Split mechanically to keep self-host modules below the source-size gate.
+// Lower typed MIR into verified Forge IR. Language semantics should already be
+// decided before this point; this file maps those decisions onto backend operations.
+// String literals are emitted as immutable byte globals. The value flowing
+// through HIR/MIR is the relocatable address of that storage, which keeps the
+// built-in string representation pointer-sized and independent of host memory.
+fn forge_string_literal_byte_length(Source& source, i64 offset, i64 length, bool raw_slice) -> i64 {
+  if (raw_slice) {
+    return length + 1;
+  }
+  if (length < 2) {
+    return 1;
+  }
+
+  i64 index = 1;
+  i64 end = length - 1;
+  i64 bytes = 0;
+
+  while (index < end) {
+    i64 current = source_byte(source, offset + index);
+
+    if (current == 92 && index + 1 < end) {
+      // Raz escape sequences currently encode one output byte. Keep the
+      // original spelling for Forge and count the decoded payload here.
+      index += 2;
+    } else {
+      index += 1;
+    }
+    bytes += 1;
+  }
+  return bytes + 1;
+}
+
+fn writer_string_global_name(ForgeWriter&mut out, i64 instruction) {
+  writer_put(out, 64);
+  writer_put(out, 95);
+  writer_put(out, 95);
+  writer_put(out, 114);
+  writer_put(out, 97);
+  writer_put(out, 122);
+  writer_put(out, 95);
+  writer_put(out, 115);
+  writer_put(out, 116);
+  writer_put(out, 114);
+  writer_put(out, 105);
+  writer_put(out, 110);
+  writer_put(out, 103);
+  writer_put(out, 95);
+  writer_decimal(out, instruction);
+}
+
+fn emit_forge_string_global(ForgeWriter&mut out, Source& source, MirModule& mir, i64 instruction) {
+  i64 offset = raz_rt_stage1_arena_get(mir.op_a, instruction);
+  i64 length = raz_rt_stage1_arena_get(mir.op_b, instruction);
+  bool raw_slice = raz_rt_stage1_arena_get(mir.op_c, instruction) != 0;
+  i64 byte_length = forge_string_literal_byte_length(source, offset, length, raw_slice);
+
+  writer_space(out);
+  writer_space(out);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 110);
+  writer_put(out, 115);
+  writer_put(out, 116);
+  writer_put(out, 97);
+  writer_put(out, 110);
+  writer_put(out, 116);
+  writer_space(out);
+  writer_string_global_name(out, instruction);
+  writer_put(out, 58);
+  writer_space(out);
+  writer_i8(out);
+  writer_put(out, 91);
+  writer_decimal(out, byte_length);
+  writer_put(out, 93);
+  writer_space(out);
+  writer_put(out, 97);
+  writer_put(out, 108);
+  writer_put(out, 105);
+  writer_put(out, 103);
+  writer_put(out, 110);
+  writer_space(out);
+  writer_decimal(out, 1);
+  writer_space(out);
+  writer_put(out, 61);
+  writer_space(out);
+  writer_put(out, 34);
+  if (raw_slice) {
+    if (length > 0) {
+      writer_text(out, source, offset, length);
+    }
+  } else if (length > 2) {
+    writer_text(out, source, offset + 1, length - 2);
+  }
+  writer_put(out, 92);
+  writer_put(out, 48);
+  writer_put(out, 34);
+  writer_newline(out);
+}
+
+fn forge_is_builtin_runtime_extern(Source& source, HirModule& hir, i64 function_index) -> bool {
+  i64 length = raz_rt_stage1_arena_get(hir.function_name_lengths, function_index);
+
+  if (length < 7) {
+    return false;
+  }
+
+  i64 offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function_index);
+
+  bool runtime_prefix =
+  source_byte(source, offset) == 114 &&
+  source_byte(source, offset + 1) == 97 &&
+  source_byte(source, offset + 2) == 122 &&
+  source_byte(source, offset + 3) == 95 &&
+  source_byte(source, offset + 4) == 114 &&
+  source_byte(source, offset + 5) == 116 &&
+  source_byte(source, offset + 6) == 95;
+  if (!runtime_prefix) {
+    return false;
+  }
+  // Only suppress declarations that the Forge emitter itself guarantees.
+  // User-facing runtime/OS shims such as raz_rt_alloc, raz_rt_file_open,
+  // and raz_rt_udp_send_to must be emitted from their source-level extern
+  // declarations.  The old prefix-only test silently dropped every raz_rt_*
+  // extern, leaving valid stdlib programs with unresolved callees.
+  if (
+  length >= 14 &&
+  source_byte(source, offset + 7) == 115 &&
+  source_byte(source, offset + 8) == 116 &&
+  source_byte(source, offset + 9) == 97 &&
+  source_byte(source, offset + 10) == 103 &&
+  source_byte(source, offset + 11) == 101 &&
+  source_byte(source, offset + 12) == 49 &&
+  source_byte(source, offset + 13) == 95
+  ) {
+    return true;
+  }
+  if (
+  length >= 13 &&
+  source_byte(source, offset + 7) == 97 &&
+  source_byte(source, offset + 8) == 115 &&
+  source_byte(source, offset + 9) == 121 &&
+  source_byte(source, offset + 10) == 110 &&
+  source_byte(source, offset + 11) == 99 &&
+  source_byte(source, offset + 12) == 95
+  ) {
+    return true;
+  }
+  if (
+  length >= 14 &&
+  source_byte(source, offset + 7) == 102 &&
+  source_byte(source, offset + 8) == 117 &&
+  source_byte(source, offset + 9) == 116 &&
+  source_byte(source, offset + 10) == 117 &&
+  source_byte(source, offset + 11) == 114 &&
+  source_byte(source, offset + 12) == 101 &&
+  source_byte(source, offset + 13) == 95
+  ) {
+    return true;
+  }
+  if (length == 22) {
+    i64 expected[22] = [114, 97, 122, 95, 114, 116, 95, 119, 114, 105, 116, 101, 95, 97, 115, 99, 105, 105, 95, 105, 54, 52];
+    i64 index = 0;
+    bool same = true;
+
+    while (index < 22 && same) {
+      if (source_byte(source, offset + index) != expected[index]) {
+        same = false;
+      }
+      index += 1;
+    }
+    if (same) {
+      return true;
+    }
+  }
+  if (length == 21) {
+    i64 expected[21] = [114, 97, 122, 95, 114, 116, 95, 114, 101, 97, 100, 95, 97, 115, 99, 105, 105, 95, 105, 54, 52];
+    i64 index = 0;
+    bool same = true;
+
+    while (index < 21 && same) {
+      if (source_byte(source, offset + index) != expected[index]) {
+        same = false;
+      }
+      index += 1;
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn forge_extern_already_emitted(Source& source, HirModule& hir, i64 function_index) -> bool {
+  i64 previous = 0;
+
+  while (previous < function_index) {
+    if (
+    raz_rt_stage1_arena_get(hir.function_is_extern, previous) != 0 &&
+    !forge_is_builtin_runtime_extern(source, hir, previous) &&
+    function_native_symbol_same(source, hir, previous, function_index)
+    ) {
+      return true;
+    }
+    previous += 1;
+  }
+  return false;
+}
+
+fn emit_forge_string_globals(ForgeWriter&mut out, Source& source, MirModule& mir) {
+  i64 instruction = 0;
+
+  while (instruction < mir.instruction_count) {
+    if (raz_rt_stage1_arena_get(mir.opcodes, instruction) == 42) {
+      emit_forge_string_global(out, source, mir, instruction);
+    }
+    instruction += 1;
+  }
+}
+
+fn forge_function_pointer_local_type(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
+  i64 declared_count = raz_rt_stage1_arena_get(hir.function_local_counts, function_index);
+
+  if (local_slot >= 0 && local_slot < declared_count) {
+    i64 local_start = raz_rt_stage1_arena_get(hir.function_local_starts, function_index);
+    i64 local_index = local_start + local_slot;
+
+    if (
+    raz_rt_stage1_arena_get(hir.local_types, local_index) == 14 &&
+    raz_rt_stage1_arena_get(hir.local_function_types, local_index) >= 0
+    ) {
+      return raz_rt_stage1_arena_get(hir.local_function_types, local_index);
+    }
+    return -1;
+  }
+
+  i64 parameter = local_slot - declared_count;
+  i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+
+  if (parameter >= 0 && parameter < parameter_count) {
+    i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index);
+
+    return raz_rt_stage1_arena_get(hir.parameter_function_types, parameter_start + parameter);
+  }
+  return -1;
+}
+
+fn forge_function_pointer_local_register(i64 local_slot) -> i64 {
+  return writer_synthetic_register(70, local_slot);
+}
+
+fn emit_forge_function(
+ForgeWriter&mut out,
+Source& source,
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+) -> bool {
+  writer_space(out);
+  writer_space(out);
+  // Target features are part of the FIR function contract. Forge carries this
+  // prefix into machine IR so target backends can validate/select instructions
+  // without the frontend depending on native codegen details.
+
+  i64 feature_length = raz_rt_stage1_arena_get(hir.function_target_feature_lengths, function_index);
+
+  if (feature_length != 0) {
+    writer_text(
+    out,
+    source,
+    raz_rt_stage1_arena_get(hir.function_target_feature_offsets, function_index),
+    feature_length,
+    );
+    writer_space(out);
+  }
+  writer_keyword_func(out);
+  writer_space(out);
+  writer_function_name(out, source, hir, function_index);
+  writer_put(out, 40);
+
+  i64 parameter = 0;
+
+  while (parameter < raz_rt_stage1_arena_get(mir.function_parameter_counts, function_index)) {
+    if (parameter > 0) {
+      writer_put(out, 44);
+      writer_space(out);
+    }
+    writer_parameter(out, parameter);
+    writer_put(out, 58);
+    writer_space(out);
+
+    i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index);
+    i64 parameter_index = parameter_start + parameter;
+
+    if (
+    raz_rt_stage1_arena_get(hir.parameter_references, parameter_index) != 0 ||
+    raz_rt_stage1_arena_get(hir.parameter_slices, parameter_index) != 0 ||
+    raz_rt_stage1_arena_get(hir.parameter_array_extents, parameter_index) >= 0 ||
+    raz_rt_stage1_arena_get(hir.parameter_type_structs, parameter_index) >= 0
+    ) {
+      writer_i64(out);
+    } else {
+      writer_scalar_type(out, raz_rt_stage1_arena_get(hir.parameter_types, parameter_index));
+    }
+    parameter += 1;
+  }
+  writer_put(out, 41);
+  writer_space(out);
+  writer_put(out, 45);
+  writer_put(out, 62);
+  writer_space(out);
+  if (raz_rt_stage1_arena_get(hir.function_returns_value, function_index) == 0) {
+    writer_void(out);
+  } else if (
+  raz_rt_stage1_arena_get(hir.function_return_references, function_index) != 0 ||
+  raz_rt_stage1_arena_get(hir.function_return_slices, function_index) != 0 ||
+  raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index) >= 0
+  ) {
+    writer_i64(out);
+  } else {
+    writer_scalar_type(out, raz_rt_stage1_arena_get(hir.function_return_types, function_index));
+  }
+  writer_space(out);
+  writer_put(out, 123);
+  writer_newline(out);
+  writer_space(out);
+  writer_space(out);
+  writer_put(out, 101);
+  writer_put(out, 110);
+  writer_put(out, 116);
+  writer_put(out, 114);
+  writer_put(out, 121);
+  writer_put(out, 58);
+  writer_newline(out);
+  writer_instruction_prefix(out, 999999);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 110);
+  writer_put(out, 115);
+  writer_put(out, 116);
+  writer_space(out);
+  writer_i64(out);
+  writer_space(out);
+  writer_decimal(out, 0);
+  writer_newline(out);
+  writer_instruction_prefix(out, 999998);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 110);
+  writer_put(out, 115);
+  writer_put(out, 116);
+  writer_space(out);
+  writer_i64(out);
+  writer_space(out);
+  writer_decimal(out, 1);
+  writer_newline(out);
+
+  i64 local_capacity = raz_rt_stage1_arena_get(mir.function_local_counts, function_index) + 1;
+  i64 frame_register = writer_synthetic_register(0, function_index);
+  i64 frame_count_register = writer_synthetic_register(1, function_index);
+
+  writer_instruction_prefix(out, frame_count_register);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 110);
+  writer_put(out, 115);
+  writer_put(out, 116);
+  writer_space(out);
+  writer_i64(out);
+  writer_space(out);
+  writer_decimal(out, local_capacity);
+  writer_newline(out);
+  writer_instruction_prefix(out, frame_register);
+  writer_put(out, 99);
+  writer_put(out, 97);
+  writer_put(out, 108);
+  writer_put(out, 108);
+  writer_space(out);
+  writer_i64(out);
+  writer_space(out);
+  writer_runtime_name(out, 1);
+  writer_put(out, 40);
+  writer_register(out, frame_count_register);
+  writer_put(out, 41);
+  writer_newline(out);
+  // Function-pointer locals cannot live in the scalar stage arena: Forge
+  // models callable targets as ptr values while the arena stores i64 cells.
+  // Give those locals genuine pointer stack slots and keep all other locals
+  // on the existing deterministic arena path.
+
+  i64 pointer_local = 0;
+  i64 pointer_local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+  while (pointer_local < pointer_local_count) {
+    if (forge_function_pointer_local_type(hir, function_index, pointer_local) >= 0) {
+      writer_instruction_prefix(out, forge_function_pointer_local_register(pointer_local));
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_put(out, 97);
+      writer_put(out, 99);
+      writer_put(out, 107);
+      writer_put(out, 46);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_put(out, 111);
+      writer_put(out, 99);
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+      writer_decimal(out, 8);
+      writer_space(out);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 105);
+      writer_put(out, 103);
+      writer_put(out, 110);
+      writer_space(out);
+      writer_decimal(out, 8);
+      writer_newline(out);
+    }
+    pointer_local += 1;
+  }
+
+  i64 local_registers = raz_rt_stage1_arena_create(local_capacity);
+
+  if (local_registers == 0) {
+    return false;
+  }
+
+  i64 local = 0;
+
+  while (local < local_capacity) {
+    raz_rt_stage1_arena_set(local_registers, local, -1);
+    local += 1;
+  }
+
+  i64 ip = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+  i64 end = ip + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+  i64 block_terminated = 0;
+
+  while (ip < end) {
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, ip);
+
+    if (opcode == 24) {
+      if (block_terminated == 0) {
+        writer_jump_edge_no_arguments(out, ip);
+      }
+      writer_newline(out);
+      writer_space(out);
+      writer_space(out);
+      writer_block_name(out, ip);
+      if (raz_rt_stage1_arena_get(mir.op_a, ip) != 0) {
+        writer_put(out, 40);
+        writer_register(out, ip);
+        writer_put(out, 58);
+        writer_space(out);
+        writer_i64(out);
+        writer_put(out, 41);
+      }
+      writer_put(out, 58);
+      writer_newline(out);
+      block_terminated = 0;
+    } else if (block_terminated != 0) {} else if (opcode == 1) {
+      i64 op_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_scalar_type(out, op_type);
+      writer_space(out);
+      if (op_type == 1) {
+        i64 literal_length = raz_rt_stage1_arena_get(mir.op_b, ip);
+
+        if (literal_length > 0) {
+          writer_text(out, source, raz_rt_stage1_arena_get(mir.op_a, ip), literal_length);
+        } else {
+          writer_put(out, 48);
+          writer_put(out, 46);
+          writer_put(out, 48);
+        }
+      } else {
+        writer_decimal(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      }
+      writer_newline(out);
+    } else if (opcode == 42) {
+      writer_instruction_prefix(out, ip);
+
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      writer_global_address_opcode(
+      out,
+      raz_rt_stage1_arena_get(hir.global_tls_flags, global_index) != 0,
+      );
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+      writer_string_global_name(out, ip);
+      writer_newline(out);
+    } else if (opcode == 43) {
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 102);
+      writer_put(out, 117);
+      writer_put(out, 110);
+      writer_put(out, 99);
+      writer_put(out, 46);
+      writer_put(out, 97);
+      writer_put(out, 100);
+      writer_put(out, 100);
+      writer_put(out, 114);
+      writer_put(out, 101);
+      writer_put(out, 115);
+      writer_put(out, 115);
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+
+      i64 address_function = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      writer_function_name(out, source, hir, address_function);
+      i64 address_signature_encoded = raz_rt_stage1_arena_get(
+      hir.function_pointer_signatures,
+      address_function,
+      );
+      if (address_signature_encoded > 0) {
+        writer_space(out);
+        writer_put(out, 97);
+        writer_put(out, 115);
+        writer_space(out);
+        writer_function_signature_name(out, address_signature_encoded - 1);
+      }
+      writer_newline(out);
+    } else if (opcode == 2) {
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 112);
+      writer_put(out, 121);
+      writer_space(out);
+
+      i64 copied_parameter = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      i64 copied_parameter_index =
+      raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index) +
+      copied_parameter;
+      if (
+      raz_rt_stage1_arena_get(hir.parameter_references, copied_parameter_index) != 0 ||
+      raz_rt_stage1_arena_get(hir.parameter_slices, copied_parameter_index) != 0 ||
+      raz_rt_stage1_arena_get(hir.parameter_array_extents, copied_parameter_index) >= 0 ||
+      raz_rt_stage1_arena_get(hir.parameter_type_structs, copied_parameter_index) >= 0
+      ) {
+        writer_i64(out);
+      } else if (raz_rt_stage1_arena_get(hir.parameter_function_types, copied_parameter_index) >= 0) {
+        writer_ptr(out);
+      } else {
+        writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      }
+      writer_space(out);
+      writer_parameter(out, copied_parameter);
+      writer_newline(out);
+    } else if (opcode == 3) {
+      i64 loaded_local_slot = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      if (forge_function_pointer_local_type(hir, function_index, loaded_local_slot) >= 0) {
+        writer_instruction_prefix(out, ip);
+        writer_put(out, 108);
+        writer_put(out, 111);
+        writer_put(out, 97);
+        writer_put(out, 100);
+        writer_space(out);
+        writer_ptr(out);
+        writer_space(out);
+        writer_register(out, forge_function_pointer_local_register(loaded_local_slot));
+        writer_space(out);
+        writer_put(out, 97);
+        writer_put(out, 108);
+        writer_put(out, 105);
+        writer_put(out, 103);
+        writer_put(out, 110);
+        writer_space(out);
+        writer_decimal(out, 8);
+        writer_newline(out);
+      } else {
+        i64 slot_register = writer_synthetic_register(2, ip);
+
+        writer_instruction_prefix(out, slot_register);
+        writer_put(out, 99);
+        writer_put(out, 111);
+        writer_put(out, 110);
+        writer_put(out, 115);
+        writer_put(out, 116);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        writer_decimal(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+        writer_newline(out);
+
+        i64 load_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+
+        if (primitive_type_is_float(load_type)) {
+          i64 loaded_register = ip;
+
+          if (load_type == 11) {
+            loaded_register = writer_synthetic_register(236, ip);
+          }
+          writer_instruction_prefix(out, loaded_register);
+          writer_put(out, 99);
+          writer_put(out, 97);
+          writer_put(out, 108);
+          writer_put(out, 108);
+          writer_space(out);
+          writer_f64(out);
+          writer_space(out);
+          writer_runtime_name(out, 8);
+          writer_put(out, 40);
+          writer_register(out, frame_register);
+          writer_put(out, 44);
+          writer_space(out);
+          writer_register(out, slot_register);
+          writer_put(out, 41);
+          writer_newline(out);
+          if (load_type == 11) {
+            writer_instruction_prefix(out, ip);
+            writer_numeric_cast_opcode(out, 1, 11);
+            writer_space(out);
+            writer_f32(out);
+            writer_space(out);
+            writer_register(out, loaded_register);
+            writer_newline(out);
+          }
+        } else if (primitive_type_width(load_type) < 64) {
+          i64 raw_register = writer_synthetic_register(3, ip);
+
+          writer_instruction_prefix(out, raw_register);
+          writer_put(out, 99);
+          writer_put(out, 97);
+          writer_put(out, 108);
+          writer_put(out, 108);
+          writer_space(out);
+          writer_i64(out);
+          writer_space(out);
+          writer_runtime_name(out, 3);
+          writer_put(out, 40);
+          writer_register(out, frame_register);
+          writer_put(out, 44);
+          writer_space(out);
+          writer_register(out, slot_register);
+          writer_put(out, 41);
+          writer_newline(out);
+          writer_instruction_prefix(out, ip);
+          writer_numeric_cast_opcode(out, 0, load_type);
+          writer_space(out);
+          writer_scalar_type(out, load_type);
+          writer_space(out);
+          writer_register(out, raw_register);
+          writer_newline(out);
+        } else {
+          writer_instruction_prefix(out, ip);
+          writer_put(out, 99);
+          writer_put(out, 97);
+          writer_put(out, 108);
+          writer_put(out, 108);
+          writer_space(out);
+          writer_i64(out);
+          writer_space(out);
+          writer_runtime_name(out, 3);
+          writer_put(out, 40);
+          writer_register(out, frame_register);
+          writer_put(out, 44);
+          writer_space(out);
+          writer_register(out, slot_register);
+          writer_put(out, 41);
+          writer_newline(out);
+        }
+      }
+    } else if ((opcode >= 4 && opcode <= 7) || (opcode >= 34 && opcode <= 39)) {
+      i64 op_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+
+      writer_instruction_prefix(out, ip);
+      writer_operator(out, opcode, op_type);
+      writer_space(out);
+      writer_scalar_type(out, op_type);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_newline(out);
+    } else if (opcode == 40) {
+      writer_instruction_prefix(out, ip);
+
+      i64 source_type = raz_rt_stage1_arena_get(mir.op_b, ip);
+      i64 target_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+
+      writer_numeric_cast_opcode(out, source_type, target_type);
+      writer_space(out);
+      writer_scalar_type(out, target_type);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+    } else if (opcode == 8) {
+      i64 target_function = raz_rt_stage1_arena_get(mir.op_a, ip);
+      bool void_call = raz_rt_stage1_arena_get(hir.function_returns_value, target_function) == 0;
+
+      if (!void_call) {
+        writer_instruction_prefix(out, ip);
+      } else {
+        writer_space(out);
+        writer_space(out);
+      }
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      if (void_call) {
+        writer_put(out, 118);
+        writer_put(out, 111);
+        writer_put(out, 105);
+        writer_put(out, 100);
+      } else {
+        if (
+        raz_rt_stage1_arena_get(hir.function_return_references, target_function) != 0 ||
+        raz_rt_stage1_arena_get(hir.function_return_slices, target_function) != 0 ||
+        raz_rt_stage1_arena_get(hir.function_return_type_structs, target_function) >= 0
+        ) {
+          writer_i64(out);
+        } else if (
+        raz_rt_stage1_arena_get(hir.function_return_function_types, target_function) >= 0
+        ) {
+          writer_ptr(out);
+        } else {
+          writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+        }
+      }
+      writer_space(out);
+      writer_function_name(out, source, hir, target_function);
+      writer_put(out, 40);
+
+      i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, ip);
+      i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, ip);
+      i64 argument_index = 0;
+
+      while (argument_index < argument_count) {
+        if (argument_index > 0) {
+          writer_put(out, 44);
+          writer_space(out);
+        }
+        writer_register(
+        out,
+        raz_rt_stage1_arena_get(mir.call_arguments, argument_start + argument_index),
+        );
+        argument_index += 1;
+      }
+      writer_put(out, 41);
+      writer_newline(out);
+      if (void_call) {
+        writer_instruction_prefix(out, ip);
+        writer_put(out, 99);
+        writer_put(out, 111);
+        writer_put(out, 110);
+        writer_put(out, 115);
+        writer_put(out, 116);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        writer_decimal(out, 0);
+        writer_newline(out);
+      }
+    } else if (opcode >= 11 && opcode <= 16) {
+      i64 compare_register = writer_synthetic_register(4, ip);
+
+      writer_instruction_prefix(out, compare_register);
+      writer_compare(out, opcode, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 115);
+      writer_put(out, 101);
+      writer_put(out, 108);
+      writer_put(out, 101);
+      writer_put(out, 99);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, compare_register);
+      writer_space(out);
+      writer_register(out, 999998);
+      writer_space(out);
+      writer_register(out, 999999);
+      writer_newline(out);
+    } else if (opcode == 17) {
+      i64 select_zero = writer_synthetic_register(5, ip);
+      i64 select_condition = writer_synthetic_register(6, ip);
+
+      writer_instruction_prefix(out, select_zero);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, 0);
+      writer_newline(out);
+      writer_instruction_prefix(out, select_condition);
+      writer_compare(out, 12, 0);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, select_zero);
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 115);
+      writer_put(out, 101);
+      writer_put(out, 108);
+      writer_put(out, 101);
+      writer_put(out, 99);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, select_condition);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_c, ip));
+      writer_newline(out);
+    } else if (opcode == 18) {
+      i64 logical_zero = writer_synthetic_register(7, ip);
+      i64 logical_condition = writer_synthetic_register(8, ip);
+
+      writer_instruction_prefix(out, logical_zero);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, 0);
+      writer_newline(out);
+      writer_instruction_prefix(out, logical_condition);
+      writer_put(out, 99);
+      writer_put(out, 109);
+      writer_put(out, 112);
+      writer_put(out, 46);
+      writer_put(out, 101);
+      writer_put(out, 113);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, logical_zero);
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 115);
+      writer_put(out, 101);
+      writer_put(out, 108);
+      writer_put(out, 101);
+      writer_put(out, 99);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, logical_condition);
+      writer_space(out);
+      writer_register(out, 999998);
+      writer_space(out);
+      writer_register(out, 999999);
+      writer_newline(out);
+    } else if (opcode == 19 || opcode == 20) {
+      writer_instruction_prefix(out, ip);
+      if (opcode == 19) {
+        writer_put(out, 97);
+        writer_put(out, 110);
+        writer_put(out, 100);
+      } else {
+        writer_put(out, 111);
+        writer_put(out, 114);
+      }
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_newline(out);
+    } else if (opcode == 44) {
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      // c
+      writer_put(out, 97);
+      // a
+      writer_put(out, 108);
+      // l
+      writer_put(out, 108);
+      // l
+      writer_put(out, 46);
+      // .
+      writer_put(out, 105);
+      // i
+      writer_put(out, 110);
+      // n
+      writer_put(out, 100);
+      // d
+      writer_put(out, 105);
+      // i
+      writer_put(out, 114);
+      // r
+      writer_put(out, 101);
+      // e
+      writer_put(out, 99);
+      // c
+      writer_put(out, 116);
+      // t
+      writer_space(out);
+      writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_put(out, 97);
+      writer_put(out, 115);
+      writer_space(out);
+      writer_function_signature_name(out, raz_rt_stage1_arena_get(mir.op_d, ip));
+      writer_put(out, 40);
+
+      i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, ip);
+      i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, ip);
+      i64 argument_index = 0;
+
+      while (argument_index < argument_count) {
+        if (argument_index > 0) {
+          writer_put(out, 44);
+          writer_space(out);
+        }
+        writer_register(
+        out,
+        raz_rt_stage1_arena_get(mir.call_arguments, argument_start + argument_index),
+        );
+        argument_index += 1;
+      }
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 45) {
+      // Borrowed-array iteration materializes an element reference by
+      // reusing the stage reference table with the aggregate handle as
+      // the owning arena and the loop index as its slot.
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_runtime_name(out, 5);
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 47) {
+      i64 global_address = writer_synthetic_register(9, ip);
+
+      writer_instruction_prefix(out, global_address);
+
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      writer_global_address_opcode(
+      out,
+      raz_rt_stage1_arena_get(hir.global_tls_flags, global_index) != 0,
+      );
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+      writer_module_global_name(out, source, hir, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 108);
+      writer_put(out, 111);
+      writer_put(out, 97);
+      writer_put(out, 100);
+      writer_space(out);
+      writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_register(out, global_address);
+      writer_newline(out);
+    } else if (opcode == 48) {
+      i64 global_address = writer_synthetic_register(9, ip);
+
+      writer_instruction_prefix(out, global_address);
+
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      writer_global_address_opcode(
+      out,
+      raz_rt_stage1_arena_get(hir.global_tls_flags, global_index) != 0,
+      );
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+      writer_module_global_name(out, source, hir, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_put(out, 111);
+      writer_put(out, 114);
+      writer_put(out, 101);
+      writer_space(out);
+      writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_space(out);
+      writer_register(out, global_address);
+      writer_newline(out);
+    } else if (opcode == 49) {
+      i64 global_address = writer_synthetic_register(19, ip);
+
+      writer_instruction_prefix(out, global_address);
+
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      writer_global_address_opcode(
+      out,
+      raz_rt_stage1_arena_get(hir.global_tls_flags, global_index) != 0,
+      );
+      writer_space(out);
+      writer_ptr(out);
+      writer_space(out);
+      writer_module_global_name(out, source, hir, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_runtime_name(out, 10);
+      writer_put(out, 40);
+      writer_register(out, global_address);
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 46) {
+      // Source-level spawn is a distinct MIR effect, but async calls already
+      // return completion-future handles. Preserve that handle in Forge.
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 112);
+      writer_put(out, 121);
+      writer_space(out);
+      writer_scalar_type(out, raz_rt_stage1_arena_get(mir.op_types, ip));
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+    } else if (opcode == 9) {
+      i64 stored_local_slot = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      if (forge_function_pointer_local_type(hir, function_index, stored_local_slot) >= 0) {
+        writer_space(out);
+        writer_space(out);
+        writer_put(out, 115);
+        writer_put(out, 116);
+        writer_put(out, 111);
+        writer_put(out, 114);
+        writer_put(out, 101);
+        writer_space(out);
+        writer_ptr(out);
+        writer_space(out);
+        writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+        writer_space(out);
+        writer_register(out, forge_function_pointer_local_register(stored_local_slot));
+        writer_space(out);
+        writer_put(out, 97);
+        writer_put(out, 108);
+        writer_put(out, 105);
+        writer_put(out, 103);
+        writer_put(out, 110);
+        writer_space(out);
+        writer_decimal(out, 8);
+        writer_newline(out);
+      } else {
+        i64 slot_register = writer_synthetic_register(2, ip);
+
+        writer_instruction_prefix(out, slot_register);
+        writer_put(out, 99);
+        writer_put(out, 111);
+        writer_put(out, 110);
+        writer_put(out, 115);
+        writer_put(out, 116);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        writer_decimal(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+        writer_newline(out);
+
+        i64 store_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+        i64 stored_register = raz_rt_stage1_arena_get(mir.op_b, ip);
+
+        if (store_type == 11) {
+          i64 extended_register = writer_synthetic_register(237, ip);
+
+          writer_instruction_prefix(out, extended_register);
+          writer_numeric_cast_opcode(out, 11, 1);
+          writer_space(out);
+          writer_f64(out);
+          writer_space(out);
+          writer_register(out, stored_register);
+          writer_newline(out);
+          stored_register = extended_register;
+        } else if (!primitive_type_is_float(store_type) && primitive_type_width(store_type) < 64) {
+          i64 extended_register = writer_synthetic_register(9, ip);
+
+          writer_instruction_prefix(out, extended_register);
+          writer_numeric_cast_opcode(out, store_type, 0);
+          writer_space(out);
+          writer_i64(out);
+          writer_space(out);
+          writer_register(out, stored_register);
+          writer_newline(out);
+          stored_register = extended_register;
+        }
+        writer_space(out);
+        writer_space(out);
+        writer_put(out, 99);
+        writer_put(out, 97);
+        writer_put(out, 108);
+        writer_put(out, 108);
+        writer_space(out);
+        writer_put(out, 118);
+        writer_put(out, 111);
+        writer_put(out, 105);
+        writer_put(out, 100);
+        writer_space(out);
+        if (primitive_type_is_float(store_type)) {
+          writer_runtime_name(out, 9);
+        } else {
+          writer_runtime_name(out, 4);
+        }
+        writer_put(out, 40);
+        writer_register(out, frame_register);
+        writer_put(out, 44);
+        writer_space(out);
+        writer_register(out, slot_register);
+        writer_put(out, 44);
+        writer_space(out);
+        writer_register(out, stored_register);
+        writer_put(out, 41);
+        writer_newline(out);
+      }
+    } else if (opcode == 10) {
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_put(out, 118);
+      writer_put(out, 111);
+      writer_put(out, 105);
+      writer_put(out, 100);
+      writer_space(out);
+      writer_runtime_name(out, 2);
+      writer_put(out, 40);
+      writer_register(out, frame_register);
+      writer_put(out, 41);
+      writer_newline(out);
+      writer_space(out);
+      writer_space(out);
+      writer_keyword_return(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      block_terminated = 1;
+    } else if (opcode == 21) {
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_put(out, 118);
+      writer_put(out, 111);
+      writer_put(out, 105);
+      writer_put(out, 100);
+      writer_space(out);
+      writer_runtime_name(out, 2);
+      writer_put(out, 40);
+      writer_register(out, frame_register);
+      writer_put(out, 41);
+      writer_newline(out);
+      writer_space(out);
+      writer_space(out);
+      writer_keyword_return(out);
+      writer_newline(out);
+      block_terminated = 1;
+    } else if (opcode == 22) {
+      i64 jump_target = raz_rt_stage1_arena_get(mir.op_b, ip);
+
+      writer_jump_edge(out, jump_target, raz_rt_stage1_arena_get(mir.op_c, ip));
+      block_terminated = 1;
+    } else if (opcode == 23) {
+      i64 condition_zero = writer_synthetic_register(11, ip);
+      i64 condition_i1 = 740000 + ip;
+
+      writer_instruction_prefix(out, condition_zero);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, 0);
+      writer_newline(out);
+      writer_instruction_prefix(out, condition_i1);
+      writer_compare(out, 12, 0);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_space(out);
+      writer_register(out, condition_zero);
+      writer_newline(out);
+
+      i64 true_target = raz_rt_stage1_arena_get(mir.op_c, ip);
+      i64 false_target = raz_rt_stage1_arena_get(mir.op_b, ip);
+      i64 edge_argument = raz_rt_stage1_arena_get(mir.op_d, ip);
+
+      writer_branch_edge(out, condition_i1, true_target, false_target, edge_argument, edge_argument);
+      block_terminated = 1;
+    } else if (opcode == 25) {
+      i64 slot_register = writer_synthetic_register(2, ip);
+
+      writer_instruction_prefix(out, slot_register);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_runtime_name(out, 5);
+      writer_put(out, 40);
+      writer_register(out, frame_register);
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, slot_register);
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 26) {
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_runtime_name(out, 6);
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 27) {
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_put(out, 118);
+      writer_put(out, 111);
+      writer_put(out, 105);
+      writer_put(out, 100);
+      writer_space(out);
+      writer_runtime_name(out, 7);
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_put(out, 41);
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 112);
+      writer_put(out, 121);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_newline(out);
+    } else if (opcode == 28) {
+      i64 value_type = raz_rt_stage1_arena_get(mir.op_types, ip);
+      bool floating = value_type == 1;
+
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      if (floating) {
+        writer_f64(out);
+      } else {
+        writer_i64(out);
+      }
+      writer_space(out);
+      if (floating) {
+        writer_runtime_name(out, 8);
+      } else {
+        writer_runtime_name(out, 3);
+      }
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 29) {
+      i64 stored_register = raz_rt_stage1_arena_get(mir.op_c, ip);
+      bool floating = raz_rt_stage1_arena_get(mir.op_types, stored_register) == 1;
+
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_put(out, 118);
+      writer_put(out, 111);
+      writer_put(out, 105);
+      writer_put(out, 100);
+      writer_space(out);
+      if (floating) {
+        writer_runtime_name(out, 9);
+      } else {
+        writer_runtime_name(out, 4);
+      }
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_b, ip));
+      writer_put(out, 44);
+      writer_space(out);
+      writer_register(out, stored_register);
+      writer_put(out, 41);
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 112);
+      writer_put(out, 121);
+      writer_space(out);
+      if (floating) {
+        writer_f64(out);
+      } else {
+        writer_i64(out);
+      }
+      writer_space(out);
+      writer_register(out, stored_register);
+      writer_newline(out);
+    } else if (opcode == 30) {
+      i64 allocation_count = writer_synthetic_register(12, ip);
+
+      writer_instruction_prefix(out, allocation_count);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_newline(out);
+      writer_instruction_prefix(out, ip);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_runtime_name(out, 1);
+      writer_put(out, 40);
+      writer_register(out, allocation_count);
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 31) {
+      writer_space(out);
+      writer_space(out);
+      writer_put(out, 99);
+      writer_put(out, 97);
+      writer_put(out, 108);
+      writer_put(out, 108);
+      writer_space(out);
+      writer_put(out, 118);
+      writer_put(out, 111);
+      writer_put(out, 105);
+      writer_put(out, 100);
+      writer_space(out);
+      writer_runtime_name(out, 2);
+      writer_put(out, 40);
+      writer_register(out, raz_rt_stage1_arena_get(mir.op_a, ip));
+      writer_put(out, 41);
+      writer_newline(out);
+    } else if (opcode == 32 || opcode == 33) {} else {
+      write_stage1_diagnostic(11, ip, opcode);
+      raz_rt_stage1_arena_destroy(local_registers);
+      return false;
+    }
+    ip += 1;
+  }
+  if (block_terminated == 0) {
+    if (raz_rt_stage1_arena_get(hir.function_returns_value, function_index) == 0) {
+      writer_space(out);
+      writer_space(out);
+      writer_keyword_return(out);
+      writer_newline(out);
+    } else {
+      i64 final_zero = writer_synthetic_register(13, function_index);
+
+      writer_instruction_prefix(out, final_zero);
+      writer_put(out, 99);
+      writer_put(out, 111);
+      writer_put(out, 110);
+      writer_put(out, 115);
+      writer_put(out, 116);
+      writer_space(out);
+      writer_i64(out);
+      writer_space(out);
+      writer_decimal(out, 0);
+      writer_newline(out);
+      writer_space(out);
+      writer_space(out);
+      writer_keyword_return(out);
+      writer_space(out);
+      writer_register(out, final_zero);
+      writer_newline(out);
+    }
+  }
+  writer_space(out);
+  writer_space(out);
+  writer_put(out, 125);
+  writer_newline(out);
+  writer_newline(out);
+  raz_rt_stage1_arena_destroy(local_registers);
+  return !out.failed;
+}

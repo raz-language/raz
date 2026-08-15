@@ -1,0 +1,194 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::tree;
+import alloc::string;
+import core::result;
+import std::fs::metadata;
+import std::fs::read_dir;
+import std::io::error;
+import std::path;
+
+extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;
+extern fn raz_rt_remove_one(usize path, i64 length) -> i64;
+
+fn separator(i64 value) -> bool {
+    return value == 47 || value == 92;
+}
+
+// Pure-Raz recursive directory creation. The runtime primitive creates exactly
+// one directory; path segmentation and policy live here.
+public fn create_dir_all(usize path, i64 length) -> Result<bool, IoError> {
+    if (length <= 0 || path == 0) {
+        return Result<bool, IoError>::Error(IoError {
+            operation: IoOperation::CreateDir,
+            code: 22
+        }
+        );
+    }
+
+    i64 start = 0;
+    bool created_any = false;
+
+    // Preserve POSIX root and Windows drive/UNC prefixes by only creating when
+    // a non-empty path component has been accumulated.
+
+    i64 index = 0;
+
+    while (index <= length) {
+        bool boundary = index == length;
+
+        if (!boundary) {
+            boundary = separator(raz_rt_load_u8(path + index));
+        }
+        if (boundary && index > start) {
+            i64 status = raz_rt_create_dir_one(path, index);
+
+            if (status == 1) {
+                created_any = true;
+            }
+            if (status < 0) {
+                // Existing components are normal. Verify the prefix is a directory
+                // before treating a failed create as an error.
+
+                Result<Metadata, IoError> meta = std::fs::metadata::query(path, index);
+
+                match meta {
+                    Result<Metadata, IoError>::Ok(value) => {
+                        if (!value.exists || !std::fs::metadata::is_dir(&value)) {
+                            return Result<bool, IoError>::Error(std::io::error::last_error(IoOperation::CreateDir));
+                        }
+                    }
+                    Result<Metadata, IoError>::Error(error) => {
+                        return Result<bool, IoError>::Error(error);
+                    }
+                }
+            }
+            start = index + 1;
+        }
+        index += 1;
+    }
+    return Result<bool, IoError>::Ok(created_any);
+}
+
+fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
+    Result<Metadata, IoError> metadata_result = std::fs::metadata::query(path, length);
+
+    Metadata metadata = Metadata {
+        kind: 0,
+        size: 0,
+        modified_millis: 0,
+        readonly: false,
+        symlink: false,
+        exists: false
+    };
+    match metadata_result {
+        Result<Metadata, IoError>::Error(error) => {
+            return Result<i64, IoError>::Error(error);
+        }
+        Result<Metadata, IoError>::Ok(value) => {
+            metadata = value;
+        }
+    }
+    // Symlinks are removed as links and never followed.
+    if (!std::fs::metadata::is_dir(&metadata) || metadata.symlink) {
+        i64 removed = raz_rt_remove_one(path, length);
+
+        if (removed < 0) {
+            return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Remove));
+        }
+        return Result<i64, IoError>::Ok(removed);
+    }
+
+    Result<ReadDir, IoError> opened = std::fs::read_dir::open(path, length);
+
+    ReadDir iterator = ReadDir {
+        handle: 0,
+        finished: true
+    };
+    match opened {
+        Result<ReadDir, IoError>::Error(error) => {
+            return Result<i64, IoError>::Error(error);
+        }
+        Result<ReadDir, IoError>::Ok(value) => {
+            iterator = move value;
+        }
+    }
+
+    String name = alloc::string::with_capacity(64);
+
+    Metadata child_metadata = Metadata {
+        kind: 0,
+        size: 0,
+        modified_millis: 0,
+        readonly: false,
+        symlink: false,
+        exists: false
+    };
+
+    i64 removed_total = 0;
+
+    while (true) {
+        i64 next_status = std::fs::read_dir::next(&mut iterator, &mut name, &mut child_metadata);
+
+        if (next_status == 0) {
+            break;
+        }
+        if (next_status < 0) {
+            return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Read));
+        }
+        PathView base = PathView {
+            data: path,
+            length: length
+        };
+        PathView child = PathView {
+            data: name.data,
+            length: name.length
+        };
+
+        i64 required = std::path::join_required(base, child);
+        String joined = alloc::string::with_capacity(required);
+
+        if (required > 0 && joined.data == 0) {
+            return Result<i64, IoError>::Error(IoError {
+                operation: IoOperation::Remove,
+                code: 12
+            }
+            );
+        }
+
+        i64 written = std::path::join_into(base, child, joined.data, required);
+
+        if (written < 0) {
+            return Result<i64, IoError>::Error(IoError {
+                operation: IoOperation::Remove,
+                code: 22
+            }
+            );
+        }
+        joined.length = written;
+
+        Result<i64, IoError> child_result = remove_tree_inner(joined.data, joined.length);
+
+        match child_result {
+            Result<i64, IoError>::Error(error) => {
+                return Result<i64, IoError>::Error(error);
+            }
+            Result<i64, IoError>::Ok(count) => {
+                removed_total += count;
+            }
+        }
+    }
+    std::fs::read_dir::close(&mut iterator);
+
+    i64 removed_dir = raz_rt_remove_one(path, length);
+
+    if (removed_dir < 0) {
+        return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Remove));
+    }
+    return Result<i64, IoError>::Ok(removed_total + removed_dir);
+}
+
+public fn remove_dir_all(usize path, i64 length) -> Result<i64, IoError> {
+    return remove_tree_inner(path, length);
+}

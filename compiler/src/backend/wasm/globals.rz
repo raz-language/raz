@@ -1,0 +1,124 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_wasm_globals;
+public import raz_compiler_backend_wasm_memory;
+// WebAssembly global 0 is reserved for the linear-memory bump pointer and
+// global 1 stores the most recent WASI errno. Raz module globals follow them
+// one-for-one and retain the scalar MIR i64 ABI. Keeping errno in a wasm
+// global avoids aliasing the shared low-memory scratch/allocator metadata.
+fn wasm_last_error_global_index() -> i64 {
+    return 1;
+}
+
+fn wasm_global_index(i64 global_index) -> i64 {
+    return global_index + 2;
+}
+
+fn wasm_global_reference_tag(i64 global_index) -> i64 {
+    // Keep module references disjoint from local references -(slot+1).
+    return -1048577 - global_index;
+}
+
+fn wasm_global_reference_index(i64 tag) -> i64 {
+    return -tag - 1048577;
+}
+
+fn wasm_global_reference_is_tag(i64 tag) -> bool {
+    return tag <= -1048577;
+}
+
+fn wasm_globals_async_count(HirModule& hir) -> i64 {
+    i64 count = 0;
+    i64 function_index = 0;
+
+    while (function_index < hir.function_count) {
+        if (
+            raz_rt_stage1_arena_get(hir.function_is_async, function_index) != 0 &&
+            raz_rt_stage1_arena_get(hir.function_is_extern, function_index) == 0
+        ) {
+            count += 1;
+        }
+        function_index += 1;
+    }
+    return count;
+}
+
+fn wasm_globals_validate(MirModule& mir) -> bool {
+    i64 global_index = 0;
+
+    while (global_index < mir.global_count) {
+        if (raz_rt_stage1_arena_get(mir.global_extern_flags, global_index) != 0) {
+            return false;
+        }
+        global_index += 1;
+    }
+    return true;
+}
+
+fn wasm_globals_emit_get(ForgeWriter&mut out, i64 global_index) {
+    wasm_u8(out, 35);
+    wasm_u32(out, wasm_global_index(global_index));
+}
+
+fn wasm_globals_emit_set(ForgeWriter&mut out, i64 global_index) {
+    wasm_u8(out, 36);
+    wasm_u32(out, wasm_global_index(global_index));
+}
+
+fn wasm_globals_emit_reference(ForgeWriter&mut out, i64 global_index) {
+    wasm_u8(out, 66);
+    wasm_i64(out, wasm_global_reference_tag(global_index));
+}
+
+fn wasm_emit_global_section(ForgeWriter&mut module, Source& source, HirModule& hir, MirModule& mir) -> bool {
+    ForgeWriter section;
+
+    writer_init(&mut section);
+    if (section.failed || !wasm_globals_validate(mir)) {
+        return false;
+    }
+    wasm_u32(&mut section, mir.global_count + 2 + wasm_globals_async_count(hir));
+    // Global 0: mutable i32 linear-memory bump pointer.
+    wasm_u8(&mut section, 127);
+    wasm_u8(&mut section, 1);
+    wasm_u8(&mut section, 65);
+    wasm_i64(&mut section, wasm_memory_heap_base(source, mir));
+    wasm_u8(&mut section, 11);
+    // Global 1: mutable i32 last WASI errno. Runtime wrappers update this after
+    // every host call; raz_rt_last_error_code exposes it through std::io.
+    wasm_u8(&mut section, 127);
+    wasm_u8(&mut section, 1);
+    wasm_u8(&mut section, 65);
+    wasm_i64(&mut section, 0);
+    wasm_u8(&mut section, 11);
+
+    i64 global_index = 0;
+
+    while (global_index < mir.global_count) {
+        wasm_u8(&mut section, 126);
+        // i64
+        wasm_u8(&mut section, 1);
+        // mutable
+        wasm_u8(&mut section, 66);
+        // i64.const
+        wasm_i64(&mut section, raz_rt_stage1_arena_get(mir.global_values, global_index));
+        wasm_u8(&mut section, 11);
+        global_index += 1;
+    }
+    if (wasm_globals_async_count(hir) != 0) {
+        // Mutable i64 current async frame. It is appended after user globals so
+        // the stable Raz module-global numbering remains unchanged.
+        wasm_u8(&mut section, 126);
+        wasm_u8(&mut section, 1);
+        wasm_u8(&mut section, 66);
+        wasm_i64(&mut section, 0);
+        wasm_u8(&mut section, 11);
+    }
+    wasm_section(module, 6, &section);
+
+    bool success = !section.failed && !module.failed;
+
+    writer_destroy(&mut section);
+    return success;
+}

@@ -1,0 +1,1547 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_forge_native_types;
+public import raz_compiler_backend_forge_native_support;
+
+fn forge_native_writer_array_name(ForgeWriter&mut out, i64 element_type, i64 extent) {
+  i64 prefix[12] = [64, 95, 95, 114, 97, 122, 95, 97, 114, 114, 95, 97];
+
+  writer_chars(out, &prefix, 12);
+  writer_decimal(out, forge_native_type(element_type));
+  writer_put(out, 95);
+  writer_decimal(out, extent);
+}
+
+fn forge_native_writer_struct_array_name(ForgeWriter&mut out, i64 element_structure, i64 extent) {
+  i64 prefix[13] = [64, 95, 95, 114, 97, 122, 95, 97, 114, 114, 115, 95, 115];
+
+  writer_chars(out, &prefix, 13);
+  writer_decimal(out, element_structure);
+  writer_put(out, 95);
+  writer_decimal(out, extent);
+}
+
+fn forge_native_write_array_aggregate_name(
+ForgeWriter&mut out,
+i64 extent,
+i64 element_type,
+i64 element_structure,
+) {
+  if (element_structure >= 0) {
+    forge_native_writer_struct_array_name(out, element_structure, extent);
+  } else {
+    forge_native_writer_array_name(out, element_type, extent);
+  }
+}
+
+fn forge_native_fixed_array_supported(i64 extent, i64 element_type, i64 element_structure) -> bool {
+  if (extent <= 0 || element_structure >= 0) {
+    return false;
+  }
+  // The current MIR aggregate image uses one native 64-bit slot per element.
+  // Only layouts with the same native width are true by-value Forge arrays.
+  if (element_type == 12 || element_type == 14) {
+    return true;
+  }
+  return (
+  forge_native_primitive_type_supported(element_type) &&
+  forge_native_scalar_storage_size(element_type) == 8
+  );
+}
+
+fn forge_native_array_supported(HirModule& hir, i64 extent, i64 element_type, i64 element_structure) -> bool {
+  if (extent <= 0) {
+    return false;
+  }
+  if (element_structure >= 0) {
+    return forge_native_nested_structure_supported(hir, element_structure, 0);
+  }
+  // Standalone MIR arrays still use one 64-bit image slot per scalar element.
+  return forge_native_fixed_array_supported(extent, element_type, element_structure);
+}
+
+fn forge_native_parameter_array_supported(HirModule& hir, i64 parameter_index) -> bool {
+  return forge_native_array_supported(
+  hir,
+  raz_rt_stage1_arena_get(hir.parameter_array_extents, parameter_index),
+  raz_rt_stage1_arena_get(hir.parameter_types, parameter_index),
+  raz_rt_stage1_arena_get(hir.parameter_type_structs, parameter_index),
+  );
+}
+
+fn forge_native_emit_return_structures(
+i64 session,
+Source& source,
+HirModule& hir,
+ForgeWriter&mut name,
+ForgeWriter&mut field_name,
+ForgeWriter&mut aggregate_name,
+) -> bool {
+  i64 structure = 0;
+
+  while (structure < hir.struct_count) {
+    if (forge_native_flat_return_structure_supported(hir, structure)) {
+      forge_native_scratch_reset(name);
+      writer_structure_name(name, source, hir, structure);
+      i64 structure_handle = raz_compiler_forge_session_add_struct_i64(
+      session,
+      name.data,
+      name.length,
+      0,
+      );
+      if (structure_handle == 0) {
+        return false;
+      }
+
+      i64 first = raz_rt_stage1_arena_get(hir.struct_field_starts, structure);
+      i64 count = raz_rt_stage1_arena_get(hir.struct_field_counts, structure);
+      i64 field = 0;
+
+      while (field < count) {
+        i64 metadata = first + field;
+
+        forge_native_scratch_reset(field_name);
+        writer_text(
+        field_name,
+        source,
+        raz_rt_stage1_arena_get(hir.struct_field_name_offsets, metadata),
+        raz_rt_stage1_arena_get(hir.struct_field_name_lengths, metadata),
+        );
+        forge_native_scratch_reset(aggregate_name);
+
+        i64 field_type = raz_rt_stage1_arena_get(hir.struct_field_types, metadata);
+        i64 aggregate_kind = 0;
+        i64 nested = raz_rt_stage1_arena_get(hir.struct_field_type_structs, metadata);
+        i64 extent = raz_rt_stage1_arena_get(hir.struct_field_array_extents, metadata);
+
+        if (
+        raz_rt_stage1_arena_get(hir.struct_field_references, metadata) != 0 ||
+        raz_rt_stage1_arena_get(hir.struct_field_function_types, metadata) >= 0
+        ) {
+          field_type = 12;
+        } else if (raz_rt_stage1_arena_get(hir.struct_field_slices, metadata) != 0) {
+          field_type = 12;
+          aggregate_kind = 1;
+          forge_native_writer_slice_name(aggregate_name);
+        } else if (extent >= 0) {
+          field_type = 12;
+          aggregate_kind = 2;
+          if (nested >= 0) {
+            forge_native_writer_struct_array_name(aggregate_name, nested, extent);
+            forge_native_scratch_reset(name);
+            writer_structure_name(name, source, hir, nested);
+            if (
+            raz_compiler_forge_session_add_aggregate_array_i64(
+            session,
+            aggregate_name.data,
+            aggregate_name.length,
+            1,
+            name.data,
+            name.length,
+            extent,
+            0,
+            ) == 0
+            ) {
+              return false;
+            }
+          } else {
+            forge_native_writer_array_name(
+            aggregate_name,
+            raz_rt_stage1_arena_get(hir.struct_field_types, metadata),
+            extent,
+            );
+            if (
+            raz_compiler_forge_session_add_array_i64(
+            session,
+            aggregate_name.data,
+            aggregate_name.length,
+            forge_native_type(raz_rt_stage1_arena_get(hir.struct_field_types, metadata)),
+            extent,
+            0,
+            ) == 0
+            ) {
+              return false;
+            }
+          }
+        } else if (nested >= 0) {
+          field_type = 12;
+          aggregate_kind = 1;
+          writer_structure_name(aggregate_name, source, hir, nested);
+        }
+        if (
+        raz_compiler_forge_struct_add_field_i64(
+        session,
+        structure_handle,
+        field_name.data,
+        field_name.length,
+        forge_native_type(field_type),
+        aggregate_kind,
+        aggregate_name.data,
+        aggregate_name.length,
+        ) == 0
+        ) {
+          return false;
+        }
+        field += 1;
+      }
+    }
+    structure += 1;
+  }
+  return true;
+}
+
+fn forge_native_function_return_type(HirModule& hir, i64 function_index) -> i64 {
+  if (raz_rt_stage1_arena_get(hir.function_returns_value, function_index) == 0) {
+    return -2;
+  }
+  if (raz_rt_stage1_arena_get(hir.function_return_references, function_index) != 0) {
+    return 12;
+  }
+  if (raz_rt_stage1_arena_get(hir.function_return_function_types, function_index) >= 0) {
+    return 14;
+  }
+  if (raz_rt_stage1_arena_get(hir.function_return_slices, function_index) != 0) {
+    return 12;
+  }
+
+  i64 return_structure = raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index);
+
+  if (return_structure >= 0) {
+    if (!forge_native_flat_return_structure_supported(hir, return_structure)) {
+      return -1;
+    }
+    return 12;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(hir.function_return_types, function_index);
+
+  if (type_kind == 13) {
+    return 13;
+  }
+  if (!forge_native_primitive_type_supported(type_kind)) {
+    return -1;
+  }
+  return type_kind;
+}
+
+fn forge_native_parameter_type(HirModule& hir, i64 parameter_index) -> i64 {
+  if (
+  raz_rt_stage1_arena_get(hir.parameter_references, parameter_index) != 0 ||
+  raz_rt_stage1_arena_get(hir.parameter_slices, parameter_index) != 0 ||
+  raz_rt_stage1_arena_get(hir.parameter_array_extents, parameter_index) >= 0 ||
+  raz_rt_stage1_arena_get(hir.parameter_type_structs, parameter_index) >= 0
+  ) {
+    return 12;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(hir.parameter_types, parameter_index);
+
+  if (type_kind >= 16 && type_kind <= 18) {
+    return 12;
+  }
+  if (raz_rt_stage1_arena_get(hir.parameter_function_types, parameter_index) >= 0) {
+    return 14;
+  }
+  if (type_kind == 15 || (type_kind >= 1024 && type_kind < 1280)) {
+    return 12;
+  }
+  if (type_kind == 13) {
+    return 13;
+  }
+  if (!forge_native_primitive_type_supported(type_kind)) {
+    return -1;
+  }
+  return type_kind;
+}
+
+fn forge_native_scalar_function_type_supported(HirModule& hir, i64 function_index) -> bool {
+  if (raz_rt_stage1_arena_get(hir.function_is_async, function_index) != 0) {
+    return false;
+  }
+  if (forge_native_function_return_type(hir, function_index) == -1) {
+    return false;
+  }
+
+  i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index);
+  i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+  i64 parameter = 0;
+
+  while (parameter < parameter_count) {
+    i64 index = parameter_start + parameter;
+
+    if (forge_native_parameter_type(hir, index) < 0) {
+      return false;
+    }
+    // True by-value structures and native-width fixed arrays use Forge
+    // aggregate metadata so Win64/System V ABI classification provides an
+    // isolated callee copy. Slices/payload enums and non-native arrays stay
+    // on the compatibility path until their exact layouts are structural.
+
+    i64 parameter_structure = raz_rt_stage1_arena_get(hir.parameter_type_structs, index);
+    i64 parameter_extent = raz_rt_stage1_arena_get(hir.parameter_array_extents, index);
+
+    bool native_array_parameter =
+    parameter_extent >= 0 &&
+    forge_native_parameter_array_supported(hir, index);
+    if (
+    raz_rt_stage1_arena_get(hir.parameter_references, index) == 0 &&
+    parameter_structure >= 0 &&
+    parameter_extent < 0 &&
+    !forge_native_flat_return_structure_supported(hir, parameter_structure)
+    ) {
+      return false;
+    }
+    if (parameter_extent >= 0 && !native_array_parameter) {
+      return false;
+    }
+
+    i64 parameter_type_kind = raz_rt_stage1_arena_get(hir.parameter_types, index);
+    bool payload_enum_parameter = parameter_type_kind >= 1024 && parameter_type_kind < 1280;
+
+    bool non_native_aggregate_parameter =
+    raz_rt_stage1_arena_get(hir.parameter_references, index) == 0 &&
+    payload_enum_parameter;
+    if (
+    non_native_aggregate_parameter &&
+    (
+    raz_rt_stage1_arena_get(hir.function_is_extern, function_index) != 0 ||
+    raz_rt_stage1_arena_get(hir.parameter_mutated, index) != 0
+    )
+    ) {
+      return false;
+    }
+    parameter += 1;
+  }
+  return true;
+}
+
+fn forge_native_scalar_local_type(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
+  i64 declared_count = raz_rt_stage1_arena_get(hir.function_local_counts, function_index);
+
+  if (local_slot < 0) {
+    return -1;
+  }
+  if (local_slot < declared_count) {
+    i64 local_index = forge_native_hir_local_index(hir, function_index, local_slot);
+
+    if (local_index < 0) {
+      return -1;
+    }
+    if (
+    raz_rt_stage1_arena_get(hir.local_references, local_index) != 0 ||
+    raz_rt_stage1_arena_get(hir.local_slices, local_index) != 0 ||
+    raz_rt_stage1_arena_get(hir.local_array_extents, local_index) >= 0 ||
+    raz_rt_stage1_arena_get(hir.local_type_structs, local_index) >= 0
+    ) {
+      return 12;
+    }
+
+    i64 type_kind = raz_rt_stage1_arena_get(hir.local_types, local_index);
+
+    if (type_kind >= 16 && type_kind <= 18) {
+      return 12;
+    }
+    if (raz_rt_stage1_arena_get(hir.local_function_types, local_index) >= 0) {
+      return 14;
+    }
+    if (type_kind == 15 || (type_kind >= 1024 && type_kind < 1280)) {
+      return 12;
+    }
+    if (type_kind == 13) {
+      return 13;
+    }
+    if (!forge_native_primitive_type_supported(type_kind)) {
+      return -1;
+    }
+    return type_kind;
+  }
+
+  i64 parameter = local_slot - declared_count;
+  i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+
+  if (parameter < 0 || parameter >= parameter_count) {
+    return -1;
+  }
+
+  i64 parameter_index = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index) + parameter;
+
+  return forge_native_parameter_type(hir, parameter_index);
+}
+
+fn forge_native_scalar_local_signature(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
+  i64 declared_count = raz_rt_stage1_arena_get(hir.function_local_counts, function_index);
+
+  if (local_slot < 0) {
+    return -1;
+  }
+  if (local_slot < declared_count) {
+    i64 local_index = forge_native_hir_local_index(hir, function_index, local_slot);
+
+    if (local_index < 0) {
+      return -1;
+    }
+    if (raz_rt_stage1_arena_get(hir.local_types, local_index) != 14) {
+      return -1;
+    }
+    return raz_rt_stage1_arena_get(hir.local_function_types, local_index);
+  }
+
+  i64 parameter = local_slot - declared_count;
+  i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+
+  if (parameter < 0 || parameter >= parameter_count) {
+    return -1;
+  }
+
+  i64 parameter_index = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index) + parameter;
+
+  if (raz_rt_stage1_arena_get(hir.parameter_types, parameter_index) != 14) {
+    return -1;
+  }
+  return raz_rt_stage1_arena_get(hir.parameter_function_types, parameter_index);
+}
+
+fn forge_native_flat_aggregate_locals_supported(HirModule& hir, i64 function_index) -> bool {
+  // Structured Forge represents MIR aggregate images as native stack storage.
+  // Nested aggregate fields therefore contain pointers to other stack images,
+  // matching the existing MIR handle graph without requiring the Stage-1
+  // arena. The whole graph has function lifetime, and aggregate returns/async
+  // escape paths are rejected separately, so nested synchronous locals are
+  // safe here as well.
+
+  i64 local_count = raz_rt_stage1_arena_get(hir.function_local_counts, function_index);
+  i64 local = 0;
+
+  while (local < local_count) {
+    i64 index = forge_native_hir_local_index(hir, function_index, local);
+
+    if (index < 0) {
+      return false;
+    }
+    if (
+    raz_rt_stage1_arena_get(hir.local_slices, index) != 0 &&
+    raz_rt_stage1_arena_get(hir.local_array_extents, index) >= 0
+    ) {
+      return false;
+    }
+    local += 1;
+  }
+  return true;
+}
+
+fn forge_native_global_is_aggregate(HirModule& hir, i64 global_index) -> bool {
+  return (
+  raz_rt_stage1_arena_get(hir.global_type_structs, global_index) >= 0 ||
+  raz_rt_stage1_arena_get(hir.global_array_extents, global_index) >= 0
+  );
+}
+
+fn forge_native_aggregate_global_slot_count(HirModule& hir, i64 global_index) -> i64 {
+  i64 extent = raz_rt_stage1_arena_get(hir.global_array_extents, global_index);
+
+  if (extent >= 0) {
+    return extent;
+  }
+
+  i64 structure = raz_rt_stage1_arena_get(hir.global_type_structs, global_index);
+
+  if (structure < 0) {
+    return 0;
+  }
+  return raz_rt_stage1_arena_get(hir.struct_field_counts, structure);
+}
+
+fn forge_native_flat_aggregate_global_supported(HirModule& hir, i64 global_index) -> bool {
+  if (
+  !forge_native_global_is_aggregate(hir, global_index) ||
+  raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) != 0
+  ) {
+    return false;
+  }
+
+  i64 extent = raz_rt_stage1_arena_get(hir.global_array_extents, global_index);
+  i64 structure = raz_rt_stage1_arena_get(hir.global_type_structs, global_index);
+
+  if (extent >= 0 && structure >= 0) {
+    return false;
+  }
+  if (extent >= 0) {
+    i64 element_type = raz_rt_stage1_arena_get(hir.global_types, global_index);
+
+    return (
+    forge_native_primitive_type_supported(element_type) ||
+    element_type == 12 ||
+    element_type == 13 ||
+    element_type == 14
+    );
+  }
+
+  i64 field_start = raz_rt_stage1_arena_get(hir.struct_field_starts, structure);
+  i64 field_count = raz_rt_stage1_arena_get(hir.struct_field_counts, structure);
+  i64 field = 0;
+
+  while (field < field_count) {
+    i64 metadata = field_start + field;
+
+    if (
+    raz_rt_stage1_arena_get(hir.struct_field_type_structs, metadata) >= 0 ||
+    raz_rt_stage1_arena_get(hir.struct_field_array_extents, metadata) >= 0 ||
+    raz_rt_stage1_arena_get(hir.struct_field_slices, metadata) != 0
+    ) {
+      return false;
+    }
+
+    i64 field_type = raz_rt_stage1_arena_get(hir.struct_field_types, metadata);
+
+    if (
+    !forge_native_primitive_type_supported(field_type) &&
+    field_type != 12 &&
+    field_type != 13 &&
+    field_type != 14
+    ) {
+      return false;
+    }
+    field += 1;
+  }
+  return true;
+}
+
+fn forge_native_write_aggregate_global_bytes(
+ForgeWriter&mut out,
+MirModule& mir,
+i64 global_index,
+i64 slot_count,
+) -> bool {
+  forge_native_scratch_reset(out);
+  if (slot_count <= 0) {
+    return false;
+  }
+
+  i64 storage = raz_rt_stage1_arena_get(mir.global_values, global_index);
+  i64 slot = 0;
+
+  while (slot < slot_count) {
+    i64 value = 0;
+
+    if (storage != 0) {
+      value = raz_rt_stage1_arena_get(storage, slot);
+    }
+
+    i64 byte = 0;
+
+    while (byte < 8) {
+      writer_put(out, (value >> (byte * 8)) & 255);
+      byte += 1;
+    }
+    slot += 1;
+  }
+  return !out.failed;
+}
+
+fn forge_native_local_address_register(i64 local_slot) -> i64 {
+  return writer_synthetic_register(250, local_slot);
+}
+
+fn forge_native_value_used_as_image_pointer(
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+i64 value,
+) -> bool {
+  if (value < 0 || value >= mir.instruction_count) {
+    return false;
+  }
+
+  i64 cursor = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+  i64 end = cursor + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+
+  while (cursor < end) {
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, cursor);
+
+    // MIR arena/image operations use operand A as the aggregate base. If a
+    // value flows into one of these positions it is semantically an image
+    // pointer on the structured backend even when legacy MIR type metadata
+    // still says i64 (the textual fallback historically stored arena handles).
+    if (
+    (opcode == 28 || opcode == 29 || opcode == 45) &&
+    raz_rt_stage1_arena_get(mir.op_a, cursor) == value
+    ) {
+      return true;
+    }
+    if (
+    opcode == 10 &&
+    raz_rt_stage1_arena_get(mir.op_a, cursor) == value &&
+    raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index) >= 0
+    ) {
+      return true;
+    }
+    // Legacy MIR represents nested aggregate images as integer arena
+    // handles. On the structured backend those images are real pointers,
+    // including when they flow directly into an internal aggregate or
+    // reference parameter such as a synthesized Drop call. Infer the
+    // pointer type from the callee parameter instead of trusting the old
+    // handle-shaped op_type metadata.
+    if (opcode == 9 && raz_rt_stage1_arena_get(mir.op_b, cursor) == value) {
+      i64 local_type = forge_native_scalar_local_type(
+      hir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.op_a, cursor),
+      );
+      if (local_type == 12 || local_type == 13 || local_type == 14) {
+        return true;
+      }
+    }
+    if (opcode == 8) {
+      i64 target = raz_rt_stage1_arena_get(mir.op_a, cursor);
+
+      if (target >= 0 && target < hir.function_count) {
+        i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, cursor);
+        i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, cursor);
+        i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, target);
+        i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, target);
+        i64 argument = 0;
+
+        while (argument < argument_count && argument < parameter_count) {
+          if (
+          raz_rt_stage1_arena_get(mir.call_arguments, argument_start + argument) == value &&
+          forge_native_parameter_type(hir, parameter_start + argument) == 12
+          ) {
+            return true;
+          }
+          argument += 1;
+        }
+      }
+    }
+    cursor += 1;
+  }
+  return false;
+}
+
+fn forge_native_register_type(HirModule& hir, MirModule& mir, i64 function_index, i64 value) -> i64 {
+  if (value < 0 || value >= mir.instruction_count) {
+    return -1;
+  }
+
+  i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, value);
+
+  if (opcode == 8) {
+    i64 target = raz_rt_stage1_arena_get(mir.op_a, value);
+
+    if (
+    target >= 0 &&
+    target < hir.function_count &&
+    raz_rt_stage1_arena_get(hir.function_return_type_structs, target) >= 0
+    ) {
+      return 12;
+    }
+  }
+  if (
+  opcode == 25 ||
+  opcode == 30 ||
+  opcode == 42 ||
+  opcode == 43 ||
+  opcode == 45 ||
+  opcode == 49 ||
+  opcode == 50 ||
+  opcode == 52
+  ) {
+    return 12;
+  }
+  if (opcode == 51) {
+    i64 signature = raz_rt_stage1_arena_get(mir.op_d, value);
+
+    return forge_native_function_type_return_type(hir, signature);
+  }
+  if (opcode == 47) {
+    i64 global_index = raz_rt_stage1_arena_get(mir.op_a, value);
+
+    if (
+    global_index >= 0 &&
+    global_index < hir.global_count &&
+    forge_native_global_is_aggregate(hir, global_index)
+    ) {
+      return 12;
+    }
+  }
+  if (opcode == 2) {
+    i64 parameter = raz_rt_stage1_arena_get(mir.op_a, value);
+    i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+
+    if (parameter < 0 || parameter >= parameter_count) {
+      return -1;
+    }
+    return forge_native_parameter_type(
+    hir,
+    raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index) + parameter,
+    );
+  }
+  if (opcode == 3) {
+    return forge_native_scalar_local_type(hir, function_index, raz_rt_stage1_arena_get(mir.op_a, value));
+  }
+  if (forge_native_value_used_as_image_pointer(hir, mir, function_index, value)) {
+    return 12;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(mir.op_types, value);
+
+  if (type_kind == 15 || (type_kind >= 1024 && type_kind < 1280)) {
+    return 12;
+  }
+  if (
+  type_kind == 12 ||
+  type_kind == 13 ||
+  type_kind == 14 ||
+  forge_native_primitive_type_supported(type_kind)
+  ) {
+    return type_kind;
+  }
+  return -1;
+}
+
+fn forge_native_build_image_pointer_values(
+HirModule& hir,
+MirModule& mir,
+i64 image_pointer_values,
+) -> bool {
+  if (image_pointer_values == 0) {
+    return false;
+  }
+
+  i64 value = 0;
+
+  while (value < mir.instruction_count + 1) {
+    raz_rt_stage1_arena_set(image_pointer_values, value, 0);
+    value += 1;
+  }
+
+  i64 function_index = 0;
+
+  while (function_index < mir.function_count) {
+    i64 instruction = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = instruction + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+
+    while (instruction < end) {
+      i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, instruction);
+
+      if (opcode == 28 || opcode == 29 || opcode == 45) {
+        i64 base = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+        if (base >= 0 && base < mir.instruction_count) {
+          raz_rt_stage1_arena_set(image_pointer_values, base, 1);
+        }
+      }
+      if (
+      opcode == 10 &&
+      raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index) >= 0
+      ) {
+        i64 returned = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+        if (returned >= 0 && returned < mir.instruction_count) {
+          raz_rt_stage1_arena_set(image_pointer_values, returned, 1);
+        }
+      }
+      if (opcode == 9) {
+        i64 local_type = forge_native_scalar_local_type(
+        hir,
+        function_index,
+        raz_rt_stage1_arena_get(mir.op_a, instruction),
+        );
+        if (local_type == 12 || local_type == 13 || local_type == 14) {
+          i64 stored = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+          if (stored >= 0 && stored < mir.instruction_count) {
+            raz_rt_stage1_arena_set(image_pointer_values, stored, 1);
+          }
+        }
+      }
+      if (opcode == 8) {
+        i64 target = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+        if (target >= 0 && target < hir.function_count) {
+          i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, instruction);
+          i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, instruction);
+          i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, target);
+          i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, target);
+          i64 argument = 0;
+
+          while (argument < argument_count && argument < parameter_count) {
+            if (forge_native_parameter_type(hir, parameter_start + argument) == 12) {
+              i64 argument_value = raz_rt_stage1_arena_get(
+              mir.call_arguments,
+              argument_start + argument,
+              );
+              if (argument_value >= 0 && argument_value < mir.instruction_count) {
+                raz_rt_stage1_arena_set(image_pointer_values, argument_value, 1);
+              }
+            }
+            argument += 1;
+          }
+        }
+      }
+      instruction += 1;
+    }
+    function_index += 1;
+  }
+  return true;
+}
+
+fn forge_native_register_type_fast(
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+i64 value,
+i64 image_pointer_values,
+) -> i64 {
+  if (value < 0 || value >= mir.instruction_count) {
+    return -1;
+  }
+
+  i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, value);
+
+  if (opcode == 8) {
+    i64 target = raz_rt_stage1_arena_get(mir.op_a, value);
+
+    if (
+    target >= 0 &&
+    target < hir.function_count &&
+    raz_rt_stage1_arena_get(hir.function_return_type_structs, target) >= 0
+    ) {
+      return 12;
+    }
+  }
+  if (
+  opcode == 25 ||
+  opcode == 30 ||
+  opcode == 42 ||
+  opcode == 43 ||
+  opcode == 45 ||
+  opcode == 49 ||
+  opcode == 50 ||
+  opcode == 52
+  ) {
+    return 12;
+  }
+  if (opcode == 51) {
+    return forge_native_function_type_return_type(hir, raz_rt_stage1_arena_get(mir.op_d, value));
+  }
+  if (opcode == 47) {
+    i64 global_index = raz_rt_stage1_arena_get(mir.op_a, value);
+
+    if (
+    global_index >= 0 &&
+    global_index < hir.global_count &&
+    forge_native_global_is_aggregate(hir, global_index)
+    ) {
+      return 12;
+    }
+  }
+  if (opcode == 2) {
+    i64 parameter = raz_rt_stage1_arena_get(mir.op_a, value);
+    i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+
+    if (parameter < 0 || parameter >= parameter_count) {
+      return -1;
+    }
+    return forge_native_parameter_type(
+    hir,
+    raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index) + parameter,
+    );
+  }
+  if (opcode == 3) {
+    return forge_native_scalar_local_type(hir, function_index, raz_rt_stage1_arena_get(mir.op_a, value));
+  }
+  if (
+  image_pointer_values != 0 &&
+  raz_rt_stage1_arena_get(image_pointer_values, value) != 0
+  ) {
+    return 12;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(mir.op_types, value);
+
+  if (type_kind == 15 || (type_kind >= 1024 && type_kind < 1280)) {
+    return 12;
+  }
+  if (
+  type_kind == 12 ||
+  type_kind == 13 ||
+  type_kind == 14 ||
+  forge_native_primitive_type_supported(type_kind)
+  ) {
+    return type_kind;
+  }
+  return -1;
+}
+
+fn forge_native_register_is_pointer(HirModule& hir, MirModule& mir, i64 function_index, i64 value) -> bool {
+  return forge_native_register_type(hir, mir, function_index, value) == 12;
+}
+
+fn forge_native_image_address_supported(
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+i64 base,
+i64 index,
+) -> bool {
+  if (!forge_native_register_is_pointer(hir, mir, function_index, base)) {
+    return false;
+  }
+
+  i64 structure = forge_native_register_structure_id(hir, mir, function_index, base, 0);
+
+  if (structure >= 0) {
+    i64 field = forge_native_constant_index(mir, index);
+
+    return field >= 0 && field < raz_rt_stage1_arena_get(hir.struct_field_counts, structure);
+  }
+
+  i64 extent = -1;
+  i64 element_type = -1;
+  i64 element_structure = -1;
+
+  if (
+  forge_native_register_array_info(
+  hir,
+  mir,
+  function_index,
+  base,
+  0,
+  &mut extent,
+  &mut element_type,
+  &mut element_structure,
+  )
+  ) {
+    i64 constant_element = forge_native_constant_index(mir, index);
+
+    if (constant_element >= 0) {
+      return (
+      constant_element < extent &&
+      forge_native_array_supported(hir, extent, element_type, element_structure)
+      );
+    }
+    return (
+    forge_native_array_supported(hir, extent, element_type, element_structure) &&
+    primitive_type_is_integer(forge_native_register_type(hir, mir, function_index, index))
+    );
+  }
+  return primitive_type_is_integer(forge_native_register_type(hir, mir, function_index, index));
+}
+
+fn forge_native_scalar_opcode_supported(
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+i64 instruction,
+) -> bool {
+  i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, instruction);
+  i64 type_kind = raz_rt_stage1_arena_get(mir.op_types, instruction);
+
+  if (
+  opcode == 1 ||
+  opcode == 2 ||
+  opcode == 3 ||
+  (opcode >= 4 && opcode <= 9) ||
+  (opcode >= 10 && opcode <= 24) ||
+  (opcode >= 34 && opcode <= 40) ||
+  opcode == 47 ||
+  opcode == 48
+  ) {
+    if (opcode == 8) {
+      i64 target = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+      return (
+      target >= 0 &&
+      target < hir.function_count &&
+      forge_native_scalar_function_type_supported(hir, target)
+      );
+    }
+    if (opcode == 40) {
+      i64 source_type = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+      // Forge bitcast supports pointer/i64-compatible conversions.  Raz
+      // represents raw/runtime pointers as type 12 and usize/u64 as 64-bit
+      // integer primitives, so allow those casts in the structured native
+      // path in addition to ordinary numeric casts.
+      if (source_type == 12 || type_kind == 12) {
+        bool source_compatible =
+        source_type == 12 ||
+        (primitive_type_is_integer(source_type) && primitive_type_width(source_type) == 64);
+        bool target_compatible =
+        type_kind == 12 ||
+        (primitive_type_is_integer(type_kind) && primitive_type_width(type_kind) == 64);
+        return source_compatible && target_compatible;
+      }
+      return (
+      forge_native_primitive_type_supported(source_type) &&
+      forge_native_primitive_type_supported(type_kind)
+      );
+    }
+    if (opcode == 47 || opcode == 48) {
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+      if (global_index < 0 || global_index >= hir.global_count) {
+        return false;
+      }
+      if (forge_native_global_is_aggregate(hir, global_index)) {
+        if (!forge_native_flat_aggregate_global_supported(hir, global_index)) {
+          return false;
+        }
+        if (opcode == 48) {
+          return forge_native_register_is_pointer(
+          hir,
+          mir,
+          function_index,
+          raz_rt_stage1_arena_get(mir.op_b, instruction),
+          );
+        }
+        return true;
+      }
+      return forge_native_primitive_type_supported(type_kind);
+    }
+    // Arithmetic and comparisons are valid for integer and floating-point
+    // primitives. Remainder, bitwise operations, and shifts remain integer-only.
+    if (opcode == 2) {
+      return forge_native_register_type(hir, mir, function_index, instruction) >= 0;
+    }
+    if (opcode == 3) {
+      i64 local_result_type = forge_native_register_type(hir, mir, function_index, instruction);
+
+      return (
+      forge_native_primitive_type_supported(local_result_type) ||
+      local_result_type == 12 ||
+      local_result_type == 13 ||
+      local_result_type == 14
+      );
+    }
+    if (opcode == 1) {
+      i64 constant_type = forge_native_register_type(hir, mir, function_index, instruction);
+
+      return forge_native_primitive_type_supported(constant_type) || constant_type == 12;
+    }
+    if ((opcode >= 4 && opcode <= 7) || (opcode >= 11 && opcode <= 16)) {
+      return forge_native_primitive_type_supported(type_kind);
+    }
+    if (opcode == 34 || (opcode >= 35 && opcode <= 39) || opcode == 19 || opcode == 20) {
+      return primitive_type_is_integer(type_kind);
+    }
+    return true;
+  }
+  if (opcode == 42) {
+    i64 offset = raz_rt_stage1_arena_get(mir.op_a, instruction);
+    i64 length = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+    return offset >= 0 && length >= 0;
+  }
+  if (opcode == 43) {
+    i64 target = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+    if (
+    target < 0 ||
+    target >= hir.function_count ||
+    raz_rt_stage1_arena_get(hir.function_abi_kinds, target) != 0
+    ) {
+      return false;
+    }
+
+    i64 encoded = raz_rt_stage1_arena_get(hir.function_pointer_signatures, target);
+
+    return encoded > 0 && forge_native_function_signature_supported(hir, encoded - 1);
+  }
+  if (opcode == 44) {
+    i64 signature = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+    i64 callee_type = forge_native_register_type(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    );
+    if (
+    (callee_type != 12 && callee_type != 14) ||
+    !forge_native_function_signature_supported(hir, signature)
+    ) {
+      return false;
+    }
+
+    i64 start = raz_rt_stage1_arena_get(mir.op_b, instruction);
+    i64 count = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+    if (
+    start < 0 ||
+    count < 0 ||
+    start + count > mir.call_argument_count ||
+    count != raz_rt_stage1_arena_get(hir.function_type_parameter_counts, signature)
+    ) {
+      return false;
+    }
+
+    i64 argument = 0;
+
+    while (argument < count) {
+      if (
+      forge_native_register_type(
+      hir,
+      mir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.call_arguments, start + argument),
+      ) < 0
+      ) {
+        return false;
+      }
+      argument += 1;
+    }
+    return true;
+  }
+  if (opcode == 50) {
+    i64 closure_function = raz_rt_stage1_arena_get(mir.op_a, instruction);
+    i64 signature = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+    if (
+    closure_function < 0 ||
+    closure_function >= hir.function_count ||
+    !forge_native_function_signature_supported(hir, signature)
+    ) {
+      return false;
+    }
+
+    i64 capture_count = raz_rt_stage1_arena_get(hir.function_closure_capture_counts, closure_function);
+    i64 argument_start = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+    if (
+    argument_start < 0 ||
+    capture_count < 0 ||
+    argument_start + capture_count > mir.call_argument_count
+    ) {
+      return false;
+    }
+    i64 explicit_count = raz_rt_stage1_arena_get(
+    hir.function_closure_explicit_parameter_counts,
+    closure_function,
+    );
+
+    i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, closure_function);
+    i64 capture = 0;
+
+    while (capture < capture_count) {
+      i64 parameter_index = parameter_start + explicit_count + capture;
+      i64 structure = raz_rt_stage1_arena_get(hir.parameter_type_structs, parameter_index);
+
+      if (structure >= 0 && !forge_native_flat_return_structure_supported(hir, structure)) {
+        return false;
+      }
+      if (
+      raz_rt_stage1_arena_get(hir.parameter_array_extents, parameter_index) >= 0 ||
+      raz_rt_stage1_arena_get(hir.parameter_slices, parameter_index) != 0
+      ) {
+        return false;
+      }
+      if (
+      forge_native_register_type(
+      hir,
+      mir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.call_arguments, argument_start + capture),
+      ) < 0
+      ) {
+        return false;
+      }
+      capture += 1;
+    }
+    return true;
+  }
+  if (opcode == 51) {
+    i64 signature = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+    if (
+    !forge_native_function_signature_supported(hir, signature) ||
+    !forge_native_register_is_pointer(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    )
+    ) {
+      return false;
+    }
+
+    i64 start = raz_rt_stage1_arena_get(mir.op_b, instruction);
+    i64 count = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+    if (
+    start < 0 ||
+    count < 0 ||
+    start + count > mir.call_argument_count ||
+    count != raz_rt_stage1_arena_get(hir.function_type_parameter_counts, signature)
+    ) {
+      return false;
+    }
+
+    i64 argument = 0;
+
+    while (argument < count) {
+      if (
+      forge_native_register_type(
+      hir,
+      mir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.call_arguments, start + argument),
+      ) < 0
+      ) {
+        return false;
+      }
+      argument += 1;
+    }
+    return true;
+  }
+  if (opcode == 25) {
+    i64 local_slot = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+    return forge_native_scalar_local_type(hir, function_index, local_slot) >= 0;
+  }
+  if (opcode == 26) {
+    i64 result_type = forge_native_register_type(hir, mir, function_index, instruction);
+
+    return (
+    forge_native_register_is_pointer(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    ) &&
+    (
+    forge_native_primitive_type_supported(result_type) ||
+    result_type == 12 ||
+    result_type == 13 ||
+    result_type == 14
+    )
+    );
+  }
+  if (opcode == 27) {
+    return (
+    forge_native_register_is_pointer(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    ) &&
+    forge_native_register_type(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_b, instruction),
+    ) >= 0
+    );
+  }
+  if (opcode == 28) {
+    i64 result_type = forge_native_register_type(hir, mir, function_index, instruction);
+
+    return (
+    forge_native_image_address_supported(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    raz_rt_stage1_arena_get(mir.op_b, instruction),
+    ) &&
+    (
+    forge_native_primitive_type_supported(result_type) ||
+    result_type == 12 ||
+    result_type == 13 ||
+    result_type == 14
+    )
+    );
+  }
+  if (opcode == 29) {
+    if (
+    !forge_native_image_address_supported(
+    hir,
+    mir,
+    function_index,
+    raz_rt_stage1_arena_get(mir.op_a, instruction),
+    raz_rt_stage1_arena_get(mir.op_b, instruction),
+    )
+    ) {
+      return false;
+    }
+
+    i64 stored = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+    if (forge_native_register_type(hir, mir, function_index, stored) >= 0) {
+      return true;
+    }
+    // Aggregate stores are handled below by structured aggregate-copy
+    // emission. Do not reject them merely because legacy MIR models the
+    // image as a handle instead of assigning it a scalar register type.
+
+    i64 aggregate_kind = 0;
+    i64 aggregate_extent = -1;
+    i64 aggregate_element_type = -1;
+    i64 aggregate_element_structure = -1;
+    i64 aggregate_structure = -1;
+
+    return forge_native_register_aggregate_info(
+    hir,
+    mir,
+    function_index,
+    stored,
+    0,
+    &mut aggregate_kind,
+    &mut aggregate_extent,
+    &mut aggregate_element_type,
+    &mut aggregate_element_structure,
+    &mut aggregate_structure,
+    );
+  }
+  if (opcode == 30) {
+    i64 count = raz_rt_stage1_arena_get(mir.op_a, instruction);
+    i64 aggregate_marker = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+    if (count <= 0) {
+      return false;
+    }
+    if (aggregate_marker == 2) {
+      return forge_native_array_supported(
+      hir,
+      count,
+      raz_rt_stage1_arena_get(mir.op_d, instruction),
+      raz_rt_stage1_arena_get(mir.op_c, instruction),
+      );
+    }
+    return true;
+  }
+  if (opcode == 31 || opcode == 32 || opcode == 33) {
+    return true;
+  }
+  if (opcode == 45) {
+    i64 base = raz_rt_stage1_arena_get(mir.op_a, instruction);
+    i64 index = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+    return forge_native_image_address_supported(hir, mir, function_index, base, index);
+  }
+  if (opcode == 49) {
+    i64 global_index = raz_rt_stage1_arena_get(mir.op_a, instruction);
+
+    if (global_index < 0 || global_index >= hir.global_count) {
+      return false;
+    }
+    if (forge_native_global_is_aggregate(hir, global_index)) {
+      return forge_native_flat_aggregate_global_supported(hir, global_index);
+    }
+    return forge_native_primitive_type_supported(raz_rt_stage1_arena_get(hir.global_types, global_index));
+  }
+  return false;
+}
+
+fn forge_native_scalar_global_initializer_supported(HirModule& hir, i64 global_index) -> bool {
+  if (raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) != 0) {
+    return true;
+  }
+
+  i64 initializer = raz_rt_stage1_arena_get(hir.global_initializer_nodes, global_index);
+
+  if (initializer < 0) {
+    return false;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(hir.global_types, global_index);
+  i64 node_kind = raz_rt_stage1_arena_get(hir.node_kinds, initializer);
+
+  if (primitive_type_is_float(type_kind)) {
+    return node_kind == 30;
+  }
+  return node_kind == 1;
+}
+
+fn forge_native_write_scalar_global_initializer(
+ForgeWriter&mut out,
+Source& source,
+HirModule& hir,
+i64 global_index,
+) -> bool {
+  i64 initializer = raz_rt_stage1_arena_get(hir.global_initializer_nodes, global_index);
+
+  if (initializer < 0) {
+    return false;
+  }
+
+  i64 type_kind = raz_rt_stage1_arena_get(hir.global_types, global_index);
+
+  if (primitive_type_is_float(type_kind)) {
+    i64 length = raz_rt_stage1_arena_get(hir.node_b, initializer);
+
+    if (length <= 0) {
+      return false;
+    }
+    writer_text(out, source, raz_rt_stage1_arena_get(hir.node_a, initializer), length);
+    return true;
+  }
+  writer_decimal(out, raz_rt_stage1_arena_get(hir.node_values, initializer));
+  return true;
+}
+
+fn forge_native_scalar_globals_supported(HirModule& hir, MirModule& mir) -> bool {
+  if (hir.global_count != mir.global_count) {
+    return false;
+  }
+
+  i64 global_index = 0;
+
+  while (global_index < hir.global_count) {
+    if (forge_native_global_is_aggregate(hir, global_index)) {
+      if (
+      !forge_native_flat_aggregate_global_supported(hir, global_index) ||
+      forge_native_aggregate_global_slot_count(hir, global_index) <= 0
+      ) {
+        return false;
+      }
+    } else {
+      if (
+      !forge_native_primitive_type_supported(
+      raz_rt_stage1_arena_get(hir.global_types, global_index),
+      )
+      ) {
+        return false;
+      }
+      if (!forge_native_scalar_global_initializer_supported(hir, global_index)) {
+        return false;
+      }
+    }
+    global_index += 1;
+  }
+  return true;
+}
+
+fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_index) -> i64 {
+  if (main_index < 0) {
+    return 1000001;
+  }
+  if (hir.function_count != mir.function_count) {
+    return 1000002;
+  }
+  if (!forge_native_scalar_globals_supported(hir, mir)) {
+    return 1100000;
+  }
+  if (raz_rt_stage1_arena_get(hir.function_parameter_counts, main_index) != 0) {
+    return 1000003;
+  }
+  if (
+  raz_rt_stage1_arena_get(hir.function_returns_value, main_index) != 0 &&
+  (
+  !primitive_type_is_integer(raz_rt_stage1_arena_get(hir.function_return_types, main_index)) ||
+  primitive_type_width(raz_rt_stage1_arena_get(hir.function_return_types, main_index)) != 64
+  )
+  ) {
+    return 1000004;
+  }
+
+  i64 function_index = 0;
+
+  while (function_index < hir.function_count) {
+    if (!forge_native_scalar_function_type_supported(hir, function_index)) {
+      return 2000000 + function_index;
+    }
+    if (!forge_native_flat_aggregate_locals_supported(hir, function_index)) {
+      return 2100000 + function_index;
+    }
+
+    i64 local_slot = 0;
+    i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    while (local_slot < local_count) {
+      if (forge_native_scalar_local_type(hir, function_index, local_slot) < 0) {
+        return 3000000 + function_index * 1000 + local_slot;
+      }
+      local_slot += 1;
+    }
+
+    i64 instruction = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = instruction + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+
+    while (instruction < end) {
+      if (!forge_native_scalar_opcode_supported(hir, mir, function_index, instruction)) {
+        i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, instruction);
+
+        return 400000000 + opcode * 1000000 + instruction;
+      }
+      instruction += 1;
+    }
+    function_index += 1;
+  }
+  return 0;
+}
+
+fn forge_native_write_support_diagnostic(HirModule& hir, MirModule& mir, i64 main_index) {
+  i64 code = forge_native_support_failure_code(hir, mir, main_index);
+  ForgeWriter diagnostic;
+
+  diagnostic.capacity = 64;
+  diagnostic.data = raz_rt_stage1_arena_create(diagnostic.capacity);
+  diagnostic.length = 0;
+  diagnostic.failed = diagnostic.data == 0;
+  if (!diagnostic.failed) {
+    writer_decimal(&mut diagnostic, code);
+    writer_newline(&mut diagnostic);
+
+    i64 path[29] = [102, 111, 114, 103, 101, 45, 115, 116, 114, 117, 99, 116, 117, 114, 101, 100, 45, 102, 97, 105, 108, 117, 114, 101, 46, 116, 120, 116, 0];
+
+    raz_rt_write_ascii_i64(&mut path[0], 28, diagnostic.data, diagnostic.length);
+  }
+  writer_destroy(&mut diagnostic);
+}
+
+fn forge_native_scalar_module_supported(HirModule& hir, MirModule& mir, i64 main_index) -> bool {
+  if (
+  main_index < 0 ||
+  hir.function_count != mir.function_count ||
+  !forge_native_scalar_globals_supported(hir, mir)
+  ) {
+    return false;
+  }
+  if (raz_rt_stage1_arena_get(hir.function_parameter_counts, main_index) != 0) {
+    return false;
+  }
+  if (
+  raz_rt_stage1_arena_get(hir.function_returns_value, main_index) != 0 &&
+  (
+  !primitive_type_is_integer(raz_rt_stage1_arena_get(hir.function_return_types, main_index)) ||
+  primitive_type_width(raz_rt_stage1_arena_get(hir.function_return_types, main_index)) != 64
+  )
+  ) {
+    return false;
+  }
+
+  i64 function_index = 0;
+
+  while (function_index < hir.function_count) {
+    if (
+    !forge_native_scalar_function_type_supported(hir, function_index) ||
+    !forge_native_flat_aggregate_locals_supported(hir, function_index)
+    ) {
+      return false;
+    }
+
+    i64 local_slot = 0;
+    i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    while (local_slot < local_count) {
+      if (forge_native_scalar_local_type(hir, function_index, local_slot) < 0) {
+        return false;
+      }
+      local_slot += 1;
+    }
+
+    i64 instruction = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = instruction + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+
+    while (instruction < end) {
+      if (!forge_native_scalar_opcode_supported(hir, mir, function_index, instruction)) {
+        return false;
+      }
+      instruction += 1;
+    }
+    function_index += 1;
+  }
+  return true;
+}

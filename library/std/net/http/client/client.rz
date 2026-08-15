@@ -1,0 +1,1402 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::http::client;
+import alloc::string;
+import core::bytes;
+import core::result;
+import std::fmt;
+import std::io::buffer;
+import std::io::error;
+import std::net;
+import std::net::http;
+import std::net::http::headers;
+import std::net::tls;
+import std::net::url;
+
+public enum ClientError {
+    None,
+    InvalidUrl,
+    UnsupportedScheme,
+    OutOfMemory,
+    Connect,
+    Tls,
+    Io,
+    Protocol,
+    HeadersTooLarge,
+    BodyTooLarge,
+    Busy,
+}
+
+public struct HttpResponse {
+    i64 status;
+    String headers;
+    String body;
+    bool keep_alive;
+    bool chunked;
+}
+
+public struct HttpResponseHead {
+    i64 status;
+    String headers;
+    i64 content_length;
+    bool chunked;
+    bool keep_alive;
+}
+
+/// Streaming body state. mode: 0=done/no-body, 1=content-length,
+/// 2=chunked, 3=close-delimited. The state itself owns no transport.
+public struct HttpBodyState {
+    i64 mode;
+    i64 remaining;
+    i64 chunk_remaining;
+    i64 decoded_total;
+    i64 max_body_bytes;
+    bool keep_alive;
+    bool done;
+    bool need_chunk_crlf;
+}
+
+public struct HttpClient {
+    TcpStream plain;
+    TlsStream secure_stream;
+    bool connected;
+    bool secure;
+    String host;
+    i64 port;
+    ByteBuffer receive_buffer;
+    String request_buffer;
+    String target_buffer;
+    String decode_buffer;
+    String get_method;
+    String post_method;
+    i64 buffer_capacity;
+    i64 max_header_bytes;
+    i64 max_body_bytes;
+    i64 timeout_millis;
+    i64 reused_connections;
+    i64 opened_connections;
+    bool body_active;
+}
+
+public fn response_new() -> HttpResponse {
+    return HttpResponse {
+        status: 0,
+        headers: alloc::string::with_capacity(512),
+        body: alloc::string::with_capacity(4096),
+        keep_alive: false,
+        chunked: false,
+    };
+}
+
+public fn response_head_new() -> HttpResponseHead {
+    return HttpResponseHead {
+        status: 0,
+        headers: alloc::string::with_capacity(512),
+        content_length: -1,
+        chunked: false,
+        keep_alive: false,
+    };
+}
+
+public fn body_state_new() -> HttpBodyState {
+    return HttpBodyState {
+        mode: 0,
+        remaining: 0,
+        chunk_remaining: -1,
+        decoded_total: 0,
+        max_body_bytes: 0,
+        keep_alive: false,
+        done: true,
+        need_chunk_crlf: false,
+    };
+}
+
+public fn body_done(HttpBodyState& state) -> bool {
+    return state.done;
+}
+
+public fn new(
+    i64 buffer_capacity,
+    i64 max_header_bytes,
+    i64 max_body_bytes,
+    i64 timeout_millis,
+) -> HttpClient {
+    i64 capacity = buffer_capacity;
+
+    if (capacity < 1024) {
+        capacity = 16384;
+    }
+
+    i64 headers_limit = max_header_bytes;
+
+    if (headers_limit <= 0) {
+        headers_limit = 65536;
+    }
+
+    i64 body_limit = max_body_bytes;
+
+    if (body_limit <= 0) {
+        body_limit = 16777216;
+    }
+
+    String get_method = alloc::string::with_capacity(3);
+
+    alloc::string::push_byte(&mut get_method, 71);
+    alloc::string::push_byte(&mut get_method, 69);
+    alloc::string::push_byte(&mut get_method, 84);
+
+    String post_method = alloc::string::with_capacity(4);
+
+    alloc::string::push_byte(&mut post_method, 80);
+    alloc::string::push_byte(&mut post_method, 79);
+    alloc::string::push_byte(&mut post_method, 83);
+    alloc::string::push_byte(&mut post_method, 84);
+    return HttpClient {
+        plain: TcpStream {
+            socket: -1
+        },
+        secure_stream: std::net::tls::empty_stream(),
+        connected: false,
+        secure: false,
+        host: alloc::string::with_capacity(128),
+        port: 0,
+        receive_buffer: byte_buffer_with_capacity(capacity),
+        request_buffer: alloc::string::with_capacity(1024),
+        target_buffer: alloc::string::with_capacity(256),
+        decode_buffer: alloc::string::with_capacity(4096),
+        get_method: move get_method,
+        post_method: move post_method,
+        buffer_capacity: capacity,
+        max_header_bytes: headers_limit,
+        max_body_bytes: body_limit,
+        timeout_millis: timeout_millis,
+        reused_connections: 0,
+        opened_connections: 0,
+        body_active: false,
+    };
+}
+
+public fn reused_connections(HttpClient& client) -> i64 {
+    return client.reused_connections;
+}
+
+public fn opened_connections(HttpClient& client) -> i64 {
+    return client.opened_connections;
+}
+
+fn close_connection(HttpClient&mut client) {
+    if (!client.connected) {
+        return;
+    }
+    if (client.secure) {
+        std::net::tls::close(&mut client.secure_stream);
+    } else {
+        tcp_stream_close(&mut client.plain);
+    }
+    client.connected = false;
+    client.secure = false;
+    client.port = 0;
+    alloc::string::clear(&mut client.host);
+    byte_buffer_clear(&mut client.receive_buffer);
+    client.body_active = false;
+}
+
+public fn close(HttpClient&mut client) {
+    close_connection(client);
+}
+
+fn host_equal(HttpClient& client, BytesView host, i64 port, bool secure) -> bool {
+    return (
+        client.connected &&
+        client.secure == secure &&
+        client.port == port &&
+        alloc::string::equals_bytes(&client.host, host.data, host.length)
+    );
+}
+
+fn ensure_connection(HttpClient&mut client, UrlView& url_view) -> ClientError {
+    bool use_tls = std::net::url::is_https(url_view);
+
+    if (!use_tls && !std::net::url::is_http(url_view)) {
+        return ClientError::UnsupportedScheme;
+    }
+    if (host_equal(client, url_view.host, url_view.port, use_tls)) {
+        client.reused_connections += 1;
+        return ClientError::None;
+    }
+    close_connection(client);
+    alloc::string::clear(&mut client.host);
+    if (!alloc::string::append_bytes(&mut client.host, url_view.host.data, url_view.host.length)) {
+        return ClientError::OutOfMemory;
+    }
+    client.port = url_view.port;
+    client.secure = use_tls;
+    if (use_tls) {
+        TlsError error = std::net::tls::connect(
+            url_view.host.data,
+            url_view.host.length,
+            url_view.port,
+            client.timeout_millis,
+            client.buffer_capacity,
+            &mut client.secure_stream,
+        );
+        if (error != TlsError::None) {
+            client.secure = false;
+            client.port = 0;
+            alloc::string::clear(&mut client.host);
+            return ClientError::Tls;
+        }
+    } else {
+        Result<TcpStream, IoError> result = try_tcp_stream_connect(
+            url_view.host.data,
+            url_view.host.length,
+            url_view.port,
+        );
+        match result {
+            Result<TcpStream, IoError>::Error(_) => {
+                client.secure = false;
+                client.port = 0;
+                alloc::string::clear(&mut client.host);
+                return ClientError::Connect;
+            }
+            Result<TcpStream, IoError>::Ok(stream) => {
+                client.plain = move stream;
+                if (client.timeout_millis >= 0) {
+                    set_timeout_millis(client.plain.socket, client.timeout_millis, client.timeout_millis);
+                }
+            }
+        }
+    }
+    client.connected = true;
+    client.opened_connections += 1;
+    byte_buffer_clear(&mut client.receive_buffer);
+    return ClientError::None;
+}
+
+fn transport_write(HttpClient&mut client, usize data, i64 length) -> bool {
+    if (client.secure) {
+        return std::net::tls::write_all(&mut client.secure_stream, data, length) == TlsError::None;
+    }
+    return tcp_stream_send_all(&client.plain, data, length);
+}
+
+fn transport_read(HttpClient&mut client, usize output, i64 capacity) -> i64 {
+    if (client.secure) {
+        return std::net::tls::read(&mut client.secure_stream, output, capacity);
+    }
+    return tcp_stream_receive(&client.plain, output, capacity);
+}
+
+fn append_crlf(String&mut output) -> bool {
+    return alloc::string::push_byte(output, 13) && alloc::string::push_byte(output, 10);
+}
+
+fn append_host_header(String&mut output, UrlView& url_view) -> bool {
+    // "Host: "
+    if (
+        !alloc::string::push_byte(output, 72) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 115) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 58) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+
+    bool ipv6 = core::bytes::find_byte(url_view.host, 58) >= 0;
+
+    if (ipv6 && !alloc::string::push_byte(output, 91)) {
+        return false;
+    }
+    if (!alloc::string::append_bytes(output, url_view.host.data, url_view.host.length)) {
+        return false;
+    }
+    if (ipv6 && !alloc::string::push_byte(output, 93)) {
+        return false;
+    }
+    bool default_port =
+        (std::net::url::is_http(url_view) && url_view.port == 80) ||
+        (std::net::url::is_https(url_view) && url_view.port == 443);
+    if (!default_port) {
+        if (!alloc::string::push_byte(output, 58) || !std::fmt::append_i64(output, url_view.port)) {
+            return false;
+        }
+    }
+    return append_crlf(output);
+}
+
+fn append_connection_keep_alive(String&mut output) -> bool {
+    // "Connection: keep-alive\r\n"
+    if (
+        !alloc::string::push_byte(output, 67) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 99) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 105) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 58) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+    if (
+        !alloc::string::push_byte(output, 107) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 112) ||
+        !alloc::string::push_byte(output, 45) ||
+        !alloc::string::push_byte(output, 97) ||
+        !alloc::string::push_byte(output, 108) ||
+        !alloc::string::push_byte(output, 105) ||
+        !alloc::string::push_byte(output, 118) ||
+        !alloc::string::push_byte(output, 101)
+    ) {
+        return false;
+    }
+    return append_crlf(output);
+}
+
+fn append_content_length(String&mut output, i64 length) -> bool {
+    // "Content-Length: "
+    if (
+        !alloc::string::push_byte(output, 67) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 45) ||
+        !alloc::string::push_byte(output, 76) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 103) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 104) ||
+        !alloc::string::push_byte(output, 58) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+    return std::fmt::append_i64(output, length) && append_crlf(output);
+}
+
+fn build_target(String&mut output, UrlView& url_view) -> bool {
+    alloc::string::clear(output);
+    if (url_view.path.length == 0) {
+        if (!alloc::string::push_byte(output, 47)) {
+            return false;
+        }
+    } else if (!alloc::string::append_bytes(output, url_view.path.data, url_view.path.length)) {
+        return false;
+    }
+    if (url_view.query.length > 0) {
+        if (
+            !alloc::string::push_byte(output, 63) ||
+            !alloc::string::append_bytes(output, url_view.query.data, url_view.query.length)
+        ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn build_request(
+    HttpClient&mut client,
+    usize method,
+    i64 method_length,
+    UrlView& url_view,
+    HeaderBlock& extra_headers,
+    usize body,
+    i64 body_length,
+) -> bool {
+    if (
+        body_length < 0 ||
+        (body_length > 0 && body == 0) ||
+        !std::net::http::headers::safe_for_managed_framing(extra_headers)
+    ) {
+        return false;
+    }
+    alloc::string::clear(&mut client.request_buffer);
+    if (
+        !alloc::string::reserve(&mut client.target_buffer, url_view.path.length + url_view.query.length + 2) ||
+        !build_target(&mut client.target_buffer, url_view)
+    ) {
+        return false;
+    }
+    if (
+        !std::net::http::append_request_line(
+            &mut client.request_buffer,
+            method,
+            method_length,
+            alloc::string::data_ptr(&client.target_buffer),
+            alloc::string::len(&client.target_buffer),
+        )
+    ) {
+        return false;
+    }
+    if (!append_host_header(&mut client.request_buffer, url_view)) {
+        return false;
+    }
+    if (!append_connection_keep_alive(&mut client.request_buffer)) {
+        return false;
+    }
+    if (!append_content_length(&mut client.request_buffer, body_length)) {
+        return false;
+    }
+    if (!std::net::http::headers::append_to(extra_headers, &mut client.request_buffer)) {
+        return false;
+    }
+    if (!std::net::http::end_headers(&mut client.request_buffer)) {
+        return false;
+    }
+    if (body_length > 0 && !alloc::string::append_bytes(&mut client.request_buffer, body, body_length)) {
+        return false;
+    }
+    return true;
+}
+
+fn read_more(HttpClient&mut client) -> i64 {
+    usize tail = byte_buffer_tail(&mut client.receive_buffer, client.buffer_capacity);
+
+    if (tail == 0) {
+        return -1;
+    }
+
+    i64 count = transport_read(client, tail, client.buffer_capacity);
+
+    if (count > 0) {
+        if (!byte_buffer_commit(&mut client.receive_buffer, count)) {
+            return -1;
+        }
+    }
+    return count;
+}
+
+fn response_http11(BytesView version) -> bool {
+    if (version.length != 8) {
+        return false;
+    }
+
+    i64 expected[8] = [72, 84, 84, 80, 47, 49, 46, 49];
+    i64 i = 0;
+
+    while (i<8) {
+        if (core::bytes::load_u8(version.data + i) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn no_body_status(i64 status) -> bool {
+    return (status >= 100 && status < 200) || status == 204 || status == 304;
+}
+
+fn copy_response(
+    HttpResponseView& view,
+    HttpResponse&mut output,
+    bool keep_alive,
+    String&mut chunk_body,
+) -> ClientError {
+    output.status = view.status;
+    output.keep_alive = keep_alive;
+    output.chunked = view.chunked;
+    alloc::string::clear(&mut output.headers);
+    alloc::string::clear(&mut output.body);
+    if (!alloc::string::append_bytes(&mut output.headers, view.header_block.data, view.header_block.length)) {
+        return ClientError::OutOfMemory;
+    }
+    if (view.chunked) {
+        if (
+            !alloc::string::append_bytes(
+                &mut output.body,
+                alloc::string::data_ptr(chunk_body),
+                alloc::string::len(chunk_body),
+            )
+        ) {
+            return ClientError::OutOfMemory;
+        }
+    } else if (view.body.length> 0) {
+        if (!alloc::string::append_bytes(&mut output.body, view.body.data, view.body.length)) {
+            return ClientError::OutOfMemory;
+        }
+    }
+    return ClientError::None;
+}
+
+fn chunked_complete(HttpResponseView& view, i64 max_body, String&mut decoded) -> HttpError {
+    alloc::string::clear(decoded);
+
+    ChunkCursor cursor = std::net::http::chunks(view.body);
+
+    ChunkView chunk = ChunkView {
+        data: BytesView {
+            data: 0,
+            length: 0
+        },
+        trailers: BytesView {
+            data: 0,
+            length: 0
+        },
+        final_chunk: false
+    };
+    while (true) {
+        HttpError error = std::net::http::next_chunk(&mut cursor, &mut chunk);
+
+        if (error != HttpError::None) {
+            return error;
+        }
+        if (chunk.final_chunk) {
+            return HttpError::None;
+        }
+        if (alloc::string::len(decoded) > max_body - chunk.data.length) {
+            return HttpError::BodyIncomplete;
+        }
+        if (!alloc::string::append_bytes(decoded, chunk.data.data, chunk.data.length)) {
+            return HttpError::BodyIncomplete;
+        }
+    }
+    return HttpError::InvalidChunk;
+}
+
+fn header_name_equal(BytesView left, usize right, i64 right_length) -> bool {
+    if (right == 0 || left.length != right_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < right_length) {
+        i64 a = core::bytes::load_u8(left.data + i);
+        i64 b = core::bytes::load_u8(right + i);
+
+        if (a >= 65 && a <= 90) {
+            a += 32;
+        }
+        if (b >= 65 && b <= 90) {
+            b += 32;
+        }
+        if (a != b) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn find_owned_header(String& headers_owned, usize name, i64 name_length, BytesView&mut output) -> bool {
+    BytesView block = BytesView {
+        data: alloc::string::data_ptr(headers_owned),
+        length: alloc::string::len(headers_owned),
+    };
+
+    HeaderIterator iterator = std::net::http::headers(block);
+
+    HeaderView field = HeaderView {
+        name: BytesView {
+            data: 0,
+            length: 0
+        },
+        value: BytesView {
+            data: 0,
+            length: 0
+        }
+    };
+    while (std::net::http::next_header(&mut iterator, &mut field)) {
+        if (header_name_equal(field.name, name, name_length)) {
+            *output = field.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Borrows a response header value from response-owned storage. The returned
+/// view remains valid until the response headers are mutated or destroyed.
+public fn response_header(HttpResponse& response, usize name, i64 name_length, BytesView&mut output) -> bool {
+    return find_owned_header(&response.headers, name, name_length, output);
+}
+
+/// Borrows a streaming response-head field from head-owned storage.
+public fn response_head_header(
+    HttpResponseHead& response,
+    usize name,
+    i64 name_length,
+    BytesView&mut output,
+) -> bool {
+    return find_owned_header(&response.headers, name, name_length, output);
+}
+
+/// Sends one HTTP/1.1 request. The client retains a compatible connection for
+/// later calls; different host/scheme/port tuples automatically retire it.
+public fn request(
+    HttpClient&mut client,
+    usize method,
+    i64 method_length,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& extra_headers,
+    usize body,
+    i64 body_length,
+    HttpResponse&mut output,
+) -> ClientError {
+    if (client.body_active) {
+        return ClientError::Busy;
+    }
+
+    Result<UrlView, UrlError> parsed = std::net::url::parse(url_data, url_length);
+
+    UrlView url_view = UrlView {
+        source: BytesView {
+            data: 0,
+            length: 0
+        },
+        scheme: BytesView {
+            data: 0,
+            length: 0
+        },
+        host: BytesView {
+            data: 0,
+            length: 0
+        },
+        port: 0,
+        explicit_port: false,
+        path: BytesView {
+            data: 0,
+            length: 0
+        },
+        query: BytesView {
+            data: 0,
+            length: 0
+        },
+        fragment: BytesView {
+            data: 0,
+            length: 0
+        },
+    };
+    match parsed {
+        Result<UrlView, UrlError>::Error(_) => {
+            return ClientError::InvalidUrl;
+        }
+        Result<UrlView, UrlError>::Ok(value) => {
+            url_view = value;
+        }
+    }
+
+    ClientError connected = ensure_connection(client, &url_view);
+
+    if (connected != ClientError::None) {
+        return connected;
+    }
+    if (!build_request(client, method, method_length, &url_view, extra_headers, body, body_length)) {
+        return ClientError::OutOfMemory;
+    }
+    if (
+        !transport_write(
+            client,
+            alloc::string::data_ptr(&client.request_buffer),
+            alloc::string::len(&client.request_buffer),
+        )
+    ) {
+        close_connection(client);
+        return ClientError::Io;
+    }
+    byte_buffer_clear(&mut client.receive_buffer);
+    alloc::string::clear(&mut client.decode_buffer);
+    HttpResponseView view = HttpResponseView {
+        source: BytesView {
+            data: 0,
+            length: 0
+        },
+        version: BytesView {
+            data: 0,
+            length: 0
+        },
+        status: 0,
+        reason: BytesView {
+            data: 0,
+            length: 0
+        },
+        header_block: BytesView {
+            data: 0,
+            length: 0
+        },
+        body: BytesView {
+            data: 0,
+            length: 0
+        },
+        content_length: -1,
+        chunked: false,
+        connection_close: false,
+    };
+    while (true) {
+        i64 readable = byte_buffer_readable(&client.receive_buffer);
+
+        if (readable > client.max_header_bytes + client.max_body_bytes + 65536) {
+            close_connection(client);
+            return ClientError::BodyTooLarge;
+        }
+        if (readable > 0) {
+            HttpError parsed_response = std::net::http::parse_response(
+                byte_buffer_data(&client.receive_buffer),
+                readable,
+                client.max_header_bytes,
+                &mut view,
+            );
+            if (parsed_response == HttpError::HeadersTooLarge) {
+                close_connection(client);
+                return ClientError::HeadersTooLarge;
+            }
+            if (
+                parsed_response != HttpError::Incomplete &&
+                parsed_response != HttpError::BodyIncomplete &&
+                parsed_response != HttpError::None
+            ) {
+                close_connection(client);
+                return ClientError::Protocol;
+            }
+            if (parsed_response == HttpError::None) {
+                if (view.content_length > client.max_body_bytes) {
+                    close_connection(client);
+                    return ClientError::BodyTooLarge;
+                }
+                if (no_body_status(view.status) || method_is_head(method, method_length)) {
+                    bool keep = response_http11(view.version) && !view.connection_close && view.status != 101;
+                    ClientError copied = copy_response(&view, output, keep, &mut client.decode_buffer);
+
+                    if (!keep) {
+                        close_connection(client);
+                    }
+                    return copied;
+                }
+                if (view.chunked) {
+                    HttpError chunk_state = chunked_complete(
+                        &view,
+                        client.max_body_bytes,
+                        &mut client.decode_buffer,
+                    );
+                    if (chunk_state == HttpError::None) {
+                        bool keep =
+                            response_http11(view.version) &&
+                            !view.connection_close &&
+                            view.status != 101;
+                        ClientError copied = copy_response(&view, output, keep, &mut client.decode_buffer);
+
+                        if (!keep) {
+                            close_connection(client);
+                        }
+                        return copied;
+                    }
+                    if (chunk_state != HttpError::Incomplete) {
+                        close_connection(client);
+                        if (chunk_state == HttpError::BodyIncomplete) {
+                            return ClientError::BodyTooLarge;
+                        }
+                        return ClientError::Protocol;
+                    }
+                } else if (view.content_length >= 0) {
+                    bool keep = response_http11(view.version) && !view.connection_close && view.status != 101;
+                    ClientError copied = copy_response(&view, output, keep, &mut client.decode_buffer);
+
+                    if (!keep) {
+                        close_connection(client);
+                    }
+                    return copied;
+                }
+            }
+        }
+
+        i64 count = read_more(client);
+
+        if (count <= 0) {
+            // A response with no explicit framing is close-delimited. Parse one
+            // final time, consume all remaining bytes as the body, and retire it.
+            readable = byte_buffer_readable(&client.receive_buffer);
+            HttpError final_parse = std::net::http::parse_response(
+                byte_buffer_data(&client.receive_buffer),
+                readable,
+                client.max_header_bytes,
+                &mut view,
+            );
+            if (final_parse == HttpError::None && !view.chunked && view.content_length < 0) {
+                if (view.body.length > client.max_body_bytes) {
+                    close_connection(client);
+                    return ClientError::BodyTooLarge;
+                }
+
+                ClientError copied = copy_response(&view, output, false, &mut client.decode_buffer);
+
+                close_connection(client);
+                return copied;
+            }
+            close_connection(client);
+            return ClientError::Io;
+        }
+    }
+    return ClientError::Protocol;
+}
+
+fn method_is_head(usize method, i64 length) -> bool {
+    return (
+        length == 4 &&
+        method != 0 &&
+        core::bytes::load_u8(method) == 72 &&
+        core::bytes::load_u8(method + 1) == 69 &&
+        core::bytes::load_u8(method + 2) == 65 &&
+        core::bytes::load_u8(method + 3) == 68
+    );
+}
+
+fn find_crlf_buffer(ByteBuffer& buffer) -> i64 {
+    i64 n = byte_buffer_readable(buffer);
+    i64 i = 0;
+
+    while (i + 1 < n) {
+        if (buffer.peek(i) == 13 && buffer.peek(i + 1) == 10) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn find_header_end_buffer(ByteBuffer& buffer) -> i64 {
+    i64 n = byte_buffer_readable(buffer);
+    i64 i = 0;
+
+    while (i + 3 < n) {
+        if (
+            buffer.peek(i) == 13 &&
+            buffer.peek(i + 1) == 10 &&
+            buffer.peek(i + 2) == 13 &&
+            buffer.peek(i + 3) == 10
+        ) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn parse_chunk_size_buffer(ByteBuffer& buffer, i64 line_length, i64&mut size) -> bool {
+    if (line_length <= 0) {
+        return false;
+    }
+
+    i64 value = 0;
+    i64 i = 0;
+    bool any = false;
+
+    while (i<line_length) {
+        i64 b = buffer.peek(i);
+
+        if (b == 59) {
+            break;
+        }
+
+        i64 digit = -1;
+
+        if (b >= 48 && b <= 57) {
+            digit = b - 48;
+        } else if (b >= 65 && b <= 70) {
+            digit = b - 65 + 10;
+        } else if (b >= 97 && b <= 102) {
+            digit = b - 97 + 10;
+        } else {
+            return false;
+        }
+        if (value> 576460752303423487) {
+            return false;
+        }
+        value = value*16 + digit;
+        any = true;
+        i += 1;
+    }
+    if (!any) {
+        return false;
+    }
+    *size = value;
+    return true;
+}
+
+fn finalize_stream(HttpClient&mut client, HttpBodyState&mut state) {
+    state.done = true;
+    client.body_active = false;
+    if (!state.keep_alive) {
+        close_connection(client);
+    }
+}
+
+/// Starts a request and returns as soon as the response head is complete.
+/// Body bytes already received stay in the client's reusable buffer.
+public fn begin_request(
+    HttpClient&mut client,
+    usize method,
+    i64 method_length,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& extra_headers,
+    usize body,
+    i64 body_length,
+    HttpResponseHead&mut head,
+    HttpBodyState&mut state,
+) -> ClientError {
+    if (client.body_active) {
+        return ClientError::Busy;
+    }
+
+    Result<UrlView, UrlError> parsed = std::net::url::parse(url_data, url_length);
+
+    UrlView url_view = UrlView {
+        source: BytesView {
+            data: 0,
+            length: 0
+        },
+        scheme: BytesView {
+            data: 0,
+            length: 0
+        },
+        host: BytesView {
+            data: 0,
+            length: 0
+        },
+        port: 0,
+        explicit_port: false,
+        path: BytesView {
+            data: 0,
+            length: 0
+        },
+        query: BytesView {
+            data: 0,
+            length: 0
+        },
+        fragment: BytesView {
+            data: 0,
+            length: 0
+        },
+    };
+    match parsed {
+        Result<UrlView, UrlError>::Error(_) => {
+            return ClientError::InvalidUrl;
+        }
+        Result<UrlView, UrlError>::Ok(value) => {
+            url_view = value;
+        }
+    }
+
+    ClientError connected = ensure_connection(client, &url_view);
+
+    if (connected != ClientError::None) {
+        return connected;
+    }
+    if (!build_request(client, method, method_length, &url_view, extra_headers, body, body_length)) {
+        return ClientError::OutOfMemory;
+    }
+    if (
+        !transport_write(
+            client,
+            alloc::string::data_ptr(&client.request_buffer),
+            alloc::string::len(&client.request_buffer),
+        )
+    ) {
+        close_connection(client);
+        return ClientError::Io;
+    }
+    byte_buffer_clear(&mut client.receive_buffer);
+    HttpResponseView view = HttpResponseView {
+        source: BytesView {
+            data: 0,
+            length: 0
+        },
+        version: BytesView {
+            data: 0,
+            length: 0
+        },
+        status: 0,
+        reason: BytesView {
+            data: 0,
+            length: 0
+        },
+        header_block: BytesView {
+            data: 0,
+            length: 0
+        },
+        body: BytesView {
+            data: 0,
+            length: 0
+        },
+        content_length: -1,
+        chunked: false,
+        connection_close: false,
+    };
+    while (true) {
+        i64 readable = byte_buffer_readable(&client.receive_buffer);
+
+        if (readable > 0) {
+            usize base = byte_buffer_data(&client.receive_buffer);
+            HttpError e = std::net::http::parse_response(base, readable, client.max_header_bytes, &mut view);
+
+            if (e == HttpError::HeadersTooLarge) {
+                close_connection(client);
+                return ClientError::HeadersTooLarge;
+            }
+            if (e != HttpError::Incomplete && e != HttpError::BodyIncomplete && e != HttpError::None) {
+                close_connection(client);
+                return ClientError::Protocol;
+            }
+            if (e == HttpError::BodyIncomplete || e == HttpError::None) {
+                alloc::string::clear(&mut head.headers);
+                if (
+                    !alloc::string::append_bytes(
+                        &mut head.headers,
+                        view.header_block.data,
+                        view.header_block.length,
+                    )
+                ) {
+                    close_connection(client);
+                    return ClientError::OutOfMemory;
+                }
+                head.status = view.status;
+                head.content_length = view.content_length;
+                head.chunked = view.chunked;
+
+                bool no_body = no_body_status(view.status) || method_is_head(method, method_length);
+                bool keep = response_http11(view.version) && !view.connection_close && view.status != 101;
+                i64 header_bytes = (view.body.data - base)as i64;
+
+                if (!byte_buffer_consume(&mut client.receive_buffer, header_bytes)) {
+                    close_connection(client);
+                    return ClientError::Protocol;
+                }
+                state.mode = 0;
+                state.remaining = 0;
+                state.chunk_remaining = -1;
+                state.decoded_total = 0;
+                state.max_body_bytes = client.max_body_bytes;
+                state.keep_alive = keep;
+                state.done = false;
+                state.need_chunk_crlf = false;
+                if (no_body) {
+                    state.done = true;
+                    head.keep_alive = keep;
+                    if (!keep) {
+                        close_connection(client);
+                    }
+                    return ClientError::None;
+                }
+                if (view.content_length > client.max_body_bytes) {
+                    close_connection(client);
+                    return ClientError::BodyTooLarge;
+                }
+                if (view.chunked) {
+                    state.mode = 2;
+                } else if (view.content_length >= 0) {
+                    state.mode = 1;
+                    state.remaining = view.content_length;
+                } else {
+                    state.mode = 3;
+                    state.keep_alive = false;
+                    keep = false;
+                }
+                head.keep_alive = keep;
+                client.body_active = true;
+                if (state.mode == 1 && state.remaining == 0) {
+                    finalize_stream(client, state);
+                }
+                return ClientError::None;
+            }
+        }
+
+        i64 count = read_more(client);
+
+        if (count <= 0) {
+            close_connection(client);
+            return ClientError::Io;
+        }
+    }
+    return ClientError::Protocol;
+}
+
+/// Reads decoded response-body bytes. `count` is set to bytes produced. A
+/// successful call with count==0 and body_done(state)==true is EOF.
+public fn read_body(
+    HttpClient&mut client,
+    HttpBodyState&mut state,
+    usize output,
+    i64 capacity,
+    i64&mut count,
+) -> ClientError {
+    *count = 0;
+    if (capacity<0 || (capacity> 0 && output == 0)) {
+        return ClientError::Protocol;
+    }
+    if (state.done) {
+        return ClientError::None;
+    }
+    if (!client.body_active) {
+        return ClientError::Busy;
+    }
+    if (capacity == 0) {
+        return ClientError::None;
+    }
+    if (state.mode == 1) {
+        while (byte_buffer_readable(&client.receive_buffer) == 0) {
+            i64 got = read_more(client);
+
+            if (got <= 0) {
+                close_connection(client);
+                state.done = true;
+                return ClientError::Io;
+            }
+        }
+
+        i64 amount = capacity;
+
+        if (amount > state.remaining) {
+            amount = state.remaining;
+        }
+        if (amount > byte_buffer_readable(&client.receive_buffer)) {
+            amount = byte_buffer_readable(&client.receive_buffer);
+        }
+        *count = byte_buffer_read_into(&mut client.receive_buffer, output, amount);
+        state.remaining -= *count;
+        state.decoded_total += *count;
+        if (state.remaining == 0) {
+            finalize_stream(client, state);
+        }
+        return ClientError::None;
+    }
+    if (state.mode == 3) {
+        if (byte_buffer_readable(&client.receive_buffer) == 0) {
+            i64 got = read_more(client);
+
+            if (got <= 0) {
+                state.done = true;
+                client.body_active = false;
+                close_connection(client);
+                return ClientError::None;
+            }
+        }
+
+        i64 amount = capacity;
+
+        if (amount > byte_buffer_readable(&client.receive_buffer)) {
+            amount = byte_buffer_readable(&client.receive_buffer);
+        }
+        if (state.decoded_total > state.max_body_bytes - amount) {
+            close_connection(client);
+            state.done = true;
+            return ClientError::BodyTooLarge;
+        }
+        *count = byte_buffer_read_into(&mut client.receive_buffer, output, amount);
+        state.decoded_total += *count;
+        return ClientError::None;
+    }
+    if (state.mode != 2) {
+        finalize_stream(client, state);
+        return ClientError::None;
+    }
+    while (*count<capacity && !state.done) {
+        if (state.need_chunk_crlf) {
+            while (byte_buffer_readable(&client.receive_buffer) < 2) {
+                i64 got = read_more(client);
+
+                if (got <= 0) {
+                    close_connection(client);
+                    state.done = true;
+                    return ClientError::Io;
+                }
+            }
+            if (client.receive_buffer.peek(0) != 13 || client.receive_buffer.peek(1) != 10) {
+                close_connection(client);
+                state.done = true;
+                return ClientError::Protocol;
+            }
+            byte_buffer_consume(&mut client.receive_buffer, 2);
+            state.need_chunk_crlf = false;
+            state.chunk_remaining = -1;
+        }
+        if (state.chunk_remaining<0) {
+            i64 line = find_crlf_buffer(&client.receive_buffer);
+
+            while (line<0) {
+                if (byte_buffer_readable(&client.receive_buffer)> client.max_header_bytes) {
+                    close_connection(client);
+                    state.done = true;
+                    return ClientError::Protocol;
+                }
+
+                i64 got = read_more(client);
+
+                if (got <= 0) {
+                    close_connection(client);
+                    state.done = true;
+                    return ClientError::Io;
+                }
+                line = find_crlf_buffer(&client.receive_buffer);
+            }
+
+            i64 size = 0;
+
+            if (!parse_chunk_size_buffer(&client.receive_buffer, line, &mut size)) {
+                close_connection(client);
+                state.done = true;
+                return ClientError::Protocol;
+            }
+            byte_buffer_consume(&mut client.receive_buffer, line + 2);
+            if (size == 0) {
+                // Trailer section: immediate CRLF or strict header block.
+                while (true) {
+                    if (
+                        byte_buffer_readable(&client.receive_buffer) >= 2 &&
+                        client.receive_buffer.peek(0) == 13 &&
+                        client.receive_buffer.peek(1) == 10
+                    ) {
+                        byte_buffer_consume(&mut client.receive_buffer, 2);
+                        finalize_stream(client, state);
+                        break;
+                    }
+
+                    i64 end = find_header_end_buffer(&client.receive_buffer);
+
+                    if (end >= 0) {
+                        BytesView block = BytesView {
+                            data: byte_buffer_data(&client.receive_buffer), length: end + 2
+                        };
+
+                        HeaderIterator it = std::net::http::headers(block);
+
+                        HeaderView field = HeaderView {
+                            name: BytesView {
+                                data: 0, length: 0
+                            }, value: BytesView {
+                                data: 0, length: 0
+                            }
+                        };
+                        while (std::net::http::next_header(&mut it, &mut field)) {}
+                        if (!std::net::http::headers_valid(&it)) {
+                            close_connection(client);
+                            state.done = true;
+                            return ClientError::Protocol;
+                        }
+                        byte_buffer_consume(&mut client.receive_buffer, end + 4);
+                        finalize_stream(client, state);
+                        break;
+                    }
+                    if (byte_buffer_readable(&client.receive_buffer)> client.max_header_bytes) {
+                        close_connection(client);
+                        state.done = true;
+                        return ClientError::Protocol;
+                    }
+
+                    i64 got = read_more(client);
+
+                    if (got <= 0) {
+                        close_connection(client);
+                        state.done = true;
+                        return ClientError::Io;
+                    }
+                }
+                break;
+            }
+            if (state.decoded_total> state.max_body_bytes - size) {
+                close_connection(client);
+                state.done = true;
+                return ClientError::BodyTooLarge;
+            }
+            state.chunk_remaining = size;
+        }
+        if (state.chunk_remaining > 0) {
+            if (byte_buffer_readable(&client.receive_buffer) == 0) {
+                i64 got = read_more(client);
+
+                if (got <= 0) {
+                    close_connection(client);
+                    state.done = true;
+                    return ClientError::Io;
+                }
+            }
+
+            i64 amount = capacity - *count;
+
+            if (amount > state.chunk_remaining) {
+                amount = state.chunk_remaining;
+            }
+            if (amount > byte_buffer_readable(&client.receive_buffer)) {
+                amount = byte_buffer_readable(&client.receive_buffer);
+            }
+
+            i64 copied = byte_buffer_read_into(&mut client.receive_buffer, output + *count, amount);
+
+            *count += copied;
+            state.chunk_remaining -= copied;
+            state.decoded_total += copied;
+            if (state.chunk_remaining == 0) {
+                state.need_chunk_crlf = true;
+            }
+            if (*count >= capacity) {
+                break;
+            }
+        }
+    }
+    return ClientError::None;
+}
+
+public fn abandon_body(HttpClient&mut client, HttpBodyState&mut state) {
+    state.done = true;
+    client.body_active = false;
+    close_connection(client);
+}
+
+public fn begin_get(
+    HttpClient&mut client,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& headers,
+    HttpResponseHead&mut head,
+    HttpBodyState&mut state,
+) -> ClientError {
+    usize method = alloc::string::data_ptr(&client.get_method);
+
+    return begin_request(client, method, 3, url_data, url_length, headers, 0, 0, head, state);
+}
+
+public fn get(
+    HttpClient&mut client,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& headers,
+    HttpResponse&mut output,
+) -> ClientError {
+    usize method = alloc::string::data_ptr(&client.get_method);
+
+    return request(client, method, 3, url_data, url_length, headers, 0, 0, output);
+}
+
+public fn post(
+    HttpClient&mut client,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& headers,
+    usize body,
+    i64 body_length,
+    HttpResponse&mut output,
+) -> ClientError {
+    usize method = alloc::string::data_ptr(&client.post_method);
+
+    return request(client, method, 4, url_data, url_length, headers, body, body_length, output);
+}
+
+impl Drop for HttpClient {
+    fn drop(HttpClient&mut self) {
+        close_connection(self);
+    }
+}

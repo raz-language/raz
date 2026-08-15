@@ -1,0 +1,109 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::reactor;
+import std::net;
+import std::thread::executor;
+// Raz-owned readiness reactor. Native code only performs a single socket poll;
+// watch scheduling, queueing, backpressure, shutdown and task/result ownership
+// are implemented by the Raz executor/worker pool.
+public struct IoReactorI64 {
+    ExecutorI64 executor;
+    bool accepting;
+}
+
+public struct IoWatchI64 {
+    ExecutorTaskI64 task;
+}
+
+public struct IoWatchResultI64 {
+    i64 status;
+    i64 events;
+}
+
+public fn create(i64 worker_count, i64 queue_capacity) -> IoReactorI64 {
+    ExecutorI64 executor = std::thread::executor::executor_create(worker_count, queue_capacity);
+    bool accepting = std::thread::executor::executor_valid(&executor);
+
+    return IoReactorI64 {
+        executor: move executor,
+        accepting
+    };
+}
+
+public fn valid(IoReactorI64& reactor) -> bool {
+    return reactor.accepting && std::thread::executor::executor_valid(&reactor.executor);
+}
+
+fn invalid_watch() -> IoWatchI64 {
+    ExecutorTaskI64 task = std::thread::executor::invalid_task();
+
+    return IoWatchI64 {
+        task: move task
+    };
+}
+
+public fn watch(IoReactorI64&mut reactor, i64 socket, i64 interests, i64 timeout_millis) -> IoWatchI64 {
+    if (!reactor.accepting || socket < 0 || (interests & 3) == 0) {
+        return invalid_watch();
+    }
+
+    i64 task_timeout = 9223372036854775807;
+
+    if (timeout_millis >= 0) {
+        if (timeout_millis > 9223372036854774807) {
+            task_timeout = 9223372036854775807;
+        } else {
+            task_timeout = timeout_millis + 1000;
+        }
+    }
+    ExecutorTaskI64 task = std::thread::executor::submit(&mut reactor.executor, move fn() -> i64 {
+        return std::net::poll(socket, interests, timeout_millis);
+    }, task_timeout);
+    return IoWatchI64 {
+        task: move task
+    };
+}
+
+public fn watch_readable(IoReactorI64&mut reactor, i64 socket, i64 timeout_millis) -> IoWatchI64 {
+    return watch(reactor, socket, 1, timeout_millis);
+}
+
+public fn watch_writable(IoReactorI64&mut reactor, i64 socket, i64 timeout_millis) -> IoWatchI64 {
+    return watch(reactor, socket, 2, timeout_millis);
+}
+
+public fn watch_valid(IoWatchI64& watch) -> bool {
+    return std::thread::executor::task_valid(&watch.task);
+}
+
+public fn wait_millis(IoWatchI64& watch, i64 timeout_millis) -> IoWatchResultI64 {
+    ExecutorTaskResultI64 result = std::thread::executor::task_wait_millis(&watch.task, timeout_millis);
+
+    return IoWatchResultI64 {
+        status: result.status,
+        events: result.value
+    };
+}
+
+public fn watch_destroy(IoWatchI64&mut watch) {
+    std::thread::executor::task_destroy(&mut watch.task);
+}
+
+public fn pending(IoReactorI64& reactor) -> i64 {
+    return std::thread::executor::executor_pending(&reactor.executor) +
+        std::thread::executor::executor_active(&reactor.executor);
+}
+
+public fn shutdown(IoReactorI64&mut reactor, bool cancel_pending) {
+    if (!reactor.accepting) {
+        return;
+    }
+    reactor.accepting = false;
+    std::thread::executor::executor_shutdown(&mut reactor.executor, cancel_pending);
+}
+
+public fn destroy(IoReactorI64&mut reactor) {
+    reactor.accepting = false;
+    std::thread::executor::executor_destroy(&mut reactor.executor);
+}

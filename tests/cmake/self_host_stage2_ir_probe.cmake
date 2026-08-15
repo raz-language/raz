@@ -1,0 +1,45 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+if(NOT DEFINED RAZ_EXE OR NOT DEFINED SOURCE_ROOT OR NOT DEFINED WORK_ROOT)
+  message(FATAL_ERROR "RAZ_EXE, SOURCE_ROOT, and WORK_ROOT are required")
+endif()
+
+include("${SOURCE_ROOT}/tests/cmake/self_host_source_set.cmake")
+file(REMOVE_RECURSE "${WORK_ROOT}")
+file(COPY "${SOURCE_ROOT}/compiler" DESTINATION "${WORK_ROOT}")
+set(project "${WORK_ROOT}/compiler")
+set(frontend "${project}/selfhost-compiler.rz")
+materialize_selfhost_source("${SOURCE_ROOT}" "${frontend}")
+execute_process(COMMAND "${RAZ_EXE}" build "${project}" --target host --profile debug --force
+  RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
+if(NOT build_result EQUAL 0)
+  message(FATAL_ERROR "Stage 2 IR probe could not build Stage 1:\n${build_output}\n${build_error}")
+endif()
+if(WIN32)
+  set(executable "${project}/target/host/debug/raz-compiler.exe")
+else()
+  set(executable "${project}/target/host/debug/raz-compiler")
+endif()
+file(COPY_FILE "${frontend}" "${project}/stage1-compiler.rz" ONLY_IF_DIFFERENT)
+file(WRITE "${project}/stage1-package.txt" "stage1-compiler.rz\n")
+execute_process(COMMAND "${executable}" "stage1-package.txt" "stage1-output.fir" WORKING_DIRECTORY "${project}" RESULT_VARIABLE run_result)
+if(NOT run_result EQUAL 0)
+  message(FATAL_ERROR "Stage 2 IR probe expected complete Stage 2 Forge emission, received ${run_result}")
+endif()
+set(forge_ir "${project}/stage1-output.fir")
+if(NOT EXISTS "${forge_ir}")
+  message(FATAL_ERROR "Stage 2 IR probe did not emit the Stage 2 Forge module")
+endif()
+file(SIZE "${forge_ir}" forge_size)
+if(forge_size LESS 500000)
+  message(FATAL_ERROR "Stage 2 Forge module is unexpectedly small: ${forge_size} bytes")
+endif()
+file(READ "${forge_ir}" emitted_ir LIMIT 8192)
+if(NOT emitted_ir MATCHES "module @raz_stage1" OR
+   NOT emitted_ir MATCHES "raz_rt_stage1_ref_create" OR
+   NOT emitted_ir MATCHES "raz_rt_stage1_ref_get" OR
+   NOT emitted_ir MATCHES "raz_rt_stage1_ref_set")
+  message(FATAL_ERROR "Stage 2 module is missing frame-aware reference ABI declarations")
+endif()
+message(STATUS "Stage 2 IR probe emitted the complete ${forge_size}-byte Stage 2 Forge module with frame-aware references")

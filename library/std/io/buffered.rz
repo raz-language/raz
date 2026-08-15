@@ -1,0 +1,296 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::io::buffered;
+// Buffered streaming I/O for file handles. Small reads/writes stay in Raz and
+// amortize OS crossings; large transfers bypass the buffer directly.
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_file_read(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_file_flush(usize handle) -> i64;
+public const i64 default_buffer_capacity = 8192;
+
+public struct BufReader {
+    usize handle;
+    usize buffer;
+    i64 capacity;
+    i64 start;
+    i64 end;
+}
+
+public struct BufWriter {
+    usize handle;
+    usize buffer;
+    i64 capacity;
+    i64 length;
+}
+
+public fn reader_with_capacity(usize handle, i64 capacity) -> BufReader {
+    if (handle == 0 || capacity <= 0) {
+        return BufReader {
+            handle: handle,
+            buffer: 0,
+            capacity: 0,
+            start: 0,
+            end: 0
+        };
+    }
+
+    usize buffer = raz_rt_alloc(capacity);
+
+    if (buffer == 0) {
+        return BufReader {
+            handle: handle,
+            buffer: 0,
+            capacity: 0,
+            start: 0,
+            end: 0
+        };
+    }
+    return BufReader {
+        handle: handle,
+        buffer: buffer,
+        capacity: capacity,
+        start: 0,
+        end: 0
+    };
+}
+
+public fn reader(usize handle) -> BufReader {
+    return reader_with_capacity(handle, default_buffer_capacity);
+}
+
+public fn reader_valid(BufReader& value) -> bool {
+    return value.handle != 0 && value.buffer != 0 && value.capacity > 0;
+}
+
+public fn reader_available(BufReader& value) -> i64 {
+    return value.end - value.start;
+}
+
+public fn reader_fill(BufReader&mut value) -> i64 {
+    if (!reader_valid(value)) {
+        return -1;
+    }
+    if (value.start < value.end) {
+        return value.end - value.start;
+    }
+    value.start = 0;
+    value.end = 0;
+
+    i64 count = raz_rt_file_read(value.handle, value.buffer, value.capacity);
+
+    if (count > 0) {
+        value.end = count;
+    }
+    return count;
+}
+
+public fn reader_read(BufReader&mut value, usize output, i64 requested) -> i64 {
+    if (!reader_valid(value) || requested < 0 || (requested > 0 && output == 0)) {
+        return -1;
+    }
+    if (requested == 0) {
+        return 0;
+    }
+
+    i64 total = 0;
+
+    while (total < requested) {
+        i64 available = value.end - value.start;
+
+        if (available <= 0) {
+            value.start = 0;
+            value.end = 0;
+            if (requested - total >= value.capacity) {
+                i64 direct = raz_rt_file_read(value.handle, output + total, requested - total);
+
+                if (direct < 0) {
+                    if (total == 0) {
+                        return -1;
+                    }
+                    return total;
+                }
+                return total + direct;
+            }
+
+            i64 filled = reader_fill(value);
+
+            if (filled < 0) {
+                if (total == 0) {
+                    return -1;
+                }
+                return total;
+            }
+            if (filled == 0) {
+                return total;
+            }
+            available = filled;
+        }
+
+        i64 take = requested - total;
+
+        if (available < take) {
+            take = available;
+        }
+        raz_rt_copy(output + total, value.buffer + value.start, take);
+        value.start += take;
+        total += take;
+    }
+    return total;
+}
+
+public fn reader_read_exact(BufReader&mut value, usize output, i64 requested) -> bool {
+    if (requested < 0) {
+        return false;
+    }
+
+    i64 total = 0;
+
+    while (total < requested) {
+        i64 count = reader_read(value, output + total, requested - total);
+
+        if (count <= 0) {
+            return false;
+        }
+        total += count;
+    }
+    return true;
+}
+
+public fn reader_read_byte(BufReader&mut value) -> i64 {
+    if (value.start >= value.end) {
+        if (reader_fill(value) <= 0) {
+            return -1;
+        }
+    }
+
+    i64 byte = raz_rt_load_u8(value.buffer + value.start);
+
+    value.start += 1;
+    return byte;
+}
+
+public fn reader_destroy(BufReader&mut value) {
+    raz_rt_dealloc(value.buffer);
+    value.buffer = 0;
+    value.capacity = 0;
+    value.start = 0;
+    value.end = 0;
+}
+
+impl Drop for BufReader {
+    fn drop(BufReader&mut self) {
+        reader_destroy(self);
+    }
+}
+
+public fn writer_with_capacity(usize handle, i64 capacity) -> BufWriter {
+    if (handle == 0 || capacity <= 0) {
+        return BufWriter {
+            handle: handle,
+            buffer: 0,
+            capacity: 0,
+            length: 0
+        };
+    }
+
+    usize buffer = raz_rt_alloc(capacity);
+
+    if (buffer == 0) {
+        return BufWriter {
+            handle: handle,
+            buffer: 0,
+            capacity: 0,
+            length: 0
+        };
+    }
+    return BufWriter {
+        handle: handle,
+        buffer: buffer,
+        capacity: capacity,
+        length: 0
+    };
+}
+
+public fn writer(usize handle) -> BufWriter {
+    return writer_with_capacity(handle, default_buffer_capacity);
+}
+
+public fn writer_valid(BufWriter& value) -> bool {
+    return value.handle != 0 && value.buffer != 0 && value.capacity > 0;
+}
+
+public fn writer_flush(BufWriter&mut value) -> bool {
+    if (!writer_valid(value)) {
+        return false;
+    }
+
+    i64 written = 0;
+
+    while (written < value.length) {
+        i64 count = raz_rt_file_write(value.handle, value.buffer + written, value.length - written);
+
+        if (count <= 0) {
+            if (written > 0) {
+                raz_rt_copy(value.buffer, value.buffer + written, value.length - written);
+                value.length -= written;
+            }
+            return false;
+        }
+        written += count;
+    }
+    value.length = 0;
+    return raz_rt_file_flush(value.handle) == 1;
+}
+
+public fn writer_write(BufWriter&mut value, usize data, i64 size) -> bool {
+    if (!writer_valid(value) || size < 0 || (size > 0 && data == 0)) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if (size >= value.capacity) {
+        if (value.length > 0 && !writer_flush(value)) {
+            return false;
+        }
+
+        i64 written = 0;
+
+        while (written < size) {
+            i64 count = raz_rt_file_write(value.handle, data + written, size - written);
+
+            if (count <= 0) {
+                return false;
+            }
+            written += count;
+        }
+        return true;
+    }
+    if (value.length + size > value.capacity && !writer_flush(value)) {
+        return false;
+    }
+    raz_rt_copy(value.buffer + value.length, data, size);
+    value.length += size;
+    return true;
+}
+
+public fn writer_destroy(BufWriter&mut value) {
+    if (value.buffer != 0) {
+        writer_flush(value);
+        raz_rt_dealloc(value.buffer);
+    }
+    value.buffer = 0;
+    value.capacity = 0;
+    value.length = 0;
+}
+
+impl Drop for BufWriter {
+    fn drop(BufWriter&mut self) {
+        writer_destroy(self);
+    }
+}

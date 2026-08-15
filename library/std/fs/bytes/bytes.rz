@@ -1,0 +1,74 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::bytes;
+import core::bytes;
+import core::result;
+import std::fs;
+import std::io::buffer;
+import std::io::error;
+// Owned binary filesystem helpers. Allocation and buffering policy live in
+// Raz; std::fs remains the thin OS boundary.
+public fn read_all(usize path, i64 path_length) -> Result<ByteBuffer, IoError> {
+    Result<i64, IoError> size_result = std::fs::try_file_size(path, path_length);
+    i64 size = 0;
+
+    match size_result {
+        Result<i64, IoError>::Error(error) => {
+            return Result<ByteBuffer, IoError>::Error(error);
+        }
+        Result<i64, IoError>::Ok(value) => {
+            size = value;
+        }
+    }
+    if (size < 0) {
+        return Result<ByteBuffer, IoError>::Error(IoError {
+            operation: IoOperation::Read,
+            code: 22
+        }
+        );
+    }
+
+    ByteBuffer output = ByteBuffer::with_capacity(size);
+    usize tail = std::io::buffer::byte_buffer_tail(&mut output, size);
+
+    if (size > 0 && tail == 0) {
+        return Result<ByteBuffer, IoError>::Error(IoError {
+            operation: IoOperation::Read,
+            code: 12
+        }
+        );
+    }
+
+    Result<i64, IoError> read_result = std::fs::try_read(path, path_length, tail, size);
+    i64 count = 0;
+
+    match read_result {
+        Result<i64, IoError>::Error(error) => {
+            return Result<ByteBuffer, IoError>::Error(error);
+        }
+        Result<i64, IoError>::Ok(value) => {
+            count = value;
+        }
+    }
+    if (count < 0 || count > size || !std::io::buffer::byte_buffer_commit(&mut output, count)) {
+        return Result<ByteBuffer, IoError>::Error(IoError {
+            operation: IoOperation::Read,
+            code: 22
+        }
+        );
+    }
+    return Result<ByteBuffer, IoError>::Ok(move output);
+}
+
+public fn write_all(usize path, i64 path_length, ByteBuffer& value) -> Result<i64, IoError> {
+    BytesView view = std::io::buffer::byte_buffer_view(value);
+
+    return std::fs::try_write(path, path_length, view.data, view.length);
+}
+
+public fn append_all(usize path, i64 path_length, ByteBuffer& value) -> Result<i64, IoError> {
+    BytesView view = std::io::buffer::byte_buffer_view(value);
+
+    return std::fs::try_append(path, path_length, view.data, view.length);
+}

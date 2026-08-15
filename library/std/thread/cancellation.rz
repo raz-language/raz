@@ -1,0 +1,151 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::cancellation;
+import std::sync::condition;
+import std::sync::mutex;
+// Raz-owned cooperative cancellation token. Native code supplies only mutex,
+// condition-variable, monotonic-clock and sleep primitives.
+extern fn raz_rt_time_monotonic_nanos() -> i64;
+extern fn raz_rt_sleep_millis(i64 milliseconds);
+
+public struct CancellationToken {
+    usize mutex;
+    usize condition;
+    bool requested;
+}
+
+fn deadline_nanos(i64 timeout_millis) -> i64 {
+    i64 now = raz_rt_time_monotonic_nanos();
+
+    if (timeout_millis <= 0) {
+        return now;
+    }
+    if (timeout_millis > 9223372036854) {
+        return 9223372036854775807;
+    }
+
+    i64 delta = timeout_millis * 1000000;
+
+    if (now > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return now + delta;
+}
+
+fn remaining_millis(i64 deadline) -> i64 {
+    i64 now = raz_rt_time_monotonic_nanos();
+
+    if (now >= deadline) {
+        return 0;
+    }
+
+    i64 ns = deadline - now;
+    i64 ms = ns / 1000000;
+
+    if (ns % 1000000 != 0) {
+        ms += 1;
+    }
+    return ms;
+}
+
+public fn create() -> CancellationToken {
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize condition = std::sync::condition::condition_create();
+
+    if (mutex == 0 || condition == 0) {
+        if (condition != 0) {
+            std::sync::condition::condition_destroy(condition);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        return CancellationToken {
+            mutex: 0,
+            condition: 0,
+            requested: true
+        };
+    }
+    return CancellationToken {
+        mutex: mutex,
+        condition: condition,
+        requested: false
+    };
+}
+
+public fn valid(CancellationToken& token) -> bool {
+    return token.mutex != 0 && token.condition != 0;
+}
+
+public fn request(CancellationToken&mut token) {
+    if (!valid(token)) {
+        return;
+    }
+    std::sync::mutex::mutex_lock_raw(token.mutex);
+
+    bool wake = !token.requested;
+
+    token.requested = true;
+    std::sync::mutex::mutex_unlock_raw(token.mutex);
+    if (wake) {
+        std::sync::condition::notify_all_raw(token.condition);
+    }
+}
+
+public fn requested(CancellationToken& token) -> bool {
+    if (!valid(token)) {
+        return true;
+    }
+    std::sync::mutex::mutex_lock_raw(token.mutex);
+
+    bool value = token.requested;
+
+    std::sync::mutex::mutex_unlock_raw(token.mutex);
+    return value;
+}
+
+public fn wait_millis(CancellationToken& token, i64 timeout_millis) -> bool {
+    if (!valid(token) || timeout_millis < 0) {
+        return true;
+    }
+
+    i64 deadline = deadline_nanos(timeout_millis);
+
+    std::sync::mutex::mutex_lock_raw(token.mutex);
+    while (!token.requested) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            std::sync::mutex::mutex_unlock_raw(token.mutex);
+            return false;
+        }
+        std::sync::condition::wait_millis_raw(token.condition, token.mutex, remaining);
+    }
+    std::sync::mutex::mutex_unlock_raw(token.mutex);
+    return true;
+}
+
+// Returns false when cancellation interrupts the sleep.
+public fn sleep(CancellationToken& token, i64 timeout_millis) -> bool {
+    if (timeout_millis <= 0) {
+        return !requested(token);
+    }
+    return !wait_millis(token, timeout_millis);
+}
+
+public fn destroy(CancellationToken&mut token) {
+    if (token.mutex != 0) {
+        request(token);
+        std::sync::condition::condition_destroy(token.condition);
+        std::sync::mutex::mutex_destroy_raw(token.mutex);
+    }
+    token.mutex = 0;
+    token.condition = 0;
+    token.requested = true;
+}
+
+impl Drop for CancellationToken {
+    fn drop(CancellationToken&mut self) {
+        destroy(self);
+    }
+}

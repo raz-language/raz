@@ -1,0 +1,100 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_rxe_blocks;
+public import raz_compiler_backend_rxe_optimize;
+
+fn rxe_find_block_for_code(RxeModule& module, i64 function, i64 code) -> i64 {
+    i64 first = raz_rt_stage1_arena_get(module.function_block_starts, function);
+    i64 count = raz_rt_stage1_arena_get(module.function_block_counts, function);
+    i64 block = first;
+    while (block < first + count) {
+        if (raz_rt_stage1_arena_get(module.block_code_starts, block) == code) { return block; }
+        block += 1;
+    }
+    return -1;
+}
+
+fn rxe_build_blocks(RxeModule&mut module) -> bool {
+    i64 marks = raz_rt_stage1_arena_create(module.instruction_count + 1);
+    if (marks == 0) { return false; }
+    i64 i = 0;
+    while (i <= module.instruction_count) { raz_rt_stage1_arena_set(marks, i, 0); i += 1; }
+
+    module.block_count = 0;
+    i64 function = 0;
+    while (function < module.function_count) {
+        i64 start = raz_rt_stage1_arena_get(module.function_code_starts, function);
+        i64 end = start + raz_rt_stage1_arena_get(module.function_code_counts, function);
+        if (start < 0 || end < start || end > module.instruction_count) { raz_rt_stage1_arena_destroy(marks); return false; }
+        raz_rt_stage1_arena_set(module.function_block_starts, function, module.block_count);
+        if (start < end) { raz_rt_stage1_arena_set(marks, start, 1); }
+        i64 ip = start;
+        while (ip < end) {
+            i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
+            if (op == rxe_op_jmp() || op == rxe_op_brnz()) {
+                i64 target = raz_rt_stage1_arena_get(module.immediates, ip);
+                if (target < start || target >= end) { raz_rt_stage1_arena_destroy(marks); return false; }
+                raz_rt_stage1_arena_set(marks, target, 1);
+            }
+            if (
+                op == rxe_op_jmp() || op == rxe_op_brnz() || op == rxe_op_ret() ||
+                op == rxe_op_ret_void() || op == rxe_op_trap()
+            ) {
+                if (ip + 1 < end) { raz_rt_stage1_arena_set(marks, ip + 1, 1); }
+            }
+            ip += 1;
+        }
+
+        ip = start;
+        i64 function_blocks = 0;
+        while (ip < end) {
+            if (raz_rt_stage1_arena_get(marks, ip) != 0) {
+                i64 next = ip + 1;
+                while (next < end && raz_rt_stage1_arena_get(marks, next) == 0) { next += 1; }
+                i64 block = module.block_count;
+                raz_rt_stage1_arena_set(module.block_code_starts, block, ip);
+                raz_rt_stage1_arena_set(module.block_code_counts, block, next - ip);
+                raz_rt_stage1_arena_set(module.block_successor0, block, -1);
+                raz_rt_stage1_arena_set(module.block_successor1, block, -1);
+                module.block_count += 1;
+                function_blocks += 1;
+                ip = next;
+            } else {
+                ip += 1;
+            }
+        }
+        raz_rt_stage1_arena_set(module.function_block_counts, function, function_blocks);
+        function += 1;
+    }
+
+    function = 0;
+    while (function < module.function_count) {
+        i64 first = raz_rt_stage1_arena_get(module.function_block_starts, function);
+        i64 count = raz_rt_stage1_arena_get(module.function_block_counts, function);
+        i64 block = first;
+        while (block < first + count) {
+            i64 code_start = raz_rt_stage1_arena_get(module.block_code_starts, block);
+            i64 code_count = raz_rt_stage1_arena_get(module.block_code_counts, block);
+            if (code_count <= 0) { raz_rt_stage1_arena_destroy(marks); return false; }
+            i64 last = code_start + code_count - 1;
+            i64 op = raz_rt_stage1_arena_get(module.opcodes, last);
+            if (op == rxe_op_jmp()) {
+                i64 target = rxe_find_block_for_code(module, function, raz_rt_stage1_arena_get(module.immediates, last));
+                if (target < 0) { raz_rt_stage1_arena_destroy(marks); return false; }
+                raz_rt_stage1_arena_set(module.block_successor0, block, target);
+            } else if (op == rxe_op_brnz()) {
+                i64 target = rxe_find_block_for_code(module, function, raz_rt_stage1_arena_get(module.immediates, last));
+                if (target < 0) { raz_rt_stage1_arena_destroy(marks); return false; }
+                raz_rt_stage1_arena_set(module.block_successor0, block, target);
+                if (block + 1 < first + count) { raz_rt_stage1_arena_set(module.block_successor1, block, block + 1); }
+            } else if (op != rxe_op_ret() && op != rxe_op_ret_void() && op != rxe_op_trap()) {
+                if (block + 1 < first + count) { raz_rt_stage1_arena_set(module.block_successor0, block, block + 1); }
+            }
+            block += 1;
+        }
+        function += 1;
+    }
+    raz_rt_stage1_arena_destroy(marks);
+    return true;
+}

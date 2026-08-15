@@ -1,0 +1,55 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: ${{ matrix.artifact }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: forge-linux-x86_64
+          - os: windows-latest
+            artifact: forge-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@v4.1.1
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFORGE_ENABLE_WERROR=ON
+          -DFORGE_BUILD_FUZZERS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install
+        run: cmake --install build --prefix package
+      - name: Package
+        run: cpack --config build/CPackConfig.cmake -B dist
+      - name: Package source
+        if: runner.os == 'Linux'
+        run: cpack --config build/CPackSourceConfig.cmake -B dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: dist/*

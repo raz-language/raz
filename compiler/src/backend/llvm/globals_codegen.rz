@@ -1,0 +1,338 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_llvm_globals_codegen;
+public import raz_compiler_backend_llvm_target;
+// LLVM module-storage construction/destruction helpers.
+fn llvm_global_is_aggregate(HirModule& hir, i64 global_index) -> bool {
+  return (
+  raz_rt_stage1_arena_get(hir.global_type_structs, global_index) >= 0 ||
+  raz_rt_stage1_arena_get(hir.global_array_extents, global_index) >= 0
+  );
+}
+
+fn llvm_has_aggregate_globals(HirModule& hir) -> bool {
+  i64 global_index = 0;
+
+  while (global_index < hir.global_count) {
+    if (
+    raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) == 0 &&
+    llvm_global_is_aggregate(hir, global_index)
+    ) {
+      return true;
+    }
+    global_index += 1;
+  }
+  return false;
+}
+
+fn llvm_global_temp(ForgeWriter&mut out, bool cleanup, i64 id) {
+  if (cleanup) {
+    i64 prefix[6] = [37, 103, 102, 105, 110, 105];
+
+    llvm_chars(out, &prefix, 6);
+  } else {
+    i64 prefix[6] = [37, 103, 105, 110, 105, 116];
+
+    llvm_chars(out, &prefix, 6);
+  }
+  writer_decimal(out, id);
+}
+
+fn llvm_static_aggregate_argument_start(HirModule& hir, i64 node) -> i64 {
+  if (raz_rt_stage1_arena_get(hir.node_kinds, node) == 34) {
+    return raz_rt_stage1_arena_get(hir.node_b, node);
+  }
+  return raz_rt_stage1_arena_get(hir.node_a, node);
+}
+
+fn llvm_static_aggregate_argument_count(HirModule& hir, i64 node) -> i64 {
+  if (raz_rt_stage1_arena_get(hir.node_kinds, node) == 34) {
+    return raz_rt_stage1_arena_get(hir.node_c, node);
+  }
+  return raz_rt_stage1_arena_get(hir.node_b, node);
+}
+
+fn llvm_emit_static_aggregate_create(
+ForgeWriter&mut out,
+HirModule& hir,
+i64 node,
+i64&mut next_temp,
+) -> i64 {
+  i64 count = llvm_static_aggregate_argument_count(hir, node);
+  i64 storage = *next_temp;
+
+  *next_temp += 1;
+  writer_space(out);
+  writer_space(out);
+  llvm_global_temp(out, false, storage);
+
+  i64 create_call[44] = [32, 61, 32, 99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 32];
+
+  llvm_chars(out, &create_call, 44);
+  writer_decimal(out, count);
+  writer_put(out, 41);
+  writer_newline(out);
+
+  i64 start = llvm_static_aggregate_argument_start(hir, node);
+  i64 argument = 0;
+
+  while (argument < count) {
+    i64 child = raz_rt_stage1_arena_get(hir.arguments, start + argument);
+    i64 child_kind = raz_rt_stage1_arena_get(hir.node_kinds, child);
+    i64 child_storage = -1;
+
+    if (child_kind == 53 || child_kind == 34) {
+      child_storage = llvm_emit_static_aggregate_create(out, hir, child, next_temp);
+    }
+    writer_space(out);
+    writer_space(out);
+
+    i64 set_call[39] = [99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 115, 101, 116, 40, 105, 54, 52, 32];
+
+    llvm_chars(out, &set_call, 39);
+    llvm_global_temp(out, false, storage);
+
+    i64 comma[6] = [44, 32, 105, 54, 52, 32];
+
+    llvm_chars(out, &comma, 6);
+    writer_decimal(out, argument);
+    llvm_chars(out, &comma, 6);
+    if (child_storage >= 0) {
+      llvm_global_temp(out, false, child_storage);
+    } else {
+      writer_decimal(out, raz_rt_stage1_arena_get(hir.node_values, child));
+    }
+    writer_put(out, 41);
+    writer_newline(out);
+    argument += 1;
+  }
+  return storage;
+}
+
+fn llvm_emit_static_aggregate_destroy(
+ForgeWriter&mut out,
+Source& source,
+HirModule& hir,
+i64 node,
+i64 storage,
+i64&mut next_temp,
+) {
+  i64 structure = raz_rt_stage1_arena_get(hir.node_type_structs, node);
+
+  if (raz_rt_stage1_arena_get(hir.node_kinds, node) == 34 && structure >= 0) {
+    i64 drop_function = raz_rt_stage1_arena_get(hir.struct_drop_functions, structure);
+
+    if (drop_function >= 0) {
+      writer_space(out);
+      writer_space(out);
+
+      i64 drop_prefix[9] = [99, 97, 108, 108, 32, 105, 54, 52, 32];
+
+      llvm_chars(out, &drop_prefix, 9);
+      llvm_function_name(out, source, hir, drop_function);
+
+      i64 open[5] = [40, 105, 54, 52, 32];
+
+      llvm_chars(out, &open, 5);
+      llvm_global_temp(out, true, storage);
+      writer_put(out, 41);
+      writer_newline(out);
+    }
+  }
+
+  i64 count = llvm_static_aggregate_argument_count(hir, node);
+  i64 start = llvm_static_aggregate_argument_start(hir, node);
+  i64 argument = count;
+
+  while (argument > 0) {
+    argument -= 1;
+
+    i64 child = raz_rt_stage1_arena_get(hir.arguments, start + argument);
+    i64 child_kind = raz_rt_stage1_arena_get(hir.node_kinds, child);
+
+    if (child_kind == 53 || child_kind == 34) {
+      i64 child_storage = *next_temp;
+
+      *next_temp += 1;
+      writer_space(out);
+      writer_space(out);
+      llvm_global_temp(out, true, child_storage);
+
+      i64 get_call[41] = [32, 61, 32, 99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 32];
+
+      llvm_chars(out, &get_call, 41);
+      llvm_global_temp(out, true, storage);
+
+      i64 comma[6] = [44, 32, 105, 54, 52, 32];
+
+      llvm_chars(out, &comma, 6);
+      writer_decimal(out, argument);
+      writer_put(out, 41);
+      writer_newline(out);
+      llvm_emit_static_aggregate_destroy(out, source, hir, child, child_storage, next_temp);
+    }
+  }
+  writer_space(out);
+  writer_space(out);
+
+  i64 destroy_call[43] = [99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54, 52, 32];
+
+  llvm_chars(out, &destroy_call, 43);
+  llvm_global_temp(out, true, storage);
+  writer_put(out, 41);
+  writer_newline(out);
+}
+
+fn llvm_emit_global_lifecycle(ForgeWriter&mut out, Source& source, HirModule& hir) {
+  if (!llvm_has_aggregate_globals(hir)) {
+    return;
+  }
+
+  i64 init_header[52] = [100, 101, 102, 105, 110, 101, 32, 105, 110, 116, 101, 114, 110, 97, 108, 32, 118, 111, 105, 100, 32, 64, 95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 105, 110, 105, 116, 40, 41, 32, 123, 10, 101, 110, 116, 114, 121, 58, 10];
+
+  llvm_chars(out, &init_header, 52);
+
+  i64 next_temp = 0;
+  i64 global_index = 0;
+
+  while (global_index < hir.global_count) {
+    if (
+    raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) == 0 &&
+    llvm_global_is_aggregate(hir, global_index)
+    ) {
+      i64 initializer = raz_rt_stage1_arena_get(hir.global_initializer_nodes, global_index);
+      i64 storage = llvm_emit_static_aggregate_create(out, hir, initializer, &mut next_temp);
+
+      writer_space(out);
+      writer_space(out);
+
+      i64 store_prefix[10] = [115, 116, 111, 114, 101, 32, 105, 54, 52, 32];
+
+      llvm_chars(out, &store_prefix, 10);
+      llvm_global_temp(out, false, storage);
+
+      i64 ptr_prefix[6] = [44, 32, 112, 116, 114, 32];
+
+      llvm_chars(out, &ptr_prefix, 6);
+      llvm_module_global_name(out, source, hir, global_index);
+      writer_newline(out);
+    }
+    global_index += 1;
+  }
+
+  i64 ret_void[14] = [32, 32, 114, 101, 116, 32, 118, 111, 105, 100, 10, 125, 10, 10];
+
+  llvm_chars(out, &ret_void, 14);
+
+  i64 fini_header[52] = [100, 101, 102, 105, 110, 101, 32, 105, 110, 116, 101, 114, 110, 97, 108, 32, 118, 111, 105, 100, 32, 64, 95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 102, 105, 110, 105, 40, 41, 32, 123, 10, 101, 110, 116, 114, 121, 58, 10];
+
+  llvm_chars(out, &fini_header, 52);
+  next_temp = 0;
+  global_index = hir.global_count;
+  while (global_index > 0) {
+    global_index -= 1;
+    if (
+    raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) == 0 &&
+    llvm_global_is_aggregate(hir, global_index)
+    ) {
+      i64 storage = next_temp;
+
+      next_temp += 1;
+      writer_space(out);
+      writer_space(out);
+      llvm_global_temp(out, true, storage);
+
+      i64 load_prefix[17] = [32, 61, 32, 108, 111, 97, 100, 32, 105, 54, 52, 44, 32, 112, 116, 114, 32];
+
+      llvm_chars(out, &load_prefix, 17);
+      llvm_module_global_name(out, source, hir, global_index);
+      writer_newline(out);
+      llvm_emit_static_aggregate_destroy(
+      out,
+      source,
+      hir,
+      raz_rt_stage1_arena_get(hir.global_initializer_nodes, global_index),
+      storage,
+      &mut next_temp,
+      );
+      writer_space(out);
+      writer_space(out);
+
+      i64 clear_prefix[17] = [115, 116, 111, 114, 101, 32, 105, 54, 52, 32, 48, 44, 32, 112, 116, 114, 32];
+
+      llvm_chars(out, &clear_prefix, 17);
+      llvm_module_global_name(out, source, hir, global_index);
+      writer_newline(out);
+    }
+  }
+
+  i64 fini_ret[14] = [32, 32, 114, 101, 116, 32, 118, 111, 105, 100, 10, 125, 10, 10];
+
+  llvm_chars(out, &fini_ret, 14);
+}
+
+fn llvm_emit_module_globals_impl(ForgeWriter&mut out, Source& source, HirModule& hir) {
+  i64 global_index = 0;
+
+  while (global_index < hir.global_count) {
+    llvm_module_global_name(out, source, hir, global_index);
+    writer_space(out);
+    writer_put(out, 61);
+    writer_space(out);
+    if (raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) != 0) {
+      i64 external_word[8] = [101, 120, 116, 101, 114, 110, 97, 108];
+
+      llvm_chars(out, &external_word, 8);
+      writer_space(out);
+    } else if (raz_rt_stage1_arena_get(hir.global_internal_flags, global_index) != 0) {
+      i64 internal_word[8] = [105, 110, 116, 101, 114, 110, 97, 108];
+
+      llvm_chars(out, &internal_word, 8);
+      writer_space(out);
+    }
+    if (raz_rt_stage1_arena_get(hir.global_tls_flags, global_index) != 0) {
+      i64 tls_word[12] = [116, 104, 114, 101, 97, 100, 95, 108, 111, 99, 97, 108];
+
+      llvm_chars(out, &tls_word, 12);
+      writer_space(out);
+    }
+
+    bool aggregate_global = llvm_global_is_aggregate(hir, global_index);
+
+    if (aggregate_global || raz_rt_stage1_arena_get(hir.global_mutable_flags, global_index) != 0) {
+      i64 global_word[6] = [103, 108, 111, 98, 97, 108];
+
+      llvm_chars(out, &global_word, 6);
+    } else {
+      i64 constant_word[8] = [99, 111, 110, 115, 116, 97, 110, 116];
+
+      llvm_chars(out, &constant_word, 8);
+    }
+    writer_space(out);
+    if (aggregate_global) {
+      writer_i64(out);
+    } else {
+      llvm_type(out, raz_rt_stage1_arena_get(hir.global_types, global_index));
+    }
+    if (raz_rt_stage1_arena_get(hir.global_extern_flags, global_index) == 0) {
+      writer_space(out);
+      if (aggregate_global) {
+        writer_decimal(out, 0);
+      } else {
+        i64 initializer = raz_rt_stage1_arena_get(hir.global_initializer_nodes, global_index);
+
+        writer_decimal(out, raz_rt_stage1_arena_get(hir.node_values, initializer));
+      }
+    }
+    writer_newline(out);
+    global_index += 1;
+  }
+  if (hir.global_count > 0) {
+    writer_newline(out);
+  }
+}
+
+fn llvm_emit_module_globals(ForgeWriter&mut out, Source& source, HirModule& hir) {
+  llvm_emit_module_globals_impl(out, source, hir);
+}

@@ -1,0 +1,117 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_ownership_paths;
+public import raz_compiler_mir_ownership_move_state;
+// Canonical ownership paths are rooted at a frame slot and carry zero or more
+// static projection components. Empty paths denote the whole local.
+fn mir_ownership_event_path_count(MirModule& mir, i64 event) -> i64 {
+  if (event < 0 || event >= mir.ownership_event_count) {
+    return -1;
+  }
+  return raz_rt_stage1_arena_get(mir.ownership_event_path_counts, event);
+}
+
+fn mir_ownership_event_path_component(MirModule& mir, i64 event, i64 component) -> i64 {
+  i64 count = mir_ownership_event_path_count(mir, event);
+
+  if (component < 0 || component >= count) {
+    return -1;
+  }
+
+  i64 start = raz_rt_stage1_arena_get(mir.ownership_event_path_starts, event);
+
+  return raz_rt_stage1_arena_get(mir.ownership_path_components, start + component);
+}
+
+fn mir_ownership_paths_same(MirModule& mir, i64 left, i64 right) -> bool {
+  if (
+  raz_rt_stage1_arena_get(
+  mir.ownership_event_slots,
+  left,
+  ) != raz_rt_stage1_arena_get(mir.ownership_event_slots, right)
+  ) {
+    return false;
+  }
+
+  i64 left_count = mir_ownership_event_path_count(mir, left);
+  i64 right_count = mir_ownership_event_path_count(mir, right);
+
+  if (left_count != right_count) {
+    return false;
+  }
+
+  i64 component = 0;
+
+  while (component < left_count) {
+    if (
+    mir_ownership_event_path_component(
+    mir,
+    left,
+    component,
+    ) != mir_ownership_event_path_component(mir, right, component)
+    ) {
+      return false;
+    }
+    component += 1;
+  }
+  return true;
+}
+
+fn mir_ownership_path_prefix_of(MirModule& mir, i64 prefix, i64 value) -> bool {
+  if (
+  raz_rt_stage1_arena_get(
+  mir.ownership_event_slots,
+  prefix,
+  ) != raz_rt_stage1_arena_get(mir.ownership_event_slots, value)
+  ) {
+    return false;
+  }
+
+  i64 prefix_count = mir_ownership_event_path_count(mir, prefix);
+  i64 value_count = mir_ownership_event_path_count(mir, value);
+
+  if (prefix_count > value_count) {
+    return false;
+  }
+
+  i64 component = 0;
+
+  while (component < prefix_count) {
+    if (
+    mir_ownership_event_path_component(
+    mir,
+    prefix,
+    component,
+    ) != mir_ownership_event_path_component(mir, value, component)
+    ) {
+      return false;
+    }
+    component += 1;
+  }
+  return true;
+}
+
+fn mir_ownership_paths_overlap(MirModule& mir, i64 left, i64 right) -> bool {
+  return mir_ownership_path_prefix_of(mir, left, right) || mir_ownership_path_prefix_of(mir, right, left);
+}
+
+fn verify_mir_ownership_paths(MirModule& mir) -> bool {
+  i64 event = 0;
+
+  while (event < mir.ownership_event_count) {
+    i64 start = raz_rt_stage1_arena_get(mir.ownership_event_path_starts, event);
+    i64 count = raz_rt_stage1_arena_get(mir.ownership_event_path_counts, event);
+
+    if (
+    start < 0 ||
+    count < 0 ||
+    start + count > mir.ownership_path_component_count ||
+    raz_rt_stage1_arena_get(mir.ownership_event_slots, event) < 0
+    ) {
+      return false;
+    }
+    event += 1;
+  }
+  return true;
+}

@@ -1,0 +1,90 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread;
+// OS thread creation itself remains a native primitive through the existing task
+// ABI. JoinHandle provides lifecycle ownership in Raz and prevents raw task
+// handles from being accidentally joined twice.
+extern fn raz_rt_hardware_threads() -> i64;
+extern fn raz_rt_task_spawn_i64(i64 entry_address, i8*mut context) -> i8*mut;
+extern fn raz_rt_task_is_ready(i8*mut task) -> i64;
+extern fn raz_rt_task_wait_millis(i8*mut task, i64 timeout_millis) -> i64;
+extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
+extern fn raz_rt_yield_now();
+extern fn raz_rt_sleep_millis(i64 millis);
+
+public struct JoinHandleI64 {
+    i8*mut handle;
+    bool active;
+}
+
+public fn hardware_threads() -> i64 {
+    return raz_rt_hardware_threads();
+}
+
+public unsafe fn spawn_raw_i64(i64 entry_address, i8*mut context) -> JoinHandleI64 {
+    return JoinHandleI64 {
+        handle: raz_rt_task_spawn_i64(entry_address, context),
+        active: true
+    };
+}
+
+// Preferred typed task entry point. Ownership of the FnOnce capture environment
+// transfers to the spawned OS thread and is destroyed after exactly one call.
+extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
+
+public fn spawn_callable(FnOnce() -> i64 operation) -> JoinHandleI64 {
+    auto handle = raz_rt_task_spawn_callable_i64(operation);
+    usize raw = 0;
+
+    unsafe {
+        raw = handle as usize;
+    }
+    return JoinHandleI64 {
+        handle: handle,
+        active: raw != 0
+    };
+}
+
+public fn valid(JoinHandleI64& handle) -> bool {
+    return handle.active;
+}
+
+public fn is_finished(JoinHandleI64& handle) -> bool {
+    return handle.active && raz_rt_task_is_ready(handle.handle) == 1;
+}
+
+public fn wait_millis(JoinHandleI64& handle, i64 timeout_millis) -> bool {
+    return (
+        handle.active &&
+        timeout_millis >= 0 &&
+        raz_rt_task_wait_millis(handle.handle, timeout_millis) == 1
+    );
+}
+
+public fn join(JoinHandleI64&mut handle) -> i64 {
+    if (!handle.active) {
+        return 0;
+    }
+    handle.active = false;
+    return raz_rt_task_join_i64(handle.handle);
+}
+
+public fn yield_now() {
+    raz_rt_yield_now();
+}
+
+public fn sleep_millis(i64 millis) {
+    if (millis > 0) {
+        raz_rt_sleep_millis(millis);
+    }
+}
+
+impl Drop for JoinHandleI64 {
+    fn drop(JoinHandleI64&mut self) {
+        if (self.active) {
+            self.active = false;
+            raz_rt_task_join_i64(self.handle);
+        }
+    }
+}

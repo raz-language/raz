@@ -1,0 +1,893 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_host_support;
+public import raz_compiler_driver_backend;
+// Self-host compiler host-policy support. This module deliberately composes
+// permanent OS primitives in Raz instead of adding Stage-1-specific C++
+// wrappers. Compiler arenas remain the bootstrap data representation, while
+// path/tree traversal policy lives here.
+struct Stage1DirMetadata {
+  i64 kind;
+  i64 size;
+  i64 modified_millis;
+  i64 readonly;
+  i64 symlink;
+  i64 exists;
+}
+
+extern fn raz_rt_current_dir(usize output, i64 capacity) -> i64;
+extern fn raz_rt_dir_open(usize path, i64 length) -> usize;
+extern fn raz_rt_dir_next(
+usize handle,
+usize output,
+i64 capacity,
+Stage1DirMetadata&mut metadata,
+i64 metadata_capacity,
+) -> i64;
+extern fn raz_rt_dir_close(usize handle);
+extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;
+extern fn raz_rt_remove_one(usize path, i64 length) -> i64;
+extern fn raz_rt_path_is_dir(usize path, i64 length) -> i64;
+extern fn raz_rt_copy_file(
+usize source,
+i64 source_length,
+usize destination,
+i64 destination_length,
+i64 overwrite,
+) -> i64;
+extern fn raz_rt_tool_available(usize data, i64 length) -> i64;
+extern fn raz_rt_host_platform() -> i64;
+
+fn stage1_host_separator(i64 byte) -> bool {
+  return byte == 47 || byte == 92;
+}
+
+fn stage1_host_root_length(usize data, i64 length) -> i64 {
+  if (data == 0 || length <= 0) {
+    return 0;
+  }
+
+  i64 first = raz_rt_load_u8(data);
+
+  if (stage1_host_separator(first)) {
+    if (length >= 2 && stage1_host_separator(raz_rt_load_u8(data + 1))) {
+      return 2;
+    }
+    return 1;
+  }
+  if (length >= 3) {
+    i64 second = raz_rt_load_u8(data + 1);
+    i64 third = raz_rt_load_u8(data + 2);
+    bool drive = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
+
+    if (drive && second == 58 && stage1_host_separator(third)) {
+      return 3;
+    }
+  }
+  return 0;
+}
+
+fn stage1_host_pop_component(usize output, i64 root, i64 written) -> i64 {
+  if (written <= root) {
+    return written;
+  }
+
+  i64 end = written;
+
+  while (end > root && raz_rt_load_u8(output + end - 1) == 47) {
+    end -= 1;
+  }
+  while (end > root && raz_rt_load_u8(output + end - 1) != 47) {
+    end -= 1;
+  }
+  if (end > root && raz_rt_load_u8(output + end - 1) == 47) {
+    end -= 1;
+  }
+  if (end < root) {
+    return root;
+  }
+  return end;
+}
+
+fn stage1_host_output_ends_dot_dot(usize output, i64 root, i64 written) -> bool {
+  if (written - root < 2) {
+    return false;
+  }
+
+  i64 start = written;
+
+  while (start > root && raz_rt_load_u8(output + start - 1) != 47) {
+    start -= 1;
+  }
+  return (
+  written - start == 2 &&
+  raz_rt_load_u8(output + start) == 46 &&
+  raz_rt_load_u8(output + start + 1) == 46
+  );
+}
+
+fn stage1_host_append_component(
+usize output,
+i64 capacity,
+i64 written,
+usize data,
+i64 start,
+i64 length,
+) -> i64 {
+  bool separator = written > 0 && raz_rt_load_u8(output + written - 1) != 47;
+  i64 required = written + length;
+
+  if (separator) {
+    required += 1;
+  }
+  if (required > capacity) {
+    return -1;
+  }
+  if (separator) {
+    raz_rt_store_u8(output + written, 47);
+    written += 1;
+  }
+
+  i64 i = 0;
+
+  while (i < length) {
+    raz_rt_store_u8(output + written + i, raz_rt_load_u8(data + start + i));
+    i += 1;
+  }
+  return written + length;
+}
+
+fn stage1_host_normalize_bytes(usize data, i64 length, usize output, i64 capacity) -> i64 {
+  if (length < 0 || capacity < 0 || (length > 0 && (data == 0 || output == 0))) {
+    return -1;
+  }
+
+  i64 root = stage1_host_root_length(data, length);
+  i64 written = 0;
+  i64 read = 0;
+
+  if (root > 0) {
+    i64 i = 0;
+
+    while (i < root) {
+      i64 byte = raz_rt_load_u8(data + i);
+
+      if (stage1_host_separator(byte)) {
+        byte = 47;
+      }
+      if (written >= capacity) {
+        return -1;
+      }
+      raz_rt_store_u8(output + written, byte);
+      written += 1;
+      i += 1;
+    }
+    read = root;
+  }
+  while (read < length) {
+    while (read < length && stage1_host_separator(raz_rt_load_u8(data + read))) {
+      read += 1;
+    }
+    if (read >= length) {
+      break;
+    }
+
+    i64 start = read;
+
+    while (read < length && !stage1_host_separator(raz_rt_load_u8(data + read))) {
+      read += 1;
+    }
+
+    i64 segment = read - start;
+    bool dot = segment == 1 && raz_rt_load_u8(data + start) == 46;
+
+    bool dot_dot =
+    segment == 2 &&
+    raz_rt_load_u8(data + start) == 46 &&
+    raz_rt_load_u8(data + start + 1) == 46;
+    if (dot) {
+      continue;
+    }
+    if (dot_dot) {
+      if (written > root && !stage1_host_output_ends_dot_dot(output, root, written)) {
+        written = stage1_host_pop_component(output, root, written);
+      } else if (root == 0) {
+        written = stage1_host_append_component(output, capacity, written, data, start, segment);
+        if (written < 0) {
+          return -1;
+        }
+      }
+      continue;
+    }
+    written = stage1_host_append_component(output, capacity, written, data, start, segment);
+    if (written < 0) {
+      return -1;
+    }
+  }
+  if (written == 0 && length > 0) {
+    if (capacity <= 0) {
+      return -1;
+    }
+    raz_rt_store_u8(output, 46);
+    written = 1;
+  }
+  while (written > root && written > 1 && raz_rt_load_u8(output + written - 1) == 47) {
+    written -= 1;
+  }
+  return written;
+}
+
+fn raz_rt_stage1_normalize_path(i64 path, i64 path_length, i64 output, i64 capacity) -> i64 {
+  if (path_length < 0 || capacity < 0) {
+    return -1;
+  }
+
+  usize path_bytes = stage1_ascii_pack(path, 0, path_length);
+
+  if (path_length > 0 && path_bytes == 0) {
+    return -1;
+  }
+
+  i64 root = stage1_host_root_length(path_bytes, path_length);
+  usize combined = 0;
+  i64 combined_length = path_length;
+
+  if (root == 0) {
+    i64 cwd_length = raz_rt_current_dir(0, 0);
+
+    if (cwd_length < 0) {
+      if (path_bytes != 0) {
+        raz_rt_dealloc_aligned(path_bytes, 8);
+      }
+      return -1;
+    }
+    combined = raz_rt_alloc_aligned(cwd_length + 1 + path_length + 1, 8);
+    if (combined == 0) {
+      if (path_bytes != 0) {
+        raz_rt_dealloc_aligned(path_bytes, 8);
+      }
+      return -1;
+    }
+
+    i64 actual = raz_rt_current_dir(combined, cwd_length + 1);
+
+    if (actual < 0) {
+      raz_rt_dealloc_aligned(combined, 8);
+      if (path_bytes != 0) {
+        raz_rt_dealloc_aligned(path_bytes, 8);
+      }
+      return -1;
+    }
+
+    i64 cursor = actual;
+
+    if (cursor > 0 && !stage1_host_separator(raz_rt_load_u8(combined + cursor - 1))) {
+      raz_rt_store_u8(combined + cursor, 47);
+      cursor += 1;
+    }
+
+    i64 i = 0;
+
+    while (i < path_length) {
+      raz_rt_store_u8(combined + cursor + i, raz_rt_load_u8(path_bytes + i));
+      i += 1;
+    }
+    combined_length = cursor + path_length;
+  } else {
+    combined = path_bytes;
+  }
+
+  usize normalized = raz_rt_alloc_aligned(capacity + 1, 8);
+
+  if (normalized == 0) {
+    if (combined != 0 && combined != path_bytes) {
+      raz_rt_dealloc_aligned(combined, 8);
+    }
+    if (path_bytes != 0) {
+      raz_rt_dealloc_aligned(path_bytes, 8);
+    }
+    return -1;
+  }
+
+  i64 result = stage1_host_normalize_bytes(combined, combined_length, normalized, capacity);
+
+  if (result >= 0) {
+    stage1_ascii_unpack(output, 0, normalized, result);
+  }
+  raz_rt_dealloc_aligned(normalized, 8);
+  if (combined != 0 && combined != path_bytes) {
+    raz_rt_dealloc_aligned(combined, 8);
+  }
+  if (path_bytes != 0) {
+    raz_rt_dealloc_aligned(path_bytes, 8);
+  }
+  return result;
+}
+
+fn stage1_host_line_compare(i64 output, i64 line_start, i64 line_length, usize bytes, i64 length) -> i64 {
+  i64 common = line_length;
+
+  if (length < common) {
+    common = length;
+  }
+
+  i64 i = 0;
+
+  while (i < common) {
+    i64 left = raz_rt_stage1_arena_get(output, line_start + i);
+    i64 right = raz_rt_load_u8(bytes + i);
+
+    if (left < right) {
+      return -1;
+    }
+    if (left > right) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (line_length < length) {
+    return -1;
+  }
+  if (line_length > length) {
+    return 1;
+  }
+  return 0;
+}
+
+fn stage1_host_insert_sorted_line(i64 output, i64 current, i64 capacity, usize bytes, i64 length) -> i64 {
+  if (length < 0 || current < 0 || current + length + 1 > capacity) {
+    return -1;
+  }
+
+  i64 insertion = current;
+  i64 pos = 0;
+
+  while (pos < current) {
+    i64 start = pos;
+
+    while (pos < current && raz_rt_stage1_arena_get(output, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 line_length = pos - start;
+
+    if (stage1_host_line_compare(output, start, line_length, bytes, length) > 0) {
+      insertion = start;
+      break;
+    }
+    if (pos < current) {
+      pos += 1;
+    }
+  }
+
+  i64 tail = current - insertion;
+
+  if (
+  tail > 0 &&
+  raz_rt_stage1_arena_copy(output, insertion + length + 1, output, insertion, tail) != tail
+  ) {
+    return -1;
+  }
+
+  i64 i = 0;
+
+  while (i < length) {
+    raz_rt_stage1_arena_set(output, insertion + i, raz_rt_load_u8(bytes + i));
+    i += 1;
+  }
+  raz_rt_stage1_arena_set(output, insertion + length, 10);
+  return current + length + 1;
+}
+
+fn stage1_host_join_bytes(usize left, i64 left_length, usize right, i64 right_length) -> usize {
+  i64 needed = left_length + right_length + 2;
+  usize output = raz_rt_alloc_aligned(needed, 8);
+
+  if (output == 0) {
+    return 0;
+  }
+
+  i64 cursor = 0;
+  i64 i = 0;
+
+  while (i < left_length) {
+    raz_rt_store_u8(output + cursor, raz_rt_load_u8(left + i));
+    cursor += 1;
+    i += 1;
+  }
+  if (cursor > 0 && !stage1_host_separator(raz_rt_load_u8(output + cursor - 1))) {
+    raz_rt_store_u8(output + cursor, 47);
+    cursor += 1;
+  }
+  i = 0;
+  while (i < right_length) {
+    raz_rt_store_u8(output + cursor + i, raz_rt_load_u8(right + i));
+    i += 1;
+  }
+  return output;
+}
+
+fn stage1_host_walk_files(
+usize root,
+i64 root_length,
+usize relative,
+i64 relative_length,
+i64 output,
+i64 capacity,
+i64 current,
+bool full_paths,
+) -> i64 {
+  usize dir = raz_rt_dir_open(root, root_length);
+
+  if (dir == 0) {
+    return -1;
+  }
+
+  bool running = true;
+
+  while (running) {
+    Stage1DirMetadata metadata = Stage1DirMetadata {
+      kind: 0,
+      size: 0,
+      modified_millis: 0,
+      readonly: 0,
+      symlink: 0,
+      exists: 0
+    };
+
+    i64 required = raz_rt_dir_next(dir, 0, 0, &mut metadata, 6);
+
+    if (required == -1) {
+      running = false;
+      continue;
+    }
+    if (required < 0) {
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    usize name = raz_rt_alloc_aligned(required + 1, 8);
+
+    if (name == 0) {
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    i64 fetched = raz_rt_dir_next(dir, name, required + 1, &mut metadata, 6);
+
+    if (fetched < 0) {
+      raz_rt_dealloc_aligned(name, 8);
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    usize child = stage1_host_join_bytes(root, root_length, name, fetched);
+    usize rel = 0;
+
+    if (relative_length > 0) {
+      rel = stage1_host_join_bytes(relative, relative_length, name, fetched);
+    } else {
+      rel = raz_rt_alloc_aligned(fetched + 1, 8);
+      if (rel != 0) {
+        i64 ri = 0;
+
+        while (ri < fetched) {
+          raz_rt_store_u8(rel + ri, raz_rt_load_u8(name + ri));
+          ri += 1;
+        }
+      }
+    }
+    if (child == 0 || rel == 0) {
+      if (child != 0) {
+        raz_rt_dealloc_aligned(child, 8);
+      }
+      if (rel != 0) {
+        raz_rt_dealloc_aligned(rel, 8);
+      }
+      raz_rt_dealloc_aligned(name, 8);
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    i64 child_length = root_length + fetched;
+
+    if (root_length > 0 && !stage1_host_separator(raz_rt_load_u8(root + root_length - 1))) {
+      child_length += 1;
+    }
+
+    i64 rel_length = relative_length + fetched;
+
+    if (relative_length > 0) {
+      rel_length += 1;
+    }
+    if (metadata.kind == 1) {
+      if (full_paths) {
+        current = stage1_host_insert_sorted_line(output, current, capacity, child, child_length);
+      } else {
+        current = stage1_host_insert_sorted_line(output, current, capacity, rel, rel_length);
+      }
+      if (current < 0) {
+        raz_rt_dealloc_aligned(child, 8);
+        raz_rt_dealloc_aligned(rel, 8);
+        raz_rt_dealloc_aligned(name, 8);
+        raz_rt_dir_close(dir);
+        return current;
+      }
+    } else if (metadata.kind == 2 && metadata.symlink == 0) {
+      current = stage1_host_walk_files(
+      child,
+      child_length,
+      rel,
+      rel_length,
+      output,
+      capacity,
+      current,
+      full_paths,
+      );
+      if (current < 0) {
+        raz_rt_dealloc_aligned(child, 8);
+        raz_rt_dealloc_aligned(rel, 8);
+        raz_rt_dealloc_aligned(name, 8);
+        raz_rt_dir_close(dir);
+        return current;
+      }
+    }
+    raz_rt_dealloc_aligned(child, 8);
+    raz_rt_dealloc_aligned(rel, 8);
+    raz_rt_dealloc_aligned(name, 8);
+  }
+  raz_rt_dir_close(dir);
+  return current;
+}
+
+fn raz_rt_stage1_list_files_recursive(i64 path, i64 path_length, i64 output, i64 capacity) -> i64 {
+  usize root = stage1_ascii_pack(path, 0, path_length);
+
+  if (path_length > 0 && root == 0) {
+    return -1;
+  }
+
+  i64 result = stage1_host_walk_files(root, path_length, 0, 0, output, capacity, 0, true);
+
+  if (root != 0) {
+    raz_rt_dealloc_aligned(root, 8);
+  }
+  return result;
+}
+
+fn raz_rt_stage1_tree_list_ascii(i64 path, i64 path_length, i64 output, i64 capacity) -> i64 {
+  usize root = stage1_ascii_pack(path, 0, path_length);
+
+  if (path_length > 0 && root == 0) {
+    return -1;
+  }
+
+  i64 result = stage1_host_walk_files(root, path_length, 0, 0, output, capacity, 0, false);
+
+  if (root != 0) {
+    raz_rt_dealloc_aligned(root, 8);
+  }
+  return result;
+}
+
+fn stage1_host_create_directories_bytes(usize path, i64 length) -> i64 {
+  if (path == 0 || length <= 0) {
+    return -1;
+  }
+
+  i64 root = stage1_host_root_length(path, length);
+  i64 index = root;
+
+  while (index <= length) {
+    bool boundary = index == length || stage1_host_separator(raz_rt_load_u8(path + index));
+
+    if (boundary && index > root) {
+      i64 status = raz_rt_create_dir_one(path, index);
+
+      if (status < 0 && raz_rt_path_exists(path, index) != 1) {
+        return -1;
+      }
+    }
+    index += 1;
+  }
+  return 0;
+}
+
+fn raz_rt_stage1_copy_file_ascii(
+i64 source,
+i64 source_length,
+i64 destination,
+i64 destination_length,
+) -> i64 {
+  usize source_bytes = stage1_ascii_pack(source, 0, source_length);
+  usize destination_bytes = stage1_ascii_pack(destination, 0, destination_length);
+
+  if ((source_length > 0 && source_bytes == 0) || (destination_length > 0 && destination_bytes == 0)) {
+    if (source_bytes != 0) {
+      raz_rt_dealloc_aligned(source_bytes, 8);
+    }
+    if (destination_bytes != 0) {
+      raz_rt_dealloc_aligned(destination_bytes, 8);
+    }
+    return -1;
+  }
+
+  i64 result = raz_rt_copy_file(source_bytes, source_length, destination_bytes, destination_length, 1);
+
+  if (source_bytes != 0) {
+    raz_rt_dealloc_aligned(source_bytes, 8);
+  }
+  if (destination_bytes != 0) {
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+  }
+  return result;
+}
+
+fn raz_rt_stage1_create_dir_ascii(i64 path, i64 path_length) -> i64 {
+  usize bytes = stage1_ascii_pack(path, 0, path_length);
+
+  if (path_length > 0 && bytes == 0) {
+    return -1;
+  }
+
+  i64 result = stage1_host_create_directories_bytes(bytes, path_length);
+
+  if (bytes != 0) {
+    raz_rt_dealloc_aligned(bytes, 8);
+  }
+  return result;
+}
+
+fn stage1_host_remove_tree_bytes(usize path, i64 length) -> i64 {
+  if (raz_rt_path_exists(path, length) != 1) {
+    return 0;
+  }
+  if (raz_rt_path_is_dir(path, length) != 1) {
+    if (raz_rt_remove_one(path, length) < 0) {
+      return -1;
+    }
+    return 0;
+  }
+
+  usize dir = raz_rt_dir_open(path, length);
+
+  if (dir == 0) {
+    return -1;
+  }
+
+  bool running = true;
+
+  while (running) {
+    Stage1DirMetadata metadata = Stage1DirMetadata {
+      kind: 0,
+      size: 0,
+      modified_millis: 0,
+      readonly: 0,
+      symlink: 0,
+      exists: 0
+    };
+
+    i64 required = raz_rt_dir_next(dir, 0, 0, &mut metadata, 6);
+
+    if (required == -1) {
+      running = false;
+      continue;
+    }
+    if (required < 0) {
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    usize name = raz_rt_alloc_aligned(required + 1, 8);
+
+    if (name == 0) {
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    i64 fetched = raz_rt_dir_next(dir, name, required + 1, &mut metadata, 6);
+    usize child = stage1_host_join_bytes(path, length, name, fetched);
+    i64 child_length = length + fetched;
+
+    if (length > 0 && !stage1_host_separator(raz_rt_load_u8(path + length - 1))) {
+      child_length += 1;
+    }
+    raz_rt_dealloc_aligned(name, 8);
+    if (fetched < 0 || child == 0) {
+      if (child != 0) {
+        raz_rt_dealloc_aligned(child, 8);
+      }
+      raz_rt_dir_close(dir);
+      return -1;
+    }
+
+    i64 status = 0;
+
+    if (metadata.kind == 2 && metadata.symlink == 0) {
+      status = stage1_host_remove_tree_bytes(child, child_length);
+    } else {
+      if (raz_rt_remove_one(child, child_length) < 0) {
+        status = -1;
+      }
+    }
+    raz_rt_dealloc_aligned(child, 8);
+    if (status != 0) {
+      raz_rt_dir_close(dir);
+      return status;
+    }
+  }
+  raz_rt_dir_close(dir);
+  if (raz_rt_remove_one(path, length) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+fn raz_rt_stage1_remove_path_ascii(i64 path, i64 path_length) -> i64 {
+  usize bytes = stage1_ascii_pack(path, 0, path_length);
+
+  if (path_length > 0 && bytes == 0) {
+    return -1;
+  }
+
+  i64 result = stage1_host_remove_tree_bytes(bytes, path_length);
+
+  if (bytes != 0) {
+    raz_rt_dealloc_aligned(bytes, 8);
+  }
+  return result;
+}
+
+fn stage1_host_parent_length_bytes(usize path, i64 length) -> i64 {
+  i64 index = length;
+
+  while (index > 0) {
+    if (stage1_host_separator(raz_rt_load_u8(path + index - 1))) {
+      return index - 1;
+    }
+    index -= 1;
+  }
+  return 0;
+}
+
+fn raz_rt_stage1_copy_tree_ascii(
+i64 source,
+i64 source_length,
+i64 destination,
+i64 destination_length,
+) -> i64 {
+  usize source_bytes = stage1_ascii_pack(source, 0, source_length);
+  usize destination_bytes = stage1_ascii_pack(destination, 0, destination_length);
+
+  if ((source_length > 0 && source_bytes == 0) || (destination_length > 0 && destination_bytes == 0)) {
+    if (source_bytes != 0) {
+      raz_rt_dealloc_aligned(source_bytes, 8);
+    }
+    if (destination_bytes != 0) {
+      raz_rt_dealloc_aligned(destination_bytes, 8);
+    }
+    return -1;
+  }
+  if (raz_rt_path_is_dir(source_bytes, source_length) != 1) {
+    raz_rt_dealloc_aligned(source_bytes, 8);
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+    return -1;
+  }
+
+  i64 parent = stage1_host_parent_length_bytes(destination_bytes, destination_length);
+
+  if (parent > 0 && stage1_host_create_directories_bytes(destination_bytes, parent) != 0) {
+    raz_rt_dealloc_aligned(source_bytes, 8);
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+    return -1;
+  }
+  stage1_host_remove_tree_bytes(destination_bytes, destination_length);
+  if (stage1_host_create_directories_bytes(destination_bytes, destination_length) != 0) {
+    raz_rt_dealloc_aligned(source_bytes, 8);
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+    return -1;
+  }
+
+  i64 listing = raz_rt_stage1_arena_create(4194304);
+
+  if (listing == 0) {
+    raz_rt_dealloc_aligned(source_bytes, 8);
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+    return -1;
+  }
+
+  i64 ll = raz_rt_stage1_tree_list_ascii(source, source_length, listing, 4194304);
+
+  if (ll < 0) {
+    raz_rt_stage1_arena_destroy(listing);
+    raz_rt_dealloc_aligned(source_bytes, 8);
+    raz_rt_dealloc_aligned(destination_bytes, 8);
+    return -1;
+  }
+
+  i64 pos = 0;
+
+  while (pos < ll) {
+    i64 start = pos;
+
+    while (pos < ll && raz_rt_stage1_arena_get(listing, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 rel_length = pos - start;
+
+    if (pos < ll) {
+      pos += 1;
+    }
+    if (rel_length <= 0) {
+      continue;
+    }
+
+    usize rel = stage1_ascii_pack(listing, start, rel_length);
+    usize from = stage1_host_join_bytes(source_bytes, source_length, rel, rel_length);
+    usize to = stage1_host_join_bytes(destination_bytes, destination_length, rel, rel_length);
+    i64 from_length = source_length + rel_length;
+
+    if (source_length > 0 && !stage1_host_separator(raz_rt_load_u8(source_bytes + source_length - 1))) {
+      from_length += 1;
+    }
+
+    i64 to_length = destination_length + rel_length;
+
+    if (
+    destination_length > 0 &&
+    !stage1_host_separator(raz_rt_load_u8(destination_bytes + destination_length - 1))
+    ) {
+      to_length += 1;
+    }
+
+    i64 to_parent = stage1_host_parent_length_bytes(to, to_length);
+    i64 status = 0;
+
+    if (to_parent > 0 && stage1_host_create_directories_bytes(to, to_parent) != 0) {
+      status = -1;
+    }
+    if (status == 0 && raz_rt_copy_file(from, from_length, to, to_length, 1) < 0) {
+      status = -1;
+    }
+    if (rel != 0) {
+      raz_rt_dealloc_aligned(rel, 8);
+    }
+    if (from != 0) {
+      raz_rt_dealloc_aligned(from, 8);
+    }
+    if (to != 0) {
+      raz_rt_dealloc_aligned(to, 8);
+    }
+    if (status != 0) {
+      raz_rt_stage1_arena_destroy(listing);
+      raz_rt_dealloc_aligned(source_bytes, 8);
+      raz_rt_dealloc_aligned(destination_bytes, 8);
+      return status;
+    }
+  }
+  raz_rt_stage1_arena_destroy(listing);
+  raz_rt_dealloc_aligned(source_bytes, 8);
+  raz_rt_dealloc_aligned(destination_bytes, 8);
+  return 0;
+}
+
+fn raz_rt_stage1_tool_available(i64 data, i64 length) -> i64 {
+  usize bytes = stage1_ascii_pack(data, 0, length);
+
+  if (length > 0 && bytes == 0) {
+    return 0;
+  }
+
+  i64 result = raz_rt_tool_available(bytes, length);
+
+  if (bytes != 0) {
+    raz_rt_dealloc_aligned(bytes, 8);
+  }
+  return result;
+}
+
+fn raz_rt_stage1_host_platform() -> i64 {
+  return raz_rt_host_platform();
+}

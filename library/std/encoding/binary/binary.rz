@@ -1,0 +1,271 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::encoding::binary;
+import core::bytes;
+import core::result;
+
+public enum CodecError {
+    EndOfInput,
+    OutputFull,
+    InvalidVarint,
+    LengthOverflow,
+}
+
+/// Bounded, allocation-free reader over a byte span.
+public struct BinaryReader {
+    usize data;
+    i64 length;
+    i64 position;
+}
+
+/// Bounded, allocation-free writer over caller-owned storage.
+public struct BinaryWriter {
+    usize data;
+    i64 capacity;
+    i64 position;
+}
+
+public fn reader(usize data, i64 length) -> BinaryReader {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return BinaryReader {
+            data: 0,
+            length: 0,
+            position: 0
+        };
+    }
+    return BinaryReader {
+        data: data,
+        length: length,
+        position: 0
+    };
+}
+
+public fn writer(usize data, i64 capacity) -> BinaryWriter {
+    if (capacity < 0 || (capacity > 0 && data == 0)) {
+        return BinaryWriter {
+            data: 0,
+            capacity: 0,
+            position: 0
+        };
+    }
+    return BinaryWriter {
+        data: data,
+        capacity: capacity,
+        position: 0
+    };
+}
+
+public fn reader_position(BinaryReader& value) -> i64 {
+    return value.position;
+}
+
+public fn reader_remaining(BinaryReader& value) -> i64 {
+    return value.length - value.position;
+}
+
+public fn writer_position(BinaryWriter& value) -> i64 {
+    return value.position;
+}
+
+public fn writer_remaining(BinaryWriter& value) -> i64 {
+    return value.capacity - value.position;
+}
+
+public fn read_u8(BinaryReader&mut value) -> Result<u8, CodecError> {
+    if (value.position < 0 || value.position >= value.length) {
+        return Result<u8, CodecError>::Error(CodecError::EndOfInput);
+    }
+
+    u8 output = core::bytes::load_u8(value.data + value.position)as u8;
+
+    value.position += 1;
+    return Result<u8, CodecError>::Ok(output);
+}
+
+public fn read_u16_be(BinaryReader&mut value) -> Result<u16, CodecError> {
+    u8 a = read_u8(value)?;
+    u8 b = read_u8(value)?;
+
+    return Result<u16, CodecError>::Ok(((a as u16) << 8) | (b as u16));
+}
+
+public fn read_u16_le(BinaryReader&mut value) -> Result<u16, CodecError> {
+    u8 a = read_u8(value)?;
+    u8 b = read_u8(value)?;
+
+    return Result<u16, CodecError>::Ok((a as u16) | ((b as u16) << 8));
+}
+
+public fn read_u32_be(BinaryReader&mut value) -> Result<u32, CodecError> {
+    u16 a = read_u16_be(value)?;
+    u16 b = read_u16_be(value)?;
+
+    return Result<u32, CodecError>::Ok(((a as u32) << 16) | (b as u32));
+}
+
+public fn read_u32_le(BinaryReader&mut value) -> Result<u32, CodecError> {
+    u16 a = read_u16_le(value)?;
+    u16 b = read_u16_le(value)?;
+
+    return Result<u32, CodecError>::Ok((a as u32) | ((b as u32) << 16));
+}
+
+public fn read_u64_be(BinaryReader&mut value) -> Result<u64, CodecError> {
+    u32 first = read_u32_be(value)?;
+    u32 second = read_u32_be(value)?;
+    u64 a = first as u64;
+    u64 b = second as u64;
+
+    return Result<u64, CodecError>::Ok((a << 32) | b);
+}
+
+public fn read_u64_le(BinaryReader&mut value) -> Result<u64, CodecError> {
+    u32 first = read_u32_le(value)?;
+    u32 second = read_u32_le(value)?;
+    u64 a = first as u64;
+    u64 b = second as u64;
+
+    return Result<u64, CodecError>::Ok(a | (b << 32));
+}
+
+public fn read_bytes(BinaryReader&mut value, i64 length) -> Result<BytesView, CodecError> {
+    if (length < 0 || length > reader_remaining(value)) {
+        return Result<BytesView, CodecError>::Error(CodecError::EndOfInput);
+    }
+    BytesView output = BytesView {
+        data: value.data + value.position,
+        length: length
+    };
+    value.position += length;
+    return Result<BytesView, CodecError>::Ok(output);
+}
+
+public fn read_var_u64(BinaryReader&mut value) -> Result<u64, CodecError> {
+    u64 output = 0;
+    i64 shift = 0;
+    i64 count = 0;
+
+    while (count < 10) {
+        u8 raw_byte = read_u8(value)?;
+        u64 byte = raw_byte as u64;
+
+        if (count == 9 && (byte & 254) != 0) {
+            return Result<u64, CodecError>::Error(CodecError::InvalidVarint);
+        }
+        output |= ((byte & 127)as u64) << shift;
+        if ((byte & 128) == 0) {
+            return Result<u64, CodecError>::Ok(output);
+        }
+        shift += 7;
+        count += 1;
+    }
+    return Result<u64, CodecError>::Error(CodecError::InvalidVarint);
+}
+
+public fn read_var_i64(BinaryReader&mut value) -> Result<i64, CodecError> {
+    u64 encoded = read_var_u64(value)?;
+    i64 decoded = (encoded >> 1)as i64;
+
+    if ((encoded & 1) != 0) {
+        decoded = -decoded - 1;
+    }
+    return Result<i64, CodecError>::Ok(decoded);
+}
+
+public fn write_u8(BinaryWriter&mut value, u8 input) -> Result<bool, CodecError> {
+    if (value.position < 0 || value.position >= value.capacity) {
+        return Result<bool, CodecError>::Error(CodecError::OutputFull);
+    }
+    core::bytes::store_u8(value.data + value.position, input as i64);
+    value.position += 1;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u16_be(BinaryWriter&mut value, u16 input) -> Result<bool, CodecError> {
+    write_u8(value, (input >> 8)as u8)?;
+    write_u8(value, input as u8)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u16_le(BinaryWriter&mut value, u16 input) -> Result<bool, CodecError> {
+    write_u8(value, input as u8)?;
+    write_u8(value, (input >> 8)as u8)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u32_be(BinaryWriter&mut value, u32 input) -> Result<bool, CodecError> {
+    write_u16_be(value, (input >> 16)as u16)?;
+    write_u16_be(value, input as u16)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u32_le(BinaryWriter&mut value, u32 input) -> Result<bool, CodecError> {
+    write_u16_le(value, input as u16)?;
+    write_u16_le(value, (input >> 16)as u16)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u64_be(BinaryWriter&mut value, u64 input) -> Result<bool, CodecError> {
+    write_u32_be(value, (input >> 32)as u32)?;
+    write_u32_be(value, input as u32)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_u64_le(BinaryWriter&mut value, u64 input) -> Result<bool, CodecError> {
+    write_u32_le(value, input as u32)?;
+    write_u32_le(value, (input >> 32)as u32)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_bytes(BinaryWriter&mut value, usize data, i64 length) -> Result<bool, CodecError> {
+    if (length < 0 || length > writer_remaining(value) || (length > 0 && data == 0)) {
+        return Result<bool, CodecError>::Error(CodecError::OutputFull);
+    }
+    if (length > 0) {
+        core::bytes::copy_into(value.data + value.position, writer_remaining(value), BytesView {
+            data: data,
+            length: length
+        }
+        );
+    }
+    value.position += length;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_var_u64(BinaryWriter&mut value, u64 input) -> Result<bool, CodecError> {
+    u64 remaining = input;
+
+    while (remaining >= 128) {
+        write_u8(value, ((remaining & 127) | 128)as u8)?;
+        remaining >>= 7;
+    }
+    write_u8(value, remaining as u8)?;
+    return Result<bool, CodecError>::Ok(true);
+}
+
+public fn write_var_i64(BinaryWriter&mut value, i64 input) -> Result<bool, CodecError> {
+    u64 encoded = (input as u64) << 1;
+
+    if (input < 0) {
+        encoded = ((-input - 1)as u64) << 1 | 1;
+    }
+    return write_var_u64(value, encoded);
+}
+
+public fn write_length_prefixed(BinaryWriter&mut value, usize data, i64 length) -> Result<bool, CodecError> {
+    if (length < 0) {
+        return Result<bool, CodecError>::Error(CodecError::LengthOverflow);
+    }
+    write_var_u64(value, length as u64)?;
+    return write_bytes(value, data, length);
+}
+
+public fn read_length_prefixed(BinaryReader&mut value, i64 maximum) -> Result<BytesView, CodecError> {
+    u64 encoded = read_var_u64(value)?;
+
+    if (encoded > 9223372036854775807 || (maximum >= 0 && encoded > maximum as u64)) {
+        return Result<BytesView, CodecError>::Error(CodecError::LengthOverflow);
+    }
+    return read_bytes(value, encoded as i64);
+}

@@ -1,0 +1,236 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::future;
+import std::sync::mutex;
+import std::sync::condition;
+import std::time;
+// Raz-native one-shot future. The runtime contributes only mutex/condition
+// and clock primitives; state transitions, cancellation, timeout accounting,
+// result storage, and wake policy are implemented here.
+public struct FutureI64 {
+    Mutex mutex;
+    Condition condition;
+    i64 state;
+    i64 value;
+}
+
+public struct FutureResultI64 {
+    i64 state;
+    i64 value;
+}
+
+public fn create() -> FutureI64 {
+    Mutex mutex = std::sync::mutex::create();
+    Condition condition = std::sync::condition::create();
+
+    return FutureI64 {
+        mutex: move mutex,
+        condition: move condition,
+        state: 0,
+        value: 0
+    };
+}
+
+public fn valid(FutureI64& future) -> bool {
+    return std::sync::mutex::valid(&future.mutex) && std::sync::condition::valid(&future.condition);
+}
+
+public fn status(FutureI64&mut future) -> i64 {
+    if (!valid(future)) {
+        return -2;
+    }
+    std::sync::mutex::lock(&future.mutex);
+
+    i64 result = future.state;
+
+    std::sync::mutex::unlock(&future.mutex);
+    return result;
+}
+
+public fn is_pending(FutureI64&mut future) -> bool {
+    return status(future) == 0;
+}
+
+public fn is_completed(FutureI64&mut future) -> bool {
+    return status(future) == 1;
+}
+
+public fn is_cancelled(FutureI64&mut future) -> bool {
+    return status(future) == -1;
+}
+
+public fn complete(FutureI64&mut future, i64 value) -> bool {
+    if (!valid(future)) {
+        return false;
+    }
+    std::sync::mutex::lock(&future.mutex);
+    if (future.state != 0) {
+        std::sync::mutex::unlock(&future.mutex);
+        return false;
+    }
+    future.value = value;
+    future.state = 1;
+    std::sync::mutex::unlock(&future.mutex);
+    std::sync::condition::notify_all(&future.condition);
+    return true;
+}
+
+public fn cancel(FutureI64&mut future) -> bool {
+    if (!valid(future)) {
+        return false;
+    }
+    std::sync::mutex::lock(&future.mutex);
+    if (future.state != 0) {
+        std::sync::mutex::unlock(&future.mutex);
+        return false;
+    }
+    future.state = -1;
+    std::sync::mutex::unlock(&future.mutex);
+    std::sync::condition::notify_all(&future.condition);
+    return true;
+}
+
+fn deadline(i64 timeout_millis) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (timeout_millis <= 0) {
+        return now;
+    }
+    if (timeout_millis > 9223372036854) {
+        return 9223372036854775807;
+    }
+
+    i64 delta = timeout_millis * 1000000;
+
+    if (now > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return now + delta;
+}
+
+fn remaining_millis(i64 until) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (now >= until) {
+        return 0;
+    }
+
+    i64 remaining = until - now;
+    i64 millis = remaining / 1000000;
+
+    if (remaining % 1000000 != 0) {
+        millis += 1;
+    }
+    return millis;
+}
+
+public fn wait(FutureI64&mut future) -> FutureResultI64 {
+    if (!valid(future)) {
+        return FutureResultI64 {
+            state: -2,
+            value: 0
+        };
+    }
+    std::sync::mutex::lock(&future.mutex);
+    while (future.state == 0) {
+        std::sync::condition::wait(&future.condition, &future.mutex);
+    }
+    FutureResultI64 result = FutureResultI64 {
+        state: future.state,
+        value: future.value
+    };
+    std::sync::mutex::unlock(&future.mutex);
+    return result;
+}
+
+// state: 1 completed, -1 cancelled, 0 timeout, -2 invalid.
+public fn wait_millis(FutureI64&mut future, i64 timeout_millis) -> FutureResultI64 {
+    if (!valid(future) || timeout_millis < 0) {
+        return FutureResultI64 {
+            state: -2,
+            value: 0
+        };
+    }
+
+    i64 until = deadline(timeout_millis);
+
+    std::sync::mutex::lock(&future.mutex);
+    while (future.state == 0) {
+        i64 remaining = remaining_millis(until);
+
+        if (remaining <= 0) {
+            std::sync::mutex::unlock(&future.mutex);
+            return FutureResultI64 {
+                state: 0,
+                value: 0
+            };
+        }
+        std::sync::condition::wait_millis(&future.condition, &future.mutex, remaining);
+    }
+    FutureResultI64 result = FutureResultI64 {
+        state: future.state,
+        value: future.value
+    };
+    std::sync::mutex::unlock(&future.mutex);
+    return result;
+}
+
+public fn try_result(FutureI64&mut future) -> FutureResultI64 {
+    if (!valid(future)) {
+        return FutureResultI64 {
+            state: -2,
+            value: 0
+        };
+    }
+    std::sync::mutex::lock(&future.mutex);
+    FutureResultI64 result = FutureResultI64 {
+        state: future.state,
+        value: future.value
+    };
+    std::sync::mutex::unlock(&future.mutex);
+    return result;
+}
+
+// Minimal native future kernel retained for compiler-generated async frames
+// and the low-level I/O reactor. High-level future composition belongs in Raz.
+extern fn raz_rt_future_create() -> i8*mut;
+extern fn raz_rt_future_complete_i64(i8*mut future, i64 value) -> i64;
+extern fn raz_rt_future_cancel(i8*mut future) -> i64;
+extern fn raz_rt_future_status(i8*mut future) -> i64;
+extern fn raz_rt_future_wait_millis(i8*mut future, i64 timeout_millis) -> i64;
+extern fn raz_rt_future_result_i64(i8*mut future, i64*mut output) -> i64;
+extern fn raz_rt_future_then_i64(i8*mut future, i64 continuation_address, i8*mut context) -> i64;
+extern fn raz_rt_future_destroy(i8*mut future);
+
+public fn future_create() -> i8*mut {
+    return raz_rt_future_create();
+}
+
+public fn future_complete_i64(i8*mut future, i64 value) -> bool {
+    return raz_rt_future_complete_i64(future, value) == 1;
+}
+
+public fn future_cancel(i8*mut future) -> bool {
+    return raz_rt_future_cancel(future) == 1;
+}
+
+public fn future_status(i8*mut future) -> i64 {
+    return raz_rt_future_status(future);
+}
+
+public fn future_wait_millis(i8*mut future, i64 timeout_millis) -> i64 {
+    return raz_rt_future_wait_millis(future, timeout_millis);
+}
+
+public unsafe fn future_result_i64(i8*mut future, i64*mut output) -> i64 {
+    return raz_rt_future_result_i64(future, output);
+}
+
+public unsafe fn future_then_i64(i8*mut future, i64 continuation_address, i8*mut context) -> bool {
+    return raz_rt_future_then_i64(future, continuation_address, context) == 1;
+}
+
+public fn future_destroy(i8*mut future) {
+    raz_rt_future_destroy(future);
+}

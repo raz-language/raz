@@ -1,0 +1,1941 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_project;
+public import raz_compiler_driver_incremental;
+// Project loading for raz.toml packages, deterministic source ordering, and
+// compiler diagnostics used before the frontend begins parsing source text.
+fn write_stage1_diagnostic(i64 phase, i64 code, i64 offset) {
+  // Diagnostics are tiny. Do not allocate the normal 8 Mi-entry Forge writer
+  // merely to write a three-integer progress record during recursive bootstrap.
+  // Keeping this path small also makes the very first Stage 2 diagnostic useful
+  // when debugging generated-code startup.
+
+  ForgeWriter out;
+
+  out.capacity = 128;
+  out.data = raz_rt_stage1_arena_create(out.capacity);
+  out.length = 0;
+  out.failed = out.data == 0;
+  if (out.failed) {
+    writer_destroy(&mut out);
+    return;
+  }
+  writer_decimal(&mut out, phase);
+  writer_space(&mut out);
+  writer_decimal(&mut out, code);
+  writer_space(&mut out);
+  writer_decimal(&mut out, offset);
+  writer_newline(&mut out);
+
+  i64 path[21] = [115, 116, 97, 103, 101, 49, 45, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 46, 116, 120, 116];
+
+  raz_rt_write_ascii_i64(&mut path[0], 21, out.data, out.length);
+  writer_destroy(&mut out);
+}
+
+fn path_is_check_option(i64 path, i64 length) -> bool {
+  if (path == 0 || length != 7) {
+    return false;
+  }
+
+  i64 expected[7] = [45, 45, 99, 104, 101, 99, 107];
+  i64 index = 0;
+
+  while (index < 7) {
+    if (raz_rt_stage1_arena_get(path, index) != expected[index]) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
+}
+
+fn path_has_rz_extension(i64 path, i64 length) -> bool {
+  if (path == 0 || length < 3) {
+    return false;
+  }
+  return (
+  raz_rt_stage1_arena_get(path, length - 3) == 46 &&
+  raz_rt_stage1_arena_get(path, length - 2) == 114 &&
+  raz_rt_stage1_arena_get(path, length - 1) == 122
+  );
+}
+
+fn path_range_has_rz_extension(i64 path, i64 start, i64 length) -> bool {
+  if (path == 0 || length < 3) {
+    return false;
+  }
+  return (
+  raz_rt_stage1_arena_get(path, start + length - 3) == 46 &&
+  raz_rt_stage1_arena_get(path, start + length - 2) == 114 &&
+  raz_rt_stage1_arena_get(path, start + length - 1) == 122
+  );
+}
+
+fn path_has_toml_extension(i64 path, i64 length) -> bool {
+  if (path == 0 || length < 5) {
+    return false;
+  }
+  return (
+  raz_rt_stage1_arena_get(path, length - 5) == 46 &&
+  raz_rt_stage1_arena_get(path, length - 4) == 116 &&
+  raz_rt_stage1_arena_get(path, length - 3) == 111 &&
+  raz_rt_stage1_arena_get(path, length - 2) == 109 &&
+  raz_rt_stage1_arena_get(path, length - 1) == 108
+  );
+}
+
+fn ascii_is_space(i64 value) -> bool {
+  return value == 32 || value == 9 || value == 13;
+}
+
+fn path_dirname(i64 path, i64 length, i64 output, i64 capacity) -> i64 {
+  if (path == 0 || output == 0 || length <= 0 || capacity <= 0) {
+    return -1;
+  }
+
+  i64 end = length;
+
+  while (
+  end > 0 &&
+  raz_rt_stage1_arena_get(path, end - 1) != 47 &&
+  raz_rt_stage1_arena_get(path, end - 1) != 92
+  ) {
+    end -= 1;
+  }
+  if (end == 0) {
+    if (capacity < 1) {
+      return -1;
+    }
+    raz_rt_stage1_arena_set(output, 0, 46);
+    return 1;
+  }
+
+  i64 count = end - 1;
+
+  if (count <= 0) {
+    count = 1;
+  }
+  if (count > capacity) {
+    return -1;
+  }
+
+  i64 index = 0;
+
+  while (index < count) {
+    raz_rt_stage1_arena_set(output, index, raz_rt_stage1_arena_get(path, index));
+    index += 1;
+  }
+  return count;
+}
+
+fn path_join(i64 left, i64 left_length, i64 right, i64 right_length, i64 output, i64 capacity) -> i64 {
+  if (left == 0 || right == 0 || output == 0 || left_length < 0 || right_length < 0) {
+    return -1;
+  }
+
+  i64 right_start = 0;
+  i64 right_count = right_length;
+
+  if (
+  right_length >= 2 &&
+  raz_rt_stage1_arena_get(right, 0) == 34 &&
+  raz_rt_stage1_arena_get(right, right_length - 1) == 34
+  ) {
+    right_start = 1;
+    right_count = right_length - 2;
+  }
+  bool right_absolute =
+  right_count > 0 &&
+  (
+  raz_rt_stage1_arena_get(right, right_start) == 47 ||
+  raz_rt_stage1_arena_get(right, right_start) == 92
+  );
+  if (!right_absolute && right_count >= 2) {
+    i64 drive = raz_rt_stage1_arena_get(right, right_start);
+    i64 colon = raz_rt_stage1_arena_get(right, right_start + 1);
+
+    right_absolute = ((drive >= 65 && drive <= 90) || (drive >= 97 && drive <= 122)) && colon == 58;
+  }
+  if (right_absolute) {
+    if (right_count > capacity) {
+      return -1;
+    }
+
+    i64 absolute_index = 0;
+
+    while (absolute_index < right_count) {
+      raz_rt_stage1_arena_set(
+      output,
+      absolute_index,
+      raz_rt_stage1_arena_get(right, right_start + absolute_index),
+      );
+      absolute_index += 1;
+    }
+    return right_count;
+  }
+  bool separator =
+  left_length > 0 &&
+  raz_rt_stage1_arena_get(left, left_length - 1) != 47 &&
+  raz_rt_stage1_arena_get(left, left_length - 1) != 92;
+  i64 total = left_length + right_count;
+
+  if (separator) {
+    total += 1;
+  }
+  if (total > capacity) {
+    return -1;
+  }
+
+  i64 index = 0;
+
+  while (index < left_length) {
+    raz_rt_stage1_arena_set(output, index, raz_rt_stage1_arena_get(left, index));
+    index += 1;
+  }
+  if (separator) {
+    raz_rt_stage1_arena_set(output, index, 47);
+    index += 1;
+  }
+
+  i64 right_index = 0;
+
+  while (right_index < right_count) {
+    raz_rt_stage1_arena_set(output, index, raz_rt_stage1_arena_get(right, right_start + right_index));
+    index += 1;
+    right_index += 1;
+  }
+  return index;
+}
+
+fn line_is_section(i64 data, i64 start, i64 end, i64 kind) -> bool {
+  while (start < end && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (end > start && ascii_is_space(raz_rt_stage1_arena_get(data, end - 1))) {
+    end -= 1;
+  }
+  if (kind == 1) {
+    if (end - start != 9) {
+      return false;
+    }
+
+    i64 expected[9] = [91, 112, 97, 99, 107, 97, 103, 101, 93];
+    i64 i = 0;
+
+    while (i < 9) {
+      if (raz_rt_stage1_arena_get(data, start + i) != expected[i]) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+  if (kind == 2) {
+    if (end - start != 14) {
+      return false;
+    }
+
+    i64 expected[14] = [91, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 93];
+    i64 i = 0;
+
+    while (i < 14) {
+      if (raz_rt_stage1_arena_get(data, start + i) != expected[i]) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+fn line_key_is_source(i64 data, i64 start, i64 equal) -> bool {
+  while (start < equal && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (equal > start && ascii_is_space(raz_rt_stage1_arena_get(data, equal - 1))) {
+    equal -= 1;
+  }
+  if (equal - start != 6) {
+    return false;
+  }
+
+  i64 expected[6] = [115, 111, 117, 114, 99, 101];
+  i64 i = 0;
+
+  while (i < 6) {
+    if (raz_rt_stage1_arena_get(data, start + i) != expected[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn line_key_is_name(i64 data, i64 start, i64 equal) -> bool {
+  while (start < equal && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (equal > start && ascii_is_space(raz_rt_stage1_arena_get(data, equal - 1))) {
+    equal -= 1;
+  }
+  if (equal - start != 4) {
+    return false;
+  }
+
+  i64 expected[4] = [110, 97, 109, 101];
+  i64 i = 0;
+
+  while (i < 4) {
+    if (raz_rt_stage1_arena_get(data, start + i) != expected[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn line_key_is_entry(i64 data, i64 start, i64 equal) -> bool {
+  while (start < equal && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (equal > start && ascii_is_space(raz_rt_stage1_arena_get(data, equal - 1))) {
+    equal -= 1;
+  }
+  if (equal - start != 5) {
+    return false;
+  }
+
+  i64 expected[5] = [101, 110, 116, 114, 121];
+  i64 i = 0;
+
+  while (i < 5) {
+    if (raz_rt_stage1_arena_get(data, start + i) != expected[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn copy_quoted_value(i64 data, i64 start, i64 end, i64 output, i64 capacity) -> i64 {
+  while (start < end && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (end > start && ascii_is_space(raz_rt_stage1_arena_get(data, end - 1))) {
+    end -= 1;
+  }
+  if (
+  end - start < 2 ||
+  raz_rt_stage1_arena_get(data, start) != 34 ||
+  raz_rt_stage1_arena_get(data, end - 1) != 34
+  ) {
+    return -1;
+  }
+  start += 1;
+  end -= 1;
+
+  i64 length = end - start;
+
+  if (length > capacity) {
+    return -1;
+  }
+
+  i64 i = 0;
+
+  while (i < length) {
+    raz_rt_stage1_arena_set(output, i, raz_rt_stage1_arena_get(data, start + i));
+    i += 1;
+  }
+  return length;
+}
+
+fn manifest_package_name(i64 manifest, i64 length, i64 output, i64 capacity) -> i64 {
+  i64 section = 0;
+  i64 cursor = 0;
+
+  while (cursor < length) {
+    i64 start = cursor;
+
+    while (
+    cursor < length &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 10 &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor < length &&
+    (
+    raz_rt_stage1_arena_get(manifest, cursor) == 10 ||
+    raz_rt_stage1_arena_get(manifest, cursor) == 13
+    )
+    ) {
+      cursor += 1;
+    }
+    if (line_is_section(manifest, start, end, 1)) {
+      section = 1;
+    } else if (start < end && raz_rt_stage1_arena_get(manifest, start) == 91) {
+      section = 0;
+    } else if (section == 1) {
+      i64 equal = start;
+
+      while (equal < end && raz_rt_stage1_arena_get(manifest, equal) != 61) {
+        equal += 1;
+      }
+      if (equal < end && line_key_is_name(manifest, start, equal)) {
+        return copy_quoted_value(manifest, equal + 1, end, output, capacity);
+      }
+    }
+  }
+  return -1;
+}
+
+fn manifest_source_directory(i64 manifest, i64 length, i64 output, i64 capacity) -> i64 {
+  if (capacity < 3) {
+    return -1;
+  }
+  raz_rt_stage1_arena_set(output, 0, 115);
+  raz_rt_stage1_arena_set(output, 1, 114);
+  raz_rt_stage1_arena_set(output, 2, 99);
+
+  i64 result = 3;
+  i64 section = 0;
+  i64 cursor = 0;
+
+  while (cursor < length) {
+    i64 start = cursor;
+
+    while (
+    cursor < length &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 10 &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor < length &&
+    (
+    raz_rt_stage1_arena_get(manifest, cursor) == 10 ||
+    raz_rt_stage1_arena_get(manifest, cursor) == 13
+    )
+    ) {
+      cursor += 1;
+    }
+    if (line_is_section(manifest, start, end, 1)) {
+      section = 1;
+    } else if (start < end && raz_rt_stage1_arena_get(manifest, start) == 91) {
+      section = 0;
+    } else if (section == 1) {
+      i64 equal = start;
+
+      while (equal < end && raz_rt_stage1_arena_get(manifest, equal) != 61) {
+        equal += 1;
+      }
+      if (equal < end && line_key_is_source(manifest, start, equal)) {
+        i64 value_length = copy_quoted_value(manifest, equal + 1, end, output, capacity);
+
+        if (value_length < 0) {
+          return -1;
+        }
+        result = value_length;
+      }
+    }
+  }
+  return result;
+}
+
+fn manifest_entry_path(i64 manifest, i64 length, i64 output, i64 capacity) -> i64 {
+  if (capacity < 13) {
+    return -1;
+  }
+  raz_rt_stage1_arena_set(output, 0, 115);
+  raz_rt_stage1_arena_set(output, 1, 114);
+  raz_rt_stage1_arena_set(output, 2, 99);
+  raz_rt_stage1_arena_set(output, 3, 47);
+  raz_rt_stage1_arena_set(output, 4, 109);
+  raz_rt_stage1_arena_set(output, 5, 97);
+  raz_rt_stage1_arena_set(output, 6, 105);
+  raz_rt_stage1_arena_set(output, 7, 110);
+  raz_rt_stage1_arena_set(output, 8, 46);
+  raz_rt_stage1_arena_set(output, 9, 120);
+  raz_rt_stage1_arena_set(output, 10, 121);
+  raz_rt_stage1_arena_set(output, 11, 102);
+  raz_rt_stage1_arena_set(output, 12, 116);
+
+  i64 result = 13;
+  i64 section = 0;
+  i64 cursor = 0;
+
+  while (cursor < length) {
+    i64 start = cursor;
+
+    while (
+    cursor < length &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 10 &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor < length &&
+    (
+    raz_rt_stage1_arena_get(manifest, cursor) == 10 ||
+    raz_rt_stage1_arena_get(manifest, cursor) == 13
+    )
+    ) {
+      cursor += 1;
+    }
+    if (line_is_section(manifest, start, end, 1)) {
+      section = 1;
+    } else if (start < end && raz_rt_stage1_arena_get(manifest, start) == 91) {
+      section = 0;
+    } else if (section == 1) {
+      i64 equal = start;
+
+      while (equal < end && raz_rt_stage1_arena_get(manifest, equal) != 61) {
+        equal += 1;
+      }
+      if (equal < end && line_key_is_entry(manifest, start, equal)) {
+        i64 value_length = copy_quoted_value(manifest, equal + 1, end, output, capacity);
+
+        if (value_length < 0) {
+          return -1;
+        }
+        result = value_length;
+      }
+    }
+  }
+  return result;
+}
+
+fn append_project_namespace(
+i64 bytes,
+i64&mut length,
+i64 source_capacity,
+i64 package_name,
+i64 package_name_length,
+) -> bool {
+  // Keep package provenance independent from source namespaces. An explicit
+  // `namespace` in the module may replace the default namespace, while the
+  // internal package marker continues to govern package visibility.
+  if (
+  package_name == 0 ||
+  package_name_length <= 0 ||
+  *length + package_name_length * 2 + 48 >= source_capacity
+  ) {
+    return false;
+  }
+
+  i64 package_prefix[14] = [95, 95, 114, 97, 122, 95, 112, 97, 99, 107, 97, 103, 101, 32];
+  i64 i = 0;
+
+  while (i < 14) {
+    raz_rt_stage1_arena_set(bytes, *length, package_prefix[i]);
+    *length += 1;
+    i += 1;
+  }
+  i = 0;
+  while (i < package_name_length) {
+    i64 value = raz_rt_stage1_arena_get(package_name, i);
+
+    if (value == 45 || value == 46 || value == 47 || value == 92) {
+      value = 95;
+    }
+    raz_rt_stage1_arena_set(bytes, *length, value);
+    *length += 1;
+    i += 1;
+  }
+  raz_rt_stage1_arena_set(bytes, *length, 59);
+  *length += 1;
+  raz_rt_stage1_arena_set(bytes, *length, 10);
+  *length += 1;
+
+  i64 module_marker[14] = [95, 95, 114, 97, 122, 95, 109, 111, 100, 117, 108, 101, 59, 10];
+
+  i = 0;
+  while (i < 14) {
+    raz_rt_stage1_arena_set(bytes, *length, module_marker[i]);
+    *length += 1;
+    i += 1;
+  }
+
+  i64 namespace_prefix[10] = [110, 97, 109, 101, 115, 112, 97, 99, 101, 32];
+
+  i = 0;
+  while (i < 10) {
+    raz_rt_stage1_arena_set(bytes, *length, namespace_prefix[i]);
+    *length += 1;
+    i += 1;
+  }
+  i = 0;
+  while (i < package_name_length) {
+    i64 value = raz_rt_stage1_arena_get(package_name, i);
+
+    if (value == 45 || value == 46 || value == 47 || value == 92) {
+      value = 95;
+    }
+    raz_rt_stage1_arena_set(bytes, *length, value);
+    *length += 1;
+    i += 1;
+  }
+  raz_rt_stage1_arena_set(bytes, *length, 59);
+  *length += 1;
+  raz_rt_stage1_arena_set(bytes, *length, 10);
+  *length += 1;
+  return true;
+}
+
+fn copy_manifest_key(i64 data, i64 start, i64 equal, i64 output, i64 capacity) -> i64 {
+  while (start < equal && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (equal > start && ascii_is_space(raz_rt_stage1_arena_get(data, equal - 1))) {
+    equal -= 1;
+  }
+
+  i64 length = equal - start;
+
+  if (length <= 0 || length > capacity) {
+    return -1;
+  }
+
+  i64 index = 0;
+
+  while (index < length) {
+    raz_rt_stage1_arena_set(output, index, raz_rt_stage1_arena_get(data, start + index));
+    index += 1;
+  }
+  return length;
+}
+
+fn append_project_dependency_alias(
+i64 bytes,
+i64&mut length,
+i64 source_capacity,
+i64 package_name,
+i64 package_name_length,
+i64 alias,
+i64 alias_length,
+i64 target_package,
+i64 target_package_length,
+) -> bool {
+  if (
+  alias_length <= 0 ||
+  target_package_length <= 0 ||
+  *length + package_name_length + alias_length + target_package_length + 48 >= source_capacity
+  ) {
+    return false;
+  }
+
+  i64 package_prefix[14] = [95, 95, 114, 97, 122, 95, 112, 97, 99, 107, 97, 103, 101, 32];
+  i64 index = 0;
+
+  while (index < 14) {
+    raz_rt_stage1_arena_set(bytes, *length, package_prefix[index]);
+    *length += 1;
+    index += 1;
+  }
+  index = 0;
+  while (index < package_name_length) {
+    i64 value = raz_rt_stage1_arena_get(package_name, index);
+
+    if (value == 45 || value == 46 || value == 47 || value == 92) {
+      value = 95;
+    }
+    raz_rt_stage1_arena_set(bytes, *length, value);
+    *length += 1;
+    index += 1;
+  }
+  raz_rt_stage1_arena_set(bytes, *length, 59);
+  *length += 1;
+  raz_rt_stage1_arena_set(bytes, *length, 10);
+  *length += 1;
+
+  i64 dependency_prefix[17] = [95, 95, 114, 97, 122, 95, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32];
+
+  index = 0;
+  while (index < 17) {
+    raz_rt_stage1_arena_set(bytes, *length, dependency_prefix[index]);
+    *length += 1;
+    index += 1;
+  }
+  index = 0;
+  while (index < alias_length) {
+    raz_rt_stage1_arena_set(bytes, *length, raz_rt_stage1_arena_get(alias, index));
+    *length += 1;
+    index += 1;
+  }
+  raz_rt_stage1_arena_set(bytes, *length, 32);
+  *length += 1;
+  index = 0;
+  while (index < target_package_length) {
+    i64 value = raz_rt_stage1_arena_get(target_package, index);
+
+    if (value == 45 || value == 46 || value == 47 || value == 92) {
+      value = 95;
+    }
+    raz_rt_stage1_arena_set(bytes, *length, value);
+    *length += 1;
+    index += 1;
+  }
+  raz_rt_stage1_arena_set(bytes, *length, 59);
+  *length += 1;
+  raz_rt_stage1_arena_set(bytes, *length, 10);
+  *length += 1;
+  return true;
+}
+
+fn append_source_path(
+i64 path,
+i64 path_length,
+i64 bytes,
+i64&mut length,
+i64 source_capacity,
+i64 module_capacity,
+) -> bool {
+  i64 module_bytes = raz_rt_stage1_arena_create(module_capacity);
+
+  if (module_bytes == 0) {
+    return false;
+  }
+
+  i64 module_length = raz_rt_stage1_read_ascii(path, path_length, module_bytes, module_capacity);
+
+  if (
+  module_length <= 0 ||
+  module_length >= module_capacity ||
+  *length + module_length + 1 >= source_capacity
+  ) {
+    raz_rt_stage1_arena_destroy(module_bytes);
+    return false;
+  }
+  if (raz_rt_stage1_arena_copy(bytes, *length, module_bytes, 0, module_length) != module_length) {
+    raz_rt_stage1_arena_destroy(module_bytes);
+    return false;
+  }
+  *length += module_length;
+
+  i64 final_byte = raz_rt_stage1_arena_get(module_bytes, module_length - 1);
+
+  if (final_byte != 10 && final_byte != 13) {
+    raz_rt_stage1_arena_set(bytes, *length, 10);
+    *length += 1;
+  }
+  raz_rt_stage1_arena_destroy(module_bytes);
+  return true;
+}
+
+fn path_bytes_equal(i64 left, i64 left_length, i64 right, i64 right_length) -> bool {
+  i64 left_start = 0;
+  i64 right_start = 0;
+
+  if (
+  left_length >= 2 &&
+  raz_rt_stage1_arena_get(left, 0) == 46 &&
+  (raz_rt_stage1_arena_get(left, 1) == 47 || raz_rt_stage1_arena_get(left, 1) == 92)
+  ) {
+    left_start = 2;
+  }
+  if (
+  right_length >= 2 &&
+  raz_rt_stage1_arena_get(right, 0) == 46 &&
+  (raz_rt_stage1_arena_get(right, 1) == 47 || raz_rt_stage1_arena_get(right, 1) == 92)
+  ) {
+    right_start = 2;
+  }
+  if (left_length - left_start != right_length - right_start) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i < left_length - left_start) {
+    i64 a = raz_rt_stage1_arena_get(left, left_start + i);
+    i64 b = raz_rt_stage1_arena_get(right, right_start + i);
+
+    if (a == 92) {
+      a = 47;
+    }
+    if (b == 92) {
+      b = 47;
+    }
+    if (a != b) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn path_list_contains(i64 list, i64 list_length, i64 path, i64 path_length) -> bool {
+  i64 cursor = 0;
+
+  while (cursor < list_length) {
+    i64 start = cursor;
+
+    while (cursor < list_length && raz_rt_stage1_arena_get(list, cursor) != 10) {
+      cursor += 1;
+    }
+
+    i64 line_length = cursor - start;
+
+    if (line_length == path_length) {
+      i64 i = 0;
+      bool same = true;
+
+      while (same && i < path_length) {
+        if (raz_rt_stage1_arena_get(list, start + i) != raz_rt_stage1_arena_get(path, i)) {
+          same = false;
+        }
+        i += 1;
+      }
+      if (same) {
+        return true;
+      }
+    }
+    if (cursor < list_length) {
+      cursor += 1;
+    }
+  }
+  return false;
+}
+
+fn path_list_append(i64 list, i64&mut list_length, i64 capacity, i64 path, i64 path_length) -> bool {
+  if (*list_length + path_length + 1 > capacity) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i < path_length) {
+    raz_rt_stage1_arena_set(list, *list_length, raz_rt_stage1_arena_get(path, i));
+    *list_length += 1;
+    i += 1;
+  }
+  raz_rt_stage1_arena_set(list, *list_length, 10);
+  *list_length += 1;
+  return true;
+}
+
+
+fn project_line_starts_with(i64 data, i64 start, i64 end, i64[] text, i64 length) -> bool {
+  while (start < end && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  if (end - start < length) {
+    return false;
+  }
+
+  i64 index = 0;
+
+  while (index < length) {
+    if (raz_rt_stage1_arena_get(data, start + index) != text[index]) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
+}
+
+fn project_hash_namespace_range(i64 data, i64 start, i64 end) -> i64 {
+  while (start < end && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+    start += 1;
+  }
+  while (end > start && ascii_is_space(raz_rt_stage1_arena_get(data, end - 1))) {
+    end -= 1;
+  }
+  if (end > start && raz_rt_stage1_arena_get(data, end - 1) == 59) {
+    end -= 1;
+  }
+  while (end > start && ascii_is_space(raz_rt_stage1_arena_get(data, end - 1))) {
+    end -= 1;
+  }
+  if (end <= start) {
+    return 0;
+  }
+  return raz_rt_stage1_arena_range_hash(data, start, end - start, 17);
+}
+
+fn project_module_namespace_hash(i64 data, i64 length, i64 package_name, i64 package_name_length) -> i64 {
+  i64 cursor = 0;
+
+  while (cursor < length) {
+    i64 start = cursor;
+
+    while (cursor < length && raz_rt_stage1_arena_get(data, cursor) != 10 && raz_rt_stage1_arena_get(data, cursor) != 13) {
+      cursor += 1;
+    }
+    i64 end = cursor;
+    while (cursor < length && (raz_rt_stage1_arena_get(data, cursor) == 10 || raz_rt_stage1_arena_get(data, cursor) == 13)) {
+      cursor += 1;
+    }
+
+    i64 namespace_word[10] = [110, 97, 109, 101, 115, 112, 97, 99, 101, 32];
+
+    if (project_line_starts_with(data, start, end, &namespace_word, 10)) {
+      while (start < end && ascii_is_space(raz_rt_stage1_arena_get(data, start))) {
+        start += 1;
+      }
+      return project_hash_namespace_range(data, start + 10, end);
+    }
+  }
+
+  i64 package_copy = raz_rt_stage1_arena_create(package_name_length);
+
+  if (package_copy == 0) {
+    return 0;
+  }
+  i64 index = 0;
+  while (index < package_name_length) {
+    i64 value = raz_rt_stage1_arena_get(package_name, index);
+
+    if (value == 45 || value == 46 || value == 47 || value == 92) {
+      value = 95;
+    }
+    raz_rt_stage1_arena_set(package_copy, index, value);
+    index += 1;
+  }
+  i64 result = raz_rt_stage1_arena_range_hash(package_copy, 0, package_name_length, 17);
+
+  raz_rt_stage1_arena_destroy(package_copy);
+  return result;
+}
+
+fn project_path_range_less(i64 list, i64 left_start, i64 left_length, i64 right_start, i64 right_length) -> bool {
+  i64 count = left_length;
+
+  if (right_length < count) {
+    count = right_length;
+  }
+  i64 index = 0;
+  while (index < count) {
+    i64 left = raz_rt_stage1_arena_get(list, left_start + index);
+    i64 right = raz_rt_stage1_arena_get(list, right_start + index);
+
+    if (left == 92) {
+      left = 47;
+    }
+    if (right == 92) {
+      right = 47;
+    }
+    if (left < right) {
+      return true;
+    }
+    if (left > right) {
+      return false;
+    }
+    index += 1;
+  }
+  return left_length < right_length;
+}
+
+fn project_topology_cleanup(
+i64 path_starts,
+i64 path_lengths,
+i64 namespace_hashes,
+i64 scheduled,
+i64 edge_owners,
+i64 edge_targets,
+i64 module_bytes,
+i64 path,
+) {
+  raz_rt_stage1_arena_destroy(path_starts);
+  raz_rt_stage1_arena_destroy(path_lengths);
+  raz_rt_stage1_arena_destroy(namespace_hashes);
+  raz_rt_stage1_arena_destroy(scheduled);
+  raz_rt_stage1_arena_destroy(edge_owners);
+  raz_rt_stage1_arena_destroy(edge_targets);
+  raz_rt_stage1_arena_destroy(module_bytes);
+  raz_rt_stage1_arena_destroy(path);
+}
+
+fn append_project_topological_sources(
+  i64 file_list,
+  i64 list_length,
+  i64 state,
+  i64 package_name,
+  i64 package_name_length,
+  i64 entry_path,
+  i64 entry_path_length,
+) -> i64 {
+  i64 path_starts = raz_rt_stage1_arena_create(4096);
+  i64 path_lengths = raz_rt_stage1_arena_create(4096);
+  i64 namespace_hashes = raz_rt_stage1_arena_create(4096);
+  i64 scheduled = raz_rt_stage1_arena_create(4096);
+  i64 edge_owners = raz_rt_stage1_arena_create(16384);
+  i64 edge_targets = raz_rt_stage1_arena_create(16384);
+  i64 module_bytes = raz_rt_stage1_arena_create(raz_rt_stage1_arena_get(state, 3));
+  i64 path = raz_rt_stage1_arena_create(8192);
+
+  if (
+  path_starts == 0 || path_lengths == 0 || namespace_hashes == 0 || scheduled == 0 ||
+  edge_owners == 0 || edge_targets == 0 || module_bytes == 0 || path == 0
+  ) {
+    project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+  }
+
+  i64 module_count = 0;
+  i64 entry_index = -1;
+  i64 cursor = 0;
+
+  while (cursor < list_length && module_count < 4096) {
+    i64 start = cursor;
+
+    while (cursor < list_length && raz_rt_stage1_arena_get(file_list, cursor) != 10) {
+      cursor += 1;
+    }
+    i64 end = cursor;
+    if (cursor < list_length) {
+      cursor += 1;
+    }
+    if (end > start && path_range_has_rz_extension(file_list, start, end - start)) {
+      i64 length = end - start;
+      i64 index = 0;
+
+      while (index < length) {
+        raz_rt_stage1_arena_set(path, index, raz_rt_stage1_arena_get(file_list, start + index));
+        index += 1;
+      }
+      i64 read = raz_rt_stage1_read_ascii(path, length, module_bytes, raz_rt_stage1_arena_get(state, 3));
+
+      if (read <= 0) {
+        project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+      }
+      raz_rt_stage1_arena_set(path_starts, module_count, start);
+      raz_rt_stage1_arena_set(path_lengths, module_count, length);
+      raz_rt_stage1_arena_set(
+      namespace_hashes,
+      module_count,
+      project_module_namespace_hash(module_bytes, read, package_name, package_name_length),
+      );
+      raz_rt_stage1_arena_set(scheduled, module_count, 0);
+      if (path_bytes_equal(entry_path, entry_path_length, path, length)) {
+        entry_index = module_count;
+      }
+      module_count += 1;
+    }
+  }
+  if (module_count <= 0 || entry_index < 0) {
+    project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+  }
+
+  i64 edge_count = 0;
+  i64 owner = 0;
+  while (owner < module_count) {
+    i64 path_start = raz_rt_stage1_arena_get(path_starts, owner);
+    i64 path_length = raz_rt_stage1_arena_get(path_lengths, owner);
+    i64 index = 0;
+
+    while (index < path_length) {
+      raz_rt_stage1_arena_set(path, index, raz_rt_stage1_arena_get(file_list, path_start + index));
+      index += 1;
+    }
+    i64 read = raz_rt_stage1_read_ascii(path, path_length, module_bytes, raz_rt_stage1_arena_get(state, 3));
+    if (read <= 0) {
+      project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+    }
+
+    i64 line = 0;
+    while (line < read) {
+      i64 start = line;
+
+      while (line < read && raz_rt_stage1_arena_get(module_bytes, line) != 10 && raz_rt_stage1_arena_get(module_bytes, line) != 13) {
+        line += 1;
+      }
+      i64 end = line;
+      while (line < read && (raz_rt_stage1_arena_get(module_bytes, line) == 10 || raz_rt_stage1_arena_get(module_bytes, line) == 13)) {
+        line += 1;
+      }
+
+      i64 import_word[7] = [105, 109, 112, 111, 114, 116, 32];
+      i64 public_import_word[14] = [112, 117, 98, 108, 105, 99, 32, 105, 109, 112, 111, 114, 116, 32];
+      i64 import_start = -1;
+      if (project_line_starts_with(module_bytes, start, end, &public_import_word, 14)) {
+        while (start < end && ascii_is_space(raz_rt_stage1_arena_get(module_bytes, start))) {
+          start += 1;
+        }
+        import_start = start + 14;
+      } else if (project_line_starts_with(module_bytes, start, end, &import_word, 7)) {
+        while (start < end && ascii_is_space(raz_rt_stage1_arena_get(module_bytes, start))) {
+          start += 1;
+        }
+        import_start = start + 7;
+      }
+      if (import_start >= 0) {
+        i64 import_hash = project_hash_namespace_range(module_bytes, import_start, end);
+        i64 target = 0;
+
+        while (target < module_count) {
+          if (
+          target != owner &&
+          import_hash != 0 &&
+          raz_rt_stage1_arena_get(namespace_hashes, target) == import_hash
+          ) {
+            if (edge_count >= 16384) {
+              project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+            }
+            raz_rt_stage1_arena_set(edge_owners, edge_count, owner);
+            raz_rt_stage1_arena_set(edge_targets, edge_count, target);
+            edge_count += 1;
+          }
+          target += 1;
+        }
+      }
+    }
+    owner += 1;
+  }
+
+  i64 scheduled_count = 0;
+  while (scheduled_count < module_count - 1) {
+    i64 candidate = -1;
+    i64 scan = 0;
+
+    while (scan < module_count) {
+      if (scan != entry_index && raz_rt_stage1_arena_get(scheduled, scan) == 0) {
+        bool ready = true;
+        i64 edge = 0;
+
+        while (edge < edge_count && ready) {
+          if (
+          raz_rt_stage1_arena_get(edge_owners, edge) == scan &&
+          raz_rt_stage1_arena_get(scheduled, raz_rt_stage1_arena_get(edge_targets, edge)) == 0
+          ) {
+            ready = false;
+          }
+          edge += 1;
+        }
+        if (ready) {
+          if (candidate < 0) {
+            candidate = scan;
+          } else if (
+          project_path_range_less(
+          file_list,
+          raz_rt_stage1_arena_get(path_starts, scan),
+          raz_rt_stage1_arena_get(path_lengths, scan),
+          raz_rt_stage1_arena_get(path_starts, candidate),
+          raz_rt_stage1_arena_get(path_lengths, candidate),
+          )
+          ) {
+            candidate = scan;
+          }
+        }
+      }
+      scan += 1;
+    }
+    if (candidate < 0) {
+      project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+    }
+
+    i64 selected_start = raz_rt_stage1_arena_get(path_starts, candidate);
+    i64 selected_length = raz_rt_stage1_arena_get(path_lengths, candidate);
+    i64 index = 0;
+    while (index < selected_length) {
+      raz_rt_stage1_arena_set(path, index, raz_rt_stage1_arena_get(file_list, selected_start + index));
+      index += 1;
+    }
+    i64 current_length = raz_rt_stage1_arena_get(state, 1);
+    if (
+    !append_project_namespace(
+    raz_rt_stage1_arena_get(state, 0),
+    &mut current_length,
+    raz_rt_stage1_arena_get(state, 2),
+    package_name,
+    package_name_length,
+    ) ||
+    !append_source_path(
+    path,
+    selected_length,
+    raz_rt_stage1_arena_get(state, 0),
+    &mut current_length,
+    raz_rt_stage1_arena_get(state, 2),
+    raz_rt_stage1_arena_get(state, 3),
+    )
+    ) {
+      project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+    }
+    raz_rt_stage1_arena_set(state, 1, current_length);
+    raz_rt_stage1_arena_set(state, 4, raz_rt_stage1_arena_get(state, 4) + 1);
+    raz_rt_stage1_arena_set(scheduled, candidate, 1);
+    scheduled_count += 1;
+  }
+
+  i64 selected_start = raz_rt_stage1_arena_get(path_starts, entry_index);
+  i64 selected_length = raz_rt_stage1_arena_get(path_lengths, entry_index);
+  i64 index = 0;
+  while (index < selected_length) {
+    raz_rt_stage1_arena_set(path, index, raz_rt_stage1_arena_get(file_list, selected_start + index));
+    index += 1;
+  }
+  i64 current_length = raz_rt_stage1_arena_get(state, 1);
+  if (
+  !append_project_namespace(
+  raz_rt_stage1_arena_get(state, 0),
+  &mut current_length,
+  raz_rt_stage1_arena_get(state, 2),
+  package_name,
+  package_name_length,
+  ) ||
+  !append_source_path(
+  path,
+  selected_length,
+  raz_rt_stage1_arena_get(state, 0),
+  &mut current_length,
+  raz_rt_stage1_arena_get(state, 2),
+  raz_rt_stage1_arena_get(state, 3),
+  )
+  ) {
+    project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+    return 0;
+  }
+  raz_rt_stage1_arena_set(state, 1, current_length);
+  raz_rt_stage1_arena_set(state, 4, raz_rt_stage1_arena_get(state, 4) + 1);
+  project_topology_cleanup(path_starts, path_lengths, namespace_hashes, scheduled, edge_owners, edge_targets, module_bytes, path);
+  return 1;
+}
+
+// Optional package source-order.txt overrides physical discovery order when a package requires it.
+fn append_project_source_order(
+i64 root,
+i64 root_length,
+i64 state,
+i64 package_name,
+i64 package_name_length,
+) -> i64 {
+  i64 order_name = raz_rt_stage1_arena_create(16);
+  i64 order_path = raz_rt_stage1_arena_create(8192);
+  i64 order_data = raz_rt_stage1_arena_create(262144);
+  i64 relative = raz_rt_stage1_arena_create(8192);
+  i64 full_path = raz_rt_stage1_arena_create(8192);
+
+  if (order_name == 0 || order_path == 0 || order_data == 0 || relative == 0 || full_path == 0) {
+    return -1;
+  }
+
+  i64 order_codes[16] = [115, 111, 117, 114, 99, 101, 45, 111, 114, 100, 101, 114, 46, 116, 120, 116];
+  i64 code_index = 0;
+
+  while (code_index < 16) {
+    raz_rt_stage1_arena_set(order_name, code_index, order_codes[code_index]);
+    code_index += 1;
+  }
+
+  i64 order_path_length = path_join(root, root_length, order_name, 16, order_path, 8192);
+
+  if (order_path_length <= 0) {
+    return -1;
+  }
+
+  i64 order_length = raz_rt_stage1_read_ascii(order_path, order_path_length, order_data, 262144);
+
+  if (order_length < 0) {
+    raz_rt_stage1_arena_destroy(order_name);
+    raz_rt_stage1_arena_destroy(order_path);
+    raz_rt_stage1_arena_destroy(order_data);
+    raz_rt_stage1_arena_destroy(relative);
+    raz_rt_stage1_arena_destroy(full_path);
+    return 0;
+  }
+
+  i64 current_namespace_length = raz_rt_stage1_arena_get(state, 1);
+
+  if (
+  !append_project_namespace(
+  raz_rt_stage1_arena_get(state, 0),
+  &mut current_namespace_length,
+  raz_rt_stage1_arena_get(state, 2),
+  package_name,
+  package_name_length,
+  )
+  ) {
+    return -1;
+  }
+  raz_rt_stage1_arena_set(state, 1, current_namespace_length);
+
+  i64 cursor = 0;
+  i64 source_count = 0;
+
+  while (cursor < order_length) {
+    i64 start = cursor;
+
+    while (
+    cursor < order_length &&
+    raz_rt_stage1_arena_get(order_data, cursor) != 10 &&
+    raz_rt_stage1_arena_get(order_data, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor < order_length &&
+    (
+    raz_rt_stage1_arena_get(order_data, cursor) == 10 ||
+    raz_rt_stage1_arena_get(order_data, cursor) == 13
+    )
+    ) {
+      cursor += 1;
+    }
+    while (start < end && ascii_is_space(raz_rt_stage1_arena_get(order_data, start))) {
+      start += 1;
+    }
+    while (end > start && ascii_is_space(raz_rt_stage1_arena_get(order_data, end - 1))) {
+      end -= 1;
+    }
+    if (start >= end || raz_rt_stage1_arena_get(order_data, start) == 35) {
+      continue;
+    }
+
+    i64 relative_length = end - start;
+
+    if (
+    relative_length <= 0 ||
+    relative_length > 8192 ||
+    !path_range_has_rz_extension(order_data, start, relative_length)
+    ) {
+      return -1;
+    }
+
+    i64 index = 0;
+
+    while (index < relative_length) {
+      raz_rt_stage1_arena_set(relative, index, raz_rt_stage1_arena_get(order_data, start + index));
+      index += 1;
+    }
+
+    i64 full_length = path_join(root, root_length, relative, relative_length, full_path, 8192);
+
+    if (full_length <= 0) {
+      return -1;
+    }
+
+    i64 current_length = raz_rt_stage1_arena_get(state, 1);
+
+    if (
+    !append_source_path(
+    full_path,
+    full_length,
+    raz_rt_stage1_arena_get(state, 0),
+    &mut current_length,
+    raz_rt_stage1_arena_get(state, 2),
+    raz_rt_stage1_arena_get(state, 3),
+    )
+    ) {
+      return -1;
+    }
+    raz_rt_stage1_arena_set(state, 1, current_length);
+    raz_rt_stage1_arena_set(state, 4, raz_rt_stage1_arena_get(state, 4) + 1);
+    source_count += 1;
+  }
+  raz_rt_stage1_arena_destroy(order_name);
+  raz_rt_stage1_arena_destroy(order_path);
+  raz_rt_stage1_arena_destroy(order_data);
+  raz_rt_stage1_arena_destroy(relative);
+  raz_rt_stage1_arena_destroy(full_path);
+  if (source_count == 0) {
+    return -1;
+  }
+  return 1;
+}
+
+fn append_project_manifest(i64 manifest_path, i64 manifest_path_length, i64 state, i64 depth) -> bool {
+  if (depth > 32) {
+    write_stage1_diagnostic(4, 101, depth);
+    return false;
+  }
+
+  i64 canonical_manifest = raz_rt_stage1_arena_create(8192);
+
+  if (canonical_manifest == 0) {
+    write_stage1_diagnostic(4, 102, depth);
+    return false;
+  }
+  i64 canonical_length = raz_rt_stage1_normalize_path(
+  manifest_path,
+  manifest_path_length,
+  canonical_manifest,
+  8192,
+  );
+  if (canonical_length <= 0) {
+    write_stage1_diagnostic(4, 103, depth);
+    return false;
+  }
+  if (
+  path_list_contains(
+  raz_rt_stage1_arena_get(state, 7),
+  raz_rt_stage1_arena_get(state, 8),
+  canonical_manifest,
+  canonical_length,
+  )
+  ) {
+    write_stage1_diagnostic(4, 104, depth);
+    return false;
+  }
+  if (
+  path_list_contains(
+  raz_rt_stage1_arena_get(state, 5),
+  raz_rt_stage1_arena_get(state, 6),
+  canonical_manifest,
+  canonical_length,
+  )
+  ) {
+    raz_rt_stage1_arena_destroy(canonical_manifest);
+    return true;
+  }
+
+  i64 active_mark = raz_rt_stage1_arena_get(state, 8);
+  i64 active_length = raz_rt_stage1_arena_get(state, 8);
+  i64 visited_length = raz_rt_stage1_arena_get(state, 6);
+
+  if (
+  !path_list_append(
+  raz_rt_stage1_arena_get(state, 7),
+  &mut active_length,
+  262144,
+  canonical_manifest,
+  canonical_length,
+  ) ||
+  !path_list_append(
+  raz_rt_stage1_arena_get(state, 5),
+  &mut visited_length,
+  262144,
+  canonical_manifest,
+  canonical_length,
+  )
+  ) {
+    write_stage1_diagnostic(4, 105, depth);
+    return false;
+  }
+  raz_rt_stage1_arena_set(state, 8, active_length);
+  raz_rt_stage1_arena_set(state, 6, visited_length);
+
+  i64 manifest_capacity = 65536;
+  i64 manifest = raz_rt_stage1_arena_create(manifest_capacity);
+  i64 root = raz_rt_stage1_arena_create(4096);
+  i64 source_name = raz_rt_stage1_arena_create(4096);
+  i64 package_name = raz_rt_stage1_arena_create(4096);
+  i64 source_root = raz_rt_stage1_arena_create(8192);
+  i64 entry_name = raz_rt_stage1_arena_create(4096);
+  i64 entry_path = raz_rt_stage1_arena_create(8192);
+  i64 file_list = raz_rt_stage1_arena_create(2097152);
+
+  if (
+  manifest == 0 ||
+  root == 0 ||
+  source_name == 0 ||
+  package_name == 0 ||
+  source_root == 0 ||
+  entry_name == 0 ||
+  entry_path == 0 ||
+  file_list == 0
+  ) {
+    write_stage1_diagnostic(4, 106, depth);
+    return false;
+  }
+  i64 manifest_length = raz_rt_stage1_read_ascii(
+  canonical_manifest,
+  canonical_length,
+  manifest,
+  manifest_capacity,
+  );
+
+  i64 root_length = path_dirname(canonical_manifest, canonical_length, root, 4096);
+  i64 source_name_length = manifest_source_directory(manifest, manifest_length, source_name, 4096);
+  i64 package_name_length = manifest_package_name(manifest, manifest_length, package_name, 4096);
+  i64 entry_name_length = manifest_entry_path(manifest, manifest_length, entry_name, 4096);
+  i64 entry_path_length = path_join(root, root_length, entry_name, entry_name_length, entry_path, 8192);
+
+  if (
+  manifest_length <= 0 ||
+  root_length <= 0 ||
+  source_name_length <= 0 ||
+  package_name_length <= 0 ||
+  entry_name_length <= 0 ||
+  entry_path_length <= 0
+  ) {
+    write_stage1_diagnostic(4, 107, depth);
+    return false;
+  }
+
+  i64 section = 0;
+  i64 cursor = 0;
+
+  while (cursor < manifest_length) {
+    i64 start = cursor;
+
+    while (
+    cursor < manifest_length &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 10 &&
+    raz_rt_stage1_arena_get(manifest, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor < manifest_length &&
+    (
+    raz_rt_stage1_arena_get(manifest, cursor) == 10 ||
+    raz_rt_stage1_arena_get(manifest, cursor) == 13
+    )
+    ) {
+      cursor += 1;
+    }
+    if (line_is_section(manifest, start, end, 2)) {
+      section = 2;
+    } else if (start < end && raz_rt_stage1_arena_get(manifest, start) == 91) {
+      section = 0;
+    } else if (section == 2) {
+      i64 equal = start;
+
+      while (equal < end && raz_rt_stage1_arena_get(manifest, equal) != 61) {
+        equal += 1;
+      }
+      if (equal < end) {
+        i64 dependency = raz_rt_stage1_arena_create(4096);
+        i64 dependency_root = raz_rt_stage1_arena_create(8192);
+        i64 dependency_manifest = raz_rt_stage1_arena_create(8192);
+
+        if (dependency == 0 || dependency_root == 0 || dependency_manifest == 0) {
+          write_stage1_diagnostic(4, 108, depth);
+          return false;
+        }
+
+        i64 dependency_length = copy_quoted_value(manifest, equal + 1, end, dependency, 4096);
+
+        i64 dependency_root_length = path_join(
+        root,
+        root_length,
+        dependency,
+        dependency_length,
+        dependency_root,
+        8192,
+        );
+
+        i64 raz_toml = raz_rt_stage1_arena_create(9);
+
+        if (raz_toml == 0) {
+          return false;
+        }
+        raz_rt_stage1_arena_set(raz_toml, 0, 120);
+        raz_rt_stage1_arena_set(raz_toml, 1, 121);
+        raz_rt_stage1_arena_set(raz_toml, 2, 102);
+        raz_rt_stage1_arena_set(raz_toml, 3, 116);
+        raz_rt_stage1_arena_set(raz_toml, 4, 46);
+        raz_rt_stage1_arena_set(raz_toml, 5, 116);
+        raz_rt_stage1_arena_set(raz_toml, 6, 111);
+        raz_rt_stage1_arena_set(raz_toml, 7, 109);
+        raz_rt_stage1_arena_set(raz_toml, 8, 108);
+        i64 dependency_manifest_length = path_join(
+        dependency_root,
+        dependency_root_length,
+        raz_toml,
+        9,
+        dependency_manifest,
+        8192,
+        );
+        raz_rt_stage1_arena_destroy(raz_toml);
+        if (
+        dependency_length <= 0 ||
+        dependency_root_length <= 0 ||
+        dependency_manifest_length <= 0 ||
+        !append_project_manifest(
+        dependency_manifest,
+        dependency_manifest_length,
+        state,
+        depth + 1,
+        )
+        ) {
+          write_stage1_diagnostic(4, 109, depth);
+          return false;
+        }
+
+        i64 dependency_manifest_data = raz_rt_stage1_arena_create(65536);
+        i64 dependency_package_name = raz_rt_stage1_arena_create(4096);
+        i64 dependency_alias = raz_rt_stage1_arena_create(4096);
+
+        if (dependency_manifest_data == 0 || dependency_package_name == 0 || dependency_alias == 0) {
+          write_stage1_diagnostic(4, 108, depth);
+          return false;
+        }
+        i64 dependency_manifest_data_length = raz_rt_stage1_read_ascii(
+        dependency_manifest,
+        dependency_manifest_length,
+        dependency_manifest_data,
+        65536,
+        );
+        i64 dependency_package_name_length = manifest_package_name(
+        dependency_manifest_data,
+        dependency_manifest_data_length,
+        dependency_package_name,
+        4096,
+        );
+        i64 dependency_alias_length = copy_manifest_key(
+        manifest,
+        start,
+        equal,
+        dependency_alias,
+        4096,
+        );
+
+        i64 combined_length = raz_rt_stage1_arena_get(state, 1);
+
+        if (
+        dependency_manifest_data_length <= 0 ||
+        dependency_package_name_length <= 0 ||
+        dependency_alias_length <= 0 ||
+        !append_project_dependency_alias(
+        raz_rt_stage1_arena_get(state, 0),
+        &mut combined_length,
+        raz_rt_stage1_arena_get(state, 2),
+        package_name,
+        package_name_length,
+        dependency_alias,
+        dependency_alias_length,
+        dependency_package_name,
+        dependency_package_name_length,
+        )
+        ) {
+          write_stage1_diagnostic(4, 109, depth);
+          return false;
+        }
+        raz_rt_stage1_arena_set(state, 1, combined_length);
+        raz_rt_stage1_arena_destroy(dependency_manifest_data);
+        raz_rt_stage1_arena_destroy(dependency_package_name);
+        raz_rt_stage1_arena_destroy(dependency_alias);
+        raz_rt_stage1_arena_destroy(dependency);
+        raz_rt_stage1_arena_destroy(dependency_root);
+        raz_rt_stage1_arena_destroy(dependency_manifest);
+      }
+    }
+  }
+
+  i64 source_root_length = path_join(root, root_length, source_name, source_name_length, source_root, 8192);
+
+  if (source_root_length <= 0) {
+    write_stage1_diagnostic(4, 110, depth);
+    return false;
+  }
+  i64 ordered_status = append_project_source_order(
+  root,
+  root_length,
+  state,
+  package_name,
+  package_name_length,
+  );
+  if (ordered_status < 0) {
+    write_stage1_diagnostic(4, 111, depth);
+    return false;
+  }
+  if (ordered_status > 0) {
+    raz_rt_stage1_arena_destroy(manifest);
+    raz_rt_stage1_arena_destroy(root);
+    raz_rt_stage1_arena_destroy(source_name);
+    raz_rt_stage1_arena_destroy(package_name);
+    raz_rt_stage1_arena_destroy(source_root);
+    raz_rt_stage1_arena_destroy(entry_name);
+    raz_rt_stage1_arena_destroy(entry_path);
+    raz_rt_stage1_arena_destroy(file_list);
+    raz_rt_stage1_arena_set(state, 8, active_mark);
+    raz_rt_stage1_arena_destroy(canonical_manifest);
+    return true;
+  }
+
+  i64 list_length = raz_rt_stage1_list_files_recursive(source_root, source_root_length, file_list, 2097152);
+
+  if (list_length < 0) {
+    write_stage1_diagnostic(4, 111, depth);
+    return false;
+  }
+
+  i64 topological_status = append_project_topological_sources(
+  file_list,
+  list_length,
+  state,
+  package_name,
+  package_name_length,
+  entry_path,
+  entry_path_length,
+  );
+  if (topological_status > 0) {
+    raz_rt_stage1_arena_destroy(manifest);
+    raz_rt_stage1_arena_destroy(root);
+    raz_rt_stage1_arena_destroy(source_name);
+    raz_rt_stage1_arena_destroy(package_name);
+    raz_rt_stage1_arena_destroy(source_root);
+    raz_rt_stage1_arena_destroy(entry_name);
+    raz_rt_stage1_arena_destroy(entry_path);
+    raz_rt_stage1_arena_destroy(file_list);
+    raz_rt_stage1_arena_set(state, 8, active_mark);
+    raz_rt_stage1_arena_destroy(canonical_manifest);
+    return true;
+  }
+
+  bool entry_found = false;
+
+  cursor = 0;
+  while (cursor < list_length) {
+    i64 start = cursor;
+
+    while (cursor < list_length && raz_rt_stage1_arena_get(file_list, cursor) != 10) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    if (cursor < list_length) {
+      cursor += 1;
+    }
+    if (end > start && path_range_has_rz_extension(file_list, start, end - start)) {
+      i64 path = raz_rt_stage1_arena_create(end - start);
+
+      if (path == 0) {
+        write_stage1_diagnostic(4, 112, depth);
+        return false;
+      }
+
+      i64 i = 0;
+
+      while (start + i < end) {
+        raz_rt_stage1_arena_set(path, i, raz_rt_stage1_arena_get(file_list, start + i));
+        i += 1;
+      }
+
+      bool is_entry = path_bytes_equal(entry_path, entry_path_length, path, end - start);
+
+      if (is_entry) {
+        entry_found = true;
+      } else {
+        i64 current_length = raz_rt_stage1_arena_get(state, 1);
+
+        if (
+        !append_project_namespace(
+        raz_rt_stage1_arena_get(state, 0),
+        &mut current_length,
+        raz_rt_stage1_arena_get(state, 2),
+        package_name,
+        package_name_length,
+        )
+        ) {
+          write_stage1_diagnostic(4, 113, depth);
+          return false;
+        }
+        if (
+        !append_source_path(
+        path,
+        end - start,
+        raz_rt_stage1_arena_get(state, 0),
+        &mut current_length,
+        raz_rt_stage1_arena_get(state, 2),
+        raz_rt_stage1_arena_get(state, 3),
+        )
+        ) {
+          write_stage1_diagnostic(4, 113, depth);
+          return false;
+        }
+        raz_rt_stage1_arena_set(state, 1, current_length);
+        raz_rt_stage1_arena_set(state, 4, raz_rt_stage1_arena_get(state, 4) + 1);
+      }
+      raz_rt_stage1_arena_destroy(path);
+    }
+  }
+  if (entry_found) {
+    i64 entry_length = raz_rt_stage1_arena_get(state, 1);
+
+    if (
+    !append_project_namespace(
+    raz_rt_stage1_arena_get(state, 0),
+    &mut entry_length,
+    raz_rt_stage1_arena_get(state, 2),
+    package_name,
+    package_name_length,
+    )
+    ) {
+      write_stage1_diagnostic(4, 114, depth);
+      return false;
+    }
+    if (
+    !append_source_path(
+    entry_path,
+    entry_path_length,
+    raz_rt_stage1_arena_get(state, 0),
+    &mut entry_length,
+    raz_rt_stage1_arena_get(state, 2),
+    raz_rt_stage1_arena_get(state, 3),
+    )
+    ) {
+      write_stage1_diagnostic(4, 114, depth);
+      return false;
+    }
+    raz_rt_stage1_arena_set(state, 1, entry_length);
+    raz_rt_stage1_arena_set(state, 4, raz_rt_stage1_arena_get(state, 4) + 1);
+  } else if (depth == 0) {
+    write_stage1_diagnostic(4, 115, depth);
+    return false;
+  }
+  raz_rt_stage1_arena_destroy(manifest);
+  raz_rt_stage1_arena_destroy(root);
+  raz_rt_stage1_arena_destroy(source_name);
+  raz_rt_stage1_arena_destroy(package_name);
+  raz_rt_stage1_arena_destroy(source_root);
+  raz_rt_stage1_arena_destroy(entry_name);
+  raz_rt_stage1_arena_destroy(entry_path);
+  raz_rt_stage1_arena_destroy(file_list);
+  raz_rt_stage1_arena_set(state, 8, active_mark);
+  raz_rt_stage1_arena_destroy(canonical_manifest);
+  return true;
+}
+
+fn bootstrap_qualifications_requested() -> bool {
+  i64 path = raz_rt_stage1_arena_create(18);
+  i64 output = raz_rt_stage1_arena_create(1);
+
+  if (path == 0 || output == 0) {
+    raz_rt_stage1_arena_destroy(path);
+    raz_rt_stage1_arena_destroy(output);
+    return false;
+  }
+  raz_rt_stage1_arena_set(path, 0, 115);
+  raz_rt_stage1_arena_set(path, 1, 116);
+  raz_rt_stage1_arena_set(path, 2, 97);
+  raz_rt_stage1_arena_set(path, 3, 103);
+  raz_rt_stage1_arena_set(path, 4, 101);
+  raz_rt_stage1_arena_set(path, 5, 49);
+  raz_rt_stage1_arena_set(path, 6, 45);
+  raz_rt_stage1_arena_set(path, 7, 113);
+  raz_rt_stage1_arena_set(path, 8, 117);
+  raz_rt_stage1_arena_set(path, 9, 97);
+  raz_rt_stage1_arena_set(path, 10, 108);
+  raz_rt_stage1_arena_set(path, 11, 105);
+  raz_rt_stage1_arena_set(path, 12, 102);
+  raz_rt_stage1_arena_set(path, 13, 121);
+  raz_rt_stage1_arena_set(path, 14, 46);
+  raz_rt_stage1_arena_set(path, 15, 116);
+  raz_rt_stage1_arena_set(path, 16, 120);
+  raz_rt_stage1_arena_set(path, 17, 116);
+
+  i64 length = raz_rt_stage1_read_ascii(path, 18, output, 1);
+
+  raz_rt_stage1_arena_destroy(path);
+  raz_rt_stage1_arena_destroy(output);
+  return length >= 0;
+}
+
+fn profile_queries_option(i64 path, i64 length) -> bool {
+  if (path == 0 || length != 17) {
+    return false;
+  }
+
+  i64 expected[17] = [45, 45, 112, 114, 111, 102, 105, 108, 101, 45, 113, 117, 101, 114, 105, 101, 115];
+  i64 index = 0;
+
+  while (index < 17) {
+    if (raz_rt_stage1_arena_get(path, index) != expected[index]) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
+}
+
+fn write_query_profile_row(ForgeWriter&mut out, i64 kind, i64 hits, i64 misses) {
+  if (kind == 0) {
+    i64 text[7] = [103, 101, 110, 101, 114, 105, 99];
+
+    writer_chars(out, &text, 7);
+  } else if (kind == 1) {
+    i64 text[5] = [116, 114, 97, 105, 116];
+
+    writer_chars(out, &text, 5);
+  } else if (kind == 2) {
+    i64 text[10] = [114, 101, 115, 111, 108, 117, 116, 105, 111, 110];
+
+    writer_chars(out, &text, 10);
+  } else if (kind == 3) {
+    i64 text[6] = [115, 121, 109, 98, 111, 108];
+
+    writer_chars(out, &text, 6);
+  } else if (kind == 4) {
+    i64 text[6] = [108, 97, 121, 111, 117, 116];
+
+    writer_chars(out, &text, 6);
+  } else {
+    i64 text[5] = [115, 99, 111, 112, 101];
+
+    writer_chars(out, &text, 5);
+  }
+  writer_space(out);
+  writer_decimal(out, hits);
+  writer_space(out);
+  writer_decimal(out, misses);
+  writer_newline(out);
+}
+
+fn write_query_profile(HirModule& hir) {
+  ForgeWriter out;
+
+  writer_init(&mut out);
+  write_query_profile_row(&mut out, 0, hir.profile_generic_cache_hits, hir.profile_generic_cache_misses);
+  write_query_profile_row(
+  &mut out,
+  1,
+  hir.profile_trait_query_cache_hits,
+  hir.profile_trait_query_cache_misses,
+  );
+  write_query_profile_row(
+  &mut out,
+  2,
+  hir.profile_resolution_cache_hits,
+  hir.profile_resolution_cache_misses,
+  );
+  write_query_profile_row(&mut out, 3, hir.profile_symbol_cache_hits, hir.profile_symbol_cache_misses);
+  write_query_profile_row(&mut out, 4, hir.profile_layout_cache_hits, hir.profile_layout_cache_misses);
+  write_query_profile_row(&mut out, 5, hir.profile_scope_cache_hits, hir.profile_scope_cache_misses);
+  i64 total_hits =
+  hir.profile_generic_cache_hits +
+  hir.profile_trait_query_cache_hits +
+  hir.profile_resolution_cache_hits +
+  hir.profile_symbol_cache_hits +
+  hir.profile_layout_cache_hits +
+  hir.profile_scope_cache_hits;
+  i64 total_misses =
+  hir.profile_generic_cache_misses +
+  hir.profile_trait_query_cache_misses +
+  hir.profile_resolution_cache_misses +
+  hir.profile_symbol_cache_misses +
+  hir.profile_layout_cache_misses +
+  hir.profile_scope_cache_misses;
+  i64 total_text[5] = [116, 111, 116, 97, 108];
+
+  writer_chars(&mut out, &total_text, 5);
+  writer_space(&mut out);
+  writer_decimal(&mut out, total_hits);
+  writer_space(&mut out);
+  writer_decimal(&mut out, total_misses);
+  writer_newline(&mut out);
+
+  i64 path[26] = [99, 111, 109, 112, 105, 108, 101, 114, 45, 113, 117, 101, 114, 121, 45, 112, 114, 111, 102, 105, 108, 101, 46, 116, 120, 116];
+
+  raz_rt_write_ascii_i64(&mut path[0], 26, out.data, out.length);
+  writer_destroy(&mut out);
+}

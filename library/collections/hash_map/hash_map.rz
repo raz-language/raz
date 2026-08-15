@@ -1,0 +1,535 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace collections::hash_map;
+import core::hash;
+import core::iter::iterator;
+import core::option;
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+
+public struct HashMap<K, V> {
+    usize keys;
+    usize values;
+    usize states;
+    i64 length;
+    i64 capacity;
+    i64 tombstones;
+}
+
+public struct HashMapKeyIter<K> {
+    usize keys;
+    i64 stride;
+    usize states;
+    i64 capacity;
+    i64 index;
+    i64 current_slot;
+}
+
+public struct HashMapValueIter<V> {
+    usize values;
+    i64 stride;
+    usize states;
+    i64 capacity;
+    i64 index;
+    i64 current_slot;
+}
+
+public struct HashMapEntry<K, V> {
+    usize key_address;
+    usize value_address;
+}
+
+public struct HashMapEntryIter<K, V> {
+    usize keys;
+    i64 key_stride;
+    usize values;
+    i64 value_stride;
+    usize states;
+    i64 capacity;
+    i64 index;
+    i64 current_slot;
+}
+
+fn state_at(usize states, i64 slot) -> i64 {
+    unsafe {
+        u8 value = *((states + slot)as u8*const);
+
+        return value as i64;
+    }
+}
+
+fn set_state(usize states, i64 slot, i64 value) {
+    unsafe {
+        *((states + slot)as u8*mut) = value as u8;
+    }
+}
+
+fn zero_states(usize states, i64 capacity) {
+    i64 index = 0;
+
+    while (index < capacity) {
+        set_state(states, index, 0);
+        index += 1;
+    }
+}
+
+fn growth_threshold(i64 capacity) -> i64 {
+    // floor(capacity * 0.70) without overflowing the multiplication.
+    return (capacity / 10) * 7 + ((capacity % 10) * 7) / 10;
+}
+
+impl<K: Hash + Eq, V> HashMap<K, V> {
+    fn new() -> HashMap<K, V> {
+        return HashMap<K, V> {
+            keys: 0,
+            values: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            tombstones: 0
+        };
+    }
+    fn with_capacity(i64 capacity) -> HashMap<K, V> {
+        HashMap<K, V> map = HashMap<K, V>::new();
+
+        if (capacity > 0) {
+            map.reserve(capacity);
+        }
+        return map;
+    }
+    fn len(HashMap<K, V>& self) -> i64 {
+        return self.length;
+    }
+    fn capacity(HashMap<K, V>& self) -> i64 {
+        return self.capacity;
+    }
+    fn is_empty(HashMap<K, V>& self) -> bool {
+        return self.length == 0;
+    }
+    fn find_slot(HashMap<K, V>& self, K& key, bool insertion) -> i64 {
+        if (self.capacity <= 0) {
+            return -1;
+        }
+        // Capacities are powers of two; masking avoids integer division in the
+        // hottest lookup loop and preserves all low hash bits.
+
+        i64 mask = self.capacity - 1;
+        i64 slot = key.hash() & mask;
+        i64 first_tombstone = -1;
+        i64 scanned = 0;
+
+        while (scanned < self.capacity) {
+            i64 state = state_at(self.states, slot);
+
+            if (state == 0) {
+                if (insertion && first_tombstone >= 0) {
+                    return first_tombstone;
+                }
+                return slot;
+            }
+            if (state == 2) {
+                if (insertion && first_tombstone < 0) {
+                    first_tombstone = slot;
+                }
+            } else {
+                unsafe {
+                    K& stored = & *((self.keys + slot * (size_of<K>()as i64))as K*const);
+
+                    if (stored.equals(key)) {
+                        return slot;
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+            scanned += 1;
+        }
+        return first_tombstone;
+    }
+    fn rehash(HashMap<K, V>&mut self, i64 requested) -> bool {
+        i64 next = requested;
+
+        if (next < 8) {
+            next = 8;
+        }
+
+        i64 key_size = size_of<K>()as i64;
+        i64 value_size = size_of<V>()as i64;
+        i64 key_alignment = align_of<K>()as i64;
+        i64 value_alignment = align_of<V>()as i64;
+
+        if (
+            key_size <= 0 ||
+            value_size <= 0 ||
+            next > 9223372036854775807 / key_size ||
+            next > 9223372036854775807 / value_size
+        ) {
+            return false;
+        }
+
+        usize new_keys = raz_rt_alloc_aligned(next * key_size, key_alignment);
+
+        if (new_keys == 0) {
+            return false;
+        }
+
+        usize new_values = raz_rt_alloc_aligned(next * value_size, value_alignment);
+
+        if (new_values == 0) {
+            raz_rt_dealloc_aligned(new_keys, key_alignment);
+            return false;
+        }
+
+        usize new_states = raz_rt_alloc(next);
+
+        if (new_states == 0) {
+            raz_rt_dealloc_aligned(new_values, value_alignment);
+            raz_rt_dealloc_aligned(new_keys, key_alignment);
+            return false;
+        }
+        zero_states(new_states, next);
+
+        usize old_keys = self.keys;
+        usize old_values = self.values;
+        usize old_states = self.states;
+        i64 old_capacity = self.capacity;
+
+        self.keys = new_keys;
+        self.values = new_values;
+        self.states = new_states;
+        self.capacity = next;
+        self.length = 0;
+        self.tombstones = 0;
+
+        i64 index = 0;
+
+        while (index < old_capacity) {
+            if (state_at(old_states, index) == 1) {
+                unsafe {
+                    K& key = & *((old_keys + index * key_size)as K*const);
+                    i64 slot = self.find_slot(key, true);
+
+                    raz_rt_copy(self.keys + slot * key_size, old_keys + index * key_size, key_size);
+                    raz_rt_copy(self.values + slot * value_size, old_values + index * value_size, value_size);
+                    set_state(self.states, slot, 1);
+                    self.length += 1;
+                }
+            }
+            index += 1;
+        }
+        raz_rt_dealloc(old_states);
+        raz_rt_dealloc_aligned(old_values, value_alignment);
+        raz_rt_dealloc_aligned(old_keys, key_alignment);
+        return true;
+    }
+    fn reserve(HashMap<K, V>&mut self, i64 entries) -> bool {
+        if (entries < 0) {
+            return false;
+        }
+
+        i64 next = 8;
+
+        if (self.capacity > next) {
+            next = self.capacity;
+        }
+        while (growth_threshold(next) < entries) {
+            if (next > 4611686018427387903) {
+                return false;
+            }
+            next *= 2;
+        }
+        if (next == self.capacity && self.tombstones == 0) {
+            return true;
+        }
+        return self.rehash(next);
+    }
+    fn shrink_to_fit(HashMap<K, V>&mut self) -> bool {
+        i64 next = 8;
+
+        while (growth_threshold(next) < self.length) {
+            if (next > 4611686018427387903) {
+                return false;
+            }
+            next *= 2;
+        }
+        if (self.capacity == 0 && self.length == 0) {
+            return true;
+        }
+        if (next == self.capacity && self.tombstones == 0) {
+            return true;
+        }
+        return self.rehash(next);
+    }
+    fn ensure_insert_capacity(HashMap<K, V>&mut self) -> bool {
+        if (self.capacity == 0) {
+            return self.rehash(8);
+        }
+
+        i64 threshold = growth_threshold(self.capacity);
+
+        if (self.length + self.tombstones + 1 <= threshold) {
+            return true;
+        }
+        // If tombstones, rather than live entries, caused the pressure, rebuild
+        // at the same capacity. This restores short probe chains without
+        // doubling memory unnecessarily.
+        if (self.length + 1 <= threshold) {
+            return self.rehash(self.capacity);
+        }
+        if (self.capacity > 4611686018427387903) {
+            return false;
+        }
+        return self.rehash(self.capacity * 2);
+    }
+    fn insert(HashMap<K, V>&mut self, K key, V value) -> bool {
+        if (!self.ensure_insert_capacity()) {
+            return false;
+        }
+
+        i64 slot = self.find_slot(&key, true);
+
+        if (slot < 0) {
+            return false;
+        }
+
+        i64 state = state_at(self.states, slot);
+
+        if (state == 1) {
+            unsafe {
+                V replaced = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
+
+                replaced;
+            }
+        } else {
+            if (state == 2) {
+                self.tombstones -= 1;
+            }
+            unsafe {
+                *((self.keys + slot * (size_of<K>()as i64))as K*mut) = move key;
+            }
+            set_state(self.states, slot, 1);
+            self.length += 1;
+        }
+        // Keep the owning value move at one syntactic site. Besides being
+        // easier for the ownership checker to prove, this is the correct
+        // operation for both replacement and first insertion.
+        unsafe {
+            *((self.values + slot * (size_of<V>()as i64))as V*mut) = move value;
+        }
+        return true;
+    }
+    fn contains_key(HashMap<K, V>& self, K& key) -> bool {
+        i64 slot = self.find_slot(key, false);
+
+        return slot >= 0 && state_at(self.states, slot) == 1;
+    }
+    fn get_ptr(HashMap<K, V>& self, K& key) -> V*const {
+        i64 slot = self.find_slot(key, false);
+
+        if (slot < 0 || state_at(self.states, slot) != 1) {
+            unsafe {
+                return 0 as V*const;
+            }
+        }
+        unsafe {
+            return (self.values + slot * (size_of<V>()as i64))as V*const;
+        }
+    }
+    fn get_mut_ptr(HashMap<K, V>&mut self, K& key) -> V*mut {
+        i64 slot = self.find_slot(key, false);
+
+        if (slot < 0 || state_at(self.states, slot) != 1) {
+            unsafe {
+                return 0 as V*mut;
+            }
+        }
+        unsafe {
+            return (self.values + slot * (size_of<V>()as i64))as V*mut;
+        }
+    }
+    fn remove(HashMap<K, V>&mut self, K& key) -> Option<V> {
+        i64 slot = self.find_slot(key, false);
+
+        if (slot < 0 || state_at(self.states, slot) != 1) {
+            return Option<V>::None;
+        }
+        unsafe {
+            V removed_value = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
+            K removed_key = move*((self.keys + slot * (size_of<K>()as i64))as K*mut);
+
+            removed_key;
+            set_state(self.states, slot, 2);
+            self.length -= 1;
+            self.tombstones += 1;
+            return Option<V>::Some(move removed_value);
+        }
+    }
+    fn try_remove(HashMap<K, V>&mut self, K& key, V&mut output) -> bool {
+        i64 slot = self.find_slot(key, false);
+
+        if (slot < 0 || state_at(self.states, slot) != 1) {
+            return false;
+        }
+        unsafe {
+            *output = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
+
+            K removed_key = move*((self.keys + slot * (size_of<K>()as i64))as K*mut);
+
+            removed_key;
+        }
+        set_state(self.states, slot, 2);
+        self.length -= 1;
+        self.tombstones += 1;
+        return true;
+    }
+    fn clear(HashMap<K, V>&mut self) {
+        i64 slot = 0;
+
+        while (slot < self.capacity) {
+            if (state_at(self.states, slot) == 1) {
+                unsafe {
+                    K removed_key = move*((self.keys + slot * (size_of<K>()as i64))as K*mut);
+                    V removed_value = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
+
+                    removed_key;
+                    removed_value;
+                }
+            }
+            set_state(self.states, slot, 0);
+            slot += 1;
+        }
+        self.length = 0;
+        self.tombstones = 0;
+    }
+    fn keys(HashMap<K, V>& self) -> HashMapKeyIter<K> {
+        return HashMapKeyIter<K> {
+            keys: self.keys,
+            stride: size_of<K>()as i64,
+            states: self.states,
+            capacity: self.capacity,
+            index: 0,
+            current_slot: -1,
+        };
+    }
+    fn values(HashMap<K, V>& self) -> HashMapValueIter<V> {
+        return HashMapValueIter<V> {
+            values: self.values,
+            stride: size_of<V>()as i64,
+            states: self.states,
+            capacity: self.capacity,
+            index: 0,
+            current_slot: -1,
+        };
+    }
+    fn entries(HashMap<K, V>& self) -> HashMapEntryIter<K, V> {
+        return HashMapEntryIter<K, V> {
+            keys: self.keys,
+            key_stride: size_of<K>()as i64,
+            values: self.values,
+            value_stride: size_of<V>()as i64,
+            states: self.states,
+            capacity: self.capacity,
+            index: 0,
+            current_slot: -1,
+        };
+    }
+}
+
+impl<K, V> HashMapEntry<K, V> {
+    fn key(HashMapEntry<K, V>& self) -> K& {
+        unsafe {
+            return & *(self.key_address as K*const);
+        }
+    }
+    fn value(HashMapEntry<K, V>& self) -> V& {
+        unsafe {
+            return & *(self.value_address as V*const);
+        }
+    }
+}
+
+impl<K> Iterator for HashMapKeyIter<K> {
+    type Item = K&;
+
+    fn next(HashMapKeyIter<K>&mut self) -> bool {
+        while (self.index < self.capacity) {
+            i64 slot = self.index;
+
+            self.index += 1;
+            if (state_at(self.states, slot) == 1) {
+                self.current_slot = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+    fn current(HashMapKeyIter<K>& self) -> K& {
+        unsafe {
+            return & *((self.keys + self.current_slot * self.stride)as K*const);
+        }
+    }
+}
+
+impl<V> Iterator for HashMapValueIter<V> {
+    type Item = V&;
+
+    fn next(HashMapValueIter<V>&mut self) -> bool {
+        while (self.index < self.capacity) {
+            i64 slot = self.index;
+
+            self.index += 1;
+            if (state_at(self.states, slot) == 1) {
+                self.current_slot = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+    fn current(HashMapValueIter<V>& self) -> V& {
+        unsafe {
+            return & *((self.values + self.current_slot * self.stride)as V*const);
+        }
+    }
+}
+
+impl<K, V> Iterator for HashMapEntryIter<K, V> {
+    type Item = HashMapEntry<K, V>;
+
+    fn next(HashMapEntryIter<K, V>&mut self) -> bool {
+        while (self.index < self.capacity) {
+            i64 slot = self.index;
+
+            self.index += 1;
+            if (state_at(self.states, slot) == 1) {
+                self.current_slot = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+    fn current(HashMapEntryIter<K, V>& self) -> HashMapEntry<K, V> {
+        unsafe {
+            return HashMapEntry<K, V> {
+                key_address: self.keys + self.current_slot * self.key_stride,
+                value_address: self.values + self.current_slot * self.value_stride,
+            };
+        }
+    }
+}
+
+impl<K: Hash + Eq, V> Drop for HashMap<K, V> {
+    fn drop(HashMap<K, V>&mut self) {
+        self.clear();
+        raz_rt_dealloc(self.states);
+        raz_rt_dealloc_aligned(self.values, align_of<V>()as i64);
+        raz_rt_dealloc_aligned(self.keys, align_of<K>()as i64);
+        self.states = 0;
+        self.values = 0;
+        self.keys = 0;
+        self.capacity = 0;
+    }
+}

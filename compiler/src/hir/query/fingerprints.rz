@@ -1,0 +1,262 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_hir_query_fingerprints;
+public import raz_compiler_hir_query_types;
+// Module fingerprints are deterministic compiler-local summaries. The full
+// source fingerprint detects implementation changes. The exported-interface
+// fingerprint hashes only public top-level declaration regions, so changes
+// confined to private declarations do not force downstream interface changes.
+fn hir_query_fingerprint_mix(i64 fingerprint, i64 value) -> i64 {
+  i64 mixed = (fingerprint * 131 + value + 4099) % 281474976710597;
+
+  if (mixed < 0) {
+    mixed = 0 - mixed;
+  }
+  return mixed;
+}
+
+fn hir_query_source_range_fingerprint(Source& source, i64 start, i64 end) -> i64 {
+  if (start < 0) {
+    start = 0;
+  }
+  if (end > source.length) {
+    end = source.length;
+  }
+  if (end < start) {
+    end = start;
+  }
+  return raz_rt_stage1_arena_range_hash(source.bytes, start, end - start, 146959810393466);
+}
+
+fn hir_query_module_interface_fingerprint(HirBuilder&mut builder, i64 module_id, Source& source) -> i64 {
+  i64 fingerprint = 17;
+  i64 declaration = 0;
+
+  while (declaration < builder.declaration_visibility_count) {
+    i64 offset = raz_rt_stage1_arena_get(builder.declaration_visibility_offsets, declaration);
+    i64 visibility = raz_rt_stage1_arena_get(builder.declaration_visibility_values, declaration);
+
+    if (visibility == 1 && hir_module_at_offset(builder, offset) == module_id) {
+      i64 end = source.length;
+
+      if (declaration + 1 < builder.declaration_visibility_count) {
+        end = raz_rt_stage1_arena_get(builder.declaration_visibility_offsets, declaration + 1);
+      }
+      fingerprint = hir_query_fingerprint_mix(
+      fingerprint,
+      hir_query_source_range_fingerprint(source, offset, end),
+      );
+    }
+    declaration += 1;
+  }
+  return fingerprint;
+}
+
+fn hir_query_record_module_fingerprint(
+HirBuilder&mut builder,
+i64 module_id,
+i64 source_fingerprint,
+i64 interface_fingerprint,
+) -> bool {
+  i64 index = 0;
+
+  while (index < builder.query_module_fingerprint_count) {
+    if (raz_rt_stage1_arena_get(builder.query_module_fingerprint_ids, index) == module_id) {
+      raz_rt_stage1_arena_set(builder.query_module_source_fingerprints, index, source_fingerprint);
+      raz_rt_stage1_arena_set(
+      builder.query_module_interface_fingerprints,
+      index,
+      interface_fingerprint,
+      );
+      return true;
+    }
+    index += 1;
+  }
+  if (builder.query_module_fingerprint_count >= 4096) {
+    return false;
+  }
+  index = builder.query_module_fingerprint_count;
+  builder.query_module_fingerprint_count += 1;
+  raz_rt_stage1_arena_set(builder.query_module_fingerprint_ids, index, module_id);
+  raz_rt_stage1_arena_set(builder.query_module_source_fingerprints, index, source_fingerprint);
+  raz_rt_stage1_arena_set(builder.query_module_interface_fingerprints, index, interface_fingerprint);
+  return true;
+}
+
+fn hir_query_record_module_fingerprints(HirBuilder&mut builder, Source& source) -> bool {
+  i64 segment = 0;
+
+  while (segment < builder.module_segment_count) {
+    i64 start = raz_rt_stage1_arena_get(builder.module_segment_offsets, segment);
+    i64 end = source.length;
+
+    if (segment + 1 < builder.module_segment_count) {
+      end = raz_rt_stage1_arena_get(builder.module_segment_offsets, segment + 1);
+    }
+
+    i64 module_id = raz_rt_stage1_arena_get(builder.module_segment_ids, segment);
+    i64 source_fingerprint = hir_query_source_range_fingerprint(source, start, end);
+    i64 interface_fingerprint = hir_query_module_interface_fingerprint(builder, module_id, source);
+
+    if (
+    !hir_query_record_module_fingerprint(
+    builder,
+    module_id,
+    source_fingerprint,
+    interface_fingerprint,
+    )
+    ) {
+      return false;
+    }
+    segment += 1;
+  }
+  return true;
+}
+fn hir_query_incremental_module_index(HirModule& out, i64 module_id) -> i64 {
+    i64 index = 0;
+
+    while (index < out.incremental_module_fingerprint_count) {
+        if (raz_rt_stage1_arena_get(out.incremental_module_ids, index) == module_id) {
+            return index;
+        }
+        index += 1;
+    }
+    return -1;
+}
+
+fn hir_query_incremental_dependency_exists(HirModule& out, i64 owner, i64 target) -> bool {
+    i64 edge = 0;
+
+    while (edge < out.incremental_module_dependency_count) {
+        if (
+        raz_rt_stage1_arena_get(out.incremental_module_dependency_owners, edge) == owner &&
+        raz_rt_stage1_arena_get(out.incremental_module_dependency_targets, edge) == target
+        ) {
+            return true;
+        }
+        edge += 1;
+    }
+    return false;
+}
+
+fn hir_query_export_incremental_module_graph(HirBuilder&mut builder, HirModule&mut out, Source& source) -> bool {
+    if (out.incremental_module_fingerprint_count != builder.module_segment_count) {
+        return false;
+    }
+
+    i64 module_index = 0;
+
+    while (module_index < builder.module_segment_count) {
+        i64 start = raz_rt_stage1_arena_get(builder.module_segment_offsets, module_index);
+        i64 end = source.length;
+
+        if (module_index + 1 < builder.module_segment_count) {
+            end = raz_rt_stage1_arena_get(builder.module_segment_offsets, module_index + 1);
+        }
+        i64 probe = start;
+
+        if (end > start) {
+            probe = end - 1;
+        }
+        raz_rt_stage1_arena_set(
+        out.incremental_module_package_hashes,
+        module_index,
+        hir_package_at_offset(builder, probe),
+        );
+        raz_rt_stage1_arena_set(
+        out.incremental_module_namespace_hashes,
+        module_index,
+        hir_namespace_at_offset(builder, probe),
+        );
+        module_index += 1;
+    }
+
+    i64 function_index = 0;
+
+    while (function_index < out.function_count) {
+        i64 offset = raz_rt_stage1_arena_get(out.function_name_offsets, function_index);
+        raz_rt_stage1_arena_set(
+        out.incremental_function_module_ids,
+        function_index,
+        hir_module_at_offset(builder, offset),
+        );
+        function_index += 1;
+    }
+
+    i64 flat_function_count = 0;
+    module_index = 0;
+    while (module_index < out.incremental_module_fingerprint_count) {
+        i64 module_id = raz_rt_stage1_arena_get(out.incremental_module_ids, module_index);
+        i64 module_start = flat_function_count;
+
+        function_index = 0;
+        while (function_index < out.function_count) {
+            if (raz_rt_stage1_arena_get(out.incremental_function_module_ids, function_index) == module_id) {
+                if (flat_function_count >= 16384) {
+                    return false;
+                }
+                raz_rt_stage1_arena_set(
+                out.incremental_module_function_indices,
+                flat_function_count,
+                function_index,
+                );
+                flat_function_count += 1;
+            }
+            function_index += 1;
+        }
+        raz_rt_stage1_arena_set(out.incremental_module_function_starts, module_index, module_start);
+        raz_rt_stage1_arena_set(
+        out.incremental_module_function_counts,
+        module_index,
+        flat_function_count - module_start,
+        );
+        module_index += 1;
+    }
+
+    out.incremental_module_dependency_count = 0;
+    i64 import_index = 0;
+
+    while (import_index < builder.namespace_import_count) {
+        i64 owner_package = raz_rt_stage1_arena_get(builder.namespace_import_owner_packages, import_index);
+        i64 owner_namespace = raz_rt_stage1_arena_get(builder.namespace_import_owners, import_index);
+        i64 target_package = raz_rt_stage1_arena_get(builder.namespace_import_target_packages, import_index);
+        i64 target_namespace = raz_rt_stage1_arena_get(builder.namespace_import_targets, import_index);
+        i64 owner_module = 0;
+
+        while (owner_module < out.incremental_module_fingerprint_count) {
+            if (
+            raz_rt_stage1_arena_get(out.incremental_module_package_hashes, owner_module) == owner_package &&
+            raz_rt_stage1_arena_get(out.incremental_module_namespace_hashes, owner_module) == owner_namespace
+            ) {
+                i64 target_module = 0;
+
+                while (target_module < out.incremental_module_fingerprint_count) {
+                    if (
+                    target_module != owner_module &&
+                    raz_rt_stage1_arena_get(out.incremental_module_package_hashes, target_module) == target_package &&
+                    raz_rt_stage1_arena_get(out.incremental_module_namespace_hashes, target_module) == target_namespace
+                    ) {
+                        i64 owner_id = raz_rt_stage1_arena_get(out.incremental_module_ids, owner_module);
+                        i64 target_id = raz_rt_stage1_arena_get(out.incremental_module_ids, target_module);
+
+                        if (!hir_query_incremental_dependency_exists(out, owner_id, target_id)) {
+                            if (out.incremental_module_dependency_count >= 16384) {
+                                return false;
+                            }
+                            i64 edge = out.incremental_module_dependency_count;
+
+                            out.incremental_module_dependency_count += 1;
+                            raz_rt_stage1_arena_set(out.incremental_module_dependency_owners, edge, owner_id);
+                            raz_rt_stage1_arena_set(out.incremental_module_dependency_targets, edge, target_id);
+                        }
+                    }
+                    target_module += 1;
+                }
+            }
+            owner_module += 1;
+        }
+        import_index += 1;
+    }
+    return true;
+}

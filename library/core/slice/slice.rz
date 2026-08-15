@@ -1,0 +1,214 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace core::slice;
+import core::iter::iterator;
+// Zero-allocation contiguous views. Slice<T> and SliceMut<T> are two machine
+// words and never own storage; callers retain the lifetime of the backing
+// allocation. All indexing helpers perform one bounds check and return a null
+// pointer on failure so hot callers can choose checked or explicitly-unsafe
+// access without allocating Option wrappers.
+public struct Slice<T> {
+    usize data;
+    i64 length;
+}
+
+public struct SliceMut<T> {
+    usize data;
+    i64 length;
+}
+
+// Compatibility byte view retained for existing low-level APIs.
+public struct SliceIter<T> {
+    usize data;
+    i64 length;
+    i64 index;
+}
+
+public struct ByteSlice {
+    usize data;
+    i64 length;
+}
+
+public fn is_empty(ByteSlice slice) -> bool {
+    return slice.length == 0;
+}
+
+public fn valid(ByteSlice slice) -> bool {
+    return slice.length >= 0 && (slice.length == 0 || slice.data != 0);
+}
+
+impl<T> Slice<T> {
+    fn new(T*const data, i64 length) -> Slice<T> {
+        unsafe {
+            return Slice<T> {
+                data: data as usize,
+                length: length
+            };
+        }
+    }
+    fn len(Slice<T>& self) -> i64 {
+        return self.length;
+    }
+    fn is_empty(Slice<T>& self) -> bool {
+        return self.length == 0;
+    }
+    fn valid(Slice<T>& self) -> bool {
+        if (self.length < 0) {
+            return false;
+        }
+        if (self.length == 0) {
+            return true;
+        }
+        unsafe {
+            return self.data != 0;
+        }
+    }
+    fn as_ptr(Slice<T>& self) -> T*const {
+        unsafe {
+            return self.data as T*const;
+        }
+    }
+    fn get_ptr(Slice<T>& self, i64 index) -> T*const {
+        if (index < 0 || index >= self.length) {
+            unsafe {
+                return 0 as T*const;
+            }
+        }
+        unsafe {
+            return (self.data + index * (size_of<T>()as i64))as T*const;
+        }
+    }
+    fn first_ptr(Slice<T>& self) -> T*const {
+        return self.get_ptr(0);
+    }
+    fn last_ptr(Slice<T>& self) -> T*const {
+        return self.get_ptr(self.length - 1);
+    }
+    fn subslice(Slice<T>& self, i64 start, i64 count) -> Slice<T> {
+        if (start < 0 || count < 0 || start > self.length || count > self.length - start) {
+            unsafe {
+                return Slice<T> {
+                    data: 0,
+                    length: -1
+                };
+            }
+        }
+        unsafe {
+            return Slice<T> {
+                data: self.data + start * (size_of<T>()as i64),
+                length: count
+            };
+        }
+    }
+}
+
+impl<T> Slice<T> {
+    fn iter(Slice<T>& self) -> SliceIter<T> {
+        return SliceIter<T> {
+            data: self.data,
+            length: self.length,
+            index: 0
+        };
+    }
+    fn into_iter(Slice<T>&mut self) -> SliceIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T> Iterator for SliceIter<T> {
+    type Item = T&;
+
+    fn next(SliceIter<T>&mut self) -> bool {
+        if (self.index < self.length) {
+            self.index += 1;
+            return true;
+        }
+        return false;
+    }
+    unsafe fn current(SliceIter<T>& self) -> T& {
+        return & *((self.data + (self.index - 1) * (size_of<T>()as i64))as T*const);
+    }
+}
+
+impl<T> IntoIterator for Slice<T> {
+    type Item = T&;
+    type IntoIter = SliceIter<T>;
+
+    fn into_iter(Slice<T>&mut self) -> SliceIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T> SliceMut<T> {
+    fn new(T*mut data, i64 length) -> SliceMut<T> {
+        unsafe {
+            return SliceMut<T> {
+                data: data as usize,
+                length: length
+            };
+        }
+    }
+    fn len(SliceMut<T>& self) -> i64 {
+        return self.length;
+    }
+    fn is_empty(SliceMut<T>& self) -> bool {
+        return self.length == 0;
+    }
+    fn valid(SliceMut<T>& self) -> bool {
+        if (self.length < 0) {
+            return false;
+        }
+        if (self.length == 0) {
+            return true;
+        }
+        unsafe {
+            return self.data != 0;
+        }
+    }
+    fn as_mut_ptr(SliceMut<T>&mut self) -> T*mut {
+        unsafe {
+            return self.data as T*mut;
+        }
+    }
+    fn get_mut_ptr(SliceMut<T>&mut self, i64 index) -> T*mut {
+        if (index < 0 || index >= self.length) {
+            unsafe {
+                return 0 as T*mut;
+            }
+        }
+        unsafe {
+            return (self.data + index * (size_of<T>()as i64))as T*mut;
+        }
+    }
+    fn first_mut_ptr(SliceMut<T>&mut self) -> T*mut {
+        return self.get_mut_ptr(0);
+    }
+    fn last_mut_ptr(SliceMut<T>&mut self) -> T*mut {
+        return self.get_mut_ptr(self.length - 1);
+    }
+    fn subslice_mut(SliceMut<T>&mut self, i64 start, i64 count) -> SliceMut<T> {
+        if (start < 0 || count < 0 || start > self.length || count > self.length - start) {
+            unsafe {
+                return SliceMut<T> {
+                    data: 0,
+                    length: -1
+                };
+            }
+        }
+        unsafe {
+            return SliceMut<T> {
+                data: self.data + start * (size_of<T>()as i64),
+                length: count
+            };
+        }
+    }
+    fn as_slice(SliceMut<T>& self) -> Slice<T> {
+        unsafe {
+            return Slice<T> {
+                data: self.data,
+                length: self.length
+            };
+        }
+    }
+}

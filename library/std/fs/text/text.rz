@@ -1,0 +1,71 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::text;
+import std::fs;
+import std::io::error;
+import alloc::string;
+import core::result;
+
+public enum TextError {
+    Io(IoError),
+    InvalidUtf8,
+    OutOfMemory,
+}
+
+public fn read_to_string(usize path, i64 path_length) -> Result<String, TextError> {
+    Result<i64, IoError> size_result = std::fs::try_file_size(path, path_length);
+    i64 size = 0;
+
+    match size_result {
+        Result<i64, IoError>::Ok(value) => {
+            size = value;
+        }
+        Result<i64, IoError>::Error(error) => {
+            return Result<String, TextError>::Error(TextError::Io(error));
+        }
+    }
+    if (size < 0) {
+        return Result<String, TextError>::Error(TextError::Io(error_with_code(IoOperation::Read, -1)));
+    }
+
+    String value = alloc::string::with_capacity(size);
+
+    if (size > 0 && alloc::string::data_ptr(&value) == 0) {
+        return Result<String, TextError>::Error(TextError::OutOfMemory);
+    }
+    Result<i64, IoError> read_result = std::fs::try_read(
+        path,
+        path_length,
+        alloc::string::data_ptr(&value),
+        size,
+    );
+
+    i64 count = 0;
+
+    match read_result {
+        Result<i64, IoError>::Ok(value_count) => {
+            count = value_count;
+        }
+        Result<i64, IoError>::Error(error) => {
+            return Result<String, TextError>::Error(TextError::Io(error));
+        }
+    }
+    unsafe {
+        if (!alloc::string::set_len_initialized(&mut value, count)) {
+            return Result<String, TextError>::Error(TextError::OutOfMemory);
+        }
+    }
+    if (!alloc::string::is_valid_utf8(&value)) {
+        return Result<String, TextError>::Error(TextError::InvalidUtf8);
+    }
+    return Result<String, TextError>::Ok(move value);
+}
+
+public fn write_string(usize path, i64 path_length, String& value) -> Result<i64, IoError> {
+    return std::fs::try_write(path, path_length, alloc::string::data_ptr(value), alloc::string::len(value));
+}
+
+public fn append_string(usize path, i64 path_length, String& value) -> Result<i64, IoError> {
+    return std::fs::try_append(path, path_length, alloc::string::data_ptr(value), alloc::string::len(value));
+}

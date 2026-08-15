@@ -1,0 +1,657 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::encoding::json::document;
+import alloc::string;
+import alloc::vec;
+import core::bytes;
+import std::encoding::json;
+/// Cache-friendly JSON DOM kind. Object member names and string/number values
+/// are represented as byte ranges into JsonDocument::source; parsing therefore
+/// performs one source allocation plus geometric node-vector growth rather
+/// than one heap allocation per value.
+public enum JsonValueKind {
+    Object,
+    Array,
+    String,
+    Number,
+    Bool,
+    Null,
+}
+
+public struct JsonNode {
+    JsonValueKind kind;
+    i64 value_offset;
+    i64 value_length;
+    i64 key_offset;
+    i64 key_length;
+    i64 first_child;
+    i64 next_sibling;
+    i64 child_count;
+    bool bool_value;
+}
+
+public struct JsonDocument {
+    String source;
+    RawVec nodes;
+    i64 root;
+    usize borrowed_source;
+    i64 borrowed_length;
+    bool borrowed;
+}
+
+public fn empty() -> JsonDocument {
+    return JsonDocument {
+        source: alloc::string::with_capacity(0),
+        nodes: alloc::vec::create_aligned(size_of<JsonNode>()as i64, align_of<JsonNode>()as i64, 0),
+        root: -1,
+        borrowed_source: 0,
+        borrowed_length: 0,
+        borrowed: false,
+    };
+}
+
+fn source_base(JsonDocument& document) -> usize {
+    if (document.borrowed) {
+        return document.borrowed_source;
+    }
+    return alloc::string::data_ptr(&document.source);
+}
+
+public fn source_view(JsonDocument& document) -> BytesView {
+    if (document.borrowed) {
+        return BytesView {
+            data: document.borrowed_source,
+            length: document.borrowed_length
+        };
+    }
+    return BytesView {
+        data: alloc::string::data_ptr(&document.source),
+        length: alloc::string::len(&document.source),
+    };
+}
+
+public fn node_count(JsonDocument& document) -> i64 {
+    return alloc::vec::len(&document.nodes);
+}
+
+public fn root_index(JsonDocument& document) -> i64 {
+    return document.root;
+}
+
+public fn node_ptr(JsonDocument& document, i64 index) -> JsonNode*const {
+    unsafe {
+        return alloc::vec::element_address(&document.nodes, index)as JsonNode*const;
+    }
+}
+
+public fn value_view(JsonDocument& document, i64 index) -> BytesView {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return BytesView {
+            data: 0,
+            length: 0
+        };
+    }
+    unsafe {
+        return BytesView {
+            data: source_base(document) + (*(address as JsonNode*const)).value_offset,
+            length: (*(address as JsonNode*const)).value_length,
+        };
+    }
+}
+
+public fn key_view(JsonDocument& document, i64 index) -> BytesView {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return BytesView {
+            data: 0,
+            length: 0
+        };
+    }
+    unsafe {
+        if ((*(address as JsonNode*const)).key_offset < 0) {
+            return BytesView {
+                data: 0,
+                length: 0
+            };
+        }
+        return BytesView {
+            data: source_base(document) + (*(address as JsonNode*const)).key_offset,
+            length: (*(address as JsonNode*const)).key_length,
+        };
+    }
+}
+
+public fn first_child(JsonDocument& document, i64 index) -> i64 {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return -1;
+    }
+    unsafe {
+        return (*(address as JsonNode*const)).first_child;
+    }
+}
+
+public fn next_sibling(JsonDocument& document, i64 index) -> i64 {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return -1;
+    }
+    unsafe {
+        return (*(address as JsonNode*const)).next_sibling;
+    }
+}
+
+public fn child_count(JsonDocument& document, i64 index) -> i64 {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return 0;
+    }
+    unsafe {
+        return (*(address as JsonNode*const)).child_count;
+    }
+}
+
+fn token_offset(usize base, BytesView view) -> i64 {
+    if (view.data < base) {
+        return -1;
+    }
+    return (view.data - base)as i64;
+}
+
+fn append_node(RawVec&mut nodes, JsonNode node) -> i64 {
+    i64 index = alloc::vec::len(nodes);
+
+    if (!alloc::vec::reserve(nodes, index + 1)) {
+        return -1;
+    }
+    unsafe {
+        *((nodes.data + index * nodes.element_size)as JsonNode*mut) = node;
+    }
+    nodes.length = index + 1;
+    return index;
+}
+
+fn attach_child(RawVec&mut nodes, i64 parent, i64 child, i64 previous) -> bool {
+    usize parent_address = alloc::vec::element_address(nodes, parent);
+
+    if (parent_address == 0) {
+        return false;
+    }
+    unsafe {
+        if ((*(parent_address as JsonNode*mut)).first_child < 0) {
+            (*(parent_address as JsonNode*mut)).first_child = child;
+        }
+        (*(parent_address as JsonNode*mut)).child_count += 1;
+    }
+    if (previous >= 0) {
+        usize previous_address = alloc::vec::element_address(nodes, previous);
+
+        if (previous_address == 0) {
+            return false;
+        }
+        unsafe {
+            (*(previous_address as JsonNode*mut)).next_sibling = child;
+        }
+    }
+    return true;
+}
+
+fn parse_value(
+    JsonLexer&mut lexer,
+    RawVec&mut nodes,
+    usize base,
+    i64 depth,
+    i64 max_depth,
+    i64 key_offset,
+    i64 key_length,
+    i64&mut output,
+) -> JsonError {
+    if (depth > max_depth) {
+        return JsonError::DepthExceeded;
+    }
+
+    JsonToken token = std::encoding::json::next(lexer);
+
+    if (token.kind == JsonTokenKind::Error) {
+        return token.error;
+    }
+    if (token.kind == JsonTokenKind::End) {
+        return JsonError::UnexpectedEnd;
+    }
+    if (token.kind == JsonTokenKind::String) {
+        i64 index = append_node(nodes, JsonNode {
+            kind: JsonValueKind::String,
+            value_offset: token_offset(base, token.lexeme),
+            value_length: token.lexeme.length,
+            key_offset: key_offset,
+            key_length: key_length,
+            first_child: -1,
+            next_sibling: -1,
+            child_count: 0,
+            bool_value: false,
+        }
+        );
+        if (index < 0) {
+            return JsonError::OutOfMemory;
+        }
+        *output = index;
+        return JsonError::None;
+    }
+    if (token.kind == JsonTokenKind::Number) {
+        i64 index = append_node(nodes, JsonNode {
+            kind: JsonValueKind::Number,
+            value_offset: token_offset(base, token.lexeme),
+            value_length: token.lexeme.length,
+            key_offset: key_offset,
+            key_length: key_length,
+            first_child: -1,
+            next_sibling: -1,
+            child_count: 0,
+            bool_value: false,
+        }
+        );
+        if (index < 0) {
+            return JsonError::OutOfMemory;
+        }
+        *output = index;
+        return JsonError::None;
+    }
+    if (token.kind == JsonTokenKind::True || token.kind == JsonTokenKind::False) {
+        i64 index = append_node(nodes, JsonNode {
+            kind: JsonValueKind::Bool,
+            value_offset: token_offset(base, token.lexeme),
+            value_length: token.lexeme.length,
+            key_offset: key_offset,
+            key_length: key_length,
+            first_child: -1,
+            next_sibling: -1,
+            child_count: 0,
+            bool_value: token.kind == JsonTokenKind::True,
+        }
+        );
+        if (index < 0) {
+            return JsonError::OutOfMemory;
+        }
+        *output = index;
+        return JsonError::None;
+    }
+    if (token.kind == JsonTokenKind::Null) {
+        i64 index = append_node(nodes, JsonNode {
+            kind: JsonValueKind::Null,
+            value_offset: token_offset(base, token.lexeme),
+            value_length: token.lexeme.length,
+            key_offset: key_offset,
+            key_length: key_length,
+            first_child: -1,
+            next_sibling: -1,
+            child_count: 0,
+            bool_value: false,
+        }
+        );
+        if (index < 0) {
+            return JsonError::OutOfMemory;
+        }
+        *output = index;
+        return JsonError::None;
+    }
+
+    bool object = token.kind == JsonTokenKind::LeftBrace;
+    bool array = token.kind == JsonTokenKind::LeftBracket;
+
+    if (!object && !array) {
+        return JsonError::UnexpectedToken;
+    }
+
+    JsonValueKind container_kind = JsonValueKind::Array;
+
+    if (object) {
+        container_kind = JsonValueKind::Object;
+    }
+    i64 container = append_node(nodes, JsonNode {
+        kind: container_kind,
+        value_offset: token.offset,
+        value_length: 0,
+        key_offset: key_offset,
+        key_length: key_length,
+        first_child: -1,
+        next_sibling: -1,
+        child_count: 0,
+        bool_value: false,
+    }
+    );
+    if (container < 0) {
+        return JsonError::UnexpectedEnd;
+    }
+    *output = container;
+
+    JsonToken next_token = std::encoding::json::next(lexer);
+
+    if (next_token.kind == JsonTokenKind::Error) {
+        return next_token.error;
+    }
+    if (
+        (object && next_token.kind == JsonTokenKind::RightBrace) ||
+        (array && next_token.kind == JsonTokenKind::RightBracket)
+    ) {
+        return JsonError::None;
+    }
+    // The lexer has no push-back operation; rewind to the token's offset. This
+    // is safe because offsets refer to the immutable owned source buffer.
+    lexer.cursor = next_token.offset;
+
+    i64 previous = -1;
+
+    while (true) {
+        i64 member_key_offset = -1;
+        i64 member_key_length = 0;
+
+        if (object) {
+            JsonToken key = std::encoding::json::next(lexer);
+
+            if (key.kind == JsonTokenKind::Error) {
+                return key.error;
+            }
+            if (key.kind != JsonTokenKind::String) {
+                return JsonError::UnexpectedToken;
+            }
+            member_key_offset = token_offset(base, key.lexeme);
+            member_key_length = key.lexeme.length;
+
+            JsonToken colon = std::encoding::json::next(lexer);
+
+            if (colon.kind != JsonTokenKind::Colon) {
+                if (colon.kind == JsonTokenKind::Error) {
+                    return colon.error;
+                }
+                return JsonError::UnexpectedToken;
+            }
+        }
+
+        i64 child = -1;
+
+        JsonError parsed = parse_value(
+            lexer,
+            nodes,
+            base,
+            depth + 1,
+            max_depth,
+            member_key_offset,
+            member_key_length,
+            &mut child,
+        );
+        if (parsed != JsonError::None) {
+            return parsed;
+        }
+        if (!attach_child(nodes, container, child, previous)) {
+            return JsonError::UnexpectedEnd;
+        }
+        previous = child;
+
+        JsonToken separator = std::encoding::json::next(lexer);
+
+        if (separator.kind == JsonTokenKind::Error) {
+            return separator.error;
+        }
+        if (
+            (object && separator.kind == JsonTokenKind::RightBrace) ||
+            (array && separator.kind == JsonTokenKind::RightBracket)
+        ) {
+            return JsonError::None;
+        }
+        if (separator.kind != JsonTokenKind::Comma) {
+            return JsonError::UnexpectedToken;
+        }
+    }
+    return JsonError::UnexpectedToken;
+}
+
+/// Parses an owned source string into a flat arena DOM. `output.nodes` retains
+/// its capacity across calls, so a long-lived parser can reuse node storage.
+public fn parse_owned(String source, i64 max_depth, JsonDocument&mut output) -> JsonError {
+    if (max_depth <= 0) {
+        return JsonError::DepthExceeded;
+    }
+
+    usize base = alloc::string::data_ptr(&source);
+    i64 length = alloc::string::len(&source);
+
+    if (length <= 0 || base == 0) {
+        return JsonError::UnexpectedEnd;
+    }
+    alloc::vec::clear(&mut output.nodes);
+
+    JsonLexer lexer = std::encoding::json::lexer(base, length);
+    i64 root = -1;
+    JsonError error = parse_value(&mut lexer, &mut output.nodes, base, 1, max_depth, -1, 0, &mut root);
+
+    if (error != JsonError::None) {
+        alloc::vec::clear(&mut output.nodes);
+        return error;
+    }
+
+    JsonToken tail = std::encoding::json::next(&mut lexer);
+
+    if (tail.kind != JsonTokenKind::End) {
+        alloc::vec::clear(&mut output.nodes);
+        if (tail.kind == JsonTokenKind::Error) {
+            return tail.error;
+        }
+        return JsonError::TrailingData;
+    }
+    alloc::string::destroy(&mut output.source);
+    output.source = move source;
+    output.root = root;
+    output.borrowed_source = 0;
+    output.borrowed_length = 0;
+    output.borrowed = false;
+    return JsonError::None;
+}
+
+/// Parses caller-owned immutable bytes without copying them. The caller must
+/// keep the bytes alive and unchanged while the document is used. Node arena
+/// capacity is retained across calls.
+public fn parse_borrowed(usize data, i64 length, i64 max_depth, JsonDocument&mut output) -> JsonError {
+    if (max_depth <= 0) {
+        return JsonError::DepthExceeded;
+    }
+    if (data == 0 || length <= 0) {
+        return JsonError::UnexpectedEnd;
+    }
+    alloc::vec::clear(&mut output.nodes);
+
+    JsonLexer lexer = std::encoding::json::lexer(data, length);
+    i64 root = -1;
+    JsonError error = parse_value(&mut lexer, &mut output.nodes, data, 1, max_depth, -1, 0, &mut root);
+
+    if (error != JsonError::None) {
+        alloc::vec::clear(&mut output.nodes);
+        return error;
+    }
+
+    JsonToken tail = std::encoding::json::next(&mut lexer);
+
+    if (tail.kind != JsonTokenKind::End) {
+        alloc::vec::clear(&mut output.nodes);
+        if (tail.kind == JsonTokenKind::Error) {
+            return tail.error;
+        }
+        return JsonError::TrailingData;
+    }
+    alloc::string::clear(&mut output.source);
+    output.root = root;
+    output.borrowed_source = data;
+    output.borrowed_length = length;
+    output.borrowed = true;
+    return JsonError::None;
+}
+
+public fn kind_at(JsonDocument& document, i64 index, JsonValueKind&mut output) -> bool {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return false;
+    }
+    unsafe {
+        *output = (*(address as JsonNode*const)).kind;
+    }
+    return true;
+}
+
+public fn array_get(JsonDocument& document, i64 array_index, i64 position) -> i64 {
+    if (position<0) {
+        return -1;
+    }
+
+    usize address = alloc::vec::element_address(&document.nodes, array_index);
+
+    if (address == 0) {
+        return -1;
+    }
+
+    i64 child = -1;
+
+    unsafe {
+        if ((*(address as JsonNode*const)).kind != JsonValueKind::Array) {
+            return -1;
+        }
+        child = (*(address as JsonNode*const)).first_child;
+    }
+
+    i64 i = 0;
+
+    while (child >= 0 && i<position) {
+        child = next_sibling(document, child);
+        i += 1;
+    }
+    return child;
+}
+
+public fn decode_string(JsonDocument& document, i64 index, String&mut output) -> bool {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return false;
+    }
+    unsafe {
+        if ((*(address as JsonNode*const)).kind != JsonValueKind::String) {
+            return false;
+        }
+
+        BytesView view = value_view(document, index);
+
+        JsonToken token = JsonToken {
+            kind: JsonTokenKind::String, lexeme: view, offset: (*(address as JsonNode*const)).value_offset, error: JsonError::None,
+        };
+        return std::encoding::json::decode_string(&token, output);
+    }
+}
+
+public fn number_i64(JsonDocument& document, i64 index, i64&mut output) -> bool {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return false;
+    }
+    unsafe {
+        if ((*(address as JsonNode*const)).kind != JsonValueKind::Number) {
+            return false;
+        }
+
+        BytesView view = value_view(document, index);
+
+        JsonToken token = JsonToken {
+            kind: JsonTokenKind::Number, lexeme: view, offset: (*(address as JsonNode*const)).value_offset, error: JsonError::None,
+        };
+        return std::encoding::json::token_i64(&token, output);
+    }
+}
+
+public fn bool_at(JsonDocument& document, i64 index, bool&mut output) -> bool {
+    usize address = alloc::vec::element_address(&document.nodes, index);
+
+    if (address == 0) {
+        return false;
+    }
+    unsafe {
+        if ((*(address as JsonNode*const)).kind != JsonValueKind::Bool) {
+            return false;
+        }
+        *output = (*(address as JsonNode*const)).bool_value;
+        return true;
+    }
+}
+
+/// Fast object lookup. Unescaped member names compare directly without
+/// allocating. Escaped member names decode into caller-provided scratch only
+/// on the slow path, and scratch capacity is reusable across lookups.
+public fn object_get(
+    JsonDocument& document,
+    i64 object_index,
+    usize key,
+    i64 key_length,
+    String&mut scratch,
+) -> i64 {
+    usize object_address = alloc::vec::element_address(&document.nodes, object_index);
+
+    if (object_address == 0 || key_length < 0 || (key_length> 0 && key == 0)) {
+        return -1;
+    }
+    unsafe {
+        if ((*(object_address as JsonNode*const)).kind != JsonValueKind::Object) {
+            return -1;
+        }
+    }
+
+    i64 child = -1;
+
+    unsafe {
+        child = (*(object_address as JsonNode*const)).first_child;
+    }
+    while (child >= 0) {
+        usize value_address = alloc::vec::element_address(&document.nodes, child);
+
+        if (value_address == 0) {
+            return -1;
+        }
+
+        BytesView raw = key_view(document, child);
+        bool escaped = core::bytes::find_byte(raw, 92) >= 0;
+
+        if (!escaped) {
+            if (raw.length == key_length && core::bytes::equal(raw, BytesView {
+                data: key, length: key_length
+            }
+            )) {
+                return child;
+            }
+        } else {
+            alloc::string::clear(scratch);
+
+            i64 key_offset = 0;
+
+            unsafe {
+                key_offset = (*(value_address as JsonNode*const)).key_offset;
+            }
+            JsonToken token = JsonToken {
+                kind: JsonTokenKind::String, lexeme: raw, offset: key_offset, error: JsonError::None
+            };
+            if (
+                std::encoding::json::decode_string(&token, scratch) &&
+                alloc::string::equals_bytes(scratch, key, key_length)
+            ) {
+                return child;
+            }
+        }
+        unsafe {
+            child = (*(value_address as JsonNode*const)).next_sibling;
+        }
+    }
+    return -1;
+}

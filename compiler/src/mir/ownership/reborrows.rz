@@ -1,0 +1,101 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_ownership_reborrows;
+public import raz_compiler_mir_ownership_loan_regions;
+// Reborrow provenance is explicit MIR semantic metadata. Child loans inherit the
+// canonical referent path from the parent loan. A shared parent can only create
+// shared children; an exclusive parent may be reborrowed shared or exclusive.
+fn mir_loan_is_descendant_of(MirModule& mir, i64 child, i64 ancestor) -> bool {
+  i64 current = child;
+  i64 depth = 0;
+
+  while (current >= 0 && current < mir.ownership_event_count && depth < 256) {
+    i64 parent = raz_rt_stage1_arena_get(mir.ownership_event_parents, current);
+
+    if (parent == ancestor) {
+      return true;
+    }
+    if (parent < 0 || parent >= current) {
+      return false;
+    }
+    current = parent;
+    depth += 1;
+  }
+  return false;
+}
+
+fn verify_mir_reborrow_provenance(MirModule& mir) -> bool {
+  if (mir.ownership_event_count == 0) {
+    return true;
+  }
+
+  bool has_reborrow = false;
+  i64 scan_event = 0;
+
+  while (scan_event < mir.ownership_event_count && !has_reborrow) {
+    has_reborrow = raz_rt_stage1_arena_get(mir.ownership_event_parents, scan_event) >= 0;
+    scan_event += 1;
+  }
+  if (!has_reborrow) {
+    return true;
+  }
+
+  MirCfg cfg;
+
+  if (!build_mir_cfg(mir, &mut cfg)) {
+    return false;
+  }
+
+  i64 loan_last_uses = raz_rt_stage1_arena_create(mir.ownership_event_count + 1);
+
+  if (loan_last_uses == 0) {
+    destroy_mir_cfg(&mut cfg);
+    return false;
+  }
+  if (!build_mir_loan_last_use_table(mir, &cfg, loan_last_uses)) {
+    raz_rt_stage1_arena_destroy(loan_last_uses);
+    destroy_mir_cfg(&mut cfg);
+    return false;
+  }
+
+  bool valid = true;
+  i64 event = 0;
+
+  while (event < mir.ownership_event_count && valid) {
+    i64 parent = raz_rt_stage1_arena_get(mir.ownership_event_parents, event);
+
+    if (parent >= 0) {
+      if (parent >= event || parent >= mir.ownership_event_count) {
+        valid = false;
+      } else {
+        i64 kind = raz_rt_stage1_arena_get(mir.ownership_event_kinds, event);
+        i64 parent_kind = raz_rt_stage1_arena_get(mir.ownership_event_kinds, parent);
+
+        if ((kind != 3 && kind != 4) || (parent_kind != 3 && parent_kind != 4)) {
+          valid = false;
+        } else if (parent_kind == 3 && kind == 4) {
+          valid = false;
+        } else if (!mir_ownership_paths_overlap(mir, parent, event)) {
+          valid = false;
+        } else if (
+        raz_rt_stage1_arena_get(
+        mir.ownership_event_instructions,
+        parent,
+        ) >= raz_rt_stage1_arena_get(mir.ownership_event_instructions, event)
+        ) {
+          valid = false;
+        } else if (
+        raz_rt_stage1_arena_get(loan_last_uses, event) >
+        raz_rt_stage1_arena_get(loan_last_uses, parent)
+        ) {
+          valid = false;
+        }
+      }
+    }
+    event += 1;
+  }
+  raz_rt_stage1_arena_destroy(loan_last_uses);
+  destroy_mir_cfg(&mut cfg);
+  return valid;
+}

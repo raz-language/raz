@@ -1,0 +1,332 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace collections::deque;
+import alloc::deque;
+import core::iter::iterator;
+import core::hash;
+import core::option;
+
+public struct Deque<T> {
+    RawDeque raw;
+}
+
+public struct DequeIter<T> {
+    usize data;
+    i64 stride;
+    i64 length;
+    i64 capacity;
+    i64 head;
+    i64 index;
+}
+
+impl<T> Deque<T> {
+    fn new() -> Deque<T> {
+        return Deque<T> {
+            raw: raw_deque_create_aligned(size_of<T>()as i64, align_of<T>()as i64, 0),
+        };
+    }
+    fn with_capacity(i64 capacity) -> Deque<T> {
+        return Deque<T> {
+            raw: raw_deque_create_aligned(size_of<T>()as i64, align_of<T>()as i64, capacity),
+        };
+    }
+    fn len(Deque<T>& self) -> i64 {
+        return self.raw.length;
+    }
+    fn capacity(Deque<T>& self) -> i64 {
+        return self.raw.capacity;
+    }
+    fn is_empty(Deque<T>& self) -> bool {
+        return self.raw.length == 0;
+    }
+    fn reserve(Deque<T>&mut self, i64 capacity) -> bool {
+        return raw_deque_reserve(&mut self.raw, capacity);
+    }
+    fn reserve_exact(Deque<T>&mut self, i64 capacity) -> bool {
+        return raw_deque_reserve_exact(&mut self.raw, capacity);
+    }
+    fn push_back(Deque<T>&mut self, T value) -> bool {
+        if (
+            self.raw.length == 9223372036854775807 ||
+            !raw_deque_reserve(&mut self.raw, self.raw.length + 1)
+        ) {
+            return false;
+        }
+
+        i64 slot = (self.raw.head + self.raw.length) % self.raw.capacity;
+
+        unsafe {
+            *((self.raw.data + slot * self.raw.element_size)as T*mut) = move value;
+        }
+        self.raw.length += 1;
+        return true;
+    }
+    fn push_front(Deque<T>&mut self, T value) -> bool {
+        if (
+            self.raw.length == 9223372036854775807 ||
+            !raw_deque_reserve(&mut self.raw, self.raw.length + 1)
+        ) {
+            return false;
+        }
+        self.raw.head -= 1;
+        if (self.raw.head < 0) {
+            self.raw.head += self.raw.capacity;
+        }
+        unsafe {
+            *((self.raw.data + self.raw.head * self.raw.element_size)as T*mut) = move value;
+        }
+        self.raw.length += 1;
+        return true;
+    }
+    fn get_ptr(Deque<T>& self, i64 index) -> T*const {
+        if (index < 0 || index >= self.raw.length || self.raw.capacity <= 0) {
+            unsafe {
+                return 0 as T*const;
+            }
+        }
+
+        i64 slot = (self.raw.head + index) % self.raw.capacity;
+
+        unsafe {
+            return (self.raw.data + slot * self.raw.element_size)as T*const;
+        }
+    }
+    fn get_mut_ptr(Deque<T>&mut self, i64 index) -> T*mut {
+        if (index < 0 || index >= self.raw.length || self.raw.capacity <= 0) {
+            unsafe {
+                return 0 as T*mut;
+            }
+        }
+
+        i64 slot = (self.raw.head + index) % self.raw.capacity;
+
+        unsafe {
+            return (self.raw.data + slot * self.raw.element_size)as T*mut;
+        }
+    }
+    fn pop_front(Deque<T>&mut self) -> Option<T> {
+        if (self.raw.length <= 0) {
+            return Option<T>::None;
+        }
+        unsafe {
+            T value = move*((self.raw.data + self.raw.head * self.raw.element_size)as T*mut);
+
+            self.raw.head = (self.raw.head + 1) % self.raw.capacity;
+            self.raw.length -= 1;
+            if (self.raw.length == 0) {
+                self.raw.head = 0;
+            }
+            return Option<T>::Some(move value);
+        }
+    }
+    fn pop_back(Deque<T>&mut self) -> Option<T> {
+        if (self.raw.length <= 0) {
+            return Option<T>::None;
+        }
+
+        i64 slot = (self.raw.head + self.raw.length - 1) % self.raw.capacity;
+
+        unsafe {
+            T value = move*((self.raw.data + slot * self.raw.element_size)as T*mut);
+
+            self.raw.length -= 1;
+            if (self.raw.length == 0) {
+                self.raw.head = 0;
+            }
+            return Option<T>::Some(move value);
+        }
+    }
+    fn remove(Deque<T>&mut self, i64 index) -> Option<T> {
+        if (index < 0 || index >= self.raw.length || self.raw.capacity <= 0) {
+            return Option<T>::None;
+        }
+
+        i64 slot = (self.raw.head + index) % self.raw.capacity;
+
+        unsafe {
+            T value = move*((self.raw.data + slot * self.raw.element_size)as T*mut);
+
+            if (index < self.raw.length / 2) {
+                i64 cursor = index;
+
+                while (cursor > 0) {
+                    i64 destination = (self.raw.head + cursor) % self.raw.capacity;
+                    i64 source = (self.raw.head + cursor - 1) % self.raw.capacity;
+
+                    raz_rt_move(
+                        self.raw.data + destination * self.raw.element_size,
+                        self.raw.data + source * self.raw.element_size,
+                        self.raw.element_size,
+                    );
+                    cursor -= 1;
+                }
+                self.raw.head = (self.raw.head + 1) % self.raw.capacity;
+            } else {
+                i64 cursor = index;
+
+                while (cursor + 1 < self.raw.length) {
+                    i64 destination = (self.raw.head + cursor) % self.raw.capacity;
+                    i64 source = (self.raw.head + cursor + 1) % self.raw.capacity;
+
+                    raz_rt_move(
+                        self.raw.data + destination * self.raw.element_size,
+                        self.raw.data + source * self.raw.element_size,
+                        self.raw.element_size,
+                    );
+                    cursor += 1;
+                }
+            }
+            self.raw.length -= 1;
+            if (self.raw.length == 0) {
+                self.raw.head = 0;
+            }
+            return Option<T>::Some(move value);
+        }
+    }
+    fn try_pop_front(Deque<T>&mut self, T&mut output) -> bool {
+        if (self.raw.length <= 0) {
+            return false;
+        }
+        unsafe {
+            *output = move*((self.raw.data + self.raw.head * self.raw.element_size)as T*mut);
+        }
+        self.raw.head = (self.raw.head + 1) % self.raw.capacity;
+        self.raw.length -= 1;
+        if (self.raw.length == 0) {
+            self.raw.head = 0;
+        }
+        return true;
+    }
+    fn try_pop_back(Deque<T>&mut self, T&mut output) -> bool {
+        if (self.raw.length <= 0) {
+            return false;
+        }
+
+        i64 slot = (self.raw.head + self.raw.length - 1) % self.raw.capacity;
+
+        unsafe {
+            *output = move*((self.raw.data + slot * self.raw.element_size)as T*mut);
+        }
+        self.raw.length -= 1;
+        if (self.raw.length == 0) {
+            self.raw.head = 0;
+        }
+        return true;
+    }
+    fn first_ptr(Deque<T>& self) -> T*const {
+        return self.get_ptr(0);
+    }
+    fn last_ptr(Deque<T>& self) -> T*const {
+        return self.get_ptr(self.raw.length - 1);
+    }
+    fn shrink_to_fit(Deque<T>&mut self) -> bool {
+        return raw_deque_shrink_to_fit(&mut self.raw);
+    }
+    fn clear(Deque<T>&mut self) {
+        while (self.raw.length > 0) {
+            i64 slot = (self.raw.head + self.raw.length - 1) % self.raw.capacity;
+
+            unsafe {
+                T removed = move*((self.raw.data + slot * self.raw.element_size)as T*mut);
+
+                removed;
+            }
+            self.raw.length -= 1;
+        }
+        self.raw.head = 0;
+    }
+    fn iter(Deque<T>& self) -> DequeIter<T> {
+        return DequeIter<T> {
+            data: self.raw.data,
+            stride: self.raw.element_size,
+            length: self.raw.length,
+            capacity: self.raw.capacity,
+            head: self.raw.head,
+            index: 0,
+        };
+    }
+}
+
+impl<T: Eq> Deque<T> {
+    fn position(Deque<T>& self, T& value) -> i64 {
+        i64 index = 0;
+
+        while (index < self.raw.length) {
+            i64 slot = (self.raw.head + index) % self.raw.capacity;
+
+            unsafe {
+                T& current = & *((self.raw.data + slot * self.raw.element_size)as T*const);
+
+                if (current.equals(value)) {
+                    return index;
+                }
+            }
+            index += 1;
+        }
+        return -1;
+    }
+    fn contains(Deque<T>& self, T& value) -> bool {
+        return self.position(value) >= 0;
+    }
+    fn count(Deque<T>& self, T& value) -> i64 {
+        i64 total = 0;
+        i64 index = 0;
+
+        while (index < self.raw.length) {
+            i64 slot = (self.raw.head + index) % self.raw.capacity;
+
+            unsafe {
+                T& current = & *((self.raw.data + slot * self.raw.element_size)as T*const);
+
+                if (current.equals(value)) {
+                    total += 1;
+                }
+            }
+            index += 1;
+        }
+        return total;
+    }
+    fn remove_first(Deque<T>&mut self, T& value) -> Option<T> {
+        i64 index = self.position(value);
+
+        if (index < 0) {
+            return Option<T>::None;
+        }
+        return self.remove(index);
+    }
+}
+
+impl<T> Iterator for DequeIter<T> {
+    type Item = T&;
+
+    fn next(DequeIter<T>&mut self) -> bool {
+        if (self.index < self.length) {
+            self.index += 1;
+            return true;
+        }
+        return false;
+    }
+    unsafe fn current(DequeIter<T>& self) -> T& {
+        i64 logical = self.index - 1;
+        i64 slot = (self.head + logical) % self.capacity;
+
+        return & *((self.data + slot * self.stride)as T*const);
+    }
+}
+
+impl<T> IntoIterator for Deque<T> {
+    type Item = T&;
+    type IntoIter = DequeIter<T>;
+
+    fn into_iter(Deque<T>&mut self) -> DequeIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T: Drop> Drop for Deque<T> {
+    fn drop(Deque<T>&mut self) {
+        self.clear();
+        raw_deque_destroy(&mut self.raw);
+    }
+}

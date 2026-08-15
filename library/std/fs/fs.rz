@@ -1,0 +1,262 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs;
+import core::result;
+import std::io::error;
+import std::fs::tree;
+import std::fs::file;
+// Filesystem primitives keep the public Raz layer small and allocation-neutral.
+// Higher-level buffering and path abstractions can build on these bulk operations.
+extern fn raz_rt_path_exists(usize path, i64 length) -> i64;
+extern fn raz_rt_file_size(usize path, i64 length) -> i64;
+
+public fn create_dir(usize path, i64 length) -> bool {
+    Result<bool, IoError> result = std::fs::tree::create_dir_all(path, length);
+
+    match result {
+        Result<bool, IoError>::Ok(value) => {
+            return true;
+        }
+        Result<bool, IoError>::Error(error) => {
+            return false;
+        }
+    }
+}
+
+public fn remove(usize path, i64 length) -> bool {
+    Result<i64, IoError> result = std::fs::tree::remove_dir_all(path, length);
+
+    match result {
+        Result<i64, IoError>::Ok(count) => {
+            return true;
+        }
+        Result<i64, IoError>::Error(error) => {
+            return false;
+        }
+    }
+}
+
+public fn exists(usize path, i64 length) -> bool {
+    return raz_rt_path_exists(path, length) == 1;
+}
+
+public fn file_size(usize path, i64 length) -> i64 {
+    return raz_rt_file_size(path, length);
+}
+
+public fn read(usize path, i64 length, usize output, i64 capacity) -> i64 {
+    File file = std::fs::file::open_read(path, length);
+
+    if (!std::fs::file::valid(&file)) {
+        return -1;
+    }
+
+    i64 count = std::fs::file::read(&mut file, output, capacity);
+
+    std::fs::file::close(&mut file);
+    return count;
+}
+
+public fn write(usize path, i64 length, usize data, i64 size) -> i64 {
+    File file = std::fs::file::create(path, length);
+
+    if (!std::fs::file::valid(&file)) {
+        return -1;
+    }
+
+    bool complete = std::fs::file::write_all(&mut file, data, size);
+
+    std::fs::file::close(&mut file);
+    if (!complete) {
+        return -1;
+    }
+    return size;
+}
+
+public fn append(usize path, i64 length, usize data, i64 size) -> i64 {
+    File file = std::fs::file::open_append(path, length);
+
+    if (!std::fs::file::valid(&file)) {
+        return -1;
+    }
+
+    bool complete = std::fs::file::write_all(&mut file, data, size);
+
+    std::fs::file::close(&mut file);
+    if (!complete) {
+        return -1;
+    }
+    return size;
+}
+
+extern fn raz_rt_path_is_file(usize path, i64 length) -> i64;
+extern fn raz_rt_path_is_dir(usize path, i64 length) -> i64;
+extern fn raz_rt_rename_path(usize from, i64 from_length, usize to, i64 to_length) -> i64;
+extern fn raz_rt_copy_file(usize from, i64 from_length, usize to, i64 to_length, i64 overwrite) -> i64;
+
+public fn is_file(usize path, i64 length) -> bool {
+    return raz_rt_path_is_file(path, length) == 1;
+}
+
+public fn is_dir(usize path, i64 length) -> bool {
+    return raz_rt_path_is_dir(path, length) == 1;
+}
+
+public fn rename(usize from, i64 from_length, usize to, i64 to_length) -> bool {
+    return raz_rt_rename_path(from, from_length, to, to_length) == 1;
+}
+
+public fn copy_file(usize from, i64 from_length, usize to, i64 to_length, bool overwrite) -> bool {
+    if (overwrite) {
+        return raz_rt_copy_file(from, from_length, to, to_length, 1) == 1;
+    }
+    return raz_rt_copy_file(from, from_length, to, to_length, 0) == 1;
+}
+
+/// Structured-error filesystem surface. Existing bool/i64 functions above are
+/// retained for compatibility; new code can use these Result-returning forms.
+public fn try_create_dir(usize path, i64 length) -> Result<bool, IoError> {
+    return std::fs::tree::create_dir_all(path, length);
+}
+
+public fn try_remove(usize path, i64 length) -> Result<i64, IoError> {
+    return std::fs::tree::remove_dir_all(path, length);
+}
+
+public fn try_exists(usize path, i64 length) -> Result<bool, IoError> {
+    i64 status = raz_rt_path_exists(path, length);
+
+    if (status < 0) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Metadata));
+    }
+    return Result<bool, IoError>::Ok(status == 1);
+}
+
+public fn try_file_size(usize path, i64 length) -> Result<i64, IoError> {
+    i64 size = raz_rt_file_size(path, length);
+
+    if (size < 0) {
+        return Result<i64, IoError>::Error(last_error(IoOperation::Metadata));
+    }
+    return Result<i64, IoError>::Ok(size);
+}
+
+public fn try_read(usize path, i64 length, usize output, i64 capacity) -> Result<i64, IoError> {
+    Result<File, IoError> opened = std::fs::file::try_open_read(path, length);
+
+    match opened {
+        Result<File, IoError>::Error(error) => {
+            return Result<i64, IoError>::Error(error);
+        }
+        Result<File, IoError>::Ok(value) => {
+            File file = move value;
+            Result<i64, IoError> result = std::fs::file::try_read(&mut file, output, capacity);
+
+            std::fs::file::close(&mut file);
+            return result;
+        }
+    }
+}
+
+public fn try_write(usize path, i64 length, usize data, i64 size) -> Result<i64, IoError> {
+    Result<File, IoError> opened = std::fs::file::try_create(path, length);
+
+    match opened {
+        Result<File, IoError>::Error(error) => {
+            return Result<i64, IoError>::Error(error);
+        }
+        Result<File, IoError>::Ok(value) => {
+            File file = move value;
+            Result<bool, IoError> written = std::fs::file::try_write_all(&mut file, data, size);
+
+            std::fs::file::close(&mut file);
+            match written {
+                Result<bool, IoError>::Error(error) => {
+                    return Result<i64, IoError>::Error(error);
+                }
+                Result<bool, IoError>::Ok(complete) => {
+                    if (!complete) {
+                        return Result<i64, IoError>::Error(error_with_code(IoOperation::Write, -1));
+                    }
+                    return Result<i64, IoError>::Ok(size);
+                }
+            }
+        }
+    }
+}
+
+public fn try_append(usize path, i64 length, usize data, i64 size) -> Result<i64, IoError> {
+    Result<File, IoError> opened = std::fs::file::try_open_append(path, length);
+
+    match opened {
+        Result<File, IoError>::Error(error) => {
+            return Result<i64, IoError>::Error(error);
+        }
+        Result<File, IoError>::Ok(value) => {
+            File file = move value;
+            Result<bool, IoError> written = std::fs::file::try_write_all(&mut file, data, size);
+
+            std::fs::file::close(&mut file);
+            match written {
+                Result<bool, IoError>::Error(error) => {
+                    return Result<i64, IoError>::Error(error);
+                }
+                Result<bool, IoError>::Ok(complete) => {
+                    if (!complete) {
+                        return Result<i64, IoError>::Error(error_with_code(IoOperation::Write, -1));
+                    }
+                    return Result<i64, IoError>::Ok(size);
+                }
+            }
+        }
+    }
+}
+
+public fn try_is_file(usize path, i64 length) -> Result<bool, IoError> {
+    i64 status = raz_rt_path_is_file(path, length);
+
+    if (status < 0) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Metadata));
+    }
+    return Result<bool, IoError>::Ok(status == 1);
+}
+
+public fn try_is_dir(usize path, i64 length) -> Result<bool, IoError> {
+    i64 status = raz_rt_path_is_dir(path, length);
+
+    if (status < 0) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Metadata));
+    }
+    return Result<bool, IoError>::Ok(status == 1);
+}
+
+public fn try_rename(usize from, i64 from_length, usize to, i64 to_length) -> Result<bool, IoError> {
+    i64 status = raz_rt_rename_path(from, from_length, to, to_length);
+
+    if (status != 1) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Rename));
+    }
+    return Result<bool, IoError>::Ok(true);
+}
+
+public fn try_copy_file(
+    usize from,
+    i64 from_length,
+    usize to,
+    i64 to_length,
+    bool overwrite,
+) -> Result<bool, IoError> {
+    i64 raw_overwrite = 0;
+
+    if (overwrite) {
+        raw_overwrite = 1;
+    }
+
+    i64 status = raz_rt_copy_file(from, from_length, to, to_length, raw_overwrite);
+
+    if (status != 1) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Copy));
+    }
+    return Result<bool, IoError>::Ok(true);
+}

@@ -1,0 +1,303 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::vec;
+// Alignment-aware raw growable storage. Typed collections use create_aligned
+// with compiler-specialized size_of<T>() / align_of<T>(); create() remains a
+// compatibility helper for byte-oriented callers.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_move(usize destination, usize source, i64 size);
+
+public struct RawVec {
+    usize data;
+    i64 length;
+    i64 capacity;
+    i64 element_size;
+    i64 element_alignment;
+}
+
+fn valid_alignment(i64 alignment) -> bool {
+    if (alignment <= 0 || alignment > 4096) {
+        return false;
+    }
+    return (alignment & (alignment - 1)) == 0;
+}
+
+fn allocation_size(i64 element_size, i64 capacity) -> i64 {
+    if (element_size <= 0 || capacity < 0) {
+        return -1;
+    }
+    if (capacity != 0 && element_size > 9223372036854775807 / capacity) {
+        return -1;
+    }
+    return element_size * capacity;
+}
+
+fn growth_capacity(i64 current, i64 required) -> i64 {
+    if (required <= current) {
+        return current;
+    }
+
+    i64 next = current;
+
+    if (next < 8) {
+        next = 8;
+    }
+    while (next < required) {
+        if (next > 2305843009213693951) {
+            return required;
+        }
+        next *= 2;
+    }
+    return next;
+}
+
+public fn create_aligned(i64 element_size, i64 element_alignment, i64 capacity) -> RawVec {
+    if (element_size <= 0 || capacity < 0 || !valid_alignment(element_alignment)) {
+        return RawVec {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+        };
+    }
+    if (capacity == 0) {
+        return RawVec {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+        };
+    }
+
+    i64 bytes = allocation_size(element_size, capacity);
+
+    if (bytes < 0) {
+        return RawVec {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+        };
+    }
+
+    usize data = raz_rt_alloc_aligned(bytes, element_alignment);
+
+    if (data == 0) {
+        return RawVec {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+        };
+    }
+    return RawVec {
+        data: data,
+        length: 0,
+        capacity: capacity,
+        element_size: element_size,
+        element_alignment: element_alignment,
+    };
+}
+
+public fn create(i64 element_size, i64 capacity) -> RawVec {
+    i64 alignment = element_size;
+
+    if (alignment > 8) {
+        alignment = 8;
+    }
+    if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+        alignment = 1;
+    }
+    return create_aligned(element_size, alignment, capacity);
+}
+
+public fn len(RawVec& vector) -> i64 {
+    return vector.length;
+}
+
+public fn capacity(RawVec& vector) -> i64 {
+    return vector.capacity;
+}
+
+public fn is_empty(RawVec& vector) -> bool {
+    return vector.length == 0;
+}
+
+public fn reserve_exact(RawVec&mut vector, i64 capacity) -> bool {
+    if (capacity <= vector.capacity) {
+        return true;
+    }
+    if (capacity < 0 || vector.element_size <= 0 || !valid_alignment(vector.element_alignment)) {
+        return false;
+    }
+
+    i64 bytes = allocation_size(vector.element_size, capacity);
+
+    if (bytes < 0) {
+        return false;
+    }
+
+    usize replacement = raz_rt_alloc_aligned(bytes, vector.element_alignment);
+
+    if (replacement == 0) {
+        return false;
+    }
+    if (vector.length > 0 && vector.data != 0) {
+        raz_rt_copy(replacement, vector.data, vector.length * vector.element_size);
+    }
+    raz_rt_dealloc_aligned(vector.data, vector.element_alignment);
+    vector.data = replacement;
+    vector.capacity = capacity;
+    return true;
+}
+
+public fn reserve(RawVec&mut vector, i64 capacity) -> bool {
+    return reserve_exact(vector, growth_capacity(vector.capacity, capacity));
+}
+
+public fn shrink_to_fit(RawVec&mut vector) -> bool {
+    if (vector.length == vector.capacity) {
+        return true;
+    }
+    if (vector.length == 0) {
+        raz_rt_dealloc_aligned(vector.data, vector.element_alignment);
+        vector.data = 0;
+        vector.capacity = 0;
+        return true;
+    }
+    if (vector.element_size <= 0 || !valid_alignment(vector.element_alignment)) {
+        return false;
+    }
+
+    i64 bytes = allocation_size(vector.element_size, vector.length);
+
+    if (bytes < 0) {
+        return false;
+    }
+
+    usize replacement = raz_rt_alloc_aligned(bytes, vector.element_alignment);
+
+    if (replacement == 0) {
+        return false;
+    }
+    raz_rt_copy(replacement, vector.data, bytes);
+    raz_rt_dealloc_aligned(vector.data, vector.element_alignment);
+    vector.data = replacement;
+    vector.capacity = vector.length;
+    return true;
+}
+
+public fn append_raw(RawVec&mut destination, RawVec&mut source) -> bool {
+    if (source.length == 0) {
+        return true;
+    }
+    if (
+        destination.element_size != source.element_size ||
+        destination.element_alignment != source.element_alignment
+    ) {
+        return false;
+    }
+    if (source.length < 0 || destination.length > 9223372036854775807 - source.length) {
+        return false;
+    }
+
+    i64 required = destination.length + source.length;
+
+    if (!reserve(destination, required)) {
+        return false;
+    }
+
+    i64 bytes = source.length * source.element_size;
+
+    raz_rt_copy(destination.data + destination.length * destination.element_size, source.data, bytes);
+    destination.length = required;
+    source.length = 0;
+    return true;
+}
+
+public fn clear(RawVec&mut vector) {
+    vector.length = 0;
+}
+
+public fn destroy(RawVec&mut vector) {
+    raz_rt_dealloc_aligned(vector.data, vector.element_alignment);
+    vector.data = 0;
+    vector.length = 0;
+    vector.capacity = 0;
+}
+
+public fn data_ptr(RawVec& vector) -> usize {
+    return vector.data;
+}
+
+public fn element_address(RawVec& vector, i64 index) -> usize {
+    if (index < 0 || index >= vector.length || vector.element_size <= 0) {
+        return 0;
+    }
+    return vector.data + index * vector.element_size;
+}
+
+public fn push_raw(RawVec&mut vector, usize source) -> bool {
+    if (source == 0 || vector.element_size <= 0 || vector.length == 9223372036854775807) {
+        return false;
+    }
+
+    i64 required = vector.length + 1;
+
+    if (!reserve(vector, required)) {
+        return false;
+    }
+    raz_rt_copy(vector.data + vector.length * vector.element_size, source, vector.element_size);
+    vector.length = required;
+    return true;
+}
+
+public fn pop_raw(RawVec&mut vector, usize output) -> bool {
+    if (vector.length <= 0 || output == 0 || vector.element_size <= 0) {
+        return false;
+    }
+    vector.length -= 1;
+    raz_rt_copy(output, vector.data + vector.length * vector.element_size, vector.element_size);
+    return true;
+}
+
+public fn remove_raw(RawVec&mut vector, i64 index, usize output) -> bool {
+    if (index < 0 || index >= vector.length || vector.element_size <= 0) {
+        return false;
+    }
+
+    usize address = vector.data + index * vector.element_size;
+
+    if (output != 0) {
+        raz_rt_copy(output, address, vector.element_size);
+    }
+
+    i64 tail = vector.length - index - 1;
+
+    if (tail > 0) {
+        raz_rt_move(address, address + vector.element_size, tail * vector.element_size);
+    }
+    vector.length -= 1;
+    return true;
+}
+
+public fn truncate(RawVec&mut vector, i64 length) -> bool {
+    if (length < 0 || length > vector.length) {
+        return false;
+    }
+    vector.length = length;
+    return true;
+}
+
+impl Drop for RawVec {
+    fn drop(RawVec&mut self) {
+        destroy(self);
+    }
+}

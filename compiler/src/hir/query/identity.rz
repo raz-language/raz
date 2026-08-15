@@ -1,0 +1,102 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_hir_query_identity;
+public import raz_compiler_hir_query_resolution;
+// Canonical semantic identities for exact generic instantiation requests.
+// Fingerprints accelerate lookup, but exact packed arguments define identity.
+fn hir_query_monomorph_arguments_same(
+HirBuilder&mut builder,
+i64 request,
+i64 argument_count,
+i64 argument_structures,
+i64 argument_types,
+) -> bool {
+  if (raz_rt_stage1_arena_get(builder.query_monomorph_argument_counts, request) != argument_count) {
+    return false;
+  }
+
+  i64 start = raz_rt_stage1_arena_get(builder.query_monomorph_argument_starts, request);
+  i64 argument = 0;
+
+  while (argument < argument_count) {
+    if (
+    raz_rt_stage1_arena_get(
+    builder.query_monomorph_argument_structures,
+    start + argument,
+    ) != raz_rt_stage1_arena_get(argument_structures, argument) ||
+    raz_rt_stage1_arena_get(
+    builder.query_monomorph_argument_types,
+    start + argument,
+    ) != raz_rt_stage1_arena_get(argument_types, argument)
+    ) {
+      return false;
+    }
+    argument += 1;
+  }
+  return true;
+}
+
+fn hir_query_intern_monomorphization(
+HirBuilder&mut builder,
+i64 entity_kind,
+i64 generic,
+i64 argument_count,
+i64 argument_structures,
+i64 argument_types,
+) -> i64 {
+  i64 hash = hir_generic_argument_hash(generic, argument_count, argument_structures, argument_types);
+  i64 request = 0;
+
+  while (request < builder.query_monomorph_count) {
+    if (
+    raz_rt_stage1_arena_get(builder.query_monomorph_entity_kinds, request) == entity_kind &&
+    raz_rt_stage1_arena_get(builder.query_monomorph_templates, request) == generic &&
+    raz_rt_stage1_arena_get(builder.query_monomorph_hashes, request) == hash &&
+    hir_query_monomorph_arguments_same(
+    builder,
+    request,
+    argument_count,
+    argument_structures,
+    argument_types,
+    )
+    ) {
+      return request;
+    }
+    request += 1;
+  }
+  if (
+  builder.query_monomorph_count >= 4096 ||
+  builder.query_monomorph_argument_count + argument_count > 32768
+  ) {
+    return -1;
+  }
+  request = builder.query_monomorph_count;
+  builder.query_monomorph_count += 1;
+
+  i64 start = builder.query_monomorph_argument_count;
+
+  builder.query_monomorph_argument_count += argument_count;
+  raz_rt_stage1_arena_set(builder.query_monomorph_entity_kinds, request, entity_kind);
+  raz_rt_stage1_arena_set(builder.query_monomorph_templates, request, generic);
+  raz_rt_stage1_arena_set(builder.query_monomorph_argument_counts, request, argument_count);
+  raz_rt_stage1_arena_set(builder.query_monomorph_hashes, request, hash);
+  raz_rt_stage1_arena_set(builder.query_monomorph_argument_starts, request, start);
+
+  i64 argument = 0;
+
+  while (argument < argument_count) {
+    raz_rt_stage1_arena_set(
+    builder.query_monomorph_argument_structures,
+    start + argument,
+    raz_rt_stage1_arena_get(argument_structures, argument),
+    );
+    raz_rt_stage1_arena_set(
+    builder.query_monomorph_argument_types,
+    start + argument,
+    raz_rt_stage1_arena_get(argument_types, argument),
+    );
+    argument += 1;
+  }
+  return request;
+}

@@ -1,0 +1,205 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_rxe_codegen;
+public import raz_compiler_backend_rxe_decoder;
+
+fn rxe_hash_source_name(Source& source, i64 offset, i64 length) -> i64 {
+    // 32-bit FNV-1a keeps the on-disk ABI descriptor compact and deterministic.
+    i64 hash = 2166136261;
+    i64 i = 0;
+    while (i < length) {
+        hash = hash ^ source_byte(source, offset + i);
+        hash = (hash * 16777619) & 4294967295;
+        i += 1;
+    }
+    return hash;
+}
+
+fn rxe_populate_callable_identity(RxeModule&mut module, Source& source, HirModule& hir) -> bool {
+    i64 function = 0;
+    while (function < module.function_count) {
+        i64 offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function);
+        i64 length = raz_rt_stage1_arena_get(hir.function_name_lengths, function);
+        if (offset < 0 || length < 0) { return false; }
+        raz_rt_stage1_arena_set(module.function_name_hashes, function, rxe_hash_source_name(source, offset, length));
+        function += 1;
+    }
+    return true;
+}
+
+
+
+fn rxe_selector_mix(i64 hash, i64 value, i64 prime) -> i64 {
+    hash = hash ^ (value & 4294967295);
+    return (hash * prime) & 4294967295;
+}
+
+fn rxe_finalize_callable_selectors(RxeModule&mut module) -> bool {
+    i64 function = 0;
+    while (function < module.function_count) {
+        i64 lo = 2166136261;
+        i64 hi = 2246822519;
+        i64 name_hash = raz_rt_stage1_arena_get(module.function_name_hashes, function);
+        i64 abi = raz_rt_stage1_arena_get(module.function_abi_kinds, function);
+        i64 start = raz_rt_stage1_arena_get(module.function_signature_starts, function);
+        i64 count = raz_rt_stage1_arena_get(module.function_argument_counts, function);
+        lo = rxe_selector_mix(lo, name_hash, 16777619);
+        hi = rxe_selector_mix(hi, name_hash, 3266489917);
+        lo = rxe_selector_mix(lo, abi, 16777619);
+        hi = rxe_selector_mix(hi, abi, 3266489917);
+        lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.function_return_types, function), 16777619);
+        lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.function_return_nested, function), 16777619);
+        lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.function_return_flags, function), 16777619);
+        hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.function_return_types, function), 3266489917);
+        hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.function_return_nested, function), 3266489917);
+        hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.function_return_flags, function), 3266489917);
+        i64 parameter = 0;
+        while (parameter < count) {
+            i64 index = start + parameter;
+            lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_types, index), 16777619);
+            lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_nested, index), 16777619);
+            lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_extents, index), 16777619);
+            lo = rxe_selector_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_flags, index), 16777619);
+            hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_types, index), 3266489917);
+            hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_nested, index), 3266489917);
+            hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_extents, index), 3266489917);
+            hi = rxe_selector_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_flags, index), 3266489917);
+            parameter += 1;
+        }
+        raz_rt_stage1_arena_set(module.function_selector_lo, function, lo);
+        raz_rt_stage1_arena_set(module.function_selector_hi, function, hi);
+        function += 1;
+    }
+    return true;
+}
+
+fn rxe_finalize_features(RxeModule&mut module) -> bool {
+    i64 flags = 0;
+    i64 i = 0;
+    while (i < module.instruction_count) {
+        flags = flags | rxe_opcode_feature(raz_rt_stage1_arena_get(module.opcodes, i));
+        i += 1;
+    }
+    module.feature_flags = flags;
+    return true;
+}
+
+fn rxe_populate_exports(RxeModule&mut module, HirModule& hir) -> bool {
+    module.export_count = 0;
+    i64 function = 0;
+    while (function < module.function_count) {
+        if (raz_rt_stage1_arena_get(hir.function_is_extern, function) == 0) {
+            i64 position = module.export_count;
+            i64 selector_lo = raz_rt_stage1_arena_get(module.function_selector_lo, function);
+            i64 selector_hi = raz_rt_stage1_arena_get(module.function_selector_hi, function);
+            // Stable insertion order by 64-bit signature-aware selector, then function index.
+            while (position > 0) {
+                i64 previous_hi = raz_rt_stage1_arena_get(module.export_selector_hi, position - 1);
+                i64 previous_lo = raz_rt_stage1_arena_get(module.export_selector_lo, position - 1);
+                i64 previous_function = raz_rt_stage1_arena_get(module.export_function_indices, position - 1);
+                if (previous_hi < selector_hi || (previous_hi == selector_hi && previous_lo < selector_lo) || (previous_hi == selector_hi && previous_lo == selector_lo && previous_function < function)) { break; }
+                raz_rt_stage1_arena_set(module.export_function_indices, position, previous_function);
+                raz_rt_stage1_arena_set(module.export_name_hashes, position, raz_rt_stage1_arena_get(module.export_name_hashes, position - 1));
+                raz_rt_stage1_arena_set(module.export_selector_lo, position, previous_lo);
+                raz_rt_stage1_arena_set(module.export_selector_hi, position, previous_hi);
+                raz_rt_stage1_arena_set(module.export_abi_kinds, position, raz_rt_stage1_arena_get(module.export_abi_kinds, position - 1));
+                raz_rt_stage1_arena_set(module.export_flags, position, raz_rt_stage1_arena_get(module.export_flags, position - 1));
+                position -= 1;
+            }
+            raz_rt_stage1_arena_set(module.export_function_indices, position, function);
+            raz_rt_stage1_arena_set(module.export_name_hashes, position, raz_rt_stage1_arena_get(module.function_name_hashes, function));
+            raz_rt_stage1_arena_set(module.export_selector_lo, position, selector_lo);
+            raz_rt_stage1_arena_set(module.export_selector_hi, position, selector_hi);
+            raz_rt_stage1_arena_set(module.export_abi_kinds, position, raz_rt_stage1_arena_get(module.function_abi_kinds, function));
+            raz_rt_stage1_arena_set(module.export_flags, position, 1);
+            module.export_count += 1;
+        }
+        function += 1;
+    }
+    return true;
+}
+
+fn rxe_fingerprint_mix(i64 hash, i64 value, i64 prime) -> i64 {
+    hash = hash ^ (value & 4294967295);
+    return (hash * prime) & 4294967295;
+}
+
+fn rxe_finalize_fingerprint(RxeModule&mut module) -> bool {
+    i64 lo = 2166136261;
+    i64 hi = 2246822519;
+    lo = rxe_fingerprint_mix(lo, rxe_format_version(), 16777619);
+    hi = rxe_fingerprint_mix(hi, rxe_isa_version(), 3266489917);
+    lo = rxe_fingerprint_mix(lo, module.feature_flags, 16777619);
+    hi = rxe_fingerprint_mix(hi, module.feature_flags, 3266489917);
+    lo = rxe_fingerprint_mix(lo, module.function_count, 16777619);
+    hi = rxe_fingerprint_mix(hi, module.function_count, 3266489917);
+    lo = rxe_fingerprint_mix(lo, module.instruction_count, 16777619);
+    hi = rxe_fingerprint_mix(hi, module.instruction_count, 3266489917);
+    lo = rxe_fingerprint_mix(lo, module.block_count, 16777619);
+    hi = rxe_fingerprint_mix(hi, module.block_count, 3266489917);
+    i64 i = 0;
+    while (i < module.function_count) {
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_code_starts, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_code_counts, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_frame_slots, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_selector_lo, i), 16777619);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_register_counts, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_selector_hi, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_abi_kinds, i), 3266489917);
+        i += 1;
+    }
+    i = 0;
+    while (i < module.instruction_count) {
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.opcodes, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.dst, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.src0, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.src1, i), 16777619);
+        lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.immediates, i), 16777619);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.opcodes, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.dst, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.src0, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.src1, i), 3266489917);
+        hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.immediates, i), 3266489917);
+        i += 1;
+    }
+    i = 0; while (i < module.constant_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.constants, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.constants, i), 3266489917); i += 1; }
+    i = 0; while (i < module.global_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.global_values, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.global_flags, i), 3266489917); i += 1; }
+    i = 0; while (i < module.layout_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.layout_kinds, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.layout_slot_counts, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.layout_field_starts, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.layout_field_counts, i), 3266489917); i += 1; }
+    i = 0; while (i < module.layout_field_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.layout_field_types, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.layout_field_nested, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.layout_field_extents, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.layout_field_flags, i), 3266489917); i += 1; }
+    i = 0; while (i < module.signature_parameter_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_types, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.signature_parameter_flags, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_nested, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.signature_parameter_extents, i), 3266489917); i += 1; }
+    i = 0; while (i < module.function_type_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_type_signature_starts, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_type_parameter_counts, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_type_return_types, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_type_return_nested, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_type_return_flags, i), 3266489917); i += 1; }
+    i = 0; while (i < module.function_type_parameter_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_type_parameter_types, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.function_type_parameter_flags, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.function_type_parameter_nested, i), 3266489917); i += 1; }
+    i = 0; while (i < module.block_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.block_code_starts, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.block_code_counts, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.block_successor0, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.block_successor1, i), 3266489917); i += 1; }
+    i = 0; while (i < module.export_count) { lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.export_selector_lo, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.export_function_indices, i), 16777619); lo = rxe_fingerprint_mix(lo, raz_rt_stage1_arena_get(module.export_name_hashes, i), 16777619); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.export_selector_hi, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.export_abi_kinds, i), 3266489917); hi = rxe_fingerprint_mix(hi, raz_rt_stage1_arena_get(module.export_flags, i), 3266489917); i += 1; }
+    module.module_fingerprint_lo = lo;
+    module.module_fingerprint_hi = hi;
+    return true;
+}
+
+fn emit_rxe_module(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length) -> bool {
+    if (output_path == 0 || output_path_length <= 0) { return false; }
+    RxeModule module;
+    if (!rxe_module_init(&mut module, hir, mir)) { return false; }
+    bool ok = rxe_populate_callable_identity(&mut module, source, hir);
+    if (ok) { ok = rxe_lower_mir(&mut module, hir, mir); }
+    if (ok) { ok = rxe_finalize_callable_selectors(&mut module); }
+    if (ok) { ok = rxe_populate_exports(&mut module, hir); }
+    // Build the canonical CFG before allocation so register liveness is driven
+    // by actual block edges rather than linear instruction order. Allocation
+    // and machine optimization do not change instruction positions or control
+    // terminators, so the same block partition remains canonical afterwards.
+    if (ok) { ok = rxe_build_blocks(&mut module); }
+    if (ok) { ok = rxe_allocate_registers(&mut module); }
+    if (ok) { ok = rxe_optimize_module(&mut module); }
+    if (ok) { ok = rxe_build_blocks(&mut module); }
+    if (ok) { ok = rxe_finalize_features(&mut module); }
+    if (ok) { ok = rxe_finalize_fingerprint(&mut module); }
+    if (ok) { ok = rxe_verify_module(&module); }
+    if (ok) { ok = rxe_write_module(&module, output_path, output_path_length); }
+    // Freeze-prep invariant: every emitted RXE must be independently decoded
+    // from bytes and re-encode to the exact canonical image before success.
+    if (ok) { ok = rxe_validate_written_module(output_path, output_path_length, &module); }
+    rxe_module_destroy(&mut module);
+    return ok;
+}

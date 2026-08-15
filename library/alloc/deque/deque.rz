@@ -1,0 +1,302 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::deque;
+
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+
+public struct RawDeque {
+    usize data;
+    i64 length;
+    i64 capacity;
+    i64 element_size;
+    i64 element_alignment;
+    i64 head;
+}
+
+fn deque_valid_alignment(i64 alignment) -> bool {
+    return alignment > 0 && alignment <= 4096 && (alignment & (alignment - 1)) == 0;
+}
+
+fn deque_allocation_size(i64 element_size, i64 capacity) -> i64 {
+    if (element_size <= 0 || capacity < 0) {
+        return -1;
+    }
+    if (capacity != 0 && element_size > 9223372036854775807 / capacity) {
+        return -1;
+    }
+    return element_size * capacity;
+}
+
+fn deque_growth(i64 current, i64 required) -> i64 {
+    if (required <= current) {
+        return current;
+    }
+
+    i64 next = current;
+
+    if (next < 8) {
+        next = 8;
+    }
+    while (next < required) {
+        if (next > 2305843009213693951) {
+            return required;
+        }
+        next *= 2;
+    }
+    return next;
+}
+
+public fn raw_deque_create_aligned(i64 element_size, i64 element_alignment, i64 capacity) -> RawDeque {
+    if (element_size <= 0 || capacity < 0 || !deque_valid_alignment(element_alignment)) {
+        return RawDeque {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+            head: 0,
+        };
+    }
+    if (capacity == 0) {
+        return RawDeque {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+            head: 0,
+        };
+    }
+
+    i64 bytes = deque_allocation_size(element_size, capacity);
+
+    if (bytes < 0) {
+        return RawDeque {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+            head: 0,
+        };
+    }
+
+    usize data = raz_rt_alloc_aligned(bytes, element_alignment);
+
+    if (data == 0) {
+        return RawDeque {
+            data: 0,
+            length: 0,
+            capacity: 0,
+            element_size: element_size,
+            element_alignment: element_alignment,
+            head: 0,
+        };
+    }
+    return RawDeque {
+        data: data,
+        length: 0,
+        capacity: capacity,
+        element_size: element_size,
+        element_alignment: element_alignment,
+        head: 0,
+    };
+}
+
+public fn raw_deque_create(i64 element_size, i64 capacity) -> RawDeque {
+    i64 alignment = element_size;
+
+    if (alignment > 8) {
+        alignment = 8;
+    }
+    if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+        alignment = 1;
+    }
+    return raw_deque_create_aligned(element_size, alignment, capacity);
+}
+
+public fn raw_deque_len(RawDeque& deque) -> i64 {
+    return deque.length;
+}
+
+public fn raw_deque_capacity(RawDeque& deque) -> i64 {
+    return deque.capacity;
+}
+
+public fn raw_deque_is_empty(RawDeque& deque) -> bool {
+    return deque.length == 0;
+}
+
+fn raw_deque_physical_index(RawDeque& deque, i64 logical) -> i64 {
+    if (deque.capacity <= 0) {
+        return -1;
+    }
+    return (deque.head + logical) % deque.capacity;
+}
+
+public fn raw_deque_element_address(RawDeque& deque, i64 index) -> usize {
+    if (index < 0 || index >= deque.length || deque.element_size <= 0) {
+        return 0;
+    }
+    return deque.data + raw_deque_physical_index(deque, index) * deque.element_size;
+}
+
+public fn raw_deque_reserve_exact(RawDeque&mut deque, i64 capacity) -> bool {
+    if (capacity <= deque.capacity) {
+        return true;
+    }
+
+    i64 bytes = deque_allocation_size(deque.element_size, capacity);
+
+    if (bytes < 0 || !deque_valid_alignment(deque.element_alignment)) {
+        return false;
+    }
+
+    usize replacement = raz_rt_alloc_aligned(bytes, deque.element_alignment);
+
+    if (replacement == 0) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < deque.length) {
+        raz_rt_copy(
+            replacement + index * deque.element_size,
+            raw_deque_element_address(deque, index),
+            deque.element_size,
+        );
+        index += 1;
+    }
+    raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
+    deque.data = replacement;
+    deque.capacity = capacity;
+    deque.head = 0;
+    return true;
+}
+
+public fn raw_deque_reserve(RawDeque&mut deque, i64 capacity) -> bool {
+    return raw_deque_reserve_exact(deque, deque_growth(deque.capacity, capacity));
+}
+
+public fn raw_deque_shrink_to_fit(RawDeque&mut deque) -> bool {
+    if (deque.length == deque.capacity) {
+        return true;
+    }
+    if (deque.length == 0) {
+        raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
+        deque.data = 0;
+        deque.capacity = 0;
+        deque.head = 0;
+        return true;
+    }
+
+    i64 bytes = deque_allocation_size(deque.element_size, deque.length);
+
+    if (bytes < 0 || !deque_valid_alignment(deque.element_alignment)) {
+        return false;
+    }
+
+    usize replacement = raz_rt_alloc_aligned(bytes, deque.element_alignment);
+
+    if (replacement == 0) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < deque.length) {
+        raz_rt_copy(
+            replacement + index * deque.element_size,
+            raw_deque_element_address(deque, index),
+            deque.element_size,
+        );
+        index += 1;
+    }
+    raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
+    deque.data = replacement;
+    deque.capacity = deque.length;
+    deque.head = 0;
+    return true;
+}
+
+public fn raw_deque_push_back_raw(RawDeque&mut deque, usize source) -> bool {
+    if (source == 0 || deque.element_size <= 0 || deque.length == 9223372036854775807) {
+        return false;
+    }
+    if (!raw_deque_reserve(deque, deque.length + 1)) {
+        return false;
+    }
+
+    i64 slot = raw_deque_physical_index(deque, deque.length);
+
+    raz_rt_copy(deque.data + slot * deque.element_size, source, deque.element_size);
+    deque.length += 1;
+    return true;
+}
+
+public fn raw_deque_push_front_raw(RawDeque&mut deque, usize source) -> bool {
+    if (source == 0 || deque.element_size <= 0 || deque.length == 9223372036854775807) {
+        return false;
+    }
+    if (!raw_deque_reserve(deque, deque.length + 1)) {
+        return false;
+    }
+    deque.head -= 1;
+    if (deque.head < 0) {
+        deque.head += deque.capacity;
+    }
+    raz_rt_copy(deque.data + deque.head * deque.element_size, source, deque.element_size);
+    deque.length += 1;
+    return true;
+}
+
+public fn raw_deque_pop_front_raw(RawDeque&mut deque, usize output) -> bool {
+    if (deque.length <= 0 || output == 0 || deque.element_size <= 0) {
+        return false;
+    }
+    raz_rt_copy(output, deque.data + deque.head * deque.element_size, deque.element_size);
+    deque.head = (deque.head + 1) % deque.capacity;
+    deque.length -= 1;
+    if (deque.length == 0) {
+        deque.head = 0;
+    }
+    return true;
+}
+
+public fn raw_deque_pop_back_raw(RawDeque&mut deque, usize output) -> bool {
+    if (deque.length <= 0 || output == 0 || deque.element_size <= 0) {
+        return false;
+    }
+
+    i64 slot = raw_deque_physical_index(deque, deque.length - 1);
+
+    raz_rt_copy(output, deque.data + slot * deque.element_size, deque.element_size);
+    deque.length -= 1;
+    if (deque.length == 0) {
+        deque.head = 0;
+    }
+    return true;
+}
+
+public fn raw_deque_clear(RawDeque&mut deque) {
+    deque.length = 0;
+    deque.head = 0;
+}
+
+public fn raw_deque_destroy(RawDeque&mut deque) {
+    raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
+    deque.data = 0;
+    deque.length = 0;
+    deque.capacity = 0;
+    deque.head = 0;
+}
+
+impl Drop for RawDeque {
+    fn drop(RawDeque&mut self) {
+        raw_deque_destroy(self);
+    }
+}

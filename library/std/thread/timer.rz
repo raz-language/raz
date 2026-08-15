@@ -1,0 +1,75 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::timer;
+
+extern fn raz_rt_time_monotonic_nanos() -> i64;
+extern fn raz_rt_sleep_millis(i64 milliseconds);
+// Allocation-free monotonic deadline. Timer policy lives in Raz; the runtime
+// exposes only monotonic time and OS sleep.
+public struct Deadline {
+    i64 nanos;
+}
+
+public fn now() -> Deadline {
+    return Deadline {
+        nanos: raz_rt_time_monotonic_nanos()
+    };
+}
+
+public fn after_millis(i64 delay_millis) -> Deadline {
+    i64 current = raz_rt_time_monotonic_nanos();
+
+    if (delay_millis <= 0) {
+        return Deadline {
+            nanos: current
+        };
+    }
+    if (delay_millis > 9223372036854) {
+        return Deadline {
+            nanos: 9223372036854775807
+        };
+    }
+
+    i64 delta = delay_millis * 1000000;
+
+    if (current > 9223372036854775807 - delta) {
+        return Deadline {
+            nanos: 9223372036854775807
+        };
+    }
+    return Deadline {
+        nanos: current + delta
+    };
+}
+
+public fn expired(Deadline& deadline) -> bool {
+    return raz_rt_time_monotonic_nanos() >= deadline.nanos;
+}
+
+public fn remaining_millis(Deadline& deadline) -> i64 {
+    i64 current = raz_rt_time_monotonic_nanos();
+
+    if (current >= deadline.nanos) {
+        return 0;
+    }
+
+    i64 ns = deadline.nanos - current;
+    i64 ms = ns / 1000000;
+
+    if (ns % 1000000 != 0) {
+        ms += 1;
+    }
+    return ms;
+}
+
+public fn sleep_until(Deadline& deadline) {
+    while (!expired(deadline)) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            return;
+        }
+        raz_rt_sleep_millis(remaining);
+    }
+}

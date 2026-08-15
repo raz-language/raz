@@ -1,0 +1,364 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::path::buf;
+import alloc::string;
+import std::path;
+/// Owned path storage backed by Raz String. PathBuf performs lexical path
+/// manipulation only; filesystem access remains in std::fs.
+public struct PathBuf {
+    String storage;
+}
+
+impl PathBuf {
+    fn new() -> PathBuf {
+        return PathBuf {
+            storage: alloc::string::with_capacity(0)
+        };
+    }
+    fn from_bytes(usize data, i64 length) -> PathBuf {
+        return PathBuf {
+            storage: alloc::string::from_bytes(data, length)
+        };
+    }
+    fn clone(PathBuf& self) -> PathBuf {
+        return PathBuf {
+            storage: alloc::string::clone_string(&self.storage)
+        };
+    }
+    fn len(PathBuf& self) -> i64 {
+        return alloc::string::len(&self.storage);
+    }
+    fn is_empty(PathBuf& self) -> bool {
+        return alloc::string::is_empty(&self.storage);
+    }
+    fn data_ptr(PathBuf& self) -> usize {
+        return alloc::string::data_ptr(&self.storage);
+    }
+    fn as_view(PathBuf& self) -> PathView {
+        return PathView {
+            data: alloc::string::data_ptr(&self.storage),
+            length: alloc::string::len(&self.storage),
+        };
+    }
+    fn clear(PathBuf&mut self) {
+        alloc::string::clear(&mut self.storage);
+    }
+    fn is_absolute(PathBuf& self) -> bool {
+        return std::path::is_absolute(self.as_view());
+    }
+    fn normalize(PathBuf&mut self) -> bool {
+        PathView view = self.as_view();
+
+        i64 written = std::path::normalize_lexical_into(
+            view,
+            alloc::string::data_ptr(&self.storage),
+            alloc::string::capacity(&self.storage),
+        );
+        if (written < 0) {
+            return false;
+        }
+        return alloc::string::truncate(&mut self.storage, written);
+    }
+    /// Appends one lexical path component. An absolute right-hand path replaces
+    /// the current path. Separators are normalized to '/'.
+    fn push(PathBuf&mut self, PathView part) -> bool {
+        if (!std::path::valid(part)) {
+            return false;
+        }
+        if (part.length == 0) {
+            return true;
+        }
+        if (std::path::is_absolute(part)) {
+            alloc::string::clear(&mut self.storage);
+            if (!alloc::string::append_bytes(&mut self.storage, part.data, part.length)) {
+                return false;
+            }
+            return self.normalize();
+        }
+
+        i64 left_length = alloc::string::len(&self.storage);
+
+        while (
+            left_length > 0 &&
+            std::path::is_separator(alloc::string::byte_at(&self.storage, left_length - 1))
+        ) {
+            left_length -= 1;
+        }
+        if (!alloc::string::truncate(&mut self.storage, left_length)) {
+            return false;
+        }
+
+        i64 start = 0;
+
+        while (start < part.length && std::path::is_separator(std::path::byte_at(part, start))) {
+            start += 1;
+        }
+        if (start >= part.length) {
+            return true;
+        }
+        if (left_length > 0 && !alloc::string::push_byte(&mut self.storage, 47)) {
+            return false;
+        }
+        if (!alloc::string::append_bytes(&mut self.storage, part.data + start, part.length - start)) {
+            return false;
+        }
+        return self.normalize();
+    }
+    fn filename(PathBuf& self) -> PathView {
+        PathView view = self.as_view();
+        i64 start = std::path::filename_start(view);
+
+        return PathView {
+            data: view.data + start,
+            length: view.length - start
+        };
+    }
+    fn parent(PathBuf& self) -> PathView {
+        PathView view = self.as_view();
+
+        return PathView {
+            data: view.data,
+            length: std::path::parent_length(view)
+        };
+    }
+    fn extension(PathBuf& self) -> PathView {
+        PathView view = self.as_view();
+        i64 start = std::path::extension_start(view);
+
+        if (start < 0) {
+            return PathView {
+                data: 0,
+                length: 0
+            };
+        }
+        return PathView {
+            data: view.data + start + 1,
+            length: view.length - start - 1
+        };
+    }
+    fn stem(PathBuf& self) -> PathView {
+        PathView view = self.as_view();
+        i64 start = std::path::file_stem_start(view);
+
+        return PathView {
+            data: view.data + start,
+            length: std::path::file_stem_length(view)
+        };
+    }
+    fn pop(PathBuf&mut self) -> bool {
+        PathView view = self.as_view();
+        i64 parent = std::path::parent_length(view);
+
+        if (parent <= 0 || parent >= view.length) {
+            return false;
+        }
+        return alloc::string::truncate(&mut self.storage, parent);
+    }
+    fn set_extension(PathBuf&mut self, PathView extension) -> bool {
+        if (!std::path::valid(extension)) {
+            return false;
+        }
+
+        PathView view = self.as_view();
+        i64 filename = std::path::filename_start(view);
+
+        if (filename >= view.length) {
+            return false;
+        }
+
+        i64 dot = std::path::extension_start(view);
+        i64 base = view.length;
+
+        if (dot >= filename) {
+            base = dot;
+        }
+        if (!alloc::string::truncate(&mut self.storage, base)) {
+            return false;
+        }
+        if (extension.length == 0) {
+            return true;
+        }
+        if (!alloc::string::push_byte(&mut self.storage, 46)) {
+            return false;
+        }
+        return alloc::string::append_bytes(&mut self.storage, extension.data, extension.length);
+    }
+}
+
+// Stable cross-module function surface for PathBuf.
+public fn path_buf_new() -> PathBuf {
+    return PathBuf {
+        storage: alloc::string::with_capacity(0)
+    };
+}
+
+public fn path_buf_from_bytes(usize data, i64 length) -> PathBuf {
+    return PathBuf {
+        storage: alloc::string::from_bytes(data, length)
+    };
+}
+
+public fn path_buf_clone(PathBuf& value) -> PathBuf {
+    return PathBuf {
+        storage: alloc::string::clone_string(&value.storage)
+    };
+}
+
+public fn path_buf_len(PathBuf& value) -> i64 {
+    return alloc::string::len(&value.storage);
+}
+
+public fn path_buf_data_ptr(PathBuf& value) -> usize {
+    return alloc::string::data_ptr(&value.storage);
+}
+
+public fn path_buf_view(PathBuf& value) -> PathView {
+    return PathView {
+        data: alloc::string::data_ptr(&value.storage),
+        length: alloc::string::len(&value.storage),
+    };
+}
+
+public fn path_buf_normalize(PathBuf&mut value) -> bool {
+    PathView view = path_buf_view(value);
+
+    i64 written = std::path::normalize_lexical_into(
+        view,
+        alloc::string::data_ptr(&value.storage),
+        alloc::string::capacity(&value.storage),
+    );
+    if (written < 0) {
+        return false;
+    }
+    return alloc::string::truncate(&mut value.storage, written);
+}
+
+public fn path_buf_push(PathBuf&mut value, PathView part) -> bool {
+    if (!std::path::valid(part)) {
+        return false;
+    }
+    if (part.length == 0) {
+        return true;
+    }
+    if (std::path::is_absolute(part)) {
+        alloc::string::clear(&mut value.storage);
+        if (!alloc::string::append_bytes(&mut value.storage, part.data, part.length)) {
+            return false;
+        }
+        return path_buf_normalize(value);
+    }
+
+    i64 left_length = alloc::string::len(&value.storage);
+
+    while (
+        left_length > 0 &&
+        std::path::is_separator(alloc::string::byte_at(&value.storage, left_length - 1))
+    ) {
+        left_length -= 1;
+    }
+    if (!alloc::string::truncate(&mut value.storage, left_length)) {
+        return false;
+    }
+
+    i64 start = 0;
+
+    while (start < part.length && std::path::is_separator(std::path::byte_at(part, start))) {
+        start += 1;
+    }
+    if (start >= part.length) {
+        return true;
+    }
+    if (left_length > 0 && !alloc::string::push_byte(&mut value.storage, 47)) {
+        return false;
+    }
+    if (!alloc::string::append_bytes(&mut value.storage, part.data + start, part.length - start)) {
+        return false;
+    }
+    return path_buf_normalize(value);
+}
+
+public fn path_buf_filename(PathBuf& value) -> PathView {
+    PathView view = path_buf_view(value);
+    i64 start = std::path::filename_start(view);
+
+    return PathView {
+        data: view.data + start,
+        length: view.length - start
+    };
+}
+
+public fn path_buf_parent(PathBuf& value) -> PathView {
+    PathView view = path_buf_view(value);
+
+    return PathView {
+        data: view.data,
+        length: std::path::parent_length(view)
+    };
+}
+
+public fn path_buf_extension(PathBuf& value) -> PathView {
+    PathView view = path_buf_view(value);
+    i64 start = std::path::extension_start(view);
+
+    if (start < 0) {
+        return PathView {
+            data: 0,
+            length: 0
+        };
+    }
+    return PathView {
+        data: view.data + start + 1,
+        length: view.length - start - 1
+    };
+}
+
+public fn path_buf_stem(PathBuf& value) -> PathView {
+    PathView view = path_buf_view(value);
+    i64 start = std::path::file_stem_start(view);
+
+    return PathView {
+        data: view.data + start,
+        length: std::path::file_stem_length(view)
+    };
+}
+
+public fn path_buf_pop(PathBuf&mut value) -> bool {
+    PathView view = path_buf_view(value);
+    i64 parent = std::path::parent_length(view);
+
+    if (parent <= 0 || parent >= view.length) {
+        return false;
+    }
+    return alloc::string::truncate(&mut value.storage, parent);
+}
+
+public fn path_buf_set_extension(PathBuf&mut value, PathView extension) -> bool {
+    if (!std::path::valid(extension)) {
+        return false;
+    }
+
+    PathView view = path_buf_view(value);
+    i64 filename = std::path::filename_start(view);
+
+    if (filename >= view.length) {
+        return false;
+    }
+
+    i64 dot = std::path::extension_start(view);
+    i64 base = view.length;
+
+    if (dot >= filename) {
+        base = dot;
+    }
+    if (!alloc::string::truncate(&mut value.storage, base)) {
+        return false;
+    }
+    if (extension.length == 0) {
+        return true;
+    }
+    if (!alloc::string::push_byte(&mut value.storage, 46)) {
+        return false;
+    }
+    return alloc::string::append_bytes(&mut value.storage, extension.data, extension.length);
+}

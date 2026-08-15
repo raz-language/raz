@@ -1,0 +1,305 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_rxe_lowering;
+public import raz_compiler_backend_rxe_model;
+
+fn rxe_encode_alloc_immediate(i64 count, i64 structure) -> i64 {
+    if (count < 0 || count > 65535 || structure < -1 || structure > 65534) { return -1; }
+    return (count & 65535) | ((structure + 1) << 16);
+}
+
+// Correctness-first RXE lowering. MIR SSA results receive deterministic frame
+// slots. r0-r5 are lowering scratch registers; the RXE register promotion pass
+// subsequently removes redundant slot reloads without changing semantics.
+fn rxe_load_value(RxeModule&mut out, i64 function_mir_start, i64 mir_value, i64 reg) {
+    rxe_emit(out, rxe_op_load_slot(), reg, 0, 0, mir_value - function_mir_start);
+}
+
+fn rxe_store_result(RxeModule&mut out, i64 function_mir_start, i64 mir_instruction) {
+    rxe_emit(out, rxe_op_store_slot(), 0, 0, 0, mir_instruction - function_mir_start);
+}
+
+fn rxe_normalize_integer(RxeModule&mut out, i64 reg, i64 type_kind) -> bool {
+    if (!primitive_type_is_integer(type_kind)) { return true; }
+    i64 width = primitive_type_width(type_kind);
+    if (width >= 64) { return true; }
+    if (width == 8) { rxe_emit(out, rxe_op_trunc8(), reg, reg, 0, 0); }
+    else if (width == 16) { rxe_emit(out, rxe_op_trunc16(), reg, reg, 0, 0); }
+    else if (width == 32) { rxe_emit(out, rxe_op_trunc32(), reg, reg, 0, 0); }
+    else { return false; }
+    if (!primitive_type_is_unsigned(type_kind)) {
+        if (width == 8) { rxe_emit(out, rxe_op_sext8(), reg, reg, 0, 0); }
+        else if (width == 16) { rxe_emit(out, rxe_op_sext16(), reg, reg, 0, 0); }
+        else if (width == 32) { rxe_emit(out, rxe_op_sext32(), reg, reg, 0, 0); }
+    }
+    return true;
+}
+
+fn rxe_stage_arguments(
+    RxeModule&mut out,
+    MirModule& mir,
+    i64 function_mir_start,
+    i64 argument_start,
+    i64 argument_count,
+) -> bool {
+    if (argument_count < 0 || argument_count > 255) { return false; }
+    i64 argument = 0;
+    while (argument < argument_count) {
+        i64 argument_value = raz_rt_stage1_arena_get(mir.call_arguments, argument_start + argument);
+        rxe_load_value(out, function_mir_start, argument_value, 0);
+        rxe_emit(out, rxe_op_arg(), 0, 0, 0, argument);
+        argument += 1;
+    }
+    return !out.failed;
+}
+
+fn rxe_lower_function(RxeModule&mut out, HirModule& hir, MirModule& mir, i64 function_index) -> bool {
+    if (raz_rt_stage1_arena_get(mir.function_is_extern, function_index) != 0) { return false; }
+    i64 start = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+    i64 count = raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+    i64 code_start = out.instruction_count;
+    raz_rt_stage1_arena_set(out.function_code_starts, function_index, code_start);
+    raz_rt_stage1_arena_set(out.function_argument_counts, function_index, raz_rt_stage1_arena_get(mir.function_parameter_counts, function_index));
+    raz_rt_stage1_arena_set(out.function_frame_slots, function_index, count + raz_rt_stage1_arena_get(mir.function_local_counts, function_index));
+
+    i64 ip = start;
+    while (ip < start + count) {
+        raz_rt_stage1_arena_set(out.mir_to_rxe, ip, out.instruction_count);
+        i64 op = raz_rt_stage1_arena_get(mir.opcodes, ip);
+        i64 type_kind = raz_rt_stage1_arena_get(mir.op_types, ip);
+        i64 a = raz_rt_stage1_arena_get(mir.op_a, ip);
+        i64 b = raz_rt_stage1_arena_get(mir.op_b, ip);
+        i64 c = raz_rt_stage1_arena_get(mir.op_c, ip);
+        i64 d = raz_rt_stage1_arena_get(mir.op_d, ip);
+        if (op == 1) {
+            if (primitive_type_is_float(type_kind)) { return false; }
+            i64 constant = rxe_constant_i64(out, a);
+            rxe_emit(out, rxe_op_ldc64(), 0, 0, 0, constant);
+            if (!rxe_normalize_integer(out, 0, type_kind)) { return false; }
+            rxe_store_result(out, start, ip);
+        } else if (op == 2) {
+            rxe_emit(out, rxe_op_load_arg(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 3) {
+            rxe_emit(out, rxe_op_load_local(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 9) {
+            rxe_load_value(out, start, b, 0);
+            rxe_emit(out, rxe_op_store_local(), 0, 0, 0, a);
+        } else if (op == 8) {
+            if (!rxe_stage_arguments(out, mir, start, b, c)) { return false; }
+            rxe_emit(out, rxe_op_call(), 0, 0, c, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 44 || op == 51) {
+            if (!rxe_stage_arguments(out, mir, start, b, c)) { return false; }
+            rxe_load_value(out, start, a, 4);
+            if (op == 44) { rxe_emit(out, rxe_op_call_indirect(), 0, 4, c, d); }
+            else { rxe_emit(out, rxe_op_call_closure(), 0, 4, c, d); }
+            rxe_store_result(out, start, ip);
+        } else if (op == 43) {
+            rxe_emit(out, rxe_op_func_ref(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 50) {
+            if (a < 0 || a >= hir.function_count) { return false; }
+            i64 capture_count = raz_rt_stage1_arena_get(hir.function_closure_capture_counts, a);
+            if (!rxe_stage_arguments(out, mir, start, c, capture_count)) { return false; }
+            // src0 carries closure kind, src1 capture count, imm synthesized function.
+            rxe_emit(out, rxe_op_make_closure(), 0, b, capture_count, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 42) {
+            // MIR string literals refer to the deterministic module/global image.
+            rxe_emit(out, rxe_op_string_ref(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 4 || op == 5 || op == 6 || op == 7 || (op >= 11 && op <= 16) || op == 19 || op == 20 || (op >= 34 && op <= 39)) {
+            if (primitive_type_is_float(type_kind)) { return false; }
+            rxe_load_value(out, start, a, 1);
+            rxe_load_value(out, start, b, 2);
+            i64 rxop = rxe_op_add64();
+            if (op == 5) { rxop = rxe_op_sub64(); }
+            else if (op == 6) { rxop = rxe_op_mul64(); }
+            else if (op == 7) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_div64(); }
+                else { rxop = rxe_op_divs64(); }
+            }
+            else if (op == 11) { rxop = rxe_op_eq64(); }
+            else if (op == 12) { rxop = rxe_op_ne64(); }
+            else if (op == 13) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_lt64(); }
+                else { rxop = rxe_op_lts64(); }
+            }
+            else if (op == 14) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_le64(); }
+                else { rxop = rxe_op_les64(); }
+            }
+            else if (op == 15) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_gt64(); }
+                else { rxop = rxe_op_gts64(); }
+            }
+            else if (op == 16) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_ge64(); }
+                else { rxop = rxe_op_ges64(); }
+            }
+            else if (op == 19) { rxop = rxe_op_mul64(); }
+            else if (op == 20) { rxop = rxe_op_add64(); }
+            else if (op == 34) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_rem64(); }
+                else { rxop = rxe_op_rems64(); }
+            }
+            else if (op == 35) { rxop = rxe_op_and64(); }
+            else if (op == 36) { rxop = rxe_op_or64(); }
+            else if (op == 37) { rxop = rxe_op_xor64(); }
+            else if (op == 38) { rxop = rxe_op_shl64(); }
+            else if (op == 39) {
+                if (primitive_type_is_unsigned(type_kind)) { rxop = rxe_op_shr64(); }
+                else { rxop = rxe_op_sar64(); }
+            }
+            rxe_emit(out, rxop, 0, 1, 2, 0);
+            if (op == 20) { rxe_emit(out, rxe_op_boolize(), 0, 0, 0, 0); }
+            else if (op == 19) { rxe_emit(out, rxe_op_boolize(), 0, 0, 0, 0); }
+            else if (op == 4 || op == 5 || op == 6 || op == 7 || (op >= 34 && op <= 39)) {
+                if (!rxe_normalize_integer(out, 0, type_kind)) { return false; }
+            }
+            rxe_store_result(out, start, ip);
+        } else if (op == 18) {
+            rxe_load_value(out, start, a, 1);
+            rxe_emit(out, rxe_op_movi(), 2, 0, 0, 0);
+            rxe_emit(out, rxe_op_eq64(), 0, 1, 2, 0);
+            rxe_store_result(out, start, ip);
+        } else if (op == 17) {
+            rxe_load_value(out, start, a, 1);
+            rxe_load_value(out, start, b, 2);
+            rxe_load_value(out, start, c, 3);
+            rxe_emit(out, rxe_op_select(), 0, 1, 2, 3);
+            rxe_store_result(out, start, ip);
+        } else if (op == 10) {
+            rxe_load_value(out, start, a, 0);
+            rxe_emit(out, rxe_op_ret(), 0, 0, 0, 0);
+        } else if (op == 21) {
+            rxe_emit(out, rxe_op_ret_void(), 0, 0, 0, 0);
+        } else if (op == 22) {
+            i64 branch = rxe_emit(out, rxe_op_jmp(), 0, 0, 0, 0);
+            raz_rt_stage1_arena_set(out.branch_mir_targets, branch, b);
+        } else if (op == 23) {
+            rxe_load_value(out, start, a, 1);
+            i64 branch = rxe_emit(out, rxe_op_brnz(), 0, 1, 0, 0);
+            raz_rt_stage1_arena_set(out.branch_mir_targets, branch, c);
+            i64 fall = rxe_emit(out, rxe_op_jmp(), 0, 0, 0, 0);
+            raz_rt_stage1_arena_set(out.branch_mir_targets, fall, b);
+        } else if (op == 26) {
+            rxe_load_value(out, start, a, 1);
+            rxe_emit(out, rxe_op_load_ref(), 0, 1, 0, 0);
+            rxe_store_result(out, start, ip);
+        } else if (op == 27) {
+            rxe_load_value(out, start, a, 1);
+            rxe_load_value(out, start, b, 2);
+            rxe_emit(out, rxe_op_store_ref(), 0, 1, 2, 0);
+            rxe_store_result(out, start, ip);
+        } else if (op == 28) {
+            if (d > 0) {
+                rxe_load_value(out, start, d - 1, 1);
+                rxe_load_value(out, start, b, 2);
+                rxe_emit(out, rxe_op_slice_load(), 0, 1, 2, 0);
+            } else {
+                rxe_load_value(out, start, a, 1);
+                rxe_load_value(out, start, b, 2);
+                rxe_emit(out, rxe_op_index_load(), 0, 1, 2, 0);
+            }
+            rxe_store_result(out, start, ip);
+        } else if (op == 29) {
+            if (d > 0) {
+                rxe_load_value(out, start, d - 1, 1);
+                rxe_load_value(out, start, b, 2);
+                rxe_load_value(out, start, c, 3);
+                rxe_emit(out, rxe_op_slice_store(), 0, 1, 2, 3);
+            } else {
+                rxe_load_value(out, start, a, 1);
+                rxe_load_value(out, start, b, 2);
+                rxe_load_value(out, start, c, 3);
+                rxe_emit(out, rxe_op_index_store(), 0, 1, 2, 3);
+            }
+            rxe_store_result(out, start, ip);
+        } else if (op == 45) {
+            rxe_load_value(out, start, a, 1);
+            rxe_load_value(out, start, b, 2);
+            // c is MIR borrow kind and remains part of canonical reference metadata.
+            rxe_emit(out, rxe_op_index_ref(), 0, 1, 2, c);
+            rxe_store_result(out, start, ip);
+        } else if (op == 30) {
+            // MIR aggregate allocation carries count in a, structure-kind in b,
+            // and structure index in c. RXE v2 packs count + layout identity so
+            // the executable is self-describing without consulting HIR.
+            i64 structure = -1;
+            if (b != 0) { structure = c; }
+            i64 encoded_alloc = rxe_encode_alloc_immediate(a, structure);
+            if (encoded_alloc < 0) { return false; }
+            rxe_emit(out, rxe_op_alloc(), 0, b, 0, encoded_alloc);
+            rxe_store_result(out, start, ip);
+        } else if (op == 31) {
+            rxe_load_value(out, start, a, 0);
+            rxe_emit(out, rxe_op_free(), 0, 0, 0, 0);
+            rxe_store_result(out, start, ip);
+        } else if (op == 32 || op == 33) {
+            // MIR ownership/drop-state markers have no runtime effect after
+            // lowering. Keep a deterministic zero result slot for MIR parity.
+            rxe_emit(out, rxe_op_movi(), 0, 0, 0, 0);
+            rxe_store_result(out, start, ip);
+        } else if (op == 47) {
+            if (a < 0 || a >= out.global_count) { return false; }
+            rxe_emit(out, rxe_op_load_global(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 48) {
+            if (a < 0 || a >= out.global_count) { return false; }
+            rxe_load_value(out, start, b, 0);
+            rxe_emit(out, rxe_op_store_global(), 0, 0, 0, a);
+        } else if (op == 49) {
+            if (a < 0 || a >= out.global_count) { return false; }
+            rxe_emit(out, rxe_op_global_ref(), 0, 0, 0, a);
+            rxe_store_result(out, start, ip);
+        } else if (op == 24 || op == 25) {
+            // MIR block/value markers do not require distinct runtime semantics.
+            if (op == 25) { rxe_emit(out, rxe_op_ldc64(), 0, 0, 0, rxe_constant_i64(out, a)); }
+            else if (a >= start && a < start + count) { rxe_load_value(out, start, a, 0); }
+            else { rxe_emit(out, rxe_op_movi(), 0, 0, 0, 0); }
+            rxe_store_result(out, start, ip);
+        } else if (op == 40) {
+            // Scalar casts are explicit in RXE so sub-64-bit wrap/sign behavior is
+            // consensus-visible rather than an implementation detail of the VM.
+            rxe_load_value(out, start, a, 0);
+            if (primitive_type_is_float(type_kind)) { return false; }
+            if (!rxe_normalize_integer(out, 0, type_kind)) { return false; }
+            rxe_store_result(out, start, ip);
+        } else {
+            // Async/future and host-native operations remain capability-gated.
+            return false;
+        }
+        ip += 1;
+    }
+    raz_rt_stage1_arena_set(out.mir_to_rxe, start + count, out.instruction_count);
+    raz_rt_stage1_arena_set(out.function_code_counts, function_index, out.instruction_count - code_start);
+    return !out.failed;
+}
+
+fn rxe_patch_branches(RxeModule&mut out) -> bool {
+    i64 i = 0;
+    while (i < out.instruction_count) {
+        i64 target = raz_rt_stage1_arena_get(out.branch_mir_targets, i);
+        if (target >= 0) {
+            if (target >= out.mir_instruction_capacity) { return false; }
+            i64 encoded = raz_rt_stage1_arena_get(out.mir_to_rxe, target);
+            if (encoded < 0 || encoded >= out.instruction_count) { return false; }
+            raz_rt_stage1_arena_set(out.immediates, i, encoded);
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn rxe_lower_mir(RxeModule&mut out, HirModule& hir, MirModule& mir) -> bool {
+    i64 function = 0;
+    while (function < mir.function_count) {
+        if (!rxe_lower_function(out, hir, mir, function)) { return false; }
+        function += 1;
+    }
+    return rxe_patch_branches(out);
+}

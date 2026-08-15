@@ -1,0 +1,1690 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_registry;
+public import raz_compiler_driver_registry_transport;
+// Registry index resolution, semantic-version selection, integrity validation,
+// and deterministic resolution-cache support for the self-hosted package manager.
+// Registry transport is intentionally abstract: RAZ_REGISTRY_INDEX points at a
+// materialized index, so HTTP/git/custom transports can populate it externally
+// without changing resolution or lockfile semantics.
+extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
+extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
+
+fn registry_digit(i64 value) -> bool {
+  return value >= 48 && value <= 57;
+}
+
+fn registry_parse_u64(i64 data, i64 start, i64 end, i64&mut cursor) -> i64 {
+  if (*cursor >= end || !registry_digit(raz_rt_stage1_arena_get(data, *cursor))) {
+    return -1;
+  }
+
+  i64 value = 0;
+
+  while (*cursor < end && registry_digit(raz_rt_stage1_arena_get(data, *cursor))) {
+    value = value * 10 + (raz_rt_stage1_arena_get(data, *cursor) - 48);
+    *cursor += 1;
+  }
+  return value;
+}
+
+fn registry_parse_semver(
+i64 data,
+i64 start,
+i64 length,
+i64&mut major,
+i64&mut minor,
+i64&mut patch,
+) -> bool {
+  i64 cursor = start;
+  i64 end = start + length;
+
+  *major = registry_parse_u64(data, start, end, &mut cursor);
+  if (*major < 0 || cursor >= end || raz_rt_stage1_arena_get(data, cursor) != 46) {
+    return false;
+  }
+  cursor += 1;
+  *minor = registry_parse_u64(data, start, end, &mut cursor);
+  if (*minor < 0 || cursor >= end || raz_rt_stage1_arena_get(data, cursor) != 46) {
+    return false;
+  }
+  cursor += 1;
+  *patch = registry_parse_u64(data, start, end, &mut cursor);
+  if (*patch < 0) {
+    return false;
+  }
+  // Prerelease/build suffixes are accepted but do not participate in this v1 ordering.
+  return (
+  cursor == end ||
+  raz_rt_stage1_arena_get(data, cursor) == 45 ||
+  raz_rt_stage1_arena_get(data, cursor) == 43
+  );
+}
+
+fn registry_semver_compare(i64 a0, i64 a1, i64 a2, i64 b0, i64 b1, i64 b2) -> i64 {
+  if (a0<b0) {
+    return -1;
+  }
+  if (a0> b0) {
+    return 1;
+  }
+  if (a1<b1) {
+    return -1;
+  }
+  if (a1> b1) {
+    return 1;
+  }
+  if (a2<b2) {
+    return -1;
+  }
+  if (a2> b2) {
+    return 1;
+  }
+  return 0;
+}
+
+fn registry_constraint_matches(
+i64 version,
+i64 version_start,
+i64 version_length,
+i64 constraint,
+i64 constraint_length,
+) -> bool {
+  i64 vm = 0;
+  i64 vn = 0;
+  i64 vp = 0;
+
+  if (!registry_parse_semver(version, version_start, version_length, &mut vm, &mut vn, &mut vp)) {
+    return false;
+  }
+  if (constraint_length <= 0) {
+    return true;
+  }
+
+  i64 offset = 0;
+  i64 mode = 0;
+  i64 first = raz_rt_stage1_arena_get(constraint, 0);
+
+  if (first == 94) {
+    mode = 1;
+    offset = 1;
+  }
+  // ^
+  else if (first == 126) {
+    mode = 2;
+    offset = 1;
+  }
+  // ~
+  else if (first == 62 && constraint_length > 1 && raz_rt_stage1_arena_get(constraint, 1) == 61) {
+    mode = 3;
+    offset = 2;
+  }
+  // >=
+
+  i64 cm = 0;
+  i64 cn = 0;
+  i64 cp = 0;
+
+  if (!registry_parse_semver(constraint, offset, constraint_length - offset, &mut cm, &mut cn, &mut cp)) {
+    return false;
+  }
+
+  i64 cmp = registry_semver_compare(vm, vn, vp, cm, cn, cp);
+
+  if (mode == 0) {
+    return cmp == 0;
+  }
+  if (mode == 3) {
+    return cmp >= 0;
+  }
+  if (mode == 2) {
+    return cmp >= 0 && vm == cm && vn == cn;
+  }
+  if (cmp<0) {
+    return false;
+  }
+  if (cm> 0) {
+    return vm == cm;
+  }
+  if (cn > 0) {
+    return vm == 0 && vn == cn;
+  }
+  return vm == 0 && vn == 0 && vp == cp;
+}
+
+fn registry_token(i64 data, i64 start, i64 end, i64 ordinal, i64&mut out_start, i64&mut out_length) -> bool {
+  i64 cursor = start;
+  i64 n = 0;
+
+  while (cursor<end) {
+    while (cursor<end && ascii_is_space(raz_rt_stage1_arena_get(data, cursor))) {
+      cursor += 1;
+    }
+    if (cursor >= end) {
+      break;
+    }
+
+    i64 ts = cursor;
+
+    while (cursor<end && !ascii_is_space(raz_rt_stage1_arena_get(data, cursor))) {
+      cursor += 1;
+    }
+    if (n == ordinal) {
+      *out_start = ts;
+      *out_length = cursor - ts;
+      return true;
+    }
+    n += 1;
+  }
+  return false;
+}
+
+fn registry_bytes_equal(i64 a, i64 as_, i64 al, i64 b, i64 bs, i64 bl) -> bool {
+  if (al != bl) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i<al) {
+    if (raz_rt_stage1_arena_get(a, as_ + i) != raz_rt_stage1_arena_get(b, bs + i)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn registry_store_materialize(
+i64 source,
+i64 source_length,
+i64 checksum,
+i64 checksum_length,
+i64 output,
+i64 capacity,
+) -> i64 {
+  i64 store_length = registry_store_path(checksum, checksum_length, output, capacity);
+
+  if (store_length <= 0) {
+    return 40;
+  }
+  if (raz_rt_stage1_path_exists_ascii(output, store_length) != 0) {
+    if (registry_store_verify(output, store_length, checksum, checksum_length)) {
+      return store_length;
+    }
+    if (registry_offline()) {
+      return -63;
+    }
+  }
+  if (registry_offline()) {
+    return -64;
+  }
+  if (raz_rt_stage1_copy_tree_ascii(source, source_length, output, store_length) != 0) {
+    return -65;
+  }
+  if (!registry_store_verify(output, store_length, checksum, checksum_length)) {
+    return -62;
+  }
+  return store_length;
+}
+
+// Returns 0 success. Registry transport errors use 60-76.
+fn registry_resolve(
+i64 name,
+i64 name_length,
+i64 constraint,
+i64 constraint_length,
+i64 out_version,
+i64 version_capacity,
+i64 out_path,
+i64 path_capacity,
+i64 out_checksum,
+i64 checksum_capacity,
+) -> i64 {
+  i64 data = raz_rt_stage1_arena_create(2097152);
+  i64 base = raz_rt_stage1_arena_create(8192);
+
+  if (data == 0 || base == 0) {
+    return 40;
+  }
+
+  i64 base_length = 0;
+  i64 length = registry_load_index(data, 2097152, base, 8192, &mut base_length);
+
+  if (length <= 0) {
+    raz_rt_stage1_arena_destroy(data);
+    raz_rt_stage1_arena_destroy(base);
+    return 60;
+  }
+
+  bool found = false;
+  i64 best0 = 0;
+  i64 best1 = 0;
+  i64 best2 = 0;
+  i64 best_vs = 0;
+  i64 best_vl = 0;
+  i64 best_ps = 0;
+  i64 best_pl = 0;
+  i64 best_cs = 0;
+  i64 best_cl = 0;
+  i64 best_ks = 0;
+  i64 best_kl = 0;
+  i64 best_ss = 0;
+  i64 best_sl = 0;
+  i64 cursor = 0;
+
+  while (cursor<length) {
+    i64 start = cursor;
+
+    while (
+    cursor<length &&
+    raz_rt_stage1_arena_get(data, cursor) != 10 &&
+    raz_rt_stage1_arena_get(data, cursor) != 13
+    ) {
+      cursor += 1;
+    }
+
+    i64 end = cursor;
+
+    while (
+    cursor<length &&
+    (raz_rt_stage1_arena_get(data, cursor) == 10 || raz_rt_stage1_arena_get(data, cursor) == 13)
+    ) {
+      cursor += 1;
+    }
+    if (start >= end) {
+      continue;
+    }
+
+    i64 ns = 0;
+    i64 nl = 0;
+    i64 vs = 0;
+    i64 vl = 0;
+    i64 ps = 0;
+    i64 pl = 0;
+    i64 cs = 0;
+    i64 cl = 0;
+    i64 ks = 0;
+    i64 kl = 0;
+    i64 ss = 0;
+    i64 sl = 0;
+
+    if (
+    !registry_token(data, start, end, 0, &mut ns, &mut nl) ||
+    !registry_token(data, start, end, 1, &mut vs, &mut vl) ||
+    !registry_token(data, start, end, 2, &mut ps, &mut pl) ||
+    !registry_token(data, start, end, 3, &mut cs, &mut cl)
+    ) {
+      continue;
+    }
+    registry_token(data, start, end, 4, &mut ks, &mut kl);
+    registry_token(data, start, end, 5, &mut ss, &mut sl);
+    if (
+    !registry_bytes_equal(data, ns, nl, name, 0, name_length) ||
+    !registry_constraint_matches(data, vs, vl, constraint, constraint_length)
+    ) {
+      continue;
+    }
+
+    i64 m = 0;
+    i64 n = 0;
+    i64 p = 0;
+
+    if (!registry_parse_semver(data, vs, vl, &mut m, &mut n, &mut p)) {
+      continue;
+    }
+    if (!found || registry_semver_compare(m, n, p, best0, best1, best2)> 0) {
+      found = true;
+      best0 = m;
+      best1 = n;
+      best2 = p;
+      best_vs = vs;
+      best_vl = vl;
+      best_ps = ps;
+      best_pl = pl;
+      best_cs = cs;
+      best_cl = cl;
+      best_ks = ks;
+      best_kl = kl;
+      best_ss = ss;
+      best_sl = sl;
+    }
+  }
+  if (!found) {
+    raz_rt_stage1_arena_destroy(data);
+    raz_rt_stage1_arena_destroy(base);
+    return 61;
+  }
+  if (best_vl> version_capacity || best_cl> checksum_capacity) {
+    return 40;
+  }
+
+  i64 i = 0;
+
+  while (i<best_vl) {
+    raz_rt_stage1_arena_set(out_version, i, raz_rt_stage1_arena_get(data, best_vs + i));
+    i += 1;
+  }
+  i = 0;
+  while (i<best_cl) {
+    raz_rt_stage1_arena_set(out_checksum, i, raz_rt_stage1_arena_get(data, best_cs + i));
+    i += 1;
+  }
+
+  i64 selected_key = raz_rt_stage1_arena_create(32);
+  i64 selected_signature = raz_rt_stage1_arena_create(160);
+
+  if (selected_key == 0 || selected_signature == 0) {
+    return 40;
+  }
+  i = 0;
+  while (i<best_kl) {
+    raz_rt_stage1_arena_set(selected_key, i, raz_rt_stage1_arena_get(data, best_ks + i));
+    i += 1;
+  }
+  i = 0;
+  while (i<best_sl) {
+    raz_rt_stage1_arena_set(selected_signature, i, raz_rt_stage1_arena_get(data, best_ss + i));
+    i += 1;
+  }
+  i64 trust = signing_verify_metadata(
+  name,
+  name_length,
+  out_version,
+  best_vl,
+  out_checksum,
+  best_cl,
+  selected_key,
+  best_kl,
+  selected_signature,
+  best_sl,
+  );
+  raz_rt_stage1_arena_destroy(selected_key);
+  raz_rt_stage1_arena_destroy(selected_signature);
+  if (trust != 1) {
+    raz_rt_stage1_arena_destroy(data);
+    raz_rt_stage1_arena_destroy(base);
+    return 68;
+  }
+
+  i64 cached_length = registry_store_path(out_checksum, best_cl, out_path, path_capacity);
+
+  if (
+  cached_length> 0 &&
+  raz_rt_stage1_path_exists_ascii(out_path, cached_length) != 0 &&
+  registry_store_verify(out_path, cached_length, out_checksum, best_cl)
+  ) {
+    raz_rt_stage1_arena_destroy(data);
+    raz_rt_stage1_arena_destroy(base);
+    return 0;
+  }
+
+  i64 source = raz_rt_stage1_arena_create(16384);
+
+  if (source == 0) {
+    return 40;
+  }
+
+  i64 source_length = best_pl;
+
+  i = 0;
+  while (i<best_pl) {
+    raz_rt_stage1_arena_set(source, i, raz_rt_stage1_arena_get(data, best_ps + i));
+    i += 1;
+  }
+
+  i64 http[7] = [104, 116, 116, 112, 58, 47, 47];
+  i64 https[8] = [104, 116, 116, 112, 115, 58, 47, 47];
+
+  bool remote =
+  registry_starts(source, source_length, &http, 7) ||
+  registry_starts(source, source_length, &https, 8);
+  if (!remote && base_length> 0) {
+    i64 joined = raz_rt_stage1_arena_create(16384);
+
+    if (joined == 0) {
+      return 40;
+    }
+    source_length = registry_join_url(base, base_length, source, 0, source_length, joined, 16384);
+    i = 0;
+    while (i<source_length) {
+      raz_rt_stage1_arena_set(source, i, raz_rt_stage1_arena_get(joined, i));
+      i += 1;
+    }
+    raz_rt_stage1_arena_destroy(joined);
+    remote = true;
+  }
+
+  i64 stored = 0;
+
+  if (remote) {
+    stored = registry_store_materialize_archive(
+    source,
+    source_length,
+    out_checksum,
+    best_cl,
+    out_path,
+    path_capacity,
+    );
+  } else if (registry_ends_dpk(source, source_length)) {
+    stored = registry_store_materialize_local_archive(
+    source,
+    source_length,
+    out_checksum,
+    best_cl,
+    out_path,
+    path_capacity,
+    );
+  } else {
+    stored = registry_store_materialize(
+    source,
+    source_length,
+    out_checksum,
+    best_cl,
+    out_path,
+    path_capacity,
+    );
+  }
+  raz_rt_stage1_arena_destroy(source);
+  raz_rt_stage1_arena_destroy(data);
+  raz_rt_stage1_arena_destroy(base);
+  if (stored<0) {
+    return -stored;
+  }
+  return 0;
+}
+
+fn registry_print_resolution(i64 name, i64 nl, i64 constraint, i64 cl) -> i64 {
+  i64 v = raz_rt_stage1_arena_create(256);
+  i64 p = raz_rt_stage1_arena_create(8192);
+  i64 c = raz_rt_stage1_arena_create(64);
+
+  if (v == 0 || p == 0 || c == 0) {
+    return 40;
+  }
+
+  i64 s = registry_resolve(name, nl, constraint, cl, v, 256, p, 8192, c, 64);
+
+  if (s == 0) {
+    cli_write_arena(name, nl);
+
+    i64 at[1] = [64];
+
+    cli_write(&at, 1);
+
+    i64 vl = 0;
+
+    while (vl<256 && raz_rt_stage1_arena_get(v, vl) != 0) {
+      vl += 1;
+    }
+    cli_write_arena(v, vl);
+
+    i64 sep[4] = [32, 45, 62, 32];
+
+    cli_write(&sep, 4);
+
+    i64 pl = 0;
+
+    while (pl<8192 && raz_rt_stage1_arena_get(p, pl) != 0) {
+      pl += 1;
+    }
+    cli_write_arena(p, pl);
+
+    i64 e[1] = [10];
+
+    cli_write(&e, 1);
+  }
+  raz_rt_stage1_arena_destroy(v);
+  raz_rt_stage1_arena_destroy(p);
+  raz_rt_stage1_arena_destroy(c);
+  return s;
+}
+
+fn registry_command(i64 argc) -> i64 {
+  if (argc != 4) {
+    return 55;
+  }
+
+  i64 n = raz_rt_stage1_arena_create(4096);
+  i64 c = raz_rt_stage1_arena_create(256);
+
+  if (n == 0 || c == 0) {
+    return 40;
+  }
+
+  i64 nl = raz_rt_stage1_process_arg(2, n, 4096);
+  i64 cl = raz_rt_stage1_process_arg(3, c, 256);
+  i64 s = registry_print_resolution(n, nl, c, cl);
+
+  raz_rt_stage1_arena_destroy(n);
+  raz_rt_stage1_arena_destroy(c);
+  return s;
+}
+
+fn registry_spec_parse(
+i64 spec,
+i64 length,
+i64 name,
+i64 name_cap,
+i64&mut nl,
+i64 constraint,
+i64 con_cap,
+i64&mut cl,
+) -> bool {
+  i64 prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+
+  if (length <= 10) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i<9) {
+    if (raz_rt_stage1_arena_get(spec, i) != prefix[i]) {
+      return false;
+    }
+    i += 1;
+  }
+
+  i64 at = 9;
+
+  while (at<length && raz_rt_stage1_arena_get(spec, at) != 64) {
+    at += 1;
+  }
+  if (at >= length || at - 9 <= 0 || length - at - 1 <= 0 || at - 9> name_cap || length - at - 1> con_cap) {
+    return false;
+  }
+  *nl = at - 9;
+  *cl = length - at - 1;
+  i = 0;
+  while (i<*nl) {
+    raz_rt_stage1_arena_set(name, i, raz_rt_stage1_arena_get(spec, 9 + i));
+    i += 1;
+  }
+  i = 0;
+  while (i<*cl) {
+    raz_rt_stage1_arena_set(constraint, i, raz_rt_stage1_arena_get(spec, at + 1 + i));
+    i += 1;
+  }
+  return true;
+}
+
+fn registry_write_tracking(i64 alias, i64 al, i64 name, i64 nl, i64 constraint, i64 cl) -> i64 {
+  i64 path = raz_rt_stage1_arena_create(16);
+  i64 old = raz_rt_stage1_arena_create(1048576);
+  i64 out = raz_rt_stage1_arena_create(1048576);
+
+  if (path == 0 || old == 0 || out == 0) {
+    return 40;
+  }
+
+  i64 pb[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+  i64 i = 0;
+
+  while (i<15) {
+    raz_rt_stage1_arena_set(path, i, pb[i]);
+    i += 1;
+  }
+
+  i64 ol = raz_rt_stage1_read_ascii(path, 15, old, 1048576);
+
+  if (ol<0) {
+    ol = 0;
+  }
+
+  i64 cursor = 0;
+
+  // rewrite all rows except alias
+
+  i64 pos = 0;
+
+  while (pos<ol) {
+    i64 s = pos;
+
+    while (pos<ol && raz_rt_stage1_arena_get(old, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 e = pos;
+
+    if (pos<ol) {
+      pos += 1;
+    }
+
+    i64 eq = s;
+
+    while (eq<e && raz_rt_stage1_arena_get(old, eq) != 61) {
+      eq += 1;
+    }
+    if (eq >= e || !package_key_equals(old, s, eq, alias, al)) {
+      package_append(out, 1048576, &mut cursor, old, s, e - s);
+
+      i64 lf[1] = [10];
+
+      package_append_literal(out, 1048576, &mut cursor, &lf, 1);
+    }
+  }
+  package_append(out, 1048576, &mut cursor, alias, 0, al);
+
+  i64 mid[4] = [32, 61, 32, 34];
+
+  package_append_literal(out, 1048576, &mut cursor, &mid, 4);
+  package_append(out, 1048576, &mut cursor, name, 0, nl);
+
+  i64 at[1] = [64];
+
+  package_append_literal(out, 1048576, &mut cursor, &at, 1);
+  package_append(out, 1048576, &mut cursor, constraint, 0, cl);
+
+  i64 tail[2] = [34, 10];
+
+  package_append_literal(out, 1048576, &mut cursor, &tail, 2);
+
+  i64 w = raz_rt_stage1_write_ascii(path, 16, out, cursor);
+
+  raz_rt_stage1_arena_destroy(path);
+  raz_rt_stage1_arena_destroy(old);
+  raz_rt_stage1_arena_destroy(out);
+  if (w == cursor) {
+    return 0;
+  }
+  return 56;
+}
+
+fn registry_write_cache(
+i64 alias,
+i64 al,
+i64 name,
+i64 nl,
+i64 version,
+i64 vl,
+i64 pathv,
+i64 pl,
+i64 checksum,
+i64 cl,
+) -> i64 {
+  i64 fp = raz_rt_stage1_arena_create(13);
+  i64 out = raz_rt_stage1_arena_create(32768);
+
+  if (fp == 0 || out == 0) {
+    return 40;
+  }
+
+  i64 f[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+  i64 i = 0;
+
+  while (i<12) {
+    raz_rt_stage1_arena_set(fp, i, f[i]);
+    i += 1;
+  }
+
+  i64 cur = 0;
+
+  package_append(out, 32768, &mut cur, alias, 0, al);
+
+  i64 sp[1] = [32];
+
+  package_append_literal(out, 32768, &mut cur, &sp, 1);
+  package_append(out, 32768, &mut cur, name, 0, nl);
+  package_append_literal(out, 32768, &mut cur, &sp, 1);
+  package_append(out, 32768, &mut cur, version, 0, vl);
+  package_append_literal(out, 32768, &mut cur, &sp, 1);
+  package_append(out, 32768, &mut cur, pathv, 0, pl);
+  package_append_literal(out, 32768, &mut cur, &sp, 1);
+  package_append(out, 32768, &mut cur, checksum, 0, cl);
+
+  i64 lf[1] = [10];
+
+  package_append_literal(out, 32768, &mut cur, &lf, 1);
+
+  i64 w = raz_rt_stage1_write_ascii(fp, 13, out, cur);
+
+  raz_rt_stage1_arena_destroy(fp);
+  raz_rt_stage1_arena_destroy(out);
+  if (w == cur) {
+    return 0;
+  }
+  return 56;
+}
+
+fn registry_resolve_and_apply(i64 alias, i64 al, i64 name, i64 nl, i64 con, i64 cl, bool track) -> i64 {
+  i64 v = raz_rt_stage1_arena_create(256);
+  i64 p = raz_rt_stage1_arena_create(8192);
+  i64 h = raz_rt_stage1_arena_create(64);
+
+  if (v == 0 || p == 0 || h == 0) {
+    return 40;
+  }
+
+  i64 s = registry_resolve(name, nl, con, cl, v, 256, p, 8192, h, 64);
+
+  if (s == 0) {
+    i64 vl = 0;
+
+    while (vl<256 && raz_rt_stage1_arena_get(v, vl) != 0) {
+      vl += 1;
+    }
+
+    i64 pl = 0;
+
+    while (pl<8192 && raz_rt_stage1_arena_get(p, pl) != 0) {
+      pl += 1;
+    }
+
+    i64 hl = 0;
+
+    while (hl<64 && raz_rt_stage1_arena_get(h, hl) != 0) {
+      hl += 1;
+    }
+    s = package_rewrite_dependency(alias, al, p, pl, false);
+    if (s == 0 && track) {
+      s = registry_write_tracking(alias, al, name, nl, con, cl);
+    }
+    if (s == 0) {
+      s = registry_write_cache(alias, al, name, nl, v, vl, p, pl, h, hl);
+    }
+    if (s == 0) {
+      s = package_lock_command();
+    }
+  }
+  raz_rt_stage1_arena_destroy(v);
+  raz_rt_stage1_arena_destroy(p);
+  raz_rt_stage1_arena_destroy(h);
+  return s;
+}
+
+fn package_add_registry_command(i64 alias, i64 al, i64 spec, i64 sl) -> i64 {
+  i64 n = raz_rt_stage1_arena_create(4096);
+  i64 c = raz_rt_stage1_arena_create(256);
+
+  if (n == 0 || c == 0) {
+    return 40;
+  }
+
+  i64 nl = 0;
+  i64 cl = 0;
+
+  if (!registry_spec_parse(spec, sl, n, 4096, &mut nl, c, 256, &mut cl)) {
+    return 55;
+  }
+
+  i64 s = registry_resolve_and_apply(alias, al, n, nl, c, cl, true);
+
+  raz_rt_stage1_arena_destroy(n);
+  raz_rt_stage1_arena_destroy(c);
+  return s;
+}
+
+fn registry_resolve_job(i64 name, i64 nl, i64 con, i64 cl, i64 version, i64 path, i64 checksum) -> i64 {
+  return registry_resolve(name, nl, con, cl, version, 256, path, 8192, checksum, 64);
+}
+
+fn registry_resolve_context_job(i64 context) -> i64 {
+  if (context == 0) {
+    return 40;
+  }
+  return registry_resolve_job(
+  raz_rt_stage1_arena_get(context, 0),
+  raz_rt_stage1_arena_get(context, 1),
+  raz_rt_stage1_arena_get(context, 2),
+  raz_rt_stage1_arena_get(context, 3),
+  raz_rt_stage1_arena_get(context, 4),
+  raz_rt_stage1_arena_get(context, 5),
+  raz_rt_stage1_arena_get(context, 6),
+  );
+}
+
+fn package_registry_update_command() -> i64 {
+  i64 fp = raz_rt_stage1_arena_create(16);
+  i64 data = raz_rt_stage1_arena_create(1048576);
+
+  if (fp == 0 || data == 0) {
+    return 40;
+  }
+
+  i64 f[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+  i64 i = 0;
+
+  while (i < 15) {
+    raz_rt_stage1_arena_set(fp, i, f[i]);
+    i += 1;
+  }
+
+  i64 len = raz_rt_stage1_read_ascii(fp, 15, data, 1048576);
+
+  if (len < 0) {
+    raz_rt_stage1_arena_destroy(fp);
+    raz_rt_stage1_arena_destroy(data);
+    return package_lock_command();
+  }
+  // Resolve all tracked dependencies concurrently, but defer manifest/cache/
+  // lockfile mutation until every worker has joined.  This keeps network and
+  // archive work parallel while preserving deterministic filesystem updates.
+
+  i64 max_jobs = 1024;
+  i64 aliases = raz_rt_stage1_arena_create(max_jobs);
+  i64 alias_lengths = raz_rt_stage1_arena_create(max_jobs);
+  i64 names = raz_rt_stage1_arena_create(max_jobs);
+  i64 name_lengths = raz_rt_stage1_arena_create(max_jobs);
+  i64 constraints = raz_rt_stage1_arena_create(max_jobs);
+  i64 constraint_lengths = raz_rt_stage1_arena_create(max_jobs);
+  i64 versions = raz_rt_stage1_arena_create(max_jobs);
+  i64 paths = raz_rt_stage1_arena_create(max_jobs);
+  i64 checksums = raz_rt_stage1_arena_create(max_jobs);
+  i64 contexts = raz_rt_stage1_arena_create(max_jobs);
+  i64 tasks = raz_rt_stage1_arena_create(max_jobs);
+
+  if (
+  aliases == 0 ||
+  alias_lengths == 0 ||
+  names == 0 ||
+  name_lengths == 0 ||
+  constraints == 0 ||
+  constraint_lengths == 0 ||
+  versions == 0 ||
+  paths == 0 ||
+  checksums == 0 ||
+  contexts == 0 ||
+  tasks == 0
+  ) {
+    return 40;
+  }
+
+  i64 job_count = 0;
+  i64 pos = 0;
+
+  while (pos < len) {
+    i64 s = pos;
+
+    while (pos < len && raz_rt_stage1_arena_get(data, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 e = pos;
+
+    if (pos < len) {
+      pos += 1;
+    }
+
+    i64 eq = s;
+
+    while (eq < e && raz_rt_stage1_arena_get(data, eq) != 61) {
+      eq += 1;
+    }
+    if (eq >= e) {
+      continue;
+    }
+    if (job_count >= max_jobs) {
+      return 55;
+    }
+
+    i64 alias = raz_rt_stage1_arena_create(4096);
+    i64 spec = raz_rt_stage1_arena_create(4096);
+    i64 name = raz_rt_stage1_arena_create(4096);
+    i64 con = raz_rt_stage1_arena_create(256);
+    i64 version = raz_rt_stage1_arena_create(256);
+    i64 path = raz_rt_stage1_arena_create(8192);
+    i64 checksum = raz_rt_stage1_arena_create(64);
+
+    if (alias == 0 || spec == 0 || name == 0 || con == 0 || version == 0 || path == 0 || checksum == 0) {
+      return 40;
+    }
+
+    i64 al = package_copy_key(data, s, eq, alias, 4096);
+    i64 sl = copy_quoted_value(data, eq + 1, e, spec, 4096);
+    i64 at = 0;
+
+    while (at < sl && raz_rt_stage1_arena_get(spec, at) != 64) {
+      at += 1;
+    }
+    if (at <= 0 || at >= sl) {
+      return 55;
+    }
+
+    i64 nl = at;
+    i64 cl = sl - at - 1;
+
+    i = 0;
+    while (i < nl) {
+      raz_rt_stage1_arena_set(name, i, raz_rt_stage1_arena_get(spec, i));
+      i += 1;
+    }
+    i = 0;
+    while (i < cl) {
+      raz_rt_stage1_arena_set(con, i, raz_rt_stage1_arena_get(spec, at + 1 + i));
+      i += 1;
+    }
+    raz_rt_stage1_arena_destroy(spec);
+    raz_rt_stage1_arena_set(aliases, job_count, alias);
+    raz_rt_stage1_arena_set(alias_lengths, job_count, al);
+    raz_rt_stage1_arena_set(names, job_count, name);
+    raz_rt_stage1_arena_set(name_lengths, job_count, nl);
+    raz_rt_stage1_arena_set(constraints, job_count, con);
+    raz_rt_stage1_arena_set(constraint_lengths, job_count, cl);
+    raz_rt_stage1_arena_set(versions, job_count, version);
+    raz_rt_stage1_arena_set(paths, job_count, path);
+    raz_rt_stage1_arena_set(checksums, job_count, checksum);
+
+    i64 context = raz_rt_stage1_arena_create(7);
+
+    if (context == 0) {
+      return 40;
+    }
+    raz_rt_stage1_arena_set(context, 0, name);
+    raz_rt_stage1_arena_set(context, 1, nl);
+    raz_rt_stage1_arena_set(context, 2, con);
+    raz_rt_stage1_arena_set(context, 3, cl);
+    raz_rt_stage1_arena_set(context, 4, version);
+    raz_rt_stage1_arena_set(context, 5, path);
+    raz_rt_stage1_arena_set(context, 6, checksum);
+    raz_rt_stage1_arena_set(contexts, job_count, context);
+
+    i64 captured_context = context;
+    auto task = raz_rt_task_spawn_callable_i64(move fn() -> i64 {
+      return registry_resolve_context_job(captured_context);
+    }
+    );
+
+    usize task_value = 0;
+
+    unsafe {
+      task_value = task as usize;
+    }
+    if (task_value == 0) {
+      return 40;
+    }
+    raz_rt_stage1_arena_set(tasks, job_count, task_value as i64);
+    job_count += 1;
+  }
+  if (job_count == 0) {
+    return package_lock_command();
+  }
+
+  i64 status = 0;
+
+  i = 0;
+  while (i < job_count) {
+    i64 task_value = raz_rt_stage1_arena_get(tasks, i);
+    i64 st = 40;
+
+    if (task_value != 0) {
+      unsafe {
+        st = raz_rt_task_join_i64(task_value as i8*mut);
+      }
+    }
+    if (status == 0 && st != 0) {
+      status = st;
+    }
+    i += 1;
+  }
+  // Apply successful resolutions in tracking-file order for deterministic
+  // manifests, cache metadata, and lockfiles.
+  if (status == 0) {
+    i = 0;
+    while (i < job_count) {
+      i64 alias = raz_rt_stage1_arena_get(aliases, i);
+      i64 al = raz_rt_stage1_arena_get(alias_lengths, i);
+      i64 name = raz_rt_stage1_arena_get(names, i);
+      i64 nl = raz_rt_stage1_arena_get(name_lengths, i);
+      i64 version = raz_rt_stage1_arena_get(versions, i);
+      i64 path = raz_rt_stage1_arena_get(paths, i);
+      i64 checksum = raz_rt_stage1_arena_get(checksums, i);
+      i64 vl = 0;
+
+      while (vl < 256 && raz_rt_stage1_arena_get(version, vl) != 0) {
+        vl += 1;
+      }
+
+      i64 pl = 0;
+
+      while (pl < 8192 && raz_rt_stage1_arena_get(path, pl) != 0) {
+        pl += 1;
+      }
+
+      i64 hl = 0;
+
+      while (hl < 64 && raz_rt_stage1_arena_get(checksum, hl) != 0) {
+        hl += 1;
+      }
+      status = package_rewrite_dependency(alias, al, path, pl, false);
+      if (status == 0) {
+        status = registry_write_cache(alias, al, name, nl, version, vl, path, pl, checksum, hl);
+      }
+      if (status != 0) {
+        break;
+      }
+      i += 1;
+    }
+  }
+  if (status == 0) {
+    status = package_lock_command();
+  }
+  i = 0;
+  while (i < job_count) {
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(aliases, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(names, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(constraints, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(versions, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(paths, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(checksums, i));
+    raz_rt_stage1_arena_destroy(raz_rt_stage1_arena_get(contexts, i));
+    i += 1;
+  }
+  raz_rt_stage1_arena_destroy(aliases);
+  raz_rt_stage1_arena_destroy(alias_lengths);
+  raz_rt_stage1_arena_destroy(names);
+  raz_rt_stage1_arena_destroy(name_lengths);
+  raz_rt_stage1_arena_destroy(constraints);
+  raz_rt_stage1_arena_destroy(constraint_lengths);
+  raz_rt_stage1_arena_destroy(versions);
+  raz_rt_stage1_arena_destroy(paths);
+  raz_rt_stage1_arena_destroy(checksums);
+  raz_rt_stage1_arena_destroy(contexts);
+  raz_rt_stage1_arena_destroy(tasks);
+  raz_rt_stage1_arena_destroy(fp);
+  raz_rt_stage1_arena_destroy(data);
+  return status;
+}
+
+fn registry_remove_tracking(i64 alias, i64 al) -> i64 {
+  i64 path = raz_rt_stage1_arena_create(16);
+  i64 old = raz_rt_stage1_arena_create(1048576);
+  i64 out = raz_rt_stage1_arena_create(1048576);
+
+  if (path == 0 || old == 0 || out == 0) {
+    return 40;
+  }
+
+  i64 pb[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+  i64 i = 0;
+
+  while (i<15) {
+    raz_rt_stage1_arena_set(path, i, pb[i]);
+    i += 1;
+  }
+
+  i64 ol = raz_rt_stage1_read_ascii(path, 15, old, 1048576);
+
+  if (ol<0) {
+    raz_rt_stage1_arena_destroy(path);
+    raz_rt_stage1_arena_destroy(old);
+    raz_rt_stage1_arena_destroy(out);
+    return 0;
+  }
+
+  i64 cursor = 0;
+  i64 pos = 0;
+
+  while (pos<ol) {
+    i64 s = pos;
+
+    while (pos<ol && raz_rt_stage1_arena_get(old, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 e = pos;
+
+    if (pos<ol) {
+      pos += 1;
+    }
+
+    i64 eq = s;
+
+    while (eq<e && raz_rt_stage1_arena_get(old, eq) != 61) {
+      eq += 1;
+    }
+    if (eq >= e || !package_key_equals(old, s, eq, alias, al)) {
+      package_append(out, 1048576, &mut cursor, old, s, e - s);
+
+      i64 lf[1] = [10];
+
+      package_append_literal(out, 1048576, &mut cursor, &lf, 1);
+    }
+  }
+
+  i64 w = raz_rt_stage1_write_ascii(path, 16, out, cursor);
+
+  raz_rt_stage1_arena_destroy(path);
+  raz_rt_stage1_arena_destroy(old);
+  raz_rt_stage1_arena_destroy(out);
+  if (w == cursor) {
+    return 0;
+  }
+  return 56;
+}
+
+// Package creation and publishing. Archives are deterministic DPK1 payloads and
+// registry metadata always names the full package-tree content hash.
+fn registry_current_identity(
+i64 name,
+i64 name_cap,
+i64&mut nl,
+i64 version,
+i64 version_cap,
+i64&mut vl,
+) -> i64 {
+  i64 mp = raz_rt_stage1_arena_create(11);
+  i64 manifest = raz_rt_stage1_arena_create(65536);
+
+  if (mp == 0 || manifest == 0) {
+    return 40;
+  }
+
+  i64 p[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+  i64 i = 0;
+
+  while (i<10) {
+    raz_rt_stage1_arena_set(mp, i, p[i]);
+    i += 1;
+  }
+
+  i64 length = raz_rt_stage1_read_ascii(mp, 10, manifest, 65536);
+
+  if (length <= 0) {
+    return 57;
+  }
+
+  i64 nk[4] = [110, 97, 109, 101];
+  i64 vk[7] = [118, 101, 114, 115, 105, 111, 110];
+
+  *nl = package_manifest_field(manifest, length, &nk, 4, name, name_cap);
+  *vl = package_manifest_field(manifest, length, &vk, 7, version, version_cap);
+  raz_rt_stage1_arena_destroy(mp);
+  raz_rt_stage1_arena_destroy(manifest);
+  if (*nl <= 0 || *vl <= 0) {
+    return 57;
+  }
+  return 0;
+}
+
+fn registry_hash_hex(i64 value, i64 output, i64 capacity) -> i64 {
+  if (capacity<16) {
+    return -1;
+  }
+
+  i64 shift = 60;
+  i64 i = 0;
+
+  while (shift >= 0) {
+    i64 nib = (value >> shift)&15;
+
+    raz_rt_stage1_arena_set(output, i, registry_hex_digit(nib));
+    i += 1;
+    shift -= 4;
+  }
+  return 16;
+}
+
+fn registry_default_archive_path(i64 name, i64 nl, i64 version, i64 vl, i64 output, i64 capacity) -> i64 {
+  i64 c = 0;
+
+  package_append(output, capacity, &mut c, name, 0, nl);
+
+  i64 raz[1] = [45];
+
+  package_append_literal(output, capacity, &mut c, &raz, 1);
+  package_append(output, capacity, &mut c, version, 0, vl);
+
+  i64 ext[4] = [46, 100, 112, 107];
+
+  package_append_literal(output, capacity, &mut c, &ext, 4);
+  return c;
+}
+
+fn package_pack_command(i64 argc) -> i64 {
+  if (argc> 3) {
+    return 55;
+  }
+
+  i64 name = raz_rt_stage1_arena_create(4096);
+  i64 version = raz_rt_stage1_arena_create(256);
+  i64 output = raz_rt_stage1_arena_create(8192);
+  i64 archive = raz_rt_stage1_arena_create(67108864);
+  i64 root = raz_rt_stage1_arena_create(1);
+
+  if (name == 0 || version == 0 || output == 0 || archive == 0 || root == 0) {
+    return 40;
+  }
+
+  i64 nl = 0;
+  i64 vl = 0;
+  i64 s = registry_current_identity(name, 4096, &mut nl, version, 256, &mut vl);
+
+  if (s != 0) {
+    return s;
+  }
+
+  i64 ol = 0;
+
+  if (argc == 3) {
+    ol = raz_rt_stage1_process_arg(2, output, 8192);
+  } else {
+    ol = registry_default_archive_path(name, nl, version, vl, output, 8192);
+  }
+  raz_rt_stage1_remove_path_ascii(output, ol);
+  raz_rt_stage1_arena_set(root, 0, 46);
+
+  i64 hash = registry_tree_hash(root, 1);
+
+  if (hash == 0) {
+    return 65;
+  }
+
+  i64 al = registry_pack_tree(root, 1, archive, 67108864);
+
+  if (al <= 0) {
+    return -al;
+  }
+  if (raz_rt_stage1_write_ascii(output, ol, archive, al) != al) {
+    return 65;
+  }
+
+  i64 hex = raz_rt_stage1_arena_create(16);
+
+  registry_hash_hex(hash, hex, 16);
+
+  i64 msg[7] = [80, 97, 99, 107, 101, 100, 32];
+
+  cli_write(&msg, 7);
+  cli_write_arena(output, ol);
+
+  i64 sep[6] = [32, 104, 97, 115, 104, 32];
+
+  cli_write(&sep, 6);
+  cli_write_arena(hex, 16);
+
+  i64 e[1] = [10];
+
+  cli_write(&e, 1);
+  raz_rt_stage1_arena_destroy(name);
+  raz_rt_stage1_arena_destroy(version);
+  raz_rt_stage1_arena_destroy(output);
+  raz_rt_stage1_arena_destroy(archive);
+  raz_rt_stage1_arena_destroy(root);
+  raz_rt_stage1_arena_destroy(hex);
+  return 0;
+}
+
+fn registry_publish_index_local(
+i64 directory,
+i64 dl,
+i64 name,
+i64 nl,
+i64 version,
+i64 vl,
+i64 checksum,
+i64 cl,
+i64 key_id,
+i64 kidl,
+i64 signature,
+i64 sl,
+) -> i64 {
+  i64 index = raz_rt_stage1_arena_create(8192);
+  i64 old = raz_rt_stage1_arena_create(4194304);
+  i64 out = raz_rt_stage1_arena_create(4194304);
+
+  if (index == 0 || old == 0 || out == 0) {
+    return 40;
+  }
+
+  i64 c = 0;
+
+  package_append(index, 8192, &mut c, directory, 0, dl);
+  if (c> 0 && raz_rt_stage1_arena_get(index, c - 1) != 47 && raz_rt_stage1_arena_get(index, c - 1) != 92) {
+    i64 slash[1] = [47];
+
+    package_append_literal(index, 8192, &mut c, &slash, 1);
+  }
+
+  i64 idx[9] = [105, 110, 100, 101, 120, 46, 116, 120, 116];
+
+  package_append_literal(index, 8192, &mut c, &idx, 9);
+
+  i64 oldl = raz_rt_stage1_read_ascii(index, c, old, 4194304);
+
+  if (oldl<0) {
+    oldl = 0;
+  }
+
+  i64 oc = 0;
+  i64 pos = 0;
+
+  while (pos<oldl) {
+    i64 st = pos;
+
+    while (pos<oldl && raz_rt_stage1_arena_get(old, pos) != 10) {
+      pos += 1;
+    }
+
+    i64 en = pos;
+
+    if (pos<oldl) {
+      pos += 1;
+    }
+
+    i64 ns = 0;
+    i64 nlen = 0;
+    i64 vs = 0;
+    i64 vlen = 0;
+    bool same = false;
+
+    if (
+    registry_token(old, st, en, 0, &mut ns, &mut nlen) &&
+    registry_token(old, st, en, 1, &mut vs, &mut vlen)
+    ) {
+      same =
+      registry_bytes_equal(old, ns, nlen, name, 0, nl) &&
+      registry_bytes_equal(old, vs, vlen, version, 0, vl);
+    }
+    if (!same) {
+      package_append(out, 4194304, &mut oc, old, st, en - st);
+
+      i64 e[1] = [10];
+
+      package_append_literal(out, 4194304, &mut oc, &e, 1);
+    }
+  }
+  package_append(out, 4194304, &mut oc, name, 0, nl);
+
+  i64 sp[1] = [32];
+
+  package_append_literal(out, 4194304, &mut oc, &sp, 1);
+  package_append(out, 4194304, &mut oc, version, 0, vl);
+  package_append_literal(out, 4194304, &mut oc, &sp, 1);
+  package_append(out, 4194304, &mut oc, directory, 0, dl);
+  if (
+  dl> 0 &&
+  raz_rt_stage1_arena_get(directory, dl - 1) != 47 &&
+  raz_rt_stage1_arena_get(directory, dl - 1) != 92
+  ) {
+    i64 root_slash[1] = [47];
+
+    package_append_literal(out, 4194304, &mut oc, &root_slash, 1);
+  }
+
+  i64 pp[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
+
+  package_append_literal(out, 4194304, &mut oc, &pp, 9);
+  package_append(out, 4194304, &mut oc, name, 0, nl);
+
+  i64 slash[1] = [47];
+
+  package_append_literal(out, 4194304, &mut oc, &slash, 1);
+  package_append(out, 4194304, &mut oc, version, 0, vl);
+
+  i64 ext[4] = [46, 100, 112, 107];
+
+  package_append_literal(out, 4194304, &mut oc, &ext, 4);
+  package_append_literal(out, 4194304, &mut oc, &sp, 1);
+  package_append(out, 4194304, &mut oc, checksum, 0, cl);
+  if (kidl> 0 && sl> 0) {
+    package_append_literal(out, 4194304, &mut oc, &sp, 1);
+    package_append(out, 4194304, &mut oc, key_id, 0, kidl);
+    package_append_literal(out, 4194304, &mut oc, &sp, 1);
+    package_append(out, 4194304, &mut oc, signature, 0, sl);
+  }
+
+  i64 e[1] = [10];
+
+  package_append_literal(out, 4194304, &mut oc, &e, 1);
+
+  i64 wr = raz_rt_stage1_write_ascii(index, c, out, oc);
+
+  raz_rt_stage1_arena_destroy(index);
+  raz_rt_stage1_arena_destroy(old);
+  raz_rt_stage1_arena_destroy(out);
+  if (wr != oc) {
+    return 65;
+  }
+  return 0;
+}
+
+fn package_publish_command() -> i64 {
+  if (registry_offline()) {
+    return 64;
+  }
+
+  i64 name = raz_rt_stage1_arena_create(4096);
+  i64 version = raz_rt_stage1_arena_create(256);
+  i64 archive = raz_rt_stage1_arena_create(67108864);
+  i64 root = raz_rt_stage1_arena_create(1);
+  i64 checksum = raz_rt_stage1_arena_create(16);
+  i64 key_id = raz_rt_stage1_arena_create(16);
+  i64 signature = raz_rt_stage1_arena_create(128);
+
+  if (
+  name == 0 ||
+  version == 0 ||
+  archive == 0 ||
+  root == 0 ||
+  checksum == 0 ||
+  key_id == 0 ||
+  signature == 0
+  ) {
+    return 40;
+  }
+
+  i64 nl = 0;
+  i64 vl = 0;
+  i64 s = registry_current_identity(name, 4096, &mut nl, version, 256, &mut vl);
+
+  if (s != 0) {
+    return s;
+  }
+  raz_rt_stage1_arena_set(root, 0, 46);
+
+  i64 previous = raz_rt_stage1_arena_create(8192);
+  i64 previous_length = registry_default_archive_path(name, nl, version, vl, previous, 8192);
+
+  raz_rt_stage1_remove_path_ascii(previous, previous_length);
+  raz_rt_stage1_arena_destroy(previous);
+
+  i64 hash = registry_tree_hash(root, 1);
+
+  if (hash == 0) {
+    return 65;
+  }
+  registry_hash_hex(hash, checksum, 16);
+
+  i64 signed_state = signing_sign_metadata(name, nl, version, vl, checksum, 16, key_id, 16, signature, 128);
+
+  if (signed_state<0) {
+    return 69;
+  }
+
+  i64 kidl = 0;
+  i64 sl = 0;
+
+  if (signed_state> 0) {
+    kidl = 16;
+    sl = 128;
+  }
+
+  i64 al = registry_pack_tree(root, 1, archive, 67108864);
+
+  if (al <= 0) {
+    return -al;
+  }
+
+  i64 local = raz_rt_stage1_arena_create(8192);
+  i64 lkey[24] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 80, 85, 66, 76, 73, 83, 72, 95, 68, 73, 82];
+  i64 ll = registry_env_ascii(&lkey, 24, local, 8192);
+
+  if (ll> 0) {
+    i64 package_dir = raz_rt_stage1_arena_create(8192);
+    i64 target = raz_rt_stage1_arena_create(8192);
+    i64 pc = 0;
+
+    package_append(package_dir, 8192, &mut pc, local, 0, ll);
+    if (
+    pc> 0 &&
+    raz_rt_stage1_arena_get(package_dir, pc - 1) != 47 &&
+    raz_rt_stage1_arena_get(package_dir, pc - 1) != 92
+    ) {
+      i64 slash[1] = [47];
+
+      package_append_literal(package_dir, 8192, &mut pc, &slash, 1);
+    }
+
+    i64 packages[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
+
+    package_append_literal(package_dir, 8192, &mut pc, &packages, 9);
+    package_append(package_dir, 8192, &mut pc, name, 0, nl);
+    if (raz_rt_stage1_create_dir_ascii(package_dir, pc) != 0) {
+      return 65;
+    }
+
+    i64 tc = 0;
+
+    package_append(target, 8192, &mut tc, package_dir, 0, pc);
+
+    i64 slash[1] = [47];
+
+    package_append_literal(target, 8192, &mut tc, &slash, 1);
+    package_append(target, 8192, &mut tc, version, 0, vl);
+
+    i64 ext[4] = [46, 100, 112, 107];
+
+    package_append_literal(target, 8192, &mut tc, &ext, 4);
+    if (raz_rt_stage1_write_ascii(target, tc, archive, al) != al) {
+      return 65;
+    }
+    s = registry_publish_index_local(
+    local,
+    ll,
+    name,
+    nl,
+    version,
+    vl,
+    checksum,
+    16,
+    key_id,
+    kidl,
+    signature,
+    sl,
+    );
+    raz_rt_stage1_arena_destroy(package_dir);
+    raz_rt_stage1_arena_destroy(target);
+    if (s != 0) {
+      return s;
+    }
+  } else {
+    i64 base = raz_rt_stage1_arena_create(8192);
+    i64 key[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
+    i64 bl = registry_env_ascii(&key, 16, base, 8192);
+
+    if (bl <= 0) {
+      return 60;
+    }
+
+    i64 suffix = raz_rt_stage1_arena_create(8192);
+    i64 url = raz_rt_stage1_arena_create(16384);
+    i64 sc = 0;
+    i64 pp[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
+
+    package_append_literal(suffix, 8192, &mut sc, &pp, 9);
+    package_append(suffix, 8192, &mut sc, name, 0, nl);
+
+    i64 slash[1] = [47];
+
+    package_append_literal(suffix, 8192, &mut sc, &slash, 1);
+    package_append(suffix, 8192, &mut sc, version, 0, vl);
+
+    i64 ext[4] = [46, 100, 112, 107];
+
+    package_append_literal(suffix, 8192, &mut sc, &ext, 4);
+
+    i64 ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
+    i64 ct = raz_rt_stage1_arena_create(24);
+    i64 ctb[22] = [97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 120, 45, 114, 97, 122, 45, 100, 112, 107, 49];
+    i64 i = 0;
+
+    while (i<22) {
+      raz_rt_stage1_arena_set(ct, i, ctb[i]);
+      i += 1;
+    }
+    if (registry_http_put(url, ul, archive, al, ct, 22) < 0) {
+      return 67;
+    }
+    sc = 0;
+
+    i64 ep[8] = [101, 110, 116, 114, 105, 101, 115, 47];
+
+    package_append_literal(suffix, 8192, &mut sc, &ep, 8);
+    package_append(suffix, 8192, &mut sc, name, 0, nl);
+    package_append_literal(suffix, 8192, &mut sc, &slash, 1);
+    package_append(suffix, 8192, &mut sc, version, 0, vl);
+    ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
+
+    i64 entry = raz_rt_stage1_arena_create(16384);
+    i64 ec = 0;
+
+    package_append(entry, 16384, &mut ec, name, 0, nl);
+
+    i64 sp[1] = [32];
+
+    package_append_literal(entry, 16384, &mut ec, &sp, 1);
+    package_append(entry, 16384, &mut ec, version, 0, vl);
+    package_append_literal(entry, 16384, &mut ec, &sp, 1);
+    package_append_literal(entry, 16384, &mut ec, &pp, 9);
+    package_append(entry, 16384, &mut ec, name, 0, nl);
+    package_append_literal(entry, 16384, &mut ec, &slash, 1);
+    package_append(entry, 16384, &mut ec, version, 0, vl);
+    package_append_literal(entry, 16384, &mut ec, &ext, 4);
+    package_append_literal(entry, 16384, &mut ec, &sp, 1);
+    package_append(entry, 16384, &mut ec, checksum, 0, 16);
+    if (kidl> 0 && sl> 0) {
+      package_append_literal(entry, 16384, &mut ec, &sp, 1);
+      package_append(entry, 16384, &mut ec, key_id, 0, kidl);
+      package_append_literal(entry, 16384, &mut ec, &sp, 1);
+      package_append(entry, 16384, &mut ec, signature, 0, sl);
+    }
+
+    i64 textct = raz_rt_stage1_arena_create(10);
+    i64 tx[10] = [116, 101, 120, 116, 47, 112, 108, 97, 105, 110];
+
+    i = 0;
+    while (i<10) {
+      raz_rt_stage1_arena_set(textct, i, tx[i]);
+      i += 1;
+    }
+    if (registry_http_put(url, ul, entry, ec, textct, 10) < 0) {
+      return 67;
+    }
+    raz_rt_stage1_arena_destroy(base);
+    raz_rt_stage1_arena_destroy(suffix);
+    raz_rt_stage1_arena_destroy(url);
+    raz_rt_stage1_arena_destroy(ct);
+    raz_rt_stage1_arena_destroy(entry);
+    raz_rt_stage1_arena_destroy(textct);
+  }
+
+  i64 msg[10] = [80, 117, 98, 108, 105, 115, 104, 101, 100, 32];
+
+  cli_write(&msg, 10);
+  cli_write_arena(name, nl);
+
+  i64 at[1] = [64];
+
+  cli_write(&at, 1);
+  cli_write_arena(version, vl);
+
+  i64 sp[1] = [32];
+
+  cli_write(&sp, 1);
+  cli_write_arena(checksum, 16);
+
+  i64 e[1] = [10];
+
+  cli_write(&e, 1);
+  raz_rt_stage1_arena_destroy(name);
+  raz_rt_stage1_arena_destroy(version);
+  raz_rt_stage1_arena_destroy(archive);
+  raz_rt_stage1_arena_destroy(root);
+  raz_rt_stage1_arena_destroy(checksum);
+  raz_rt_stage1_arena_destroy(key_id);
+  raz_rt_stage1_arena_destroy(signature);
+  raz_rt_stage1_arena_destroy(local);
+  return 0;
+}

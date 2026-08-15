@@ -1,0 +1,255 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::io::buffer;
+import alloc::vec;
+import core::bytes;
+/// Owned byte buffer with independent readable and writable regions.
+public struct ByteBuffer {
+    RawVec raw;
+    i64 read_position;
+}
+
+impl ByteBuffer {
+    fn new() -> ByteBuffer {
+        return ByteBuffer {
+            raw: alloc::vec::create_aligned(1, 1, 0),
+            read_position: 0
+        };
+    }
+    fn with_capacity(i64 capacity) -> ByteBuffer {
+        return ByteBuffer {
+            raw: alloc::vec::create_aligned(1, 1, capacity),
+            read_position: 0
+        };
+    }
+    fn len(ByteBuffer& self) -> i64 {
+        return self.raw.length;
+    }
+    fn capacity(ByteBuffer& self) -> i64 {
+        return self.raw.capacity;
+    }
+    fn readable(ByteBuffer& self) -> i64 {
+        return self.raw.length - self.read_position;
+    }
+    fn data_ptr(ByteBuffer& self) -> usize {
+        return self.raw.data;
+    }
+    fn readable_ptr(ByteBuffer& self) -> usize {
+        return self.raw.data + self.read_position;
+    }
+    fn reserve(ByteBuffer&mut self, i64 additional) -> bool {
+        if (additional < 0 || self.raw.length > 9223372036854775807 - additional) {
+            return false;
+        }
+
+        i64 required = self.raw.length + additional;
+
+        if (required <= self.raw.capacity) {
+            return true;
+        }
+        // Reclaim a consumed prefix before allocating. Streaming parsers often
+        // consume and append repeatedly; this keeps them at a stable capacity
+        // instead of growing because of dead bytes at the front.
+
+        i64 live = self.readable();
+
+        if (self.read_position > 0 && live <= self.raw.capacity - additional) {
+            if (live > 0) {
+                core::bytes::move_into(self.raw.data, live, BytesView {
+                    data: self.raw.data + self.read_position,
+                    length: live
+                }
+                );
+            }
+            self.raw.length = live;
+            self.read_position = 0;
+            return true;
+        }
+        return alloc::vec::reserve(&mut self.raw, required);
+    }
+    fn tail_ptr(ByteBuffer&mut self, i64 additional) -> usize {
+        if (!self.reserve(additional)) {
+            return 0;
+        }
+        return self.raw.data + self.raw.length;
+    }
+    fn commit(ByteBuffer&mut self, i64 count) -> bool {
+        if (count < 0 || self.raw.length + count > self.raw.capacity) {
+            return false;
+        }
+        self.raw.length += count;
+        return true;
+    }
+    fn append(ByteBuffer&mut self, usize data, i64 length) -> bool {
+        if (length < 0 || (length > 0 && data == 0)) {
+            return false;
+        }
+
+        usize output = self.tail_ptr(length);
+
+        if (length > 0 && output == 0) {
+            return false;
+        }
+        if (length > 0) {
+            core::bytes::copy_into(output, length, BytesView {
+                data: data,
+                length: length
+            }
+            );
+        }
+        return self.commit(length);
+    }
+    fn push(ByteBuffer&mut self, i64 byte) -> bool {
+        usize output = self.tail_ptr(1);
+
+        if (output == 0) {
+            return false;
+        }
+        core::bytes::store_u8(output, byte);
+        return self.commit(1);
+    }
+    fn peek(ByteBuffer& self, i64 offset) -> i64 {
+        if (offset < 0 || offset >= self.readable()) {
+            return -1;
+        }
+        return core::bytes::load_u8(self.raw.data + self.read_position + offset);
+    }
+    fn consume(ByteBuffer&mut self, i64 count) -> bool {
+        if (count < 0 || count > self.readable()) {
+            return false;
+        }
+        self.read_position += count;
+        if (self.read_position == self.raw.length) {
+            self.read_position = 0;
+            self.raw.length = 0;
+        }
+        return true;
+    }
+    fn compact(ByteBuffer&mut self) {
+        if (self.read_position <= 0) {
+            return;
+        }
+
+        i64 remaining = self.readable();
+
+        if (remaining > 0) {
+            core::bytes::move_into(self.raw.data, remaining, BytesView {
+                data: self.raw.data + self.read_position,
+                length: remaining
+            }
+            );
+        }
+        self.raw.length = remaining;
+        self.read_position = 0;
+    }
+    fn shrink_to_fit(ByteBuffer&mut self) -> bool {
+        if (self.read_position > 0) {
+            self.compact();
+        }
+        return alloc::vec::shrink_to_fit(&mut self.raw);
+    }
+    fn clear(ByteBuffer&mut self) {
+        self.raw.length = 0;
+        self.read_position = 0;
+    }
+    fn read_into(ByteBuffer&mut self, usize output, i64 requested) -> i64 {
+        if (requested < 0 || (requested > 0 && output == 0)) {
+            return -1;
+        }
+
+        i64 count = requested;
+
+        if (self.readable() < count) {
+            count = self.readable();
+        }
+        if (count > 0) {
+            core::bytes::copy_into(output, count, BytesView {
+                data: self.readable_ptr(),
+                length: count
+            }
+            );
+            self.consume(count);
+        }
+        return count;
+    }
+    fn as_view(ByteBuffer& self) -> BytesView {
+        return BytesView {
+            data: self.readable_ptr(),
+            length: self.readable()
+        };
+    }
+}
+
+impl Drop for ByteBuffer {
+    fn drop(ByteBuffer&mut self) {
+        alloc::vec::destroy(&mut self.raw);
+        self.read_position = 0;
+    }
+}
+
+public fn byte_buffer_new() -> ByteBuffer {
+    return ByteBuffer {
+        raw: alloc::vec::create_aligned(1, 1, 0),
+        read_position: 0
+    };
+}
+
+public fn byte_buffer_with_capacity(i64 capacity) -> ByteBuffer {
+    return ByteBuffer {
+        raw: alloc::vec::create_aligned(1, 1, capacity),
+        read_position: 0
+    };
+}
+
+public fn byte_buffer_len(ByteBuffer& value) -> i64 {
+    return value.raw.length;
+}
+
+public fn byte_buffer_readable(ByteBuffer& value) -> i64 {
+    return value.raw.length - value.read_position;
+}
+
+public fn byte_buffer_data(ByteBuffer& value) -> usize {
+    return value.raw.data + value.read_position;
+}
+
+public fn byte_buffer_reserve(ByteBuffer&mut value, i64 additional) -> bool {
+    return value.reserve(additional);
+}
+
+public fn byte_buffer_tail(ByteBuffer&mut value, i64 additional) -> usize {
+    return value.tail_ptr(additional);
+}
+
+public fn byte_buffer_commit(ByteBuffer&mut value, i64 count) -> bool {
+    return value.commit(count);
+}
+
+public fn byte_buffer_append(ByteBuffer&mut value, usize data, i64 length) -> bool {
+    return value.append(data, length);
+}
+
+public fn byte_buffer_push(ByteBuffer&mut value, i64 byte) -> bool {
+    return value.push(byte);
+}
+
+public fn byte_buffer_consume(ByteBuffer&mut value, i64 count) -> bool {
+    return value.consume(count);
+}
+
+public fn byte_buffer_compact(ByteBuffer&mut value) {
+    value.compact();
+}
+
+public fn byte_buffer_clear(ByteBuffer&mut value) {
+    value.clear();
+}
+
+public fn byte_buffer_read_into(ByteBuffer&mut value, usize output, i64 requested) -> i64 {
+    return value.read_into(output, requested);
+}
+
+public fn byte_buffer_view(ByteBuffer& value) -> BytesView {
+    return value.as_view();
+}

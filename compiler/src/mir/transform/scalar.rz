@@ -1,0 +1,102 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_transform_scalar;
+public import raz_compiler_mir_transform_copy_prop;
+// Algebraic canonicalization that preserves MIR value types. Replacements are
+// expressed through the metadata-safe use rewriter; compacting DCE removes the
+// now-unused instruction identities later in the pipeline.
+fn mir_scalar_replace_with_value(MirModule&mut mir, i64 instruction, i64 value) -> bool {
+  if (instruction == value) {
+    return true;
+  }
+  return mir_replace_value_uses(mir, instruction, value);
+}
+
+fn simplify_mir_scalars(MirModule&mut mir) -> bool {
+  i64 ip = 0;
+
+  while (ip < mir.instruction_count) {
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, ip);
+    i64 left_index = raz_rt_stage1_arena_get(mir.op_a, ip);
+    i64 right_index = raz_rt_stage1_arena_get(mir.op_b, ip);
+    i64 left = 0;
+    i64 right = 0;
+    bool left_constant = mir_constant_value(mir, left_index, &mut left);
+    bool right_constant = mir_constant_value(mir, right_index, &mut right);
+    i64 replacement = -1;
+
+    if (opcode == 4) {
+      if (left_constant && left == 0) {
+        replacement = right_index;
+      } else if (right_constant && right == 0) {
+        replacement = left_index;
+      }
+    } else if (opcode == 5) {
+      if (left_index == right_index) {
+        mir_replace_with_constant(mir, ip, 0);
+      } else if (right_constant && right == 0) {
+        replacement = left_index;
+      }
+    } else if (opcode == 6) {
+      if ((left_constant && left == 0) || (right_constant && right == 0)) {
+        mir_replace_with_constant(mir, ip, 0);
+      } else if (left_constant && left == 1) {
+        replacement = right_index;
+      } else if (right_constant && right == 1) {
+        replacement = left_index;
+      }
+    } else if (opcode == 7) {
+      if (right_constant && right == 1) {
+        replacement = left_index;
+      }
+    } else if (opcode >= 11 && opcode <= 16 && left_index == right_index) {
+      if (opcode == 11 || opcode == 14 || opcode == 16) {
+        mir_replace_with_constant(mir, ip, 1);
+      } else {
+        mir_replace_with_constant(mir, ip, 0);
+      }
+    } else if (opcode == 17) {
+      i64 condition = 0;
+
+      if (mir_constant_value(mir, left_index, &mut condition)) {
+        if (condition == 0) {
+          replacement = raz_rt_stage1_arena_get(mir.op_c, ip);
+        } else {
+          replacement = right_index;
+        }
+      }
+    } else if (opcode == 35) {
+      if ((left_constant && left == 0) || (right_constant && right == 0)) {
+        mir_replace_with_constant(mir, ip, 0);
+      } else if (left_index == right_index) {
+        replacement = left_index;
+      }
+    } else if (opcode == 36) {
+      if (left_constant && left == 0) {
+        replacement = right_index;
+      } else if (right_constant && right == 0) {
+        replacement = left_index;
+      } else if (left_index == right_index) {
+        replacement = left_index;
+      }
+    } else if (opcode == 37) {
+      if (left_index == right_index) {
+        mir_replace_with_constant(mir, ip, 0);
+      } else if (left_constant && left == 0) {
+        replacement = right_index;
+      } else if (right_constant && right == 0) {
+        replacement = left_index;
+      }
+    } else if (opcode == 38 || opcode == 39) {
+      if (right_constant && right == 0) {
+        replacement = left_index;
+      }
+    }
+    if (replacement >= 0 && !mir_scalar_replace_with_value(mir, ip, replacement)) {
+      return false;
+    }
+    ip += 1;
+  }
+  return true;
+}

@@ -1,0 +1,2610 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_hir_semantic_declarations;
+public import raz_compiler_hir_semantic_statements;
+// Declaration and implementation analysis for functions, types, traits, and impls.
+// Cross-reference work stays here so expression lowering can consume resolved metadata.
+fn hir_populate_blocks(HirBuilder&mut builder) -> bool {
+  i64 block_index = 0;
+
+  while (block_index < builder.module.block_count) {
+    if (!hir_parse_block_statements(builder, block_index)) {
+      return false;
+    }
+    block_index += 1;
+  }
+  return true;
+}
+
+fn hir_parse_function(HirBuilder&mut builder) -> bool {
+  i64 declaration_offset = builder.current.offset;
+
+  if (
+  builder.current.kind == TokenKind::Identifier &&
+  (
+  token_is_public(&builder.scan.input, &builder.current) ||
+  token_is_private(&builder.scan.input, &builder.current)
+  )
+  ) {
+    hir_advance(builder);
+  }
+
+  bool async_function = false;
+  bool unsafe_function = false;
+  bool parsing_prefixes = true;
+
+  while (parsing_prefixes && builder.current.kind == TokenKind::Identifier) {
+    if (token_is_async(&builder.scan.input, &builder.current)) {
+      async_function = true;
+      hir_advance(builder);
+    } else if (token_is_unsafe(&builder.scan.input, &builder.current)) {
+      unsafe_function = true;
+      hir_advance(builder);
+    } else {
+      parsing_prefixes = false;
+    }
+  }
+  if (
+  builder.pending_abi_kind != 0 ||
+  builder.pending_link_name_length != 0 ||
+  builder.pending_derive_copy != 0 ||
+  builder.pending_derive_clone != 0 ||
+  builder.pending_derive_trait_count != 0
+  ) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  if (builder.pending_target_feature_length != 0 && !unsafe_function) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  if (
+  builder.current.kind != TokenKind::Identifier ||
+  !token_is_fn(&builder.scan.input, &builder.current)
+  ) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  hir_advance(builder);
+  if (builder.current.kind != TokenKind::Identifier) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+  if (
+  builder.generic_reparse_function_index < 0 &&
+  builder.allow_function_name_reuse == 0 &&
+  hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)
+  ) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+
+  i64 function_index = builder.module.function_count;
+  bool reparsing_generic = builder.generic_reparse_function_index >= 0;
+
+  if (reparsing_generic) {
+    function_index = builder.generic_reparse_function_index;
+  } else if (function_index >= 16384) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+  raz_rt_stage1_arena_set(builder.module.function_name_offsets, function_index, builder.current.offset);
+  raz_rt_stage1_arena_set(builder.module.function_name_lengths, function_index, builder.current.length);
+  raz_rt_stage1_arena_set(builder.module.function_declaration_offsets, function_index, declaration_offset);
+  raz_rt_stage1_arena_set(
+  builder.module.function_parameter_starts,
+  function_index,
+  builder.module.parameter_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_parameter_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_local_starts, function_index, builder.module.local_count);
+  raz_rt_stage1_arena_set(builder.module.function_local_counts, function_index, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.function_statement_starts,
+  function_index,
+  builder.module.statement_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_statement_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_is_extern, function_index, 0);
+
+  i64 async_value = 0;
+
+  if (async_function) {
+    async_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.function_is_async, function_index, async_value);
+
+  i64 unsafe_value = 0;
+
+  if (unsafe_function) {
+    unsafe_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.function_is_unsafe, function_index, unsafe_value);
+  raz_rt_stage1_arena_set(builder.module.function_extern_kinds, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_types, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_returns_value, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_references, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_reference_mutable, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_type_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_return_slices, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_slice_mutable, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_lifetimes, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_return_function_types, function_index, -1);
+  raz_rt_stage1_arena_set(
+  builder.module.function_lifetime_parameter_starts,
+  function_index,
+  builder.module.lifetime_parameter_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_lifetime_parameter_counts, function_index, 0);
+  // Generic instantiation reparses the template body after pending declaration
+  // attributes have been consumed. Keep the template metadata already attached
+  // to the concrete function instead of replacing it with cleared pending state.
+  if (!reparsing_generic) {
+    raz_rt_stage1_arena_set(builder.module.function_abi_kinds, function_index, builder.pending_abi_kind);
+    raz_rt_stage1_arena_set(
+    builder.module.function_link_name_offsets,
+    function_index,
+    builder.pending_link_name_offset,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_link_name_lengths,
+    function_index,
+    builder.pending_link_name_length,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_target_feature_offsets,
+    function_index,
+    builder.pending_target_feature_offset,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_target_feature_lengths,
+    function_index,
+    builder.pending_target_feature_length,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_effect_flags,
+    function_index,
+    builder.pending_effect_flags,
+    );
+  }
+  raz_rt_stage1_arena_set(builder.module.function_drop_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_clone_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_ids, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_kinds, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_starts, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_ends, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_root_blocks, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_parsed, function_index, 1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_parent_functions, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_parent_blocks, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_explicit_parameter_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_closure_capture_starts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_closure_capture_counts, function_index, 0);
+  if (!reparsing_generic) {
+    raz_rt_stage1_arena_set(builder.module.function_inherent_structs, function_index, -1);
+    raz_rt_stage1_arena_set(builder.module.function_inherent_source_offsets, function_index, -1);
+    raz_rt_stage1_arena_set(builder.module.function_inherent_body_parsed, function_index, 1);
+  }
+  raz_rt_stage1_arena_set(builder.module.function_generic_template_indices, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_generic_type_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_generic_types, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 1);
+  if (!reparsing_generic) {
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_argument_starts,
+    function_index,
+    builder.module.function_generic_argument_count,
+    );
+    raz_rt_stage1_arena_set(builder.module.function_generic_argument_counts, function_index, 0);
+  }
+  if (builder.generic_active != 0) {
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_template_indices,
+    function_index,
+    builder.generic_template_index,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_type_structs,
+    function_index,
+    builder.generic_type_structure,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_types,
+    function_index,
+    builder.generic_type_kind,
+    );
+    if (builder.generic_signature_only != 0) {
+      raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 0);
+    }
+  }
+  raz_rt_stage1_arena_set(builder.module.function_defer_starts, function_index, builder.module.defer_count);
+  raz_rt_stage1_arena_set(builder.module.function_defer_counts, function_index, 0);
+  if (!reparsing_generic) {
+    builder.module.function_count += 1;
+  }
+  builder.current_function = function_index;
+  hir_advance(builder);
+  if (builder.generic_active == 0 && builder.current.kind == TokenKind::Less) {
+    if (!hir_parse_function_lifetime_parameters(builder, function_index)) {
+      return false;
+    }
+  }
+  if (builder.generic_active != 0 && builder.current.kind == TokenKind::Less) {
+    if (!hir_skip_active_generic_parameter_header(builder, 1, builder.generic_template_index)) {
+      return false;
+    }
+  }
+  if (!hir_expect(builder, TokenKind::LeftParen)) {
+    return false;
+  }
+  if (builder.current.kind != TokenKind::RightParen) {
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+      if (!hir_parse_parameter(builder)) {
+        return false;
+      }
+      if (builder.current.kind == TokenKind::Comma) {
+        hir_advance(builder);
+        if (builder.current.kind == TokenKind::RightParen) {
+          parsing_parameters = false;
+        }
+      } else {
+        parsing_parameters = false;
+      }
+    }
+  }
+  if (!hir_expect(builder, TokenKind::RightParen)) {
+    return false;
+  }
+  if (builder.current.kind == TokenKind::Arrow) {
+    hir_advance(builder);
+    raz_rt_stage1_arena_set(builder.module.function_returns_value, function_index, 1);
+
+    i64 return_structure = -1;
+    i64 return_type = 0;
+    i64 return_reference = 0;
+    i64 return_slice = 0;
+    i64 return_slice_mutable = 0;
+
+    if (
+    !hir_parse_type_spec(
+    builder,
+    &mut return_structure,
+    &mut return_type,
+    &mut return_reference,
+    &mut return_slice,
+    &mut return_slice_mutable,
+    )
+    ) {
+      return false;
+    }
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_type_structs,
+    function_index,
+    return_structure,
+    );
+    raz_rt_stage1_arena_set(builder.module.function_return_types, function_index, return_type);
+    raz_rt_stage1_arena_set(builder.module.function_return_references, function_index, return_reference);
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_reference_mutable,
+    function_index,
+    builder.last_type_reference_mutable,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_lifetimes,
+    function_index,
+    builder.last_type_lifetime,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_function_types,
+    function_index,
+    builder.last_type_function_signature,
+    );
+    raz_rt_stage1_arena_set(builder.module.function_return_slices, function_index, return_slice);
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_slice_mutable,
+    function_index,
+    return_slice_mutable,
+    );
+  }
+  if (builder.generic_signature_only != 0) {
+    raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 0);
+    if (builder.current.kind != TokenKind::LeftBrace) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+
+    i64 skip_depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+      if (builder.current.kind == TokenKind::LeftBrace) {
+        skip_depth += 1;
+      } else if (builder.current.kind == TokenKind::RightBrace) {
+        skip_depth -= 1;
+      }
+      hir_advance(builder);
+      if (skip_depth == 0) {
+        return true;
+      }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 1);
+
+  i64 saved_unsafe_depth = builder.unsafe_depth;
+
+  if (unsafe_function) {
+    builder.unsafe_depth += 1;
+  }
+  if (!hir_expect(builder, TokenKind::LeftBrace)) {
+    builder.unsafe_depth = saved_unsafe_depth;
+    return false;
+  }
+  while (builder.current.kind != TokenKind::RightBrace && builder.current.kind != TokenKind::End) {
+    if (builder.current.kind == TokenKind::LeftBrace) {
+      i64 lexical_start = 0;
+      i64 lexical_end = 0;
+      i64 lexical_block = -1;
+
+      if (
+      !hir_capture_block(builder, &mut lexical_start, &mut lexical_end, &mut lexical_block) ||
+      !hir_add_statement(builder, 14, lexical_block, 0, 0)
+      ) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_const(&builder.scan.input, &builder.current)
+    ) {
+      if (!hir_parse_const_declaration(builder)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_defer(&builder.scan.input, &builder.current)
+    ) {
+      if (!hir_parse_defer_statement(builder)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_match(&builder.scan.input, &builder.current)
+    ) {
+      if (!hir_parse_match_statement(builder)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_unsafe(&builder.scan.input, &builder.current)
+    ) {
+      if (!hir_parse_unsafe_statement(builder)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_for(&builder.scan.input, &builder.current)
+    ) {
+      if (!hir_parse_for_statement(builder)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_while(&builder.scan.input, &builder.current)
+    ) {
+      hir_advance(builder);
+
+      i64 condition = -1;
+
+      if (!hir_parse_expression(builder, &mut condition)) {
+        return false;
+      }
+      if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+      }
+
+      i64 body_start = builder.current.offset;
+      i64 body_end = body_start;
+      i64 depth = 1;
+
+      while (depth > 0 && builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+          depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+          depth -= 1;
+          if (depth == 0) {
+            body_end = builder.current.offset;
+          }
+        }
+        hir_advance(builder);
+      }
+      if (depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+
+      i64 body_block = -1;
+
+      builder.loop_depth += 1;
+
+      bool added_loop_body = hir_add_block(builder, body_start, body_end, &mut body_block);
+
+      builder.loop_depth -= 1;
+      if (!added_loop_body || !hir_add_statement(builder, 6, condition, body_block, 0)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_if(&builder.scan.input, &builder.current)
+    ) {
+      hir_advance(builder);
+
+      i64 condition = -1;
+
+      if (!hir_parse_expression(builder, &mut condition)) {
+        return false;
+      }
+
+      i64 then_start = 0;
+      i64 then_end = 0;
+      i64 then_block = -1;
+
+      if (!hir_capture_block(builder, &mut then_start, &mut then_end, &mut then_block)) {
+        return false;
+      }
+
+      i64 else_block = -1;
+
+      if (
+      builder.current.kind == TokenKind::Identifier &&
+      token_is_else(&builder.scan.input, &builder.current)
+      ) {
+        hir_advance(builder);
+        if (
+        builder.current.kind == TokenKind::Identifier &&
+        token_is_if(&builder.scan.input, &builder.current)
+        ) {
+          i64 else_start = builder.current.offset;
+          i64 else_end = else_start;
+
+          if (!hir_skip_if_chain(builder, &mut else_end)) {
+            return false;
+          }
+          if (!hir_add_block(builder, else_start, else_end, &mut else_block)) {
+            return false;
+          }
+        } else {
+          i64 else_start = 0;
+          i64 else_end = 0;
+
+          if (!hir_capture_block(builder, &mut else_start, &mut else_end, &mut else_block)) {
+            return false;
+          }
+        }
+      }
+      if (!hir_add_statement(builder, 7, condition, then_block, else_block)) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_break(&builder.scan.input, &builder.current)
+    ) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_continue(&builder.scan.input, &builder.current)
+    ) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_return(&builder.scan.input, &builder.current)
+    ) {
+      hir_advance(builder);
+
+      i64 expression = -1;
+
+      if (builder.current.kind != TokenKind::Semicolon) {
+        if (!hir_parse_expression(builder, &mut expression)) {
+          return false;
+        }
+        if (
+        raz_rt_stage1_arena_get(
+        builder.module.function_return_slices,
+        builder.current_function,
+        ) != 0
+        ) {
+          i64 sliced_return = -1;
+
+          if (
+          !hir_coerce_slice(
+          builder,
+          expression,
+          raz_rt_stage1_arena_get(
+          builder.module.function_return_slice_mutable,
+          builder.current_function,
+          ),
+          &mut sliced_return,
+          )
+          ) {
+            return false;
+          }
+          expression = sliced_return;
+        }
+        i64 return_structure = raz_rt_stage1_arena_get(
+        builder.module.function_return_type_structs,
+        builder.current_function,
+        );
+        i64 return_reference = raz_rt_stage1_arena_get(
+        builder.module.function_return_references,
+        builder.current_function,
+        );
+        if (return_reference != 0) {
+          if (
+          !hir_require_reference_type(
+          builder,
+          &mut expression,
+          return_reference,
+          return_structure,
+          raz_rt_stage1_arena_get(
+          builder.module.function_return_types,
+          builder.current_function,
+          ),
+          )
+          ) {
+            return false;
+          }
+        } else if (return_structure >= 0) {
+          if (
+          raz_rt_stage1_arena_get(
+          builder.module.node_type_structs,
+          expression,
+          ) != return_structure
+          ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+          }
+        } else {
+          i64 declared_return_type = raz_rt_stage1_arena_get(
+          builder.module.function_return_types,
+          builder.current_function,
+          );
+          if (
+          declared_return_type >= 16 &&
+          declared_return_type <= 18 &&
+          raz_rt_stage1_arena_get(builder.module.node_kinds, expression) == 42
+          ) {
+            i64 closure_function = raz_rt_stage1_arena_get(builder.module.node_a, expression);
+            i64 closure_kind = raz_rt_stage1_arena_get(builder.module.node_b, expression);
+            bool kind_compatible = false;
+
+            if (declared_return_type == 16) {
+              kind_compatible = closure_kind == 1 || closure_kind == 2;
+            } else if (declared_return_type == 17) {
+              kind_compatible = closure_kind == 1 || closure_kind == 2 || closure_kind == 3;
+            } else {
+              kind_compatible = closure_kind >= 1 && closure_kind <= 4;
+            }
+            i64 expected_signature = raz_rt_stage1_arena_get(
+            builder.module.function_return_function_types,
+            builder.current_function,
+            );
+            if (
+            hir_closure_captures_parent_stack_by_reference(
+            builder,
+            closure_function,
+            builder.current_function,
+            )
+            ) {
+              hir_fail(builder, DiagnosticCode::BorrowConflict);
+              return false;
+            }
+            if (
+            !kind_compatible ||
+            expected_signature < 0 ||
+            !hir_function_matches_pointer_signature(
+            builder,
+            closure_function,
+            expected_signature,
+            )
+            ) {
+              hir_fail(builder, DiagnosticCode::ExpectedToken);
+              return false;
+            }
+            raz_rt_stage1_arena_set(
+            builder.module.node_function_types,
+            expression,
+            expected_signature,
+            );
+          } else if (
+          declared_return_type == 14 &&
+          raz_rt_stage1_arena_get(builder.module.node_kinds, expression) == 42
+          ) {
+            i64 closure_function = raz_rt_stage1_arena_get(builder.module.node_a, expression);
+
+            if (
+            raz_rt_stage1_arena_get(
+            builder.module.function_closure_capture_counts,
+            closure_function,
+            ) != 0
+            ) {
+              hir_fail(builder, DiagnosticCode::ExpectedToken);
+              return false;
+            }
+
+            i64 closure_signature = hir_function_pointer_signature(builder, closure_function);
+
+            raz_rt_stage1_arena_set(builder.module.node_kinds, expression, 47);
+            raz_rt_stage1_arena_set(builder.module.node_a, expression, closure_function);
+            hir_set_node_type(builder, expression, 14);
+            raz_rt_stage1_arena_set(
+            builder.module.node_function_types,
+            expression,
+            closure_signature,
+            );
+          } else if (!hir_require_value_type(builder, &mut expression, declared_return_type)) {
+            return false;
+          }
+        }
+        if (
+        raz_rt_stage1_arena_get(
+        builder.module.function_return_types,
+        builder.current_function,
+        ) == 14
+        ) {
+          i64 expected_signature = raz_rt_stage1_arena_get(
+          builder.module.function_return_function_types,
+          builder.current_function,
+          );
+          i64 actual_signature = raz_rt_stage1_arena_get(
+          builder.module.node_function_types,
+          expression,
+          );
+          if (
+          expected_signature < 0 ||
+          actual_signature < 0 ||
+          !hir_function_pointer_signatures_equal(builder, expected_signature, actual_signature)
+          ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+          }
+        }
+      }
+      if (
+      !hir_expect(builder, TokenKind::Semicolon) ||
+      !hir_add_statement(builder, 2, expression, 0, 0)
+      ) {
+        return false;
+      }
+    } else if (
+    builder.current.kind == TokenKind::Identifier &&
+    token_is_fn(&builder.scan.input, &builder.current)
+    ) {
+      // In a function body, `fn(...) -> T name` is a typed function-pointer
+      // local, not a nested function declaration. Parse it directly so the
+      // lightweight declaration lookahead cannot stop at signature commas.
+      if (!hir_parse_local(builder)) {
+        return false;
+      }
+    } else {
+      bool declaration = false;
+
+      if (
+      builder.current.kind == TokenKind::Identifier ||
+      builder.current.kind == TokenKind::LeftParen
+      ) {
+        i64 declaration_scan_offset = builder.scan.offset;
+        TokenKind declaration_current_kind = builder.current.kind;
+        i64 declaration_current_offset = builder.current.offset;
+        i64 declaration_current_length = builder.current.length;
+
+        if (builder.current.kind == TokenKind::LeftParen) {
+          i64 type_depth = 0;
+          bool scanning_type = true;
+
+          while (scanning_type && builder.current.kind != TokenKind::End) {
+            if (builder.current.kind == TokenKind::LeftParen) {
+              type_depth += 1;
+            } else if (builder.current.kind == TokenKind::RightParen) {
+              type_depth -= 1;
+              if (type_depth == 0) {
+                hir_advance(builder);
+                scanning_type = false;
+              }
+            }
+            if (scanning_type) {
+              hir_advance(builder);
+            }
+          }
+        } else {
+          hir_advance(builder);
+          if (builder.current.kind == TokenKind::Less) {
+            i64 generic_depth = 0;
+            bool scanning_generic = true;
+
+            while (scanning_generic && builder.current.kind != TokenKind::End) {
+              if (builder.current.kind == TokenKind::Less) {
+                generic_depth += 1;
+              } else if (builder.current.kind == TokenKind::Greater) {
+                generic_depth -= 1;
+                if (generic_depth == 0) {
+                  hir_advance(builder);
+                  scanning_generic = false;
+                }
+              }
+              if (scanning_generic) {
+                hir_advance(builder);
+              }
+            }
+          }
+        }
+        if (builder.current.kind == TokenKind::LeftBracket) {
+          // Declaration probing must step over both slice brackets and
+          // fixed-array extents (`T[N] name`). The real local parser
+          // performs the semantic extent validation afterwards.
+          hir_advance(builder);
+          if (builder.current.kind == TokenKind::RightBracket) {
+            hir_advance(builder);
+            if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_mut(&builder.scan.input, &builder.current)
+            ) {
+              hir_advance(builder);
+            }
+          } else {
+            i64 bracket_depth = 1;
+
+            while (builder.current.kind != TokenKind::End && bracket_depth > 0) {
+              if (builder.current.kind == TokenKind::LeftBracket) {
+                bracket_depth += 1;
+              } else if (builder.current.kind == TokenKind::RightBracket) {
+                bracket_depth -= 1;
+              }
+              hir_advance(builder);
+            }
+          }
+        }
+        if (builder.current.kind == TokenKind::Ampersand) {
+          hir_advance(builder);
+          if (
+          builder.current.kind == TokenKind::Identifier &&
+          token_is_mut(&builder.scan.input, &builder.current)
+          ) {
+            hir_advance(builder);
+          }
+        }
+        declaration = builder.current.kind == TokenKind::Identifier;
+        builder.scan.offset = declaration_scan_offset;
+        init_token(
+        &mut builder.current,
+        declaration_current_kind,
+        declaration_current_offset,
+        declaration_current_length,
+        );
+      }
+      if (declaration) {
+        if (!hir_parse_local(builder)) {
+          return false;
+        }
+      } else {
+        i64 saved_scan_offset = builder.scan.offset;
+        TokenKind saved_current_kind = builder.current.kind;
+        i64 saved_current_offset = builder.current.offset;
+        i64 saved_current_length = builder.current.length;
+        i64 probe = -1;
+
+        if (!hir_parse_primary(builder, &mut probe)) {
+          return false;
+        }
+        bool assignment =
+        builder.current.kind == TokenKind::Equal ||
+        builder.current.kind == TokenKind::PlusEqual ||
+        builder.current.kind == TokenKind::MinusEqual ||
+        builder.current.kind == TokenKind::StarEqual ||
+        builder.current.kind == TokenKind::SlashEqual ||
+        builder.current.kind == TokenKind::PercentEqual ||
+        builder.current.kind == TokenKind::AmpersandEqual ||
+        builder.current.kind == TokenKind::PipeEqual ||
+        builder.current.kind == TokenKind::CaretEqual ||
+        builder.current.kind == TokenKind::LessLessEqual ||
+        builder.current.kind == TokenKind::GreaterGreaterEqual;
+        builder.scan.offset = saved_scan_offset;
+        init_token(
+        &mut builder.current,
+        saved_current_kind,
+        saved_current_offset,
+        saved_current_length,
+        );
+        if (assignment) {
+          if (!hir_parse_assignment(builder)) {
+            return false;
+          }
+        } else {
+          i64 expression = -1;
+
+          if (!hir_parse_expression(builder, &mut expression)) {
+            return false;
+          }
+          if (
+          !hir_expect(builder, TokenKind::Semicolon) ||
+          !hir_add_statement(builder, 5, expression, 0, 0)
+          ) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  if (!hir_expect(builder, TokenKind::RightBrace)) {
+    return false;
+  }
+  raz_rt_stage1_arena_set(
+  builder.module.function_root_statement_counts,
+  function_index,
+  raz_rt_stage1_arena_get(builder.module.function_statement_counts, function_index),
+  );
+  builder.unsafe_depth = saved_unsafe_depth;
+  return true;
+}
+
+fn hir_materialize_generic_inherent_function(HirBuilder&mut builder, i64 function_index) -> bool {
+  i64 structure = raz_rt_stage1_arena_get(builder.module.function_inherent_structs, function_index);
+
+  if (
+  structure == -1 ||
+  raz_rt_stage1_arena_get(builder.module.function_inherent_body_parsed, function_index) != 0
+  ) {
+    return true;
+  }
+  i64 default_trait_method = raz_rt_stage1_arena_get(
+  builder.module.function_trait_default_methods,
+  function_index,
+  ) - 1;
+
+  i64 target_template = -1;
+  i64 concrete_enum = -1;
+
+  if (structure >= 0) {
+    target_template = raz_rt_stage1_arena_get(builder.module.struct_generic_template_indices, structure);
+  } else if (structure <= -2) {
+    concrete_enum = -2 - structure;
+    i64 generic_enum = raz_rt_stage1_arena_get(
+    builder.module.enum_generic_template_indices,
+    concrete_enum,
+    );
+    if (generic_enum >= 0) {
+      target_template = -2 - generic_enum;
+    }
+  }
+  // A concrete trait default method has no generic struct template.  It still
+  // needs deferred materialization so `Self` can be rebound to the concrete
+  // implementation type.  Only ordinary generic inherent methods require a
+  // target template.
+  if (target_template < 0 && default_trait_method < 0) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  i64 method_source = raz_rt_stage1_arena_get(
+  builder.module.function_inherent_source_offsets,
+  function_index,
+  );
+
+  i64 generic_impl = -1;
+  i64 candidate = 0;
+  i64 best_source = -1;
+
+  while (candidate < builder.module.generic_inherent_impl_count) {
+    i64 candidate_source = raz_rt_stage1_arena_get(
+    builder.module.generic_inherent_source_offsets,
+    candidate,
+    );
+    if (
+    raz_rt_stage1_arena_get(
+    builder.module.generic_inherent_struct_templates,
+    candidate,
+    ) == target_template &&
+    candidate_source <= method_source &&
+    candidate_source > best_source
+    ) {
+      generic_impl = candidate;
+      best_source = candidate_source;
+    }
+    candidate += 1;
+  }
+  if (generic_impl < 0 && default_trait_method < 0) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+
+  i64 saved_scan_offset = builder.scan.offset;
+  TokenKind saved_current_kind = builder.current.kind;
+  i64 saved_current_offset = builder.current.offset;
+  i64 saved_current_length = builder.current.length;
+  i64 saved_function = builder.current_function;
+  i64 saved_block = builder.current_block;
+  i64 saved_loop_depth = builder.loop_depth;
+  i64 saved_generic_active = builder.generic_active;
+  i64 saved_generic_template = builder.generic_template_index;
+  i64 saved_generic_name_offset = builder.generic_type_name_offset;
+  i64 saved_generic_name_length = builder.generic_type_name_length;
+  i64 saved_generic_structure = builder.generic_type_structure;
+  i64 saved_generic_type = builder.generic_type_kind;
+  i64 saved_signature_only = builder.generic_signature_only;
+  i64 saved_reparse = builder.generic_reparse_function_index;
+  i64 saved_substitution_name_offsets = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_name_lengths = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_type_structures = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_types = raz_rt_stage1_arena_create(32);
+
+  if (
+  saved_substitution_name_offsets == 0 ||
+  saved_substitution_name_lengths == 0 ||
+  saved_substitution_type_structures == 0 ||
+  saved_substitution_types == 0
+  ) {
+    raz_rt_stage1_arena_destroy(saved_substitution_name_offsets);
+    raz_rt_stage1_arena_destroy(saved_substitution_name_lengths);
+    raz_rt_stage1_arena_destroy(saved_substitution_type_structures);
+    raz_rt_stage1_arena_destroy(saved_substitution_types);
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+  i64 saved_substitution_count = hir_save_generic_substitutions(
+  builder,
+  saved_substitution_name_offsets,
+  saved_substitution_name_lengths,
+  saved_substitution_type_structures,
+  saved_substitution_types,
+  );
+  builder.scan.offset = method_source;
+  next_token(&mut builder.scan, &mut builder.current);
+  builder.generic_active = 1;
+  builder.generic_template_index = target_template;
+  if (builder.generic_template_index < 0) {
+    builder.generic_template_index = -2 - builder.generic_template_index;
+  }
+  if (generic_impl >= 0) {
+    builder.generic_type_name_offset = raz_rt_stage1_arena_get(
+    builder.module.generic_inherent_type_name_offsets,
+    generic_impl,
+    );
+    builder.generic_type_name_length = raz_rt_stage1_arena_get(
+    builder.module.generic_inherent_type_name_lengths,
+    generic_impl,
+    );
+  }
+  builder.generic_type_structure = -1;
+  builder.generic_type_kind = 0;
+
+  bool installed_arguments = true;
+
+  if (structure >= 0) {
+    builder.generic_type_structure = raz_rt_stage1_arena_get(
+    builder.module.struct_generic_type_structs,
+    structure,
+    );
+    builder.generic_type_kind = raz_rt_stage1_arena_get(builder.module.struct_generic_types, structure);
+    if (target_template >= 0) {
+      installed_arguments = hir_install_struct_generic_arguments(builder, target_template, structure);
+    }
+  } else if (concrete_enum >= 0 && target_template <= -2) {
+    i64 generic_enum = -2 - target_template;
+
+    i64 parameter_start = raz_rt_stage1_arena_get(
+    builder.module.generic_enum_parameter_starts,
+    generic_enum,
+    );
+    i64 parameter_count = raz_rt_stage1_arena_get(
+    builder.module.generic_enum_parameter_counts,
+    generic_enum,
+    );
+    i64 argument_start = raz_rt_stage1_arena_get(
+    builder.module.enum_generic_argument_starts,
+    concrete_enum,
+    );
+
+    i64 index = 0;
+
+    while (index < parameter_count) {
+      if (
+      raz_rt_stage1_arena_get(builder.module.generic_parameter_kinds, parameter_start + index) == 0
+      ) {
+        builder.generic_type_structure = raz_rt_stage1_arena_get(
+        builder.module.enum_generic_argument_type_structs,
+        argument_start + index,
+        );
+        builder.generic_type_kind = raz_rt_stage1_arena_get(
+        builder.module.enum_generic_argument_types,
+        argument_start + index,
+        );
+        if (builder.generic_type_structure < 0 && builder.generic_type_kind == 16) {
+          builder.generic_type_kind = 0;
+        }
+        index = parameter_count;
+      } else {
+        index += 1;
+      }
+    }
+    installed_arguments = hir_install_enum_generic_arguments(builder, generic_enum, concrete_enum);
+  }
+  if (!installed_arguments) {
+    hir_restore_generic_substitutions(
+    builder,
+    saved_substitution_count,
+    saved_substitution_name_offsets,
+    saved_substitution_name_lengths,
+    saved_substitution_type_structures,
+    saved_substitution_types,
+    );
+    raz_rt_stage1_arena_destroy(saved_substitution_name_offsets);
+    raz_rt_stage1_arena_destroy(saved_substitution_name_lengths);
+    raz_rt_stage1_arena_destroy(saved_substitution_type_structures);
+    raz_rt_stage1_arena_destroy(saved_substitution_types);
+    return false;
+  }
+  // Generic trait impls can use a partial/nested target pattern whose
+  // parameter names differ from the target struct template (Pair<T, i64>,
+  // Wrapper<Pair<T, i64>>, Buffer<T, 4>). Install the captured primary impl
+  // parameter as well as the target struct's own generic argument names so
+  // reparsing the concrete method body resolves T correctly.
+
+  i64 trait_generic = -1;
+  i64 trait_candidate = 0;
+
+  while (generic_impl >= 0 && trait_candidate < builder.module.generic_trait_impl_count) {
+    if (
+    raz_rt_stage1_arena_get(
+    builder.module.generic_trait_source_offsets,
+    trait_candidate,
+    ) == raz_rt_stage1_arena_get(builder.module.generic_inherent_source_offsets, generic_impl)
+    ) {
+      trait_generic = trait_candidate;
+    }
+    trait_candidate += 1;
+  }
+  if (default_trait_method >= 0 && structure >= 0) {
+    Lexer default_scan;
+
+    default_scan.input = builder.scan.input;
+    default_scan.offset = method_source;
+    clear_diagnostic(&mut default_scan.last_error);
+
+    Token default_token;
+
+    next_token(&mut default_scan, &mut default_token);
+    while (
+    default_token.kind != TokenKind::End &&
+    !(
+    default_token.kind == TokenKind::Identifier &&
+    token_is_self_type(&builder.scan.input, &default_token)
+    )
+    ) {
+      next_token(&mut default_scan, &mut default_token);
+    }
+    if (
+    default_token.kind == TokenKind::End ||
+    !hir_add_generic_substitution(builder, default_token.offset, default_token.length, structure, 0)
+    ) {
+      return false;
+    }
+  }
+  if (trait_generic >= 0 && structure >= 0) {
+    i64 captured_structure = -1;
+    i64 captured_type = 0;
+
+    if (
+    !hir_generic_trait_impl_applies(
+    builder,
+    trait_generic,
+    structure,
+    &mut captured_structure,
+    &mut captured_type,
+    )
+    ) {
+      hir_fail(builder, DiagnosticCode::UnknownType);
+      return false;
+    }
+    if (
+    !hir_add_generic_substitution(
+    builder,
+    raz_rt_stage1_arena_get(builder.module.generic_trait_type_name_offsets, trait_generic),
+    raz_rt_stage1_arena_get(builder.module.generic_trait_type_name_lengths, trait_generic),
+    captured_structure,
+    captured_type,
+    )
+    ) {
+      return false;
+    }
+  }
+  builder.generic_signature_only = 0;
+  builder.generic_reparse_function_index = function_index;
+
+  bool parsed = hir_parse_function(builder);
+
+  if (parsed) {
+    raz_rt_stage1_arena_set(builder.module.function_inherent_body_parsed, function_index, 1);
+  }
+  builder.scan.offset = saved_scan_offset;
+  init_token(&mut builder.current, saved_current_kind, saved_current_offset, saved_current_length);
+  builder.current_function = saved_function;
+  builder.current_block = saved_block;
+  builder.loop_depth = saved_loop_depth;
+  builder.generic_active = saved_generic_active;
+  builder.generic_template_index = saved_generic_template;
+  builder.generic_type_name_offset = saved_generic_name_offset;
+  builder.generic_type_name_length = saved_generic_name_length;
+  builder.generic_type_structure = saved_generic_structure;
+  builder.generic_type_kind = saved_generic_type;
+  hir_restore_generic_substitutions(
+  builder,
+  saved_substitution_count,
+  saved_substitution_name_offsets,
+  saved_substitution_name_lengths,
+  saved_substitution_type_structures,
+  saved_substitution_types,
+  );
+  raz_rt_stage1_arena_destroy(saved_substitution_name_offsets);
+  raz_rt_stage1_arena_destroy(saved_substitution_name_lengths);
+  raz_rt_stage1_arena_destroy(saved_substitution_type_structures);
+  raz_rt_stage1_arena_destroy(saved_substitution_types);
+  builder.generic_signature_only = saved_signature_only;
+  builder.generic_reparse_function_index = saved_reparse;
+  return parsed;
+}
+
+fn hir_materialize_generic_function(HirBuilder&mut builder, i64 function_index) -> bool {
+  i64 generic = raz_rt_stage1_arena_get(builder.module.function_generic_template_indices, function_index);
+
+  if (
+  generic < 0 ||
+  raz_rt_stage1_arena_get(builder.module.function_generic_body_parsed, function_index) != 0
+  ) {
+    return true;
+  }
+
+  i64 saved_scan_offset = builder.scan.offset;
+  TokenKind saved_current_kind = builder.current.kind;
+  i64 saved_current_offset = builder.current.offset;
+  i64 saved_current_length = builder.current.length;
+  i64 saved_function = builder.current_function;
+  i64 saved_block = builder.current_block;
+  i64 saved_loop_depth = builder.loop_depth;
+  i64 saved_generic_active = builder.generic_active;
+  i64 saved_generic_template = builder.generic_template_index;
+  i64 saved_generic_name_offset = builder.generic_type_name_offset;
+  i64 saved_generic_name_length = builder.generic_type_name_length;
+  i64 saved_generic_structure = builder.generic_type_structure;
+  i64 saved_generic_type = builder.generic_type_kind;
+  i64 saved_signature_only = builder.generic_signature_only;
+  i64 saved_reparse = builder.generic_reparse_function_index;
+  i64 saved_substitution_name_offsets = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_name_lengths = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_type_structures = raz_rt_stage1_arena_create(32);
+  i64 saved_substitution_types = raz_rt_stage1_arena_create(32);
+
+  i64 saved_substitution_count = hir_save_generic_substitutions(
+  builder,
+  saved_substitution_name_offsets,
+  saved_substitution_name_lengths,
+  saved_substitution_type_structures,
+  saved_substitution_types,
+  );
+  builder.scan.offset = raz_rt_stage1_arena_get(builder.module.generic_function_source_offsets, generic);
+  next_token(&mut builder.scan, &mut builder.current);
+  builder.generic_active = 1;
+  builder.generic_template_index = generic;
+  builder.generic_type_name_offset = raz_rt_stage1_arena_get(
+  builder.module.generic_function_type_name_offsets,
+  generic,
+  );
+  builder.generic_type_name_length = raz_rt_stage1_arena_get(
+  builder.module.generic_function_type_name_lengths,
+  generic,
+  );
+  builder.generic_type_structure = raz_rt_stage1_arena_get(
+  builder.module.function_generic_type_structs,
+  function_index,
+  );
+  builder.generic_type_kind = raz_rt_stage1_arena_get(
+  builder.module.function_generic_types,
+  function_index,
+  );
+  if (!hir_install_function_generic_arguments(builder, generic, function_index)) {
+    hir_restore_generic_substitutions(
+    builder,
+    saved_substitution_count,
+    saved_substitution_name_offsets,
+    saved_substitution_name_lengths,
+    saved_substitution_type_structures,
+    saved_substitution_types,
+    );
+    raz_rt_stage1_arena_destroy(saved_substitution_name_offsets);
+    raz_rt_stage1_arena_destroy(saved_substitution_name_lengths);
+    raz_rt_stage1_arena_destroy(saved_substitution_type_structures);
+    raz_rt_stage1_arena_destroy(saved_substitution_types);
+    return false;
+  }
+  builder.generic_signature_only = 0;
+  builder.generic_reparse_function_index = function_index;
+
+  bool parsed = hir_parse_function(builder);
+
+  if (parsed) {
+    raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 1);
+  }
+  builder.scan.offset = saved_scan_offset;
+  init_token(&mut builder.current, saved_current_kind, saved_current_offset, saved_current_length);
+  builder.current_function = saved_function;
+  builder.current_block = saved_block;
+  builder.loop_depth = saved_loop_depth;
+  builder.generic_active = saved_generic_active;
+  builder.generic_template_index = saved_generic_template;
+  builder.generic_type_name_offset = saved_generic_name_offset;
+  builder.generic_type_name_length = saved_generic_name_length;
+  builder.generic_type_structure = saved_generic_structure;
+  builder.generic_type_kind = saved_generic_type;
+  hir_restore_generic_substitutions(
+  builder,
+  saved_substitution_count,
+  saved_substitution_name_offsets,
+  saved_substitution_name_lengths,
+  saved_substitution_type_structures,
+  saved_substitution_types,
+  );
+  raz_rt_stage1_arena_destroy(saved_substitution_name_offsets);
+  raz_rt_stage1_arena_destroy(saved_substitution_name_lengths);
+  raz_rt_stage1_arena_destroy(saved_substitution_type_structures);
+  raz_rt_stage1_arena_destroy(saved_substitution_types);
+  builder.generic_signature_only = saved_signature_only;
+  builder.generic_reparse_function_index = saved_reparse;
+  return parsed;
+}
+
+fn hir_parse_extern_function(HirBuilder&mut builder) -> bool {
+  if (builder.pending_target_feature_length != 0) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  hir_advance(builder);
+  if (
+  builder.current.kind != TokenKind::Identifier ||
+  !token_is_fn(&builder.scan.input, &builder.current)
+  ) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  hir_advance(builder);
+  if (builder.current.kind != TokenKind::Identifier) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+  if (hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+
+  i64 function_index = builder.module.function_count;
+
+  if (function_index >= 16384) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+  raz_rt_stage1_arena_set(builder.module.function_name_offsets, function_index, builder.current.offset);
+  raz_rt_stage1_arena_set(builder.module.function_name_lengths, function_index, builder.current.length);
+  raz_rt_stage1_arena_set(
+  builder.module.function_parameter_starts,
+  function_index,
+  builder.module.parameter_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_parameter_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_local_starts, function_index, builder.module.local_count);
+  raz_rt_stage1_arena_set(builder.module.function_local_counts, function_index, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.function_statement_starts,
+  function_index,
+  builder.module.statement_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_statement_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_is_extern, function_index, 1);
+  raz_rt_stage1_arena_set(builder.module.function_is_async, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_is_unsafe, function_index, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.function_extern_kinds,
+  function_index,
+  token_extern_kind(&builder.scan.input, &builder.current),
+  );
+  raz_rt_stage1_arena_set(builder.module.function_return_types, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_returns_value, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_references, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_type_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_return_slices, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_slice_mutable, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_return_lifetimes, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_return_function_types, function_index, -1);
+  raz_rt_stage1_arena_set(
+  builder.module.function_lifetime_parameter_starts,
+  function_index,
+  builder.module.lifetime_parameter_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_lifetime_parameter_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_abi_kinds, function_index, builder.pending_abi_kind);
+  raz_rt_stage1_arena_set(
+  builder.module.function_link_name_offsets,
+  function_index,
+  builder.pending_link_name_offset,
+  );
+  raz_rt_stage1_arena_set(
+  builder.module.function_link_name_lengths,
+  function_index,
+  builder.pending_link_name_length,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_target_feature_offsets, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_target_feature_lengths, function_index, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.function_effect_flags,
+  function_index,
+  builder.pending_effect_flags,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_drop_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_clone_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_inherent_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_inherent_source_offsets, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_inherent_body_parsed, function_index, 1);
+  raz_rt_stage1_arena_set(builder.module.function_generic_template_indices, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_generic_type_structs, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_generic_types, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_generic_body_parsed, function_index, 1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_ids, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_kinds, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_starts, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_ends, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_root_blocks, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_body_parsed, function_index, 1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_parent_functions, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_parent_blocks, function_index, -1);
+  raz_rt_stage1_arena_set(builder.module.function_closure_explicit_parameter_counts, function_index, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.function_closure_capture_starts,
+  function_index,
+  builder.module.closure_capture_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.function_closure_capture_counts, function_index, 0);
+  raz_rt_stage1_arena_set(builder.module.function_defer_starts, function_index, builder.module.defer_count);
+  raz_rt_stage1_arena_set(builder.module.function_defer_counts, function_index, 0);
+  if (builder.generic_active != 0) {
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_template_indices,
+    function_index,
+    builder.generic_template_index,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_type_structs,
+    function_index,
+    builder.generic_type_structure,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_generic_types,
+    function_index,
+    builder.generic_type_kind,
+    );
+  }
+  builder.module.function_count += 1;
+  builder.current_function = function_index;
+  hir_advance(builder);
+  if (!hir_expect(builder, TokenKind::LeftParen)) {
+    return false;
+  }
+  if (builder.current.kind != TokenKind::RightParen) {
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+      if (!hir_parse_parameter(builder)) {
+        return false;
+      }
+      if (builder.current.kind == TokenKind::Comma) {
+        hir_advance(builder);
+        if (builder.current.kind == TokenKind::RightParen) {
+          parsing_parameters = false;
+        }
+      } else {
+        parsing_parameters = false;
+      }
+    }
+  }
+  if (!hir_expect(builder, TokenKind::RightParen)) {
+    return false;
+  }
+  if (builder.current.kind == TokenKind::Arrow) {
+    hir_advance(builder);
+    raz_rt_stage1_arena_set(builder.module.function_returns_value, function_index, 1);
+
+    i64 return_structure = -1;
+    i64 return_type = 0;
+    i64 return_reference = 0;
+    i64 return_slice = 0;
+    i64 return_slice_mutable = 0;
+
+    if (
+    !hir_parse_type_spec(
+    builder,
+    &mut return_structure,
+    &mut return_type,
+    &mut return_reference,
+    &mut return_slice,
+    &mut return_slice_mutable,
+    )
+    ) {
+      return false;
+    }
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_type_structs,
+    function_index,
+    return_structure,
+    );
+    raz_rt_stage1_arena_set(builder.module.function_return_types, function_index, return_type);
+    raz_rt_stage1_arena_set(builder.module.function_return_references, function_index, return_reference);
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_lifetimes,
+    function_index,
+    builder.last_type_lifetime,
+    );
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_function_types,
+    function_index,
+    builder.last_type_function_signature,
+    );
+    raz_rt_stage1_arena_set(builder.module.function_return_slices, function_index, return_slice);
+    raz_rt_stage1_arena_set(
+    builder.module.function_return_slice_mutable,
+    function_index,
+    return_slice_mutable,
+    );
+  }
+  return hir_expect(builder, TokenKind::Semicolon);
+}
+
+fn hir_global_structure_needs_drop(HirBuilder& builder, i64 structure, i64 depth) -> bool {
+  if (structure < 0 || depth > 32) {
+    return false;
+  }
+  if (raz_rt_stage1_arena_get(builder.module.struct_drop_functions, structure) >= 0) {
+    return true;
+  }
+
+  i64 start = raz_rt_stage1_arena_get(builder.module.struct_field_starts, structure);
+  i64 count = raz_rt_stage1_arena_get(builder.module.struct_field_counts, structure);
+  i64 field = 0;
+
+  while (field < count) {
+    i64 metadata = start + field;
+    i64 child = raz_rt_stage1_arena_get(builder.module.struct_field_type_structs, metadata);
+
+    if (
+    child >= 0 &&
+    raz_rt_stage1_arena_get(builder.module.struct_field_references, metadata) == 0 &&
+    hir_global_structure_needs_drop(builder, child, depth + 1)
+    ) {
+      return true;
+    }
+    field += 1;
+  }
+  return false;
+}
+
+fn hir_global_initializer_is_static(HirBuilder& builder, i64 node) -> bool {
+  if (node < 0) {
+    return false;
+  }
+
+  i64 kind = raz_rt_stage1_arena_get(builder.module.node_kinds, node);
+
+  if (kind == 1 || kind == 30 || kind == 47) {
+    return true;
+  }
+  if (kind == 53 || kind == 34) {
+    // Drop-bearing structs are still static module images: construction is
+    // deterministic, and the generated module finalizer invokes user Drop
+    // before recursively releasing owned children.
+
+    i64 argument_start = raz_rt_stage1_arena_get(builder.module.node_a, node);
+    i64 argument_count = raz_rt_stage1_arena_get(builder.module.node_b, node);
+
+    if (kind == 34) {
+      argument_start = raz_rt_stage1_arena_get(builder.module.node_b, node);
+      argument_count = raz_rt_stage1_arena_get(builder.module.node_c, node);
+    }
+
+    i64 argument = 0;
+
+    while (argument < argument_count) {
+      if (
+      !hir_global_initializer_is_static(
+      builder,
+      raz_rt_stage1_arena_get(builder.module.arguments, argument_start + argument),
+      )
+      ) {
+        return false;
+      }
+      argument += 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+fn hir_parse_global_declaration(
+HirBuilder&mut builder,
+bool public_symbol,
+bool external_symbol,
+bool thread_local_symbol,
+bool internal_symbol,
+) -> bool {
+  // Grammar:
+  //   [public] [thread_local] global [mut] Type name = constant;
+  //   [thread_local] static [mut] Type name = constant;
+  //   extern [thread_local] global Type name;
+  // `static` selects internal linkage. `mut` controls source-level writes.
+  if (
+  builder.current.kind != TokenKind::Identifier ||
+  (
+  !token_is_global(&builder.scan.input, &builder.current) &&
+  !token_is_static(&builder.scan.input, &builder.current)
+  )
+  ) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  if (token_is_static(&builder.scan.input, &builder.current)) {
+    internal_symbol = true;
+  }
+  if ((internal_symbol && public_symbol) || (internal_symbol && external_symbol)) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  hir_advance(builder);
+
+  bool mutable_symbol = false;
+
+  if (
+  builder.current.kind == TokenKind::Identifier &&
+  token_is_mut(&builder.scan.input, &builder.current)
+  ) {
+    mutable_symbol = true;
+    hir_advance(builder);
+  }
+
+  i64 type_structure = -1;
+  i64 value_type = 0;
+  i64 reference = 0;
+  i64 slice = 0;
+  i64 slice_mutable = 0;
+
+  if (
+  !hir_parse_type_spec(
+  builder,
+  &mut type_structure,
+  &mut value_type,
+  &mut reference,
+  &mut slice,
+  &mut slice_mutable,
+  ) ||
+  reference != 0 ||
+  slice != 0
+  ) {
+    hir_fail(builder, DiagnosticCode::UnknownType);
+    return false;
+  }
+
+  i64 function_type = builder.last_type_function_signature;
+
+  // Module-owned storage uses the same arena-handle aggregate representation
+  // as locals. Pass 14 admits statically-described arrays/structs while
+  // keeping references, slices, callables, enums and floats on their existing
+  // conservative path until their module-image ABI is explicit.
+  if (
+  primitive_type_is_float(value_type) ||
+  value_type == 12 ||
+  value_type == 13 ||
+  value_type == 14 ||
+  hir_type_is_enum(value_type)
+  ) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  if (builder.current.kind != TokenKind::Identifier || builder.module.global_count >= 4096) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+
+  i64 name_offset = builder.current.offset;
+  i64 name_length = builder.current.length;
+
+  if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+  hir_advance(builder);
+
+  i64 array_extent = -1;
+
+  if (builder.current.kind == TokenKind::LeftBracket) {
+    hir_advance(builder);
+    if (builder.current.kind == TokenKind::RightBracket) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+
+    i64 extent_node = -1;
+
+    if (
+    !hir_parse_expression(builder, &mut extent_node) ||
+    raz_rt_stage1_arena_get(builder.module.node_kinds, extent_node) != 1
+    ) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+    array_extent = raz_rt_stage1_arena_get(builder.module.node_values, extent_node);
+    if (array_extent <= 0 || !hir_expect(builder, TokenKind::RightBracket)) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+  }
+  if (array_extent >= 0 && type_structure >= 0) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+
+  i64 initializer = -1;
+
+  if (external_symbol) {
+    if (builder.current.kind == TokenKind::Equal) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+  } else {
+    if (!hir_expect(builder, TokenKind::Equal)) {
+      return false;
+    }
+    if (!hir_parse_expression(builder, &mut initializer)) {
+      return false;
+    }
+
+    i64 initializer_kind = raz_rt_stage1_arena_get(builder.module.node_kinds, initializer);
+
+    // Module construction is deterministic: every leaf of an aggregate
+    // initializer must itself be statically describable.
+    if (!hir_global_initializer_is_static(builder, initializer)) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+    if (array_extent >= 0) {
+      if (
+      initializer_kind != 53 ||
+      raz_rt_stage1_arena_get(builder.module.node_array_extents, initializer) != array_extent ||
+      raz_rt_stage1_arena_get(builder.module.node_type_structs, initializer) != type_structure
+      ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+      if (type_structure < 0 && !hir_require_value_type(builder, &mut initializer, value_type)) {
+        return false;
+      }
+    } else if (type_structure >= 0) {
+      if (
+      initializer_kind != 34 ||
+      raz_rt_stage1_arena_get(builder.module.node_type_structs, initializer) != type_structure
+      ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+    } else if (value_type == 14) {
+      if (
+      initializer_kind != 47 ||
+      function_type < 0 ||
+      raz_rt_stage1_arena_get(builder.module.node_function_types, initializer) < 0 ||
+      !hir_function_pointer_signatures_equal(
+      builder,
+      function_type,
+      raz_rt_stage1_arena_get(builder.module.node_function_types, initializer),
+      )
+      ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+    } else if (!hir_require_value_type(builder, &mut initializer, value_type)) {
+      return false;
+    }
+  }
+  if (!hir_expect(builder, TokenKind::Semicolon)) {
+    return false;
+  }
+
+  i64 index = builder.module.global_count;
+
+  builder.module.global_count += 1;
+  raz_rt_stage1_arena_set(builder.module.global_name_offsets, index, name_offset);
+  raz_rt_stage1_arena_set(builder.module.global_name_lengths, index, name_length);
+  raz_rt_stage1_arena_set(builder.module.global_type_structs, index, type_structure);
+  raz_rt_stage1_arena_set(builder.module.global_types, index, value_type);
+  raz_rt_stage1_arena_set(builder.module.global_array_extents, index, array_extent);
+  raz_rt_stage1_arena_set(builder.module.global_function_types, index, function_type);
+
+  i64 mutable_value = 0;
+
+  if (mutable_symbol) {
+    mutable_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.global_mutable_flags, index, mutable_value);
+
+  i64 extern_value = 0;
+
+  if (external_symbol) {
+    extern_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.global_extern_flags, index, extern_value);
+
+  i64 tls_value = 0;
+
+  if (thread_local_symbol) {
+    tls_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.global_tls_flags, index, tls_value);
+
+  i64 internal_value = 0;
+
+  if (internal_symbol) {
+    internal_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.global_internal_flags, index, internal_value);
+
+  i64 public_value = 0;
+
+  if (public_symbol) {
+    public_value = 1;
+  }
+  raz_rt_stage1_arena_set(builder.module.global_public_flags, index, public_value);
+  raz_rt_stage1_arena_set(builder.module.global_initializer_nodes, index, initializer);
+  return true;
+}
+
+fn hir_parse_const_declaration(HirBuilder&mut builder) -> bool {
+  hir_advance(builder);
+
+  i64 type_structure = -1;
+  i64 value_type = 0;
+  i64 reference = 0;
+  i64 slice = 0;
+  i64 slice_mutable = 0;
+
+  if (
+  !hir_parse_type_spec(
+  builder,
+  &mut type_structure,
+  &mut value_type,
+  &mut reference,
+  &mut slice,
+  &mut slice_mutable,
+  ) ||
+  reference != 0 ||
+  slice != 0
+  ) {
+    hir_fail(builder, DiagnosticCode::UnknownType);
+    return false;
+  }
+
+  i64 array_extent = -1;
+
+  if (builder.current.kind == TokenKind::LeftBracket) {
+    hir_advance(builder);
+    if (
+    !hir_parse_const_generic_expression(builder, &mut array_extent) ||
+    array_extent <= 0 ||
+    !hir_expect(builder, TokenKind::RightBracket)
+    ) {
+      return false;
+    }
+  }
+  if (builder.current.kind != TokenKind::Identifier || builder.module.constant_count >= 4096) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+
+  i64 name_offset = builder.current.offset;
+  i64 name_length = builder.current.length;
+
+  if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+  hir_advance(builder);
+  if (!hir_expect(builder, TokenKind::Equal)) {
+    return false;
+  }
+
+  i64 value = -1;
+
+  if (array_extent >= 0) {
+    if (!hir_expect(builder, TokenKind::LeftBracket)) {
+      return false;
+    }
+
+    i64 argument_start = builder.module.argument_count;
+    i64 count = 0;
+
+    while (builder.current.kind != TokenKind::RightBracket) {
+      if (count >= array_extent || builder.module.argument_count >= 262144) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+
+      i64 element = -1;
+
+      if (!hir_parse_expression(builder, &mut element)) {
+        return false;
+      }
+      if (type_structure >= 0) {
+        if (raz_rt_stage1_arena_get(builder.module.node_type_structs, element) != type_structure) {
+          hir_fail(builder, DiagnosticCode::ExpectedToken);
+          return false;
+        }
+      } else if (!hir_require_value_type(builder, &mut element, value_type)) {
+        return false;
+      }
+      raz_rt_stage1_arena_set(builder.module.arguments, builder.module.argument_count, element);
+      builder.module.argument_count += 1;
+      count += 1;
+      if (builder.current.kind == TokenKind::Comma) {
+        hir_advance(builder);
+      } else if (builder.current.kind != TokenKind::RightBracket) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+    }
+    if (!hir_expect(builder, TokenKind::RightBracket) || count != array_extent) {
+      hir_fail(builder, DiagnosticCode::ExpectedToken);
+      return false;
+    }
+    if (!hir_add_node(builder, 53, argument_start, count, 0, 0, &mut value)) {
+      return false;
+    }
+    raz_rt_stage1_arena_set(builder.module.node_type_structs, value, type_structure);
+    hir_set_node_type(builder, value, value_type);
+    raz_rt_stage1_arena_set(builder.module.node_array_extents, value, array_extent);
+  } else {
+    if (!hir_parse_expression(builder, &mut value)) {
+      return false;
+    }
+    if (type_structure >= 0) {
+      if (raz_rt_stage1_arena_get(builder.module.node_type_structs, value) != type_structure) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+    } else if (!hir_require_value_type(builder, &mut value, value_type)) {
+      return false;
+    }
+  }
+  if (!hir_expect(builder, TokenKind::Semicolon)) {
+    return false;
+  }
+
+  i64 constant = builder.module.constant_count;
+
+  builder.module.constant_count += 1;
+  raz_rt_stage1_arena_set(builder.module.constant_name_offsets, constant, name_offset);
+  raz_rt_stage1_arena_set(builder.module.constant_name_lengths, constant, name_length);
+  raz_rt_stage1_arena_set(builder.module.constant_nodes, constant, value);
+  raz_rt_stage1_arena_set(builder.module.constant_types, constant, value_type);
+  raz_rt_stage1_arena_set(builder.module.constant_function_indices, constant, builder.current_function);
+  raz_rt_stage1_arena_set(builder.module.constant_block_indices, constant, builder.current_block);
+  raz_rt_stage1_arena_set(builder.module.constant_source_offsets, constant, name_offset);
+  return true;
+}
+
+fn hir_parse_generic_struct_template(HirBuilder&mut builder) -> bool {
+  i64 source_offset = builder.current.offset;
+
+  hir_advance(builder);
+  if (builder.current.kind != TokenKind::Identifier || builder.module.generic_struct_count >= 256) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+
+  i64 name_offset = builder.current.offset;
+  i64 name_length = builder.current.length;
+
+  if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+  hir_advance(builder);
+  if (!hir_expect(builder, TokenKind::Less)) {
+    return false;
+  }
+
+  i64 generic = builder.module.generic_struct_count;
+  i64 parameter_start = builder.module.generic_parameter_count;
+
+  if (!hir_parse_generic_parameter_list(builder, 2, generic)) {
+    return false;
+  }
+
+  i64 first_parameter = parameter_start;
+
+  i64 type_name_offset = raz_rt_stage1_arena_get(
+  builder.module.generic_parameter_name_offsets,
+  first_parameter,
+  );
+  i64 type_name_length = raz_rt_stage1_arena_get(
+  builder.module.generic_parameter_name_lengths,
+  first_parameter,
+  );
+  builder.module.generic_struct_count += 1;
+  raz_rt_stage1_arena_set(builder.module.generic_struct_name_offsets, generic, name_offset);
+  raz_rt_stage1_arena_set(builder.module.generic_struct_name_lengths, generic, name_length);
+  raz_rt_stage1_arena_set(builder.module.generic_struct_source_offsets, generic, source_offset);
+  // Compatibility mirror for single-parameter generic helpers.
+  raz_rt_stage1_arena_set(builder.module.generic_struct_type_name_offsets, generic, type_name_offset);
+  raz_rt_stage1_arena_set(builder.module.generic_struct_type_name_lengths, generic, type_name_length);
+  raz_rt_stage1_arena_set(
+  builder.module.generic_struct_derive_copy_flags,
+  generic,
+  builder.pending_derive_copy,
+  );
+  raz_rt_stage1_arena_set(
+  builder.module.generic_struct_derive_clone_flags,
+  generic,
+  builder.pending_derive_clone,
+  );
+  if (builder.current.kind != TokenKind::LeftBrace) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+
+  i64 depth = 0;
+
+  while (builder.current.kind != TokenKind::End) {
+    if (builder.current.kind == TokenKind::LeftBrace) {
+      depth += 1;
+    } else if (builder.current.kind == TokenKind::RightBrace) {
+      depth -= 1;
+    }
+    hir_advance(builder);
+    if (depth == 0) {
+      return true;
+    }
+  }
+  hir_fail(builder, DiagnosticCode::ExpectedToken);
+  return false;
+}
+
+fn hir_parse_struct_declaration(HirBuilder&mut builder) -> bool {
+  hir_advance(builder);
+  if (builder.current.kind != TokenKind::Identifier) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+  if (builder.module.struct_count >= 256) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+  if (hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+
+  i64 structure = builder.module.struct_count;
+
+  builder.module.struct_count += 1;
+  raz_rt_stage1_arena_set(builder.module.struct_name_offsets, structure, builder.current.offset);
+  raz_rt_stage1_arena_set(builder.module.struct_name_lengths, structure, builder.current.length);
+  raz_rt_stage1_arena_set(builder.module.struct_field_starts, structure, builder.module.struct_field_count);
+  raz_rt_stage1_arena_set(builder.module.struct_field_counts, structure, 0);
+  raz_rt_stage1_arena_set(builder.module.struct_tuple_flags, structure, 0);
+  raz_rt_stage1_arena_set(builder.module.struct_packed_flags, structure, builder.pending_struct_packed);
+  raz_rt_stage1_arena_set(builder.module.struct_repr_c_flags, structure, builder.pending_struct_repr_c);
+  raz_rt_stage1_arena_set(
+  builder.module.struct_explicit_alignments,
+  structure,
+  builder.pending_struct_alignment,
+  );
+  raz_rt_stage1_arena_set(
+  builder.module.struct_attribute_counts,
+  structure,
+  builder.pending_struct_attribute_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.struct_drop_functions, structure, -1);
+  raz_rt_stage1_arena_set(builder.module.struct_clone_functions, structure, -1);
+  raz_rt_stage1_arena_set(builder.module.struct_copy_flags, structure, 0);
+  raz_rt_stage1_arena_set(builder.module.struct_derived_clone_flags, structure, 0);
+  raz_rt_stage1_arena_set(builder.module.struct_generic_template_indices, structure, -1);
+  raz_rt_stage1_arena_set(builder.module.struct_generic_type_structs, structure, -1);
+  raz_rt_stage1_arena_set(builder.module.struct_generic_types, structure, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.struct_generic_argument_starts,
+  structure,
+  builder.module.struct_generic_argument_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.struct_generic_argument_counts, structure, 0);
+  hir_advance(builder);
+  if (builder.current.kind == TokenKind::LeftParen) {
+    raz_rt_stage1_arena_set(builder.module.struct_tuple_flags, structure, 1);
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::RightParen) {
+      bool parsing_fields = true;
+
+      while (parsing_fields) {
+        i64 type_offset = builder.current.offset;
+        i64 type_length = builder.current.length;
+        i64 field_structure = -1;
+        i64 field_type = 0;
+        i64 field_reference = 0;
+        i64 field_slice = 0;
+        i64 field_slice_mutable = 0;
+
+        if (
+        !hir_parse_type_spec(
+        builder,
+        &mut field_structure,
+        &mut field_type,
+        &mut field_reference,
+        &mut field_slice,
+        &mut field_slice_mutable,
+        ) ||
+        builder.module.struct_field_count >= 4096
+        ) {
+          return false;
+        }
+
+        i64 field_array_extent = -1;
+
+        if (builder.current.kind == TokenKind::LeftBracket) {
+          if (field_reference != 0 || field_slice != 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+          }
+          hir_advance(builder);
+          if (
+          !hir_parse_const_generic_expression(builder, &mut field_array_extent) ||
+          field_array_extent <= 0 ||
+          !hir_expect(builder, TokenKind::RightBracket)
+          ) {
+            return false;
+          }
+        }
+
+        i64 field = builder.module.struct_field_count;
+
+        builder.module.struct_field_count += 1;
+        raz_rt_stage1_arena_set(builder.module.struct_field_type_offsets, field, type_offset);
+        raz_rt_stage1_arena_set(builder.module.struct_field_type_lengths, field, type_length);
+        raz_rt_stage1_arena_set(builder.module.struct_field_type_structs, field, field_structure);
+        raz_rt_stage1_arena_set(builder.module.struct_field_types, field, field_type);
+        raz_rt_stage1_arena_set(builder.module.struct_field_references, field, field_reference);
+        raz_rt_stage1_arena_set(builder.module.struct_field_slices, field, field_slice);
+        raz_rt_stage1_arena_set(
+        builder.module.struct_field_slice_mutable,
+        field,
+        field_slice_mutable,
+        );
+        raz_rt_stage1_arena_set(builder.module.struct_field_array_extents, field, field_array_extent);
+        raz_rt_stage1_arena_set(builder.module.struct_field_function_types, field, -1);
+        raz_rt_stage1_arena_set(builder.module.struct_field_name_offsets, field, -1);
+        raz_rt_stage1_arena_set(builder.module.struct_field_name_lengths, field, 0);
+        raz_rt_stage1_arena_set(
+        builder.module.struct_field_counts,
+        structure,
+        raz_rt_stage1_arena_get(builder.module.struct_field_counts, structure) + 1,
+        );
+        if (builder.current.kind == TokenKind::Comma) {
+          hir_advance(builder);
+        } else {
+          parsing_fields = false;
+        }
+      }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen) || !hir_expect(builder, TokenKind::Semicolon)) {
+      return false;
+    }
+    return hir_apply_pending_struct_derives(builder, structure);
+  }
+  if (!hir_expect(builder, TokenKind::LeftBrace)) {
+    return false;
+  }
+  while (builder.current.kind != TokenKind::RightBrace) {
+    i64 type_offset = builder.current.offset;
+    i64 type_length = builder.current.length;
+    i64 field_structure = -1;
+    i64 field_type = 0;
+    i64 field_reference = 0;
+    i64 field_slice = 0;
+    i64 field_slice_mutable = 0;
+
+    if (
+    !hir_parse_type_spec(
+    builder,
+    &mut field_structure,
+    &mut field_type,
+    &mut field_reference,
+    &mut field_slice,
+    &mut field_slice_mutable,
+    )
+    ) {
+      return false;
+    }
+
+    i64 field_array_extent = -1;
+
+    if (builder.current.kind == TokenKind::LeftBracket) {
+      if (field_slice != 0 || field_reference != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+      hir_advance(builder);
+      if (
+      !hir_parse_const_generic_expression(builder, &mut field_array_extent) ||
+      field_array_extent <= 0 ||
+      !hir_expect(builder, TokenKind::RightBracket)
+      ) {
+        return false;
+      }
+    }
+    if (builder.current.kind != TokenKind::Identifier) {
+      hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+      return false;
+    }
+
+    i64 field_name_offset = builder.current.offset;
+    i64 field_name_length = builder.current.length;
+
+    hir_advance(builder);
+    if (builder.current.kind == TokenKind::LeftBracket) {
+      if (field_array_extent >= 0 || field_slice != 0 || field_reference != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+      hir_advance(builder);
+      if (
+      !hir_parse_const_generic_expression(builder, &mut field_array_extent) ||
+      field_array_extent <= 0 ||
+      !hir_expect(builder, TokenKind::RightBracket)
+      ) {
+        return false;
+      }
+    }
+    if (builder.module.struct_field_count >= 4096) {
+      hir_fail(builder, DiagnosticCode::TooManyItems);
+      return false;
+    }
+
+    i64 field = builder.module.struct_field_count;
+
+    builder.module.struct_field_count += 1;
+    raz_rt_stage1_arena_set(builder.module.struct_field_type_offsets, field, type_offset);
+    raz_rt_stage1_arena_set(builder.module.struct_field_type_lengths, field, type_length);
+    raz_rt_stage1_arena_set(builder.module.struct_field_type_structs, field, field_structure);
+    raz_rt_stage1_arena_set(builder.module.struct_field_types, field, field_type);
+    raz_rt_stage1_arena_set(builder.module.struct_field_references, field, field_reference);
+    raz_rt_stage1_arena_set(builder.module.struct_field_slices, field, field_slice);
+    raz_rt_stage1_arena_set(builder.module.struct_field_slice_mutable, field, field_slice_mutable);
+    raz_rt_stage1_arena_set(builder.module.struct_field_array_extents, field, field_array_extent);
+    raz_rt_stage1_arena_set(builder.module.struct_field_function_types, field, -1);
+    raz_rt_stage1_arena_set(builder.module.struct_field_name_offsets, field, field_name_offset);
+    raz_rt_stage1_arena_set(builder.module.struct_field_name_lengths, field, field_name_length);
+    raz_rt_stage1_arena_set(
+    builder.module.struct_field_counts,
+    structure,
+    raz_rt_stage1_arena_get(builder.module.struct_field_counts, structure) + 1,
+    );
+    if (!hir_expect(builder, TokenKind::Semicolon)) {
+      return false;
+    }
+  }
+  if (!hir_expect(builder, TokenKind::RightBrace)) {
+    return false;
+  }
+  return hir_apply_pending_struct_derives(builder, structure);
+}
+
+fn hir_validate_generic_enum_payload_types(HirBuilder&mut builder, i64 generic, i64 body_offset) -> bool {
+  Lexer scan;
+
+  scan.input = builder.scan.input;
+  scan.offset = body_offset;
+  clear_diagnostic(&mut scan.last_error);
+
+  Token current;
+
+  next_token(&mut scan, &mut current);
+  if (current.kind != TokenKind::LeftBrace) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+
+  i64 brace_depth = 1;
+  i64 paren_depth = 0;
+  bool expect_payload_type = false;
+
+  next_token(&mut scan, &mut current);
+  while (current.kind != TokenKind::End && brace_depth > 0) {
+    if (current.kind == TokenKind::LeftBrace) {
+      brace_depth += 1;
+    } else if (current.kind == TokenKind::RightBrace) {
+      brace_depth -= 1;
+    } else if (brace_depth == 1 && current.kind == TokenKind::LeftParen) {
+      paren_depth += 1;
+      if (paren_depth == 1) {
+        expect_payload_type = true;
+      }
+    } else if (brace_depth == 1 && current.kind == TokenKind::RightParen) {
+      if (paren_depth > 0) {
+        paren_depth -= 1;
+      }
+      expect_payload_type = false;
+    } else if (brace_depth == 1 && paren_depth == 1 && current.kind == TokenKind::Comma) {
+      expect_payload_type = true;
+    } else if (brace_depth == 1 && paren_depth == 1 && expect_payload_type) {
+      if (current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+      }
+      i64 known_generic = hir_generic_parameter_index(
+      builder,
+      3,
+      generic,
+      current.offset,
+      current.length,
+      );
+
+      i64 known_struct = hir_find_struct(builder, current.offset, current.length);
+      i64 known_enum = hir_find_enum(builder, current.offset, current.length);
+      i64 known_generic_struct = hir_find_generic_struct(builder, current.offset, current.length);
+      i64 known_generic_enum = hir_find_generic_enum(builder, current.offset, current.length);
+      bool known_scalar = token_is_scalar_type(&builder.scan.input, current.offset, current.length);
+
+      if (
+      known_generic < 0 &&
+      known_struct < 0 &&
+      known_enum < 0 &&
+      known_generic_struct < 0 &&
+      known_generic_enum < 0 &&
+      !known_scalar
+      ) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+      }
+      expect_payload_type = false;
+    }
+    next_token(&mut scan, &mut current);
+  }
+  if (brace_depth != 0) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  return true;
+}
+
+fn hir_parse_generic_enum_template(
+HirBuilder&mut builder,
+i64 source_offset,
+i64 name_offset,
+i64 name_length,
+) -> bool {
+  if (builder.module.generic_enum_count >= 256) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+
+  i64 generic = builder.module.generic_enum_count;
+
+  if (!hir_parse_generic_parameter_list(builder, 3, generic)) {
+    return false;
+  }
+  builder.module.generic_enum_count += 1;
+  raz_rt_stage1_arena_set(builder.module.generic_enum_name_offsets, generic, name_offset);
+  raz_rt_stage1_arena_set(builder.module.generic_enum_name_lengths, generic, name_length);
+  raz_rt_stage1_arena_set(builder.module.generic_enum_source_offsets, generic, source_offset);
+  raz_rt_stage1_arena_set(
+  builder.module.generic_enum_derive_copy_flags,
+  generic,
+  builder.pending_derive_copy,
+  );
+  raz_rt_stage1_arena_set(
+  builder.module.generic_enum_derive_clone_flags,
+  generic,
+  builder.pending_derive_clone,
+  );
+  if (builder.current.kind != TokenKind::LeftBrace) {
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+  }
+  // Generic templates are normally materialized lazily, but unknown payload
+  // types are declaration errors and must not be deferred until an
+  // instantiation happens to occur.
+  if (!hir_validate_generic_enum_payload_types(builder, generic, builder.current.offset)) {
+    return false;
+  }
+
+  i64 depth = 0;
+
+  while (builder.current.kind != TokenKind::End) {
+    if (builder.current.kind == TokenKind::LeftBrace) {
+      depth += 1;
+    } else if (builder.current.kind == TokenKind::RightBrace) {
+      depth -= 1;
+    }
+    hir_advance(builder);
+    if (depth == 0) {
+      return true;
+    }
+  }
+  hir_fail(builder, DiagnosticCode::ExpectedToken);
+  return false;
+}
+
+fn hir_parse_enum_declaration(HirBuilder&mut builder) -> bool {
+  i64 source_offset = builder.current.offset;
+
+  hir_advance(builder);
+  if (builder.current.kind != TokenKind::Identifier) {
+    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+    return false;
+  }
+
+  i64 name_offset = builder.current.offset;
+  i64 name_length = builder.current.length;
+
+  if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+    hir_fail(builder, DiagnosticCode::DuplicateName);
+    return false;
+  }
+  hir_advance(builder);
+  if (builder.current.kind == TokenKind::Less) {
+    hir_advance(builder);
+    return hir_parse_generic_enum_template(builder, source_offset, name_offset, name_length);
+  }
+  if (builder.module.enum_count >= 256) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+
+  i64 enumeration = builder.module.enum_count;
+
+  builder.module.enum_count += 1;
+  raz_rt_stage1_arena_set(builder.module.enum_name_offsets, enumeration, name_offset);
+  raz_rt_stage1_arena_set(builder.module.enum_name_lengths, enumeration, name_length);
+  raz_rt_stage1_arena_set(builder.module.enum_member_starts, enumeration, builder.module.enum_member_count);
+  raz_rt_stage1_arena_set(builder.module.enum_member_counts, enumeration, 0);
+  raz_rt_stage1_arena_set(builder.module.enum_has_payload, enumeration, 0);
+  raz_rt_stage1_arena_set(builder.module.enum_copy_flags, enumeration, 0);
+  raz_rt_stage1_arena_set(builder.module.enum_derived_clone_flags, enumeration, 0);
+  raz_rt_stage1_arena_set(
+  builder.module.enum_marker_trait_starts,
+  enumeration,
+  builder.module.enum_marker_trait_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.enum_marker_trait_counts, enumeration, 0);
+  raz_rt_stage1_arena_set(builder.module.enum_generic_template_indices, enumeration, -1);
+  raz_rt_stage1_arena_set(
+  builder.module.enum_generic_argument_starts,
+  enumeration,
+  builder.module.enum_generic_argument_count,
+  );
+  raz_rt_stage1_arena_set(builder.module.enum_generic_argument_counts, enumeration, 0);
+  if (!hir_expect(builder, TokenKind::LeftBrace)) {
+    return false;
+  }
+
+  i64 next_value = 0;
+
+  while (builder.current.kind != TokenKind::RightBrace && builder.current.kind != TokenKind::End) {
+    if (builder.current.kind != TokenKind::Identifier || builder.module.enum_member_count >= 4096) {
+      return false;
+    }
+
+    i64 member = builder.module.enum_member_count;
+
+    builder.module.enum_member_count += 1;
+    raz_rt_stage1_arena_set(builder.module.enum_member_name_offsets, member, builder.current.offset);
+    raz_rt_stage1_arena_set(builder.module.enum_member_name_lengths, member, builder.current.length);
+    raz_rt_stage1_arena_set(
+    builder.module.enum_member_payload_starts,
+    member,
+    builder.module.enum_payload_count,
+    );
+    raz_rt_stage1_arena_set(builder.module.enum_member_payload_counts, member, 0);
+    raz_rt_stage1_arena_set(
+    builder.module.enum_member_counts,
+    enumeration,
+    raz_rt_stage1_arena_get(builder.module.enum_member_counts, enumeration) + 1,
+    );
+    hir_advance(builder);
+    if (builder.current.kind == TokenKind::LeftParen) {
+      raz_rt_stage1_arena_set(builder.module.enum_has_payload, enumeration, 1);
+      hir_advance(builder);
+      if (builder.current.kind != TokenKind::RightParen) {
+        bool parsing_payloads = true;
+
+        while (parsing_payloads) {
+          if (builder.module.enum_payload_count >= 8192) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+          }
+
+          i64 payload_structure = -1;
+          i64 payload_type = 0;
+          i64 payload_reference = 0;
+          i64 payload_slice = 0;
+          i64 payload_slice_mutable = 0;
+
+          if (
+          !hir_parse_type_spec(
+          builder,
+          &mut payload_structure,
+          &mut payload_type,
+          &mut payload_reference,
+          &mut payload_slice,
+          &mut payload_slice_mutable,
+          )
+          ) {
+            return false;
+          }
+
+          i64 payload_array_extent = -1;
+
+          if (builder.current.kind == TokenKind::LeftBracket) {
+            if (payload_reference != 0 || payload_slice != 0) {
+              hir_fail(builder, DiagnosticCode::ExpectedToken);
+              return false;
+            }
+            hir_advance(builder);
+            if (
+            !hir_parse_const_generic_expression(builder, &mut payload_array_extent) ||
+            payload_array_extent <= 0 ||
+            !hir_expect(builder, TokenKind::RightBracket)
+            ) {
+              return false;
+            }
+          }
+          if (payload_reference != 0 || payload_slice != 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+          }
+          // Aggregate arena payloads are integer/reference slots today.
+          // Floating payload storage moves with the general aggregate ABI.
+          if (payload_structure < 0 && payload_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+          }
+
+          i64 payload = builder.module.enum_payload_count;
+
+          builder.module.enum_payload_count += 1;
+          raz_rt_stage1_arena_set(
+          builder.module.enum_payload_type_structs,
+          payload,
+          payload_structure,
+          );
+          raz_rt_stage1_arena_set(builder.module.enum_payload_types, payload, payload_type);
+          raz_rt_stage1_arena_set(
+          builder.module.enum_payload_array_extents,
+          payload,
+          payload_array_extent,
+          );
+          raz_rt_stage1_arena_set(
+          builder.module.enum_member_payload_counts,
+          member,
+          raz_rt_stage1_arena_get(builder.module.enum_member_payload_counts, member) + 1,
+          );
+          if (builder.current.kind == TokenKind::Comma) {
+            hir_advance(builder);
+          } else {
+            parsing_payloads = false;
+          }
+        }
+      }
+      if (!hir_expect(builder, TokenKind::RightParen)) {
+        return false;
+      }
+    }
+
+    i64 member_value = next_value;
+
+    if (builder.current.kind == TokenKind::Equal) {
+      hir_advance(builder);
+
+      bool negative = false;
+
+      if (builder.current.kind == TokenKind::Minus) {
+        negative = true;
+        hir_advance(builder);
+      }
+      if (builder.current.kind != TokenKind::Integer) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+      }
+      member_value = parse_integer_value(&builder.scan.input, &builder.current);
+      if (negative) {
+        member_value = 0 - member_value;
+      }
+      hir_advance(builder);
+    }
+    raz_rt_stage1_arena_set(builder.module.enum_member_values, member, member_value);
+    next_value = member_value + 1;
+    if (builder.current.kind == TokenKind::Comma) {
+      hir_advance(builder);
+    }
+  }
+  if (!hir_expect(builder, TokenKind::RightBrace)) {
+    return false;
+  }
+  // Copy may only be derived when every payload is itself copyable.  String
+  // owns storage, and aggregate payloads inherit their aggregate Copy state.
+  // Validate after the whole enum is known so variant ordering is irrelevant.
+
+  i64 derive_index = 0;
+
+  while (derive_index < builder.pending_derive_trait_count) {
+    if (builder.module.enum_marker_trait_count >= 8192) {
+      hir_fail(builder, DiagnosticCode::TooManyItems);
+      return false;
+    }
+
+    i64 trait_index = raz_rt_stage1_arena_get(builder.pending_derive_traits, derive_index);
+
+    raz_rt_stage1_arena_set(
+    builder.module.enum_marker_traits,
+    builder.module.enum_marker_trait_count,
+    trait_index,
+    );
+    builder.module.enum_marker_trait_count += 1;
+    raz_rt_stage1_arena_set(
+    builder.module.enum_marker_trait_counts,
+    enumeration,
+    raz_rt_stage1_arena_get(builder.module.enum_marker_trait_counts, enumeration) + 1,
+    );
+    derive_index += 1;
+  }
+  if (builder.pending_derive_copy != 0) {
+    i64 member = raz_rt_stage1_arena_get(builder.module.enum_member_starts, enumeration);
+    i64 member_end = member + raz_rt_stage1_arena_get(builder.module.enum_member_counts, enumeration);
+
+    while (member < member_end) {
+      i64 payload = raz_rt_stage1_arena_get(builder.module.enum_member_payload_starts, member);
+
+      i64 payload_end =
+      payload +
+      raz_rt_stage1_arena_get(builder.module.enum_member_payload_counts, member);
+      while (payload < payload_end) {
+        i64 payload_structure = raz_rt_stage1_arena_get(
+        builder.module.enum_payload_type_structs,
+        payload,
+        );
+
+        i64 payload_type = raz_rt_stage1_arena_get(builder.module.enum_payload_types, payload);
+
+        if (
+        payload_type == 13 ||
+        (
+        payload_structure >= 0 &&
+        raz_rt_stage1_arena_get(builder.module.struct_copy_flags, payload_structure) == 0
+        )
+        ) {
+          hir_fail(builder, DiagnosticCode::ExpectedToken);
+          return false;
+        }
+        payload += 1;
+      }
+      member += 1;
+    }
+  }
+  raz_rt_stage1_arena_set(builder.module.enum_copy_flags, enumeration, builder.pending_derive_copy);
+  raz_rt_stage1_arena_set(
+  builder.module.enum_derived_clone_flags,
+  enumeration,
+  builder.pending_derive_clone,
+  );
+  return true;
+}

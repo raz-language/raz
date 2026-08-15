@@ -1,0 +1,316 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace collections::vector;
+import alloc::vec;
+import core::iter::iterator;
+import core::hash;
+import core::option;
+import core::slice;
+/// Typed growable contiguous storage with compiler-specialized element layout.
+/// Elements are stored inline using size_of<T>() / align_of<T>(), so wide and
+/// over-aligned aggregate values no longer collapse to one machine-word slot.
+public struct Vector<T> {
+    RawVec raw;
+}
+
+public struct VectorIter<T> {
+    usize data;
+    i64 stride;
+    i64 length;
+    i64 index;
+}
+
+impl<T> Vector<T> {
+    fn new() -> Vector<T> {
+        return Vector<T> {
+            raw: create_aligned(size_of<T>()as i64, align_of<T>()as i64, 0)
+        };
+    }
+    fn with_capacity(i64 capacity) -> Vector<T> {
+        return Vector<T> {
+            raw: create_aligned(size_of<T>()as i64, align_of<T>()as i64, capacity)
+        };
+    }
+    fn len(Vector<T>& self) -> i64 {
+        return self.raw.length;
+    }
+    fn capacity(Vector<T>& self) -> i64 {
+        return self.raw.capacity;
+    }
+    fn is_empty(Vector<T>& self) -> bool {
+        return self.raw.length == 0;
+    }
+    fn reserve(Vector<T>&mut self, i64 capacity) -> bool {
+        return alloc::vec::reserve(&mut self.raw, capacity);
+    }
+    fn reserve_exact(Vector<T>&mut self, i64 capacity) -> bool {
+        return alloc::vec::reserve_exact(&mut self.raw, capacity);
+    }
+    fn push(Vector<T>&mut self, T value) -> bool {
+        if (self.raw.length == 9223372036854775807) {
+            return false;
+        }
+        if (!alloc::vec::reserve(&mut self.raw, self.raw.length + 1)) {
+            return false;
+        }
+
+        usize address = self.raw.data + self.raw.length * self.raw.element_size;
+
+        unsafe {
+            *(address as T*mut) = move value;
+        }
+        self.raw.length += 1;
+        return true;
+    }
+    fn get_ptr(Vector<T>& self, i64 index) -> T*const {
+        if (index < 0 || index >= self.raw.length) {
+            unsafe {
+                return 0 as T*const;
+            }
+        }
+        unsafe {
+            return (self.raw.data + index * self.raw.element_size)as T*const;
+        }
+    }
+    fn get_mut_ptr(Vector<T>&mut self, i64 index) -> T*mut {
+        if (index < 0 || index >= self.raw.length) {
+            unsafe {
+                return 0 as T*mut;
+            }
+        }
+        unsafe {
+            return (self.raw.data + index * self.raw.element_size)as T*mut;
+        }
+    }
+    fn pop(Vector<T>&mut self) -> Option<T> {
+        if (self.raw.length <= 0) {
+            return Option<T>::None;
+        }
+        self.raw.length -= 1;
+        unsafe {
+            T value = move*((self.raw.data + self.raw.length * self.raw.element_size)as T*mut);
+
+            return Option<T>::Some(move value);
+        }
+    }
+    fn remove(Vector<T>&mut self, i64 index) -> Option<T> {
+        if (index < 0 || index >= self.raw.length) {
+            return Option<T>::None;
+        }
+
+        usize address = self.raw.data + index * self.raw.element_size;
+
+        unsafe {
+            T value = move*(address as T*mut);
+            i64 tail = self.raw.length - index - 1;
+
+            if (tail > 0) {
+                raz_rt_move(address, address + self.raw.element_size, tail * self.raw.element_size);
+            }
+            self.raw.length -= 1;
+            return Option<T>::Some(move value);
+        }
+    }
+    fn try_pop(Vector<T>&mut self, T&mut output) -> bool {
+        if (self.raw.length <= 0) {
+            return false;
+        }
+        self.raw.length -= 1;
+        unsafe {
+            *output = move*((self.raw.data + self.raw.length * self.raw.element_size)as T*mut);
+        }
+        return true;
+    }
+    fn try_remove(Vector<T>&mut self, i64 index, T&mut output) -> bool {
+        if (index < 0 || index >= self.raw.length) {
+            return false;
+        }
+
+        usize address = self.raw.data + index * self.raw.element_size;
+
+        unsafe {
+            *output = move*(address as T*mut);
+        }
+
+        i64 tail = self.raw.length - index - 1;
+
+        if (tail > 0) {
+            raz_rt_move(address, address + self.raw.element_size, tail * self.raw.element_size);
+        }
+        self.raw.length -= 1;
+        return true;
+    }
+    fn first_ptr(Vector<T>& self) -> T*const {
+        return self.get_ptr(0);
+    }
+    fn last_ptr(Vector<T>& self) -> T*const {
+        return self.get_ptr(self.raw.length - 1);
+    }
+    fn insert(Vector<T>&mut self, i64 index, T value) -> bool {
+        if (index < 0 || index > self.raw.length || self.raw.length == 9223372036854775807) {
+            return false;
+        }
+        if (!alloc::vec::reserve(&mut self.raw, self.raw.length + 1)) {
+            return false;
+        }
+
+        usize address = self.raw.data + index * self.raw.element_size;
+        i64 tail = self.raw.length - index;
+
+        if (tail > 0) {
+            raz_rt_move(address + self.raw.element_size, address, tail * self.raw.element_size);
+        }
+        unsafe {
+            *(address as T*mut) = move value;
+        }
+        self.raw.length += 1;
+        return true;
+    }
+    fn swap_remove(Vector<T>&mut self, i64 index) -> Option<T> {
+        if (index < 0 || index >= self.raw.length) {
+            return Option<T>::None;
+        }
+
+        usize address = self.raw.data + index * self.raw.element_size;
+        i64 last = self.raw.length - 1;
+
+        unsafe {
+            T value = move*(address as T*mut);
+
+            if (index != last) {
+                usize last_address = self.raw.data + last * self.raw.element_size;
+
+                raz_rt_move(address, last_address, self.raw.element_size);
+            }
+            self.raw.length = last;
+            return Option<T>::Some(move value);
+        }
+    }
+    fn append(Vector<T>&mut self, Vector<T>&mut other) -> bool {
+        return alloc::vec::append_raw(&mut self.raw, &mut other.raw);
+    }
+    fn shrink_to_fit(Vector<T>&mut self) -> bool {
+        return alloc::vec::shrink_to_fit(&mut self.raw);
+    }
+    fn as_slice(Vector<T>& self) -> Slice<T> {
+        unsafe {
+            return Slice<T> {
+                data: self.raw.data,
+                length: self.raw.length
+            };
+        }
+    }
+    fn as_mut_slice(Vector<T>&mut self) -> SliceMut<T> {
+        unsafe {
+            return SliceMut<T> {
+                data: self.raw.data,
+                length: self.raw.length
+            };
+        }
+    }
+    fn truncate(Vector<T>&mut self, i64 length) -> bool {
+        if (length < 0 || length > self.raw.length) {
+            return false;
+        }
+        while (self.raw.length > length) {
+            self.raw.length -= 1;
+            unsafe {
+                T removed = move*((self.raw.data + self.raw.length * self.raw.element_size)as T*mut);
+
+                removed;
+            }
+        }
+        return true;
+    }
+    fn clear(Vector<T>&mut self) {
+        self.truncate(0);
+    }
+    fn iter(Vector<T>& self) -> VectorIter<T> {
+        return VectorIter<T> {
+            data: self.raw.data,
+            stride: self.raw.element_size,
+            length: self.raw.length,
+            index: 0,
+        };
+    }
+    fn into_iter(Vector<T>&mut self) -> VectorIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T: Eq> Vector<T> {
+    fn position(Vector<T>& self, T& value) -> i64 {
+        i64 index = 0;
+
+        while (index < self.raw.length) {
+            unsafe {
+                T& current = & *((self.raw.data + index * self.raw.element_size)as T*const);
+
+                if (current.equals(value)) {
+                    return index;
+                }
+            }
+            index += 1;
+        }
+        return -1;
+    }
+    fn contains(Vector<T>& self, T& value) -> bool {
+        return self.position(value) >= 0;
+    }
+    fn count(Vector<T>& self, T& value) -> i64 {
+        i64 total = 0;
+        i64 index = 0;
+
+        while (index < self.raw.length) {
+            unsafe {
+                T& current = & *((self.raw.data + index * self.raw.element_size)as T*const);
+
+                if (current.equals(value)) {
+                    total += 1;
+                }
+            }
+            index += 1;
+        }
+        return total;
+    }
+    fn remove_first(Vector<T>&mut self, T& value) -> Option<T> {
+        i64 index = self.position(value);
+
+        if (index < 0) {
+            return Option<T>::None;
+        }
+        return self.remove(index);
+    }
+}
+
+impl<T> Iterator for VectorIter<T> {
+    type Item = T&;
+
+    fn next(VectorIter<T>&mut self) -> bool {
+        if (self.index < self.length) {
+            self.index += 1;
+            return true;
+        }
+        return false;
+    }
+    unsafe fn current(VectorIter<T>& self) -> T& {
+        return & *((self.data + (self.index - 1) * self.stride)as T*const);
+    }
+}
+
+impl<T> IntoIterator for Vector<T> {
+    type Item = T&;
+    type IntoIter = VectorIter<T>;
+
+    fn into_iter(Vector<T>&mut self) -> VectorIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T: Drop> Drop for Vector<T> {
+    fn drop(Vector<T>&mut self) {
+        self.clear();
+        alloc::vec::destroy(&mut self.raw);
+    }
+}

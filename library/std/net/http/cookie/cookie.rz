@@ -1,0 +1,348 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::http::cookie;
+import alloc::string;
+import core::bytes;
+import std::net::http;
+import std::net::http::headers;
+/// A compact request Cookie header store. This intentionally manages only
+/// cookie name/value pairs; browser policy (domain/path/SameSite persistence)
+/// belongs in a higher-level package. Typical API clients get reusable,
+/// allocation-conscious cookie state without pretending to be a browser.
+public struct CookieHeader {
+    String value;
+    String scratch;
+    i64 count;
+}
+
+public fn new() -> CookieHeader {
+    return CookieHeader {
+        value: alloc::string::with_capacity(128),
+        scratch: alloc::string::with_capacity(128),
+        count: 0,
+    };
+}
+
+public fn clear(CookieHeader&mut cookies) {
+    alloc::string::clear(&mut cookies.value);
+    cookies.count = 0;
+}
+
+public fn len(CookieHeader& cookies) -> i64 {
+    return cookies.count;
+}
+
+public fn view(CookieHeader& cookies) -> BytesView {
+    return BytesView {
+        data: alloc::string::data_ptr(&cookies.value),
+        length: alloc::string::len(&cookies.value),
+    };
+}
+
+fn valid_name_byte(i64 b) -> bool {
+    return (
+        b > 32 &&
+        b<127 &&
+        b != 40 &&
+        b != 41 &&
+        b != 60 &&
+        b != 62 &&
+        b != 64 &&
+        b != 44 &&
+        b != 59 &&
+        b != 58 &&
+        b != 92 &&
+        b != 34 &&
+        b != 47 &&
+        b != 91 &&
+        b != 93 &&
+        b != 63 &&
+        b != 61 &&
+        b != 123 &&
+        b != 125
+    );
+}
+
+fn valid_value_byte(i64 b) -> bool {
+    return (
+        b == 33 ||
+        (b >= 35 && b <= 43) ||
+        (b >= 45 && b <= 58) ||
+        (b >= 60 && b <= 91) ||
+        (b >= 93 && b <= 126)
+    );
+}
+
+fn valid_name(usize data, i64 n) -> bool {
+    if (data == 0 || n <= 0) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<n) {
+        if (!valid_name_byte(core::bytes::load_u8(data + i))) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn valid_value(usize data, i64 n) -> bool {
+    if (n<0 || (n> 0 && data == 0)) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<n) {
+        if (!valid_value_byte(core::bytes::load_u8(data + i))) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn pair_name(BytesView pair) -> BytesView {
+    i64 eq = core::bytes::find_byte(pair, 61);
+
+    if (eq <= 0) {
+        return BytesView {
+            data: 0, length: 0
+        };
+    }
+    return BytesView {
+        data: pair.data, length: eq
+    };
+}
+
+fn next_pair(BytesView source, i64&mut cursor, BytesView&mut pair) -> bool {
+    i64 c = *cursor;
+
+    while (
+        c<source.length &&
+        (core::bytes::load_u8(source.data + c) == 32 || core::bytes::load_u8(source.data + c) == 59)
+    ) {
+        c += 1;
+    }
+    if (c >= source.length) {
+        *cursor = c;
+        return false;
+    }
+
+    i64 start = c;
+
+    while (c<source.length && core::bytes::load_u8(source.data + c) != 59) {
+        c += 1;
+    }
+
+    i64 end = c;
+
+    while (end> start && core::bytes::load_u8(source.data + end - 1) == 32) {
+        end -= 1;
+    }
+    *cursor = c;
+    *pair = BytesView {
+        data: source.data + start, length: end - start
+    };
+    return true;
+}
+
+fn append_pair(String&mut out, usize name, i64 name_len, usize value, i64 value_len, bool separator) -> bool {
+    if (separator) {
+        if (!alloc::string::push_byte(out, 59) || !alloc::string::push_byte(out, 32)) {
+            return false;
+        }
+    }
+    return (
+        alloc::string::append_bytes(out, name, name_len) &&
+        alloc::string::push_byte(out, 61) &&
+        alloc::string::append_bytes(out, value, value_len)
+    );
+}
+
+/// Inserts or replaces a cookie pair. Rebuild uses reusable scratch storage;
+/// no allocation is required once the two strings have reached steady-state
+/// capacity.
+public fn set(CookieHeader&mut cookies, usize name, i64 name_len, usize value, i64 value_len) -> bool {
+    if (!valid_name(name, name_len) || !valid_value(value, value_len)) {
+        return false;
+    }
+    alloc::string::clear(&mut cookies.scratch);
+
+    BytesView source = view(cookies);
+    i64 cursor = 0;
+
+    BytesView pair = BytesView {
+        data: 0, length: 0
+    };
+
+    bool wrote = false;
+    bool replaced = false;
+    i64 new_count = 0;
+
+    while (next_pair(source, &mut cursor, &mut pair)) {
+        BytesView existing = pair_name(pair);
+
+        if (existing.length <= 0) {
+            continue;
+        }
+        bool same = existing.length == name_len && core::bytes::equal(existing, BytesView {
+            data: name, length: name_len
+        }
+        );
+        if (same) {
+            if (!replaced) {
+                if (!append_pair(&mut cookies.scratch, name, name_len, value, value_len, wrote)) {
+                    return false;
+                }
+                wrote = true;
+                new_count += 1;
+                replaced = true;
+            }
+        } else {
+            if (wrote) {
+                if (
+                    !alloc::string::push_byte(&mut cookies.scratch, 59) ||
+                    !alloc::string::push_byte(&mut cookies.scratch, 32)
+                ) {
+                    return false;
+                }
+            }
+            if (!alloc::string::append_bytes(&mut cookies.scratch, pair.data, pair.length)) {
+                return false;
+            }
+            wrote = true;
+            new_count += 1;
+        }
+    }
+    if (!replaced) {
+        if (!append_pair(&mut cookies.scratch, name, name_len, value, value_len, wrote)) {
+            return false;
+        }
+        new_count += 1;
+    }
+    alloc::string::clear(&mut cookies.value);
+    if (
+        !alloc::string::append_bytes(
+            &mut cookies.value,
+            alloc::string::data_ptr(&cookies.scratch),
+            alloc::string::len(&cookies.scratch),
+        )
+    ) {
+        return false;
+    }
+    alloc::string::clear(&mut cookies.scratch);
+    cookies.count = new_count;
+    return true;
+}
+
+public fn remove(CookieHeader&mut cookies, usize name, i64 name_len) -> bool {
+    if (!valid_name(name, name_len)) {
+        return false;
+    }
+    alloc::string::clear(&mut cookies.scratch);
+
+    BytesView source = view(cookies);
+    i64 cursor = 0;
+
+    BytesView pair = BytesView {
+        data: 0, length: 0
+    };
+
+    bool wrote = false;
+    bool removed = false;
+    i64 new_count = 0;
+
+    while (next_pair(source, &mut cursor, &mut pair)) {
+        BytesView existing = pair_name(pair);
+
+        if (existing.length == name_len && core::bytes::equal(existing, BytesView {
+            data: name, length: name_len
+        }
+        )) {
+            removed = true;
+            continue;
+        }
+        if (existing.length <= 0) {
+            continue;
+        }
+        if (wrote) {
+            if (
+                !alloc::string::push_byte(&mut cookies.scratch, 59) ||
+                !alloc::string::push_byte(&mut cookies.scratch, 32)
+            ) {
+                return false;
+            }
+        }
+        if (!alloc::string::append_bytes(&mut cookies.scratch, pair.data, pair.length)) {
+            return false;
+        }
+        wrote = true;
+        new_count += 1;
+    }
+    if (!removed) {
+        return false;
+    }
+    alloc::string::clear(&mut cookies.value);
+    if (
+        !alloc::string::append_bytes(
+            &mut cookies.value,
+            alloc::string::data_ptr(&cookies.scratch),
+            alloc::string::len(&cookies.scratch),
+        )
+    ) {
+        return false;
+    }
+    alloc::string::clear(&mut cookies.scratch);
+    cookies.count = new_count;
+    return true;
+}
+
+public fn add_to_headers(CookieHeader& cookies, HeaderBlock&mut headers) -> bool {
+    if (alloc::string::len(&cookies.value) == 0) {
+        return true;
+    }
+
+    String name = alloc::string::with_capacity(6);
+
+    alloc::string::push_byte(&mut name, 67);
+    alloc::string::push_byte(&mut name, 111);
+    alloc::string::push_byte(&mut name, 111);
+    alloc::string::push_byte(&mut name, 107);
+    alloc::string::push_byte(&mut name, 105);
+    alloc::string::push_byte(&mut name, 101);
+    return std::net::http::headers::add(
+        headers,
+        alloc::string::data_ptr(&name),
+        6,
+        alloc::string::data_ptr(&cookies.value),
+        alloc::string::len(&cookies.value),
+    );
+}
+
+/// Captures the leading name=value pair of one Set-Cookie field. Attributes
+/// are intentionally ignored by this compact API-client cookie store.
+public fn capture_set_cookie(CookieHeader&mut cookies, BytesView field) -> bool {
+    i64 end = 0;
+
+    while (end<field.length && core::bytes::load_u8(field.data + end) != 59) {
+        end += 1;
+    }
+    BytesView pair = BytesView {
+        data: field.data, length: end
+    };
+
+    i64 eq = core::bytes::find_byte(pair, 61);
+
+    if (eq <= 0) {
+        return false;
+    }
+
+    i64 value_start = eq + 1;
+
+    return set(cookies, pair.data, eq, pair.data + value_start, pair.length - value_start);
+}

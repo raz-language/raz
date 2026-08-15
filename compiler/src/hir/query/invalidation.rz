@@ -1,0 +1,269 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_hir_query_invalidation;
+public import raz_compiler_hir_core_types;
+
+fn hir_query_input_fingerprint_mix(i64 fingerprint, i64 value) -> i64 {
+  i64 mixed = (fingerprint * 131 + value + 4099) % 281474976710597;
+
+  if (mixed < 0) {
+    mixed = 0 - mixed;
+  }
+  return mixed;
+}
+
+fn hir_query_kind_trait_impl() -> i64 {
+  return 1;
+}
+
+fn hir_query_kind_trait_bound() -> i64 {
+  return 2;
+}
+
+fn hir_query_kind_method() -> i64 {
+  return 3;
+}
+
+fn hir_query_kind_associated_type() -> i64 {
+  return 4;
+}
+
+fn hir_query_kind_layout() -> i64 {
+  return 5;
+}
+
+fn hir_query_kind_monomorphization() -> i64 {
+  return 6;
+}
+
+fn hir_query_kind_field_offset() -> i64 {
+  return 7;
+}
+
+fn hir_query_hash(i64 kind, i64 a, i64 b, i64 c) -> i64 {
+  i64 hash = (kind + 17) % 281474976710597;
+
+  hash = (hash * 131 + a + 4099) % 281474976710597;
+  hash = (hash * 131 + b + 8191) % 281474976710597;
+  hash = (hash * 131 + c + 16381) % 281474976710597;
+  if (hash < 0) {
+    hash = 0 - hash;
+  }
+  return hash;
+}
+
+fn hir_query_slot(i64 kind, i64 a, i64 b, i64 c) -> i64 {
+  return hir_query_hash(kind, a, b, c) % 1024;
+}
+
+fn hir_query_cache_key_matches(HirBuilder&mut builder, i64 slot, i64 kind, i64 a, i64 b, i64 c) -> bool {
+  return (
+  raz_rt_stage1_arena_get(builder.query_cache_states, slot) != 0 &&
+  raz_rt_stage1_arena_get(builder.query_cache_kinds, slot) == kind &&
+  raz_rt_stage1_arena_get(builder.query_cache_a, slot) == a &&
+  raz_rt_stage1_arena_get(builder.query_cache_b, slot) == b &&
+  raz_rt_stage1_arena_get(builder.query_cache_c, slot) == c
+  );
+}
+
+fn hir_query_invalidation_contains(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
+  i64 index = 0;
+
+  while (index < builder.query_invalidation_count) {
+    if (
+    raz_rt_stage1_arena_get(builder.query_invalidation_kinds, index) == kind &&
+    raz_rt_stage1_arena_get(builder.query_invalidation_a, index) == a &&
+    raz_rt_stage1_arena_get(builder.query_invalidation_b, index) == b &&
+    raz_rt_stage1_arena_get(builder.query_invalidation_c, index) == c
+    ) {
+      return true;
+    }
+    index += 1;
+  }
+  return false;
+}
+
+fn hir_query_push_invalidation(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
+  if (hir_query_invalidation_contains(builder, kind, a, b, c)) {
+    return true;
+  }
+  if (builder.query_invalidation_count >= 4096) {
+    return false;
+  }
+
+  i64 index = builder.query_invalidation_count;
+
+  builder.query_invalidation_count += 1;
+  raz_rt_stage1_arena_set(builder.query_invalidation_kinds, index, kind);
+  raz_rt_stage1_arena_set(builder.query_invalidation_a, index, a);
+  raz_rt_stage1_arena_set(builder.query_invalidation_b, index, b);
+  raz_rt_stage1_arena_set(builder.query_invalidation_c, index, c);
+  return true;
+}
+
+fn hir_query_invalidate_exact(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) {
+  builder.query_invalidation_count = 0;
+  if (!hir_query_push_invalidation(builder, kind, a, b, c)) {
+    return;
+  }
+
+  i64 cursor = 0;
+
+  while (cursor < builder.query_invalidation_count) {
+    i64 current_kind = raz_rt_stage1_arena_get(builder.query_invalidation_kinds, cursor);
+    i64 current_a = raz_rt_stage1_arena_get(builder.query_invalidation_a, cursor);
+    i64 current_b = raz_rt_stage1_arena_get(builder.query_invalidation_b, cursor);
+    i64 current_c = raz_rt_stage1_arena_get(builder.query_invalidation_c, cursor);
+    i64 slot = hir_query_slot(current_kind, current_a, current_b, current_c);
+
+    if (hir_query_cache_key_matches(builder, slot, current_kind, current_a, current_b, current_c)) {
+      raz_rt_stage1_arena_set(builder.query_cache_states, slot, 0);
+      builder.query_invalidation_total += 1;
+    }
+
+    i64 dependency = 0;
+
+    while (dependency < builder.query_dependency_count) {
+      if (
+      raz_rt_stage1_arena_get(builder.query_dependency_child_kinds, dependency) == current_kind &&
+      raz_rt_stage1_arena_get(builder.query_dependency_child_a, dependency) == current_a &&
+      raz_rt_stage1_arena_get(builder.query_dependency_child_b, dependency) == current_b &&
+      raz_rt_stage1_arena_get(builder.query_dependency_child_c, dependency) == current_c
+      ) {
+        hir_query_push_invalidation(
+        builder,
+        raz_rt_stage1_arena_get(builder.query_dependency_parent_kinds, dependency),
+        raz_rt_stage1_arena_get(builder.query_dependency_parent_a, dependency),
+        raz_rt_stage1_arena_get(builder.query_dependency_parent_b, dependency),
+        raz_rt_stage1_arena_get(builder.query_dependency_parent_c, dependency),
+        );
+      }
+      dependency += 1;
+    }
+    cursor += 1;
+  }
+  builder.query_invalidation_count = 0;
+}
+
+fn hir_query_invalidate_kind_transitive(HirBuilder&mut builder, i64 kind) {
+  i64 slot = 0;
+
+  while (slot < 1024) {
+    if (
+    raz_rt_stage1_arena_get(builder.query_cache_states, slot) != 0 &&
+    raz_rt_stage1_arena_get(builder.query_cache_kinds, slot) == kind
+    ) {
+      hir_query_invalidate_exact(
+      builder,
+      kind,
+      raz_rt_stage1_arena_get(builder.query_cache_a, slot),
+      raz_rt_stage1_arena_get(builder.query_cache_b, slot),
+      raz_rt_stage1_arena_get(builder.query_cache_c, slot),
+      );
+    }
+    slot += 1;
+  }
+}
+
+fn hir_query_input_traits_fingerprint(HirBuilder&mut builder) -> i64 {
+  i64 fingerprint = builder.module.trait_count + 1;
+
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.trait_impl_count);
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_trait_impl_count);
+  return fingerprint;
+}
+
+fn hir_query_input_methods_fingerprint(HirBuilder&mut builder) -> i64 {
+  i64 fingerprint = builder.module.inherent_method_count + 1;
+
+  return hir_query_input_fingerprint_mix(fingerprint, builder.module.function_count);
+}
+
+fn hir_query_input_aggregates_fingerprint(HirBuilder&mut builder) -> i64 {
+  i64 fingerprint = builder.module.struct_count + 1;
+
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.enum_count);
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.struct_field_count);
+  return fingerprint;
+}
+
+fn hir_query_input_generics_fingerprint(HirBuilder&mut builder) -> i64 {
+  i64 fingerprint = builder.module.generic_function_count + 1;
+
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_struct_count);
+  fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_enum_count);
+  return fingerprint;
+}
+
+fn hir_query_input_functions_fingerprint(HirBuilder&mut builder) -> i64 {
+  return builder.module.function_count + 1;
+}
+
+fn hir_query_input_associated_fingerprint(HirBuilder&mut builder) -> i64 {
+  i64 fingerprint = builder.module.trait_associated_type_count + 1;
+
+  return hir_query_input_fingerprint_mix(fingerprint, builder.module.trait_associated_const_count);
+}
+
+fn hir_query_sync_inputs(HirBuilder&mut builder) {
+  i64 traits = hir_query_input_traits_fingerprint(builder);
+  i64 methods = hir_query_input_methods_fingerprint(builder);
+  i64 aggregates = hir_query_input_aggregates_fingerprint(builder);
+  i64 generics = hir_query_input_generics_fingerprint(builder);
+  i64 functions = hir_query_input_functions_fingerprint(builder);
+  i64 associated = hir_query_input_associated_fingerprint(builder);
+
+  if (builder.query_input_traits_fingerprint < 0) {
+    builder.query_input_traits_fingerprint = traits;
+    builder.query_input_methods_fingerprint = methods;
+    builder.query_input_aggregates_fingerprint = aggregates;
+    builder.query_input_generics_fingerprint = generics;
+    builder.query_input_functions_fingerprint = functions;
+    builder.query_input_associated_fingerprint = associated;
+    return;
+  }
+
+  bool changed = false;
+
+  if (builder.query_input_traits_fingerprint != traits) {
+    builder.query_input_traits_fingerprint = traits;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_trait_impl());
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_trait_bound());
+    changed = true;
+  }
+  if (builder.query_input_methods_fingerprint != methods) {
+    builder.query_input_methods_fingerprint = methods;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_method());
+    changed = true;
+  }
+  if (builder.query_input_aggregates_fingerprint != aggregates) {
+    builder.query_input_aggregates_fingerprint = aggregates;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_layout());
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_field_offset());
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_trait_impl());
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_trait_bound());
+    changed = true;
+  }
+  if (builder.query_input_generics_fingerprint != generics) {
+    builder.query_input_generics_fingerprint = generics;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_monomorphization());
+    changed = true;
+  }
+  if (builder.query_input_functions_fingerprint != functions) {
+    builder.query_input_functions_fingerprint = functions;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_method());
+    changed = true;
+  }
+  if (builder.query_input_associated_fingerprint != associated) {
+    builder.query_input_associated_fingerprint = associated;
+    hir_query_invalidate_kind_transitive(builder, hir_query_kind_associated_type());
+    changed = true;
+  }
+  if (changed) {
+    builder.query_revision += 1;
+    if (builder.query_revision <= 0) {
+      builder.query_revision = 1;
+    }
+  }
+}

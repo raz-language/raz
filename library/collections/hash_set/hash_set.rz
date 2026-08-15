@@ -1,0 +1,370 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace collections::hash_set;
+import core::hash;
+import core::iter::iterator;
+import core::option;
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+
+public struct HashSet<T> {
+    usize keys;
+    usize states;
+    i64 length;
+    i64 capacity;
+    i64 tombstones;
+}
+
+public struct HashSetIter<T> {
+    usize keys;
+    i64 stride;
+    usize states;
+    i64 capacity;
+    i64 index;
+    i64 current_slot;
+}
+
+fn set_state_at(usize states, i64 slot) -> i64 {
+    unsafe {
+        u8 value = *((states + slot)as u8*const);
+
+        return value as i64;
+    }
+}
+
+fn set_state_value(usize states, i64 slot, i64 value) {
+    unsafe {
+        *((states + slot)as u8*mut) = value as u8;
+    }
+}
+
+fn set_zero_states(usize states, i64 capacity) {
+    i64 index = 0;
+
+    while (index < capacity) {
+        set_state_value(states, index, 0);
+        index += 1;
+    }
+}
+
+fn set_growth_threshold(i64 capacity) -> i64 {
+    return (capacity / 10) * 7 + ((capacity % 10) * 7) / 10;
+}
+
+impl<T: Hash + Eq> HashSet<T> {
+    fn new() -> HashSet<T> {
+        return HashSet<T> {
+            keys: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            tombstones: 0
+        };
+    }
+    fn with_capacity(i64 capacity) -> HashSet<T> {
+        HashSet<T> set = HashSet<T>::new();
+
+        if (capacity > 0) {
+            set.reserve(capacity);
+        }
+        return set;
+    }
+    fn len(HashSet<T>& self) -> i64 {
+        return self.length;
+    }
+    fn capacity(HashSet<T>& self) -> i64 {
+        return self.capacity;
+    }
+    fn is_empty(HashSet<T>& self) -> bool {
+        return self.length == 0;
+    }
+    fn find_slot(HashSet<T>& self, T& value, bool insertion) -> i64 {
+        if (self.capacity <= 0) {
+            return -1;
+        }
+
+        i64 mask = self.capacity - 1;
+        i64 slot = value.hash() & mask;
+        i64 first_tombstone = -1;
+        i64 scanned = 0;
+
+        while (scanned < self.capacity) {
+            i64 state = set_state_at(self.states, slot);
+
+            if (state == 0) {
+                if (insertion && first_tombstone >= 0) {
+                    return first_tombstone;
+                }
+                return slot;
+            }
+            if (state == 2) {
+                if (insertion && first_tombstone < 0) {
+                    first_tombstone = slot;
+                }
+            } else {
+                unsafe {
+                    T& stored = & *((self.keys + slot * (size_of<T>()as i64))as T*const);
+
+                    if (stored.equals(value)) {
+                        return slot;
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+            scanned += 1;
+        }
+        return first_tombstone;
+    }
+    fn rehash(HashSet<T>&mut self, i64 requested) -> bool {
+        i64 next = requested;
+
+        if (next < 8) {
+            next = 8;
+        }
+        if (next <= 0) {
+            return false;
+        }
+
+        i64 key_size = size_of<T>()as i64;
+        i64 key_alignment = align_of<T>()as i64;
+
+        if (key_size <= 0 || next > 9223372036854775807 / key_size) {
+            return false;
+        }
+
+        usize new_keys = raz_rt_alloc_aligned(next * key_size, key_alignment);
+
+        if (new_keys == 0) {
+            return false;
+        }
+
+        usize new_states = raz_rt_alloc(next);
+
+        if (new_states == 0) {
+            raz_rt_dealloc_aligned(new_keys, key_alignment);
+            return false;
+        }
+        set_zero_states(new_states, next);
+
+        usize old_keys = self.keys;
+        usize old_states = self.states;
+        i64 old_capacity = self.capacity;
+
+        self.keys = new_keys;
+        self.states = new_states;
+        self.capacity = next;
+        self.length = 0;
+        self.tombstones = 0;
+
+        i64 index = 0;
+
+        while (index < old_capacity) {
+            if (set_state_at(old_states, index) == 1) {
+                unsafe {
+                    T& value = & *((old_keys + index * key_size)as T*const);
+                    i64 slot = self.find_slot(value, true);
+
+                    raz_rt_copy(self.keys + slot * key_size, old_keys + index * key_size, key_size);
+                    set_state_value(self.states, slot, 1);
+                    self.length += 1;
+                }
+            }
+            index += 1;
+        }
+        raz_rt_dealloc(old_states);
+        raz_rt_dealloc_aligned(old_keys, key_alignment);
+        return true;
+    }
+    fn reserve(HashSet<T>&mut self, i64 entries) -> bool {
+        if (entries < 0) {
+            return false;
+        }
+
+        i64 next = 8;
+
+        if (self.capacity > next) {
+            next = self.capacity;
+        }
+        while (set_growth_threshold(next) < entries) {
+            if (next > 4611686018427387903) {
+                return false;
+            }
+            next *= 2;
+        }
+        if (next == self.capacity && self.tombstones == 0) {
+            return true;
+        }
+        return self.rehash(next);
+    }
+    fn shrink_to_fit(HashSet<T>&mut self) -> bool {
+        i64 next = 8;
+
+        while (set_growth_threshold(next) < self.length) {
+            if (next > 4611686018427387903) {
+                return false;
+            }
+            next *= 2;
+        }
+        if (self.capacity == 0 && self.length == 0) {
+            return true;
+        }
+        if (next == self.capacity && self.tombstones == 0) {
+            return true;
+        }
+        return self.rehash(next);
+    }
+    fn ensure_insert_capacity(HashSet<T>&mut self) -> bool {
+        if (self.capacity == 0) {
+            return self.rehash(8);
+        }
+
+        i64 threshold = set_growth_threshold(self.capacity);
+
+        if (self.length + self.tombstones + 1 <= threshold) {
+            return true;
+        }
+        if (self.length + 1 <= threshold) {
+            return self.rehash(self.capacity);
+        }
+        if (self.capacity > 4611686018427387903) {
+            return false;
+        }
+        return self.rehash(self.capacity * 2);
+    }
+    fn insert(HashSet<T>&mut self, T value) -> bool {
+        if (!self.ensure_insert_capacity()) {
+            return false;
+        }
+
+        i64 slot = self.find_slot(&value, true);
+
+        if (slot < 0) {
+            return false;
+        }
+
+        i64 state = set_state_at(self.states, slot);
+
+        if (state == 1) {
+            return false;
+        }
+        if (state == 2) {
+            self.tombstones -= 1;
+        }
+        unsafe {
+            *((self.keys + slot * (size_of<T>()as i64))as T*mut) = move value;
+        }
+        set_state_value(self.states, slot, 1);
+        self.length += 1;
+        return true;
+    }
+    fn contains(HashSet<T>& self, T& value) -> bool {
+        i64 slot = self.find_slot(value, false);
+
+        return slot >= 0 && set_state_at(self.states, slot) == 1;
+    }
+    fn take(HashSet<T>&mut self, T& value) -> Option<T> {
+        i64 slot = self.find_slot(value, false);
+
+        if (slot < 0 || set_state_at(self.states, slot) != 1) {
+            return Option<T>::None;
+        }
+        unsafe {
+            T removed = move*((self.keys + slot * (size_of<T>()as i64))as T*mut);
+
+            set_state_value(self.states, slot, 2);
+            self.length -= 1;
+            self.tombstones += 1;
+            return Option<T>::Some(move removed);
+        }
+    }
+    fn remove(HashSet<T>&mut self, T& value) -> bool {
+        i64 slot = self.find_slot(value, false);
+
+        if (slot < 0 || set_state_at(self.states, slot) != 1) {
+            return false;
+        }
+        unsafe {
+            T removed = move*((self.keys + slot * (size_of<T>()as i64))as T*mut);
+
+            removed;
+        }
+        set_state_value(self.states, slot, 2);
+        self.length -= 1;
+        self.tombstones += 1;
+        return true;
+    }
+    fn clear(HashSet<T>&mut self) {
+        i64 slot = 0;
+
+        while (slot < self.capacity) {
+            if (set_state_at(self.states, slot) == 1) {
+                unsafe {
+                    T removed = move*((self.keys + slot * (size_of<T>()as i64))as T*mut);
+
+                    removed;
+                }
+            }
+            set_state_value(self.states, slot, 0);
+            slot += 1;
+        }
+        self.length = 0;
+        self.tombstones = 0;
+    }
+    fn iter(HashSet<T>& self) -> HashSetIter<T> {
+        return HashSetIter<T> {
+            keys: self.keys,
+            stride: size_of<T>()as i64,
+            states: self.states,
+            capacity: self.capacity,
+            index: 0,
+            current_slot: -1,
+        };
+    }
+}
+
+impl<T> Iterator for HashSetIter<T> {
+    type Item = T&;
+
+    fn next(HashSetIter<T>&mut self) -> bool {
+        while (self.index < self.capacity) {
+            i64 slot = self.index;
+
+            self.index += 1;
+            if (set_state_at(self.states, slot) == 1) {
+                self.current_slot = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+    fn current(HashSetIter<T>& self) -> T& {
+        unsafe {
+            return & *((self.keys + self.current_slot * self.stride)as T*const);
+        }
+    }
+}
+
+impl<T: Hash + Eq> IntoIterator for HashSet<T> {
+    type Item = T&;
+    type IntoIter = HashSetIter<T>;
+
+    fn into_iter(HashSet<T>&mut self) -> HashSetIter<T> {
+        return self.iter();
+    }
+}
+
+impl<T: Hash + Eq> Drop for HashSet<T> {
+    fn drop(HashSet<T>&mut self) {
+        self.clear();
+        raz_rt_dealloc(self.states);
+        raz_rt_dealloc_aligned(self.keys, align_of<T>()as i64);
+        self.states = 0;
+        self.keys = 0;
+        self.capacity = 0;
+    }
+}

@@ -1,0 +1,156 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_transform_dce;
+public import raz_compiler_mir_transform_scalar;
+// Only instructions whose evaluation is known to be side-effect-free are DCE
+// candidates. Everything else is retained conservatively until its effect
+// model is explicit in MIR.
+fn mir_opcode_is_dce_candidate(i64 opcode) -> bool {
+  return (
+  (opcode >= 1 && opcode <= 7) ||
+  (opcode >= 11 && opcode <= 20) ||
+  opcode == 24 ||
+  opcode == 25 ||
+  opcode == 26 ||
+  opcode == 28 ||
+  (opcode >= 34 && opcode <= 40) ||
+  opcode == 43 ||
+  opcode == 45 ||
+  opcode == 47 ||
+  opcode == 49
+  );
+}
+
+fn mir_instruction_has_ownership_event(MirModule& mir, i64 instruction) -> bool {
+  i64 event = 0;
+
+  while (event < mir.ownership_event_count) {
+    if (raz_rt_stage1_arena_get(mir.ownership_event_instructions, event) == instruction) {
+      return true;
+    }
+    event += 1;
+  }
+  return false;
+}
+
+fn eliminate_mir_dead_values(MirModule&mut mir) -> bool {
+  if (mir.instruction_count == 0) {
+    return true;
+  }
+
+  MirUseInfo uses;
+
+  if (!build_mir_use_info(mir, &mut uses)) {
+    return false;
+  }
+
+  i64 keep = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+  i64 pinned = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+  i64 queue = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+
+  if (keep == 0 || pinned == 0 || queue == 0) {
+    if (keep != 0) { raz_rt_stage1_arena_destroy(keep); }
+    if (pinned != 0) { raz_rt_stage1_arena_destroy(pinned); }
+    if (queue != 0) { raz_rt_stage1_arena_destroy(queue); }
+    destroy_mir_use_info(&mut uses);
+    return false;
+  }
+
+  i64 ip = 0;
+  while (ip < mir.instruction_count) {
+    raz_rt_stage1_arena_set(keep, ip, 1);
+    raz_rt_stage1_arena_set(pinned, ip, 0);
+    ip += 1;
+  }
+
+  // Ownership metadata identifies semantic program points. Build this pin map
+  // once instead of rescanning every ownership event for every instruction.
+  i64 event = 0;
+  while (event < mir.ownership_event_count) {
+    i64 instruction = raz_rt_stage1_arena_get(mir.ownership_event_instructions, event);
+
+    if (instruction >= 0 && instruction < mir.instruction_count) {
+      raz_rt_stage1_arena_set(pinned, instruction, 1);
+    }
+    event += 1;
+  }
+
+  i64 queue_head = 0;
+  i64 queue_tail = 0;
+  ip = 0;
+  while (ip < mir.instruction_count) {
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, ip);
+
+    if (
+    mir_opcode_is_dce_candidate(opcode) &&
+    raz_rt_stage1_arena_get(pinned, ip) == 0 &&
+    raz_rt_stage1_arena_get(uses.use_counts, ip) == 0
+    ) {
+      raz_rt_stage1_arena_set(queue, queue_tail, ip);
+      queue_tail += 1;
+    }
+    ip += 1;
+  }
+
+  bool changed = false;
+  while (queue_head < queue_tail) {
+    i64 dead = raz_rt_stage1_arena_get(queue, queue_head);
+    queue_head += 1;
+
+    if (dead < 0 || dead >= mir.instruction_count || raz_rt_stage1_arena_get(keep, dead) == 0) {
+      continue;
+    }
+    if (
+    !mir_opcode_is_dce_candidate(raz_rt_stage1_arena_get(mir.opcodes, dead)) ||
+    raz_rt_stage1_arena_get(pinned, dead) != 0 ||
+    raz_rt_stage1_arena_get(uses.use_counts, dead) != 0
+    ) {
+      continue;
+    }
+
+    raz_rt_stage1_arena_set(keep, dead, 0);
+    changed = true;
+
+    // Removing a dead pure instruction removes its inline register uses.
+    // Newly unused producers enter the same worklist, collapsing complete
+    // dead expression chains in one pass instead of one compaction per link.
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, dead);
+    i64 operand = 0;
+    while (operand < 4) {
+      if (mir_operand_is_register(opcode, operand)) {
+        i64 value = mir_get_operand(mir, dead, operand);
+
+        if (value >= 0 && value < mir.instruction_count) {
+          i64 count = raz_rt_stage1_arena_get(uses.use_counts, value);
+
+          if (count > 0) {
+            count -= 1;
+            raz_rt_stage1_arena_set(uses.use_counts, value, count);
+            if (
+            count == 0 &&
+            raz_rt_stage1_arena_get(keep, value) != 0 &&
+            raz_rt_stage1_arena_get(pinned, value) == 0 &&
+            mir_opcode_is_dce_candidate(raz_rt_stage1_arena_get(mir.opcodes, value))
+            ) {
+              raz_rt_stage1_arena_set(queue, queue_tail, value);
+              queue_tail += 1;
+            }
+          }
+        }
+      }
+      operand += 1;
+    }
+  }
+
+  destroy_mir_use_info(&mut uses);
+  raz_rt_stage1_arena_destroy(pinned);
+  raz_rt_stage1_arena_destroy(queue);
+
+  if (changed && !compact_mir_instructions(mir, keep)) {
+    raz_rt_stage1_arena_destroy(keep);
+    return false;
+  }
+  raz_rt_stage1_arena_destroy(keep);
+  return true;
+}

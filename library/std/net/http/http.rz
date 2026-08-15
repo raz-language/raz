@@ -1,0 +1,1004 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::http;
+import alloc::string;
+import core::ascii;
+import core::bytes;
+import std::fmt;
+
+public enum HttpError {
+    None,
+    Incomplete,
+    InvalidStartLine,
+    InvalidHeader,
+    HeadersTooLarge,
+    InvalidContentLength,
+    ConflictingFraming,
+    InvalidChunk,
+    BodyIncomplete,
+}
+
+public struct HttpRequestView {
+    BytesView source;
+    BytesView method;
+    BytesView target;
+    BytesView version;
+    BytesView header_block;
+    BytesView body;
+    i64 content_length;
+    bool chunked;
+    bool connection_close;
+}
+
+public struct HttpResponseView {
+    BytesView source;
+    BytesView version;
+    i64 status;
+    BytesView reason;
+    BytesView header_block;
+    BytesView body;
+    i64 content_length;
+    bool chunked;
+    bool connection_close;
+}
+
+public struct HeaderIterator {
+    BytesView block;
+    i64 cursor;
+    bool invalid;
+}
+
+public struct HeaderView {
+    BytesView name;
+    BytesView value;
+}
+
+public struct ChunkCursor {
+    BytesView source;
+    i64 cursor;
+    bool finished;
+}
+
+public struct ChunkView {
+    BytesView data;
+    BytesView trailers;
+    bool final_chunk;
+}
+
+fn lower(i64 byte) -> i64 {
+    return core::ascii::to_lower(byte);
+}
+
+fn is_token_byte(i64 b) -> bool {
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+        return true;
+    }
+    return (
+        b == 33 ||
+        b == 35 ||
+        b == 36 ||
+        b == 37 ||
+        b == 38 ||
+        b == 39 ||
+        b == 42 ||
+        b == 43 ||
+        b == 45 ||
+        b == 46 ||
+        b == 94 ||
+        b == 95 ||
+        b == 96 ||
+        b == 124 ||
+        b == 126
+    );
+}
+
+fn find_crlf(BytesView source, i64 start) -> i64 {
+    if (start < 0) {
+        return -1;
+    }
+
+    i64 cursor = start;
+
+    while (cursor + 1 < source.length) {
+        i64 relative = core::bytes::find_byte(BytesView {
+            data: source.data + cursor,
+            length: source.length - cursor
+        }, 13);
+        if (relative < 0) {
+            return -1;
+        }
+        cursor += relative;
+        if (cursor + 1 < source.length && core::bytes::load_u8(source.data + cursor + 1) == 10) {
+            return cursor;
+        }
+        cursor += 1;
+    }
+    return -1;
+}
+
+fn trim_ows(BytesView value) -> BytesView {
+    i64 start = 0;
+    i64 end = value.length;
+
+    while (start < end) {
+        i64 b = core::bytes::load_u8(value.data + start);
+
+        if (b != 32 && b != 9) {
+            break;
+        }
+        start += 1;
+    }
+    while (end > start) {
+        i64 b = core::bytes::load_u8(value.data + end - 1);
+
+        if (b != 32 && b != 9) {
+            break;
+        }
+        end -= 1;
+    }
+    return BytesView {
+        data: value.data + start,
+        length: end - start
+    };
+}
+
+public fn bytes_equal_ascii_case(BytesView value, usize literal, i64 length) -> bool {
+    if (value.length != length || length < 0) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < length) {
+        if (lower(core::bytes::load_u8(value.data + index)) != lower(core::bytes::load_u8(literal + index))) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn parse_decimal(BytesView value) -> i64 {
+    value = trim_ows(value);
+    if (value.length <= 0) {
+        return -1;
+    }
+
+    i64 result = 0;
+    i64 index = 0;
+
+    while (index < value.length) {
+        i64 b = core::bytes::load_u8(value.data + index);
+
+        if (b < 48 || b > 57) {
+            return -1;
+        }
+
+        i64 digit = b - 48;
+
+        if (result > (i64::MAX - digit) / 10) {
+            return -1;
+        }
+        result = result * 10 + digit;
+        index += 1;
+    }
+    return result;
+}
+
+fn find_header_end(BytesView source, i64 max_header_bytes) -> i64 {
+    i64 limit = source.length;
+
+    if (max_header_bytes > 0 && limit > max_header_bytes) {
+        limit = max_header_bytes;
+    }
+
+    i64 cursor = 0;
+
+    while (cursor + 3 < limit) {
+        i64 relative = core::bytes::find_byte(BytesView {
+            data: source.data + cursor,
+            length: limit - cursor
+        }, 13);
+        if (relative < 0) {
+            return -1;
+        }
+        cursor += relative;
+        if (
+            cursor + 3 < source.length &&
+            core::bytes::load_u8(source.data + cursor + 1) == 10 &&
+            core::bytes::load_u8(source.data + cursor + 2) == 13 &&
+            core::bytes::load_u8(source.data + cursor + 3) == 10
+        ) {
+            return cursor;
+        }
+        cursor += 1;
+    }
+    return -1;
+}
+
+public fn headers(BytesView header_block) -> HeaderIterator {
+    return HeaderIterator {
+        block: header_block,
+        cursor: 0,
+        invalid: false
+    };
+}
+
+public fn headers_valid(HeaderIterator& iterator) -> bool {
+    return !iterator.invalid;
+}
+
+public fn next_header(HeaderIterator&mut iterator, HeaderView&mut output) -> bool {
+    if (iterator.cursor >= iterator.block.length) {
+        return false;
+    }
+
+    i64 line_end = find_crlf(iterator.block, iterator.cursor);
+
+    if (line_end < 0) {
+        iterator.invalid = true;
+        iterator.cursor = iterator.block.length;
+        return false;
+    }
+    if (line_end == iterator.cursor) {
+        iterator.cursor = line_end + 2;
+        return false;
+    }
+
+    i64 first_byte = core::bytes::load_u8(iterator.block.data + iterator.cursor);
+
+    if (first_byte == 32 || first_byte == 9) {
+        iterator.invalid = true;
+        iterator.cursor = iterator.block.length;
+        return false;
+    }
+
+    i64 colon = iterator.cursor;
+
+    while (colon < line_end && core::bytes::load_u8(iterator.block.data + colon) != 58) {
+        colon += 1;
+    }
+    if (colon <= iterator.cursor || colon >= line_end) {
+        iterator.invalid = true;
+        iterator.cursor = iterator.block.length;
+        return false;
+    }
+    output.name = BytesView {
+        data: iterator.block.data + iterator.cursor,
+        length: colon - iterator.cursor
+    };
+    output.value = trim_ows(BytesView {
+        data: iterator.block.data + colon + 1,
+        length: line_end - colon - 1
+    }
+    );
+    iterator.cursor = line_end + 2;
+    return true;
+}
+
+fn name_is(BytesView value, i64 kind) -> bool {
+    // 1=content-length, 2=transfer-encoding, 3=connection.
+    if (kind == 1) {
+        if (value.length != 14) {
+            return false;
+        }
+
+        i64 expected[14] = [99, 111, 110, 116, 101, 110, 116, 45, 108, 101, 110, 103, 116, 104];
+        i64 i = 0;
+
+        while (i < 14) {
+            if (lower(core::bytes::load_u8(value.data + i)) != expected[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    if (kind == 2) {
+        if (value.length != 17) {
+            return false;
+        }
+
+        i64 expected[17] = [116, 114, 97, 110, 115, 102, 101, 114, 45, 101, 110, 99, 111, 100, 105, 110, 103];
+        i64 i = 0;
+
+        while (i < 17) {
+            if (lower(core::bytes::load_u8(value.data + i)) != expected[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    if (value.length != 10) {
+        return false;
+    }
+
+    i64 expected[10] = [99, 111, 110, 110, 101, 99, 116, 105, 111, 110];
+    i64 i = 0;
+
+    while (i < 10) {
+        if (lower(core::bytes::load_u8(value.data + i)) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn token_is(BytesView value, i64 kind) -> bool {
+    // 1=chunked, 2=close.
+    if (kind == 1) {
+        if (value.length != 7) {
+            return false;
+        }
+
+        i64 expected[7] = [99, 104, 117, 110, 107, 101, 100];
+        i64 i = 0;
+
+        while (i < 7) {
+            if (lower(core::bytes::load_u8(value.data + i)) != expected[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    if (value.length != 5) {
+        return false;
+    }
+
+    i64 expected[5] = [99, 108, 111, 115, 101];
+    i64 i = 0;
+
+    while (i < 5) {
+        if (lower(core::bytes::load_u8(value.data + i)) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn value_contains_known_token(BytesView value, i64 kind) -> bool {
+    i64 cursor = 0;
+
+    while (cursor < value.length) {
+        while (
+            cursor < value.length &&
+            (
+                core::bytes::load_u8(value.data + cursor) == 32 ||
+                core::bytes::load_u8(value.data + cursor) == 9 ||
+                core::bytes::load_u8(value.data + cursor) == 44
+            )
+        ) {
+            cursor += 1;
+        }
+
+        i64 start = cursor;
+
+        while (cursor < value.length && core::bytes::load_u8(value.data + cursor) != 44) {
+            cursor += 1;
+        }
+        if (token_is(trim_ows(BytesView {
+            data: value.data + start,
+            length: cursor - start
+        }
+        ), kind)) {
+            return true;
+        }
+        if (cursor < value.length) {
+            cursor += 1;
+        }
+    }
+    return false;
+}
+
+fn analyze_headers(
+    BytesView block,
+    i64&mut content_length,
+    bool&mut chunked,
+    bool&mut connection_close,
+) -> HttpError {
+    *content_length = -1;
+    *chunked = false;
+    *connection_close = false;
+
+    HeaderIterator iterator = headers(block);
+
+    HeaderView header = HeaderView {
+        name: BytesView {
+            data: 0,
+            length: 0
+        },
+        value: BytesView {
+            data: 0,
+            length: 0
+        }
+    };
+    while (next_header(&mut iterator, &mut header)) {
+        i64 i = 0;
+
+        while (i < header.name.length) {
+            if (!is_token_byte(core::bytes::load_u8(header.name.data + i))) {
+                return HttpError::InvalidHeader;
+            }
+            i += 1;
+        }
+        if (name_is(header.name, 1)) {
+            i64 parsed = parse_decimal(header.value);
+
+            if (parsed < 0) {
+                return HttpError::InvalidContentLength;
+            }
+            if (*content_length >= 0 && *content_length != parsed) {
+                return HttpError::InvalidContentLength;
+            }
+            *content_length = parsed;
+        } else if (name_is(header.name, 2)) {
+            BytesView transfer = trim_ows(header.value);
+
+            if (!token_is(transfer, 1)) {
+                return HttpError::ConflictingFraming;
+            }
+            if (*chunked) {
+                return HttpError::ConflictingFraming;
+            }
+            *chunked = true;
+        } else if (name_is(header.name, 3)) {
+            if (value_contains_known_token(header.value, 2)) {
+                *connection_close = true;
+            }
+        }
+    }
+    if (!headers_valid(&iterator)) {
+        return HttpError::InvalidHeader;
+    }
+    if (*chunked && *content_length >= 0) {
+        return HttpError::ConflictingFraming;
+    }
+    return HttpError::None;
+}
+
+fn supported_http_version(BytesView value) -> bool {
+    if (value.length != 8) {
+        return false;
+    }
+
+    i64 prefix[7] = [72, 84, 84, 80, 47, 49, 46];
+    i64 i = 0;
+
+    while (i < 7) {
+        if (core::bytes::load_u8(value.data + i) != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+
+    i64 minor = core::bytes::load_u8(value.data + 7);
+
+    return minor == 48 || minor == 49;
+}
+
+fn split_three(BytesView line, BytesView&mut a, BytesView&mut b, BytesView&mut c) -> bool {
+    i64 first = core::bytes::find_byte(line, 32);
+
+    if (first <= 0) {
+        return false;
+    }
+    i64 second_relative = core::bytes::find_byte(BytesView {
+        data: line.data + first + 1,
+        length: line.length - first - 1
+    }, 32);
+    if (second_relative <= 0) {
+        return false;
+    }
+
+    i64 second = first + 1 + second_relative;
+
+    if (second + 1 >= line.length) {
+        return false;
+    }
+    *a = BytesView {
+        data: line.data,
+        length: first
+    };
+    *b = BytesView {
+        data: line.data + first + 1,
+        length: second - first - 1
+    };
+    *c = BytesView {
+        data: line.data + second + 1,
+        length: line.length - second - 1
+    };
+    return true;
+}
+
+public fn parse_request(
+    usize data,
+    i64 length,
+    i64 max_header_bytes,
+    HttpRequestView&mut output,
+) -> HttpError {
+    if (data == 0 || length <= 0) {
+        return HttpError::Incomplete;
+    }
+    BytesView source = BytesView {
+        data: data,
+        length: length
+    };
+
+    i64 first_end = find_crlf(source, 0);
+
+    if (first_end < 0) {
+        return HttpError::Incomplete;
+    }
+    BytesView method = BytesView {
+        data: 0,
+        length: 0
+    };
+    BytesView target = BytesView {
+        data: 0,
+        length: 0
+    };
+    BytesView version = BytesView {
+        data: 0,
+        length: 0
+    };
+    if (!split_three(BytesView {
+        data: data,
+        length: first_end
+    }, &mut method, &mut target, &mut version)) {
+        return HttpError::InvalidStartLine;
+    }
+
+    i64 i = 0;
+
+    while (i < method.length) {
+        if (!is_token_byte(core::bytes::load_u8(method.data + i))) {
+            return HttpError::InvalidStartLine;
+        }
+        i += 1;
+    }
+    if (!supported_http_version(version)) {
+        return HttpError::InvalidStartLine;
+    }
+    i = 0;
+    while (i < target.length) {
+        i64 tb = core::bytes::load_u8(target.data + i);
+
+        if (tb <= 32 || tb == 127) {
+            return HttpError::InvalidStartLine;
+        }
+        i += 1;
+    }
+
+    i64 header_end = find_header_end(source, max_header_bytes);
+
+    if (header_end < 0) {
+        if (max_header_bytes > 0 && length >= max_header_bytes) {
+            return HttpError::HeadersTooLarge;
+        }
+        return HttpError::Incomplete;
+    }
+
+    i64 header_start = first_end + 2;
+
+    BytesView block = BytesView {
+        data: data + header_start,
+        length: header_end - header_start + 2
+    };
+
+    i64 content_length = -1;
+    bool chunked = false;
+    bool close = false;
+    HttpError analyzed = analyze_headers(block, &mut content_length, &mut chunked, &mut close);
+
+    if (analyzed != HttpError::None) {
+        return analyzed;
+    }
+
+    i64 body_start = header_end + 4;
+    i64 available_body = length - body_start;
+    i64 body_length = available_body;
+
+    if (!chunked && content_length >= 0 && body_length > content_length) {
+        body_length = content_length;
+    }
+    *output = HttpRequestView {
+        source: source,
+        method: method,
+        target: target,
+        version: version,
+        header_block: block,
+        body: BytesView {
+            data: data + body_start,
+            length: body_length
+        },
+        content_length: content_length,
+        chunked: chunked,
+        connection_close: close,
+    };
+    if (!chunked && content_length >= 0 && available_body < content_length) {
+        return HttpError::BodyIncomplete;
+    }
+    return HttpError::None;
+}
+
+public fn parse_response(
+    usize data,
+    i64 length,
+    i64 max_header_bytes,
+    HttpResponseView&mut output,
+) -> HttpError {
+    if (data == 0 || length <= 0) {
+        return HttpError::Incomplete;
+    }
+    BytesView source = BytesView {
+        data: data,
+        length: length
+    };
+
+    i64 first_end = find_crlf(source, 0);
+
+    if (first_end < 0) {
+        return HttpError::Incomplete;
+    }
+    BytesView line = BytesView {
+        data: data,
+        length: first_end
+    };
+
+    i64 first_space = core::bytes::find_byte(line, 32);
+
+    if (first_space <= 0) {
+        return HttpError::InvalidStartLine;
+    }
+    BytesView version = BytesView {
+        data: data,
+        length: first_space
+    };
+    if (!supported_http_version(version)) {
+        return HttpError::InvalidStartLine;
+    }
+
+    i64 code_start = first_space + 1;
+
+    if (code_start + 3 > line.length) {
+        return HttpError::InvalidStartLine;
+    }
+
+    i64 status = 0;
+    i64 j = 0;
+
+    while (j < 3) {
+        i64 b = core::bytes::load_u8(data + code_start + j);
+
+        if (b < 48 || b > 57) {
+            return HttpError::InvalidStartLine;
+        }
+        status = status * 10 + b - 48;
+        j += 1;
+    }
+
+    i64 reason_start = code_start + 3;
+
+    if (reason_start < line.length && core::bytes::load_u8(data + reason_start) == 32) {
+        reason_start += 1;
+    }
+    BytesView reason = BytesView {
+        data: data + reason_start,
+        length: line.length - reason_start
+    };
+
+    i64 header_end = find_header_end(source, max_header_bytes);
+
+    if (header_end < 0) {
+        if (max_header_bytes > 0 && length >= max_header_bytes) {
+            return HttpError::HeadersTooLarge;
+        }
+        return HttpError::Incomplete;
+    }
+
+    i64 header_start = first_end + 2;
+
+    BytesView block = BytesView {
+        data: data + header_start,
+        length: header_end - header_start + 2
+    };
+
+    i64 content_length = -1;
+    bool chunked = false;
+    bool close = false;
+    HttpError analyzed = analyze_headers(block, &mut content_length, &mut chunked, &mut close);
+
+    if (analyzed != HttpError::None) {
+        return analyzed;
+    }
+
+    i64 body_start = header_end + 4;
+    i64 available_body = length - body_start;
+    i64 body_length = available_body;
+
+    if (!chunked && content_length >= 0 && body_length > content_length) {
+        body_length = content_length;
+    }
+    *output = HttpResponseView {
+        source: source,
+        version: version,
+        status: status,
+        reason: reason,
+        header_block: block,
+        body: BytesView {
+            data: data + body_start,
+            length: body_length
+        },
+        content_length: content_length,
+        chunked: chunked,
+        connection_close: close,
+    };
+    if (!chunked && content_length >= 0 && available_body < content_length) {
+        return HttpError::BodyIncomplete;
+    }
+    return HttpError::None;
+}
+
+fn valid_header_component(usize data, i64 length, bool name) -> bool {
+    if (length <= 0 || data == 0) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < length) {
+        i64 b = core::bytes::load_u8(data + index);
+
+        if (name) {
+            if (!is_token_byte(b)) {
+                return false;
+            }
+        } else if (b == 13 || b == 10 || b == 0) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn append_header(
+    String&mut output,
+    usize name,
+    i64 name_length,
+    usize value,
+    i64 value_length,
+) -> bool {
+    if (
+        !valid_header_component(name, name_length, true) ||
+        !valid_header_component(value, value_length, false)
+    ) {
+        return false;
+    }
+    return (
+        alloc::string::append_bytes(output, name, name_length) &&
+        alloc::string::push_byte(output, 58) &&
+        alloc::string::push_byte(output, 32) &&
+        alloc::string::append_bytes(output, value, value_length) &&
+        alloc::string::push_byte(output, 13) &&
+        alloc::string::push_byte(output, 10)
+    );
+}
+
+public fn append_request_line(
+    String&mut output,
+    usize method,
+    i64 method_len,
+    usize target,
+    i64 target_len,
+) -> bool {
+    if (!valid_header_component(method, method_len, true) || target_len <= 0 || target == 0) {
+        return false;
+    }
+    if (
+        !alloc::string::append_bytes(output, method, method_len) ||
+        !alloc::string::push_byte(output, 32) ||
+        !alloc::string::append_bytes(output, target, target_len) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+
+    i64 version[8] = [72, 84, 84, 80, 47, 49, 46, 49];
+    i64 i = 0;
+
+    while (i < 8) {
+        if (!alloc::string::push_byte(output, version[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    return alloc::string::push_byte(output, 13) && alloc::string::push_byte(output, 10);
+}
+
+public fn append_response_line(String&mut output, i64 status, usize reason, i64 reason_len) -> bool {
+    if (status < 100 || status > 999 || reason_len < 0 || (reason_len > 0 && reason == 0)) {
+        return false;
+    }
+
+    i64 prefix[9] = [72, 84, 84, 80, 47, 49, 46, 49, 32];
+    i64 i = 0;
+
+    while (i < 9) {
+        if (!alloc::string::push_byte(output, prefix[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    if (!std::fmt::append_i64(output, status)) {
+        return false;
+    }
+    if (reason_len > 0) {
+        if (
+            !alloc::string::push_byte(output, 32) ||
+            !alloc::string::append_bytes(output, reason, reason_len)
+        ) {
+            return false;
+        }
+    }
+    return alloc::string::push_byte(output, 13) && alloc::string::push_byte(output, 10);
+}
+
+public fn end_headers(String&mut output) -> bool {
+    return alloc::string::push_byte(output, 13) && alloc::string::push_byte(output, 10);
+}
+
+fn hex_digit_value(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 70) {
+        return byte - 65 + 10;
+    }
+    if (byte >= 97 && byte <= 102) {
+        return byte - 97 + 10;
+    }
+    return -1;
+}
+
+public fn chunks(BytesView source) -> ChunkCursor {
+    return ChunkCursor {
+        source: source,
+        cursor: 0,
+        finished: false
+    };
+}
+
+public fn next_chunk(ChunkCursor&mut cursor, ChunkView&mut output) -> HttpError {
+    if (cursor.finished) {
+        return HttpError::None;
+    }
+
+    i64 line_end = find_crlf(cursor.source, cursor.cursor);
+
+    if (line_end < 0) {
+        return HttpError::Incomplete;
+    }
+
+    i64 size = 0;
+    i64 index = cursor.cursor;
+    bool any = false;
+
+    while (index < line_end) {
+        i64 b = core::bytes::load_u8(cursor.source.data + index);
+
+        if (b == 59) {
+            break;
+        }
+
+        i64 digit = hex_digit_value(b);
+
+        if (digit < 0) {
+            return HttpError::InvalidChunk;
+        }
+        if (size > 576460752303423487) {
+            return HttpError::InvalidChunk;
+        }
+        size = size * 16 + digit;
+        any = true;
+        index += 1;
+    }
+    if (!any) {
+        return HttpError::InvalidChunk;
+    }
+
+    i64 data_start = line_end + 2;
+
+    if (size == 0) {
+        if (data_start + 2 > cursor.source.length) {
+            return HttpError::Incomplete;
+        }
+        // Empty trailers are the immediate CRLF following the zero-size line.
+        if (
+            core::bytes::load_u8(cursor.source.data + data_start) == 13 &&
+            core::bytes::load_u8(cursor.source.data + data_start + 1) == 10
+        ) {
+            cursor.cursor = data_start + 2;
+            cursor.finished = true;
+            *output = ChunkView {
+                data: BytesView {
+                    data: cursor.source.data + data_start,
+                    length: 0
+                },
+                trailers: BytesView {
+                    data: cursor.source.data + data_start,
+                    length: 0
+                },
+                final_chunk: true,
+            };
+            return HttpError::None;
+        }
+        // Otherwise trailers use the same strict field-line grammar as normal
+        // headers and end at the next empty line. Expose them as a borrowed view.
+        i64 trailer_end = find_header_end(BytesView {
+            data: cursor.source.data + data_start,
+            length: cursor.source.length - data_start
+        }, 0);
+        if (trailer_end < 0) {
+            return HttpError::Incomplete;
+        }
+        BytesView trailer_block = BytesView {
+            data: cursor.source.data + data_start,
+            length: trailer_end + 2
+        };
+
+        HeaderIterator iterator = headers(trailer_block);
+
+        HeaderView field = HeaderView {
+            name: BytesView {
+                data: 0,
+                length: 0
+            },
+            value: BytesView {
+                data: 0,
+                length: 0
+            }
+        };
+        while (next_header(&mut iterator, &mut field)) {}
+        if (!headers_valid(&iterator)) {
+            return HttpError::InvalidHeader;
+        }
+        cursor.cursor = data_start + trailer_end + 4;
+        cursor.finished = true;
+        *output = ChunkView {
+            data: BytesView {
+                data: cursor.source.data + data_start,
+                length: 0
+            },
+            trailers: trailer_block,
+            final_chunk: true,
+        };
+        return HttpError::None;
+    }
+    if (data_start + size + 2 > cursor.source.length) {
+        return HttpError::Incomplete;
+    }
+    if (
+        core::bytes::load_u8(cursor.source.data + data_start + size) != 13 ||
+        core::bytes::load_u8(cursor.source.data + data_start + size + 1) != 10
+    ) {
+        return HttpError::InvalidChunk;
+    }
+    *output = ChunkView {
+        data: BytesView {
+            data: cursor.source.data + data_start,
+            length: size
+        },
+        trailers: BytesView {
+            data: 0,
+            length: 0
+        },
+        final_chunk: false,
+    };
+    cursor.cursor = data_start + size + 2;
+    return HttpError::None;
+}

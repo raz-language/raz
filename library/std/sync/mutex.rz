@@ -1,0 +1,132 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::sync::mutex;
+
+extern fn raz_rt_mutex_create() -> usize;
+extern fn raz_rt_mutex_destroy(usize mutex);
+extern fn raz_rt_mutex_lock(usize mutex);
+extern fn raz_rt_mutex_try_lock(usize mutex) -> i64;
+extern fn raz_rt_mutex_unlock(usize mutex);
+
+public struct Mutex {
+    usize handle;
+}
+
+// Guard carries only the OS lock handle. Drop performs the unlock, keeping the
+// hot lock/unlock path allocation-free and branch-minimal.
+public struct MutexGuard {
+    usize handle;
+    bool locked;
+}
+
+// Raw-handle compatibility for higher-level Raz synchronization structures.
+public fn mutex_create_raw() -> usize {
+    return raz_rt_mutex_create();
+}
+
+public fn mutex_destroy_raw(usize mutex) {
+    if (mutex != 0) {
+        raz_rt_mutex_destroy(mutex);
+    }
+}
+
+public fn mutex_lock_raw(usize mutex) {
+    if (mutex != 0) {
+        raz_rt_mutex_lock(mutex);
+    }
+}
+
+public fn mutex_try_lock_raw(usize mutex) -> bool {
+    return mutex != 0 && raz_rt_mutex_try_lock(mutex) == 1;
+}
+
+public fn mutex_unlock_raw(usize mutex) {
+    if (mutex != 0) {
+        raz_rt_mutex_unlock(mutex);
+    }
+}
+
+public fn create() -> Mutex {
+    return Mutex {
+        handle: raz_rt_mutex_create()
+    };
+}
+
+public fn valid(Mutex& mutex) -> bool {
+    return mutex.handle != 0;
+}
+
+public fn lock(Mutex& mutex) {
+    if (mutex.handle != 0) {
+        raz_rt_mutex_lock(mutex.handle);
+    }
+}
+
+public fn try_lock(Mutex& mutex) -> bool {
+    return mutex.handle != 0 && raz_rt_mutex_try_lock(mutex.handle) == 1;
+}
+
+public fn unlock(Mutex& mutex) {
+    if (mutex.handle != 0) {
+        raz_rt_mutex_unlock(mutex.handle);
+    }
+}
+
+public fn guard(Mutex& mutex) -> MutexGuard {
+    if (mutex.handle == 0) {
+        return MutexGuard {
+            handle: 0,
+            locked: false
+        };
+    }
+    raz_rt_mutex_lock(mutex.handle);
+    return MutexGuard {
+        handle: mutex.handle,
+        locked: true
+    };
+}
+
+public fn try_guard(Mutex& mutex) -> MutexGuard {
+    if (mutex.handle == 0 || raz_rt_mutex_try_lock(mutex.handle) != 1) {
+        return MutexGuard {
+            handle: 0,
+            locked: false
+        };
+    }
+    return MutexGuard {
+        handle: mutex.handle,
+        locked: true
+    };
+}
+
+public fn guard_locked(MutexGuard& guard) -> bool {
+    return guard.locked;
+}
+
+public fn guard_unlock(MutexGuard&mut guard) {
+    if (guard.locked && guard.handle != 0) {
+        raz_rt_mutex_unlock(guard.handle);
+        guard.locked = false;
+        guard.handle = 0;
+    }
+}
+
+public fn destroy(Mutex&mut mutex) {
+    if (mutex.handle != 0) {
+        raz_rt_mutex_destroy(mutex.handle);
+        mutex.handle = 0;
+    }
+}
+
+impl Drop for MutexGuard {
+    fn drop(MutexGuard&mut self) {
+        guard_unlock(self);
+    }
+}
+
+impl Drop for Mutex {
+    fn drop(Mutex&mut self) {
+        destroy(self);
+    }
+}

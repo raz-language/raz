@@ -1,0 +1,202 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::address;
+import alloc::string;
+import core::bytes;
+import core::result;
+
+public enum AddressError {
+    InvalidSyntax,
+    InvalidOctet,
+    InvalidPort,
+}
+
+/// Packed IPv4 value. The low 32 bits contain the four network-order octets.
+/// A machine-word representation keeps the value ABI stable across backends.
+public struct Ipv4Address {
+    i64 value;
+}
+
+public struct SocketAddress {
+    Ipv4Address address;
+    i64 port;
+}
+
+fn ascii_digit(i64 byte) -> bool {
+    return byte >= 48 && byte <= 57;
+}
+
+fn parse_octet(usize data, i64 start, i64 end) -> Result<i64, AddressError> {
+    if (data == 0 || start < 0 || end <= start || end - start > 3) {
+        return Result<i64, AddressError>::Error(AddressError::InvalidSyntax);
+    }
+
+    i64 value = 0;
+    i64 index = start;
+
+    while (index < end) {
+        i64 byte = core::bytes::load_u8(data + index);
+
+        if (!ascii_digit(byte)) {
+            return Result<i64, AddressError>::Error(AddressError::InvalidSyntax);
+        }
+        value = value * 10 + byte - 48;
+        if (value > 255) {
+            return Result<i64, AddressError>::Error(AddressError::InvalidOctet);
+        }
+        index += 1;
+    }
+    return Result<i64, AddressError>::Ok(value);
+}
+
+public fn ipv4(i64 first, i64 second, i64 third, i64 fourth) -> Result<Ipv4Address, AddressError> {
+    if (
+        first < 0 ||
+        first > 255 ||
+        second < 0 ||
+        second > 255 ||
+        third < 0 ||
+        third > 255 ||
+        fourth < 0 ||
+        fourth > 255
+    ) {
+        return Result<Ipv4Address, AddressError>::Error(AddressError::InvalidOctet);
+    }
+
+    i64 packed = (first << 24) | (second << 16) | (third << 8) | fourth;
+
+    return Result<Ipv4Address, AddressError>::Ok(Ipv4Address {
+        value: packed
+    }
+    );
+}
+
+public fn loopback_ipv4() -> Ipv4Address {
+    return Ipv4Address {
+        value: 2130706433
+    };
+}
+
+public fn unspecified_ipv4() -> Ipv4Address {
+    return Ipv4Address {
+        value: 0
+    };
+}
+
+public fn ipv4_first(Ipv4Address& address) -> i64 {
+    return (address.value >> 24) & 255;
+}
+
+public fn ipv4_second(Ipv4Address& address) -> i64 {
+    return (address.value >> 16) & 255;
+}
+
+public fn ipv4_third(Ipv4Address& address) -> i64 {
+    return (address.value >> 8) & 255;
+}
+
+public fn ipv4_fourth(Ipv4Address& address) -> i64 {
+    return address.value & 255;
+}
+
+public fn socket_address(Ipv4Address address, i64 port) -> Result<SocketAddress, AddressError> {
+    if (port < 0 || port > 65535) {
+        return Result<SocketAddress, AddressError>::Error(AddressError::InvalidPort);
+    }
+    return Result<SocketAddress, AddressError>::Ok(SocketAddress {
+        address: address,
+        port: port
+    }
+    );
+}
+
+public fn socket_address_port(SocketAddress& endpoint) -> i64 {
+    return endpoint.port;
+}
+
+public fn socket_address_ipv4(SocketAddress& endpoint) -> Ipv4Address {
+    return endpoint.address;
+}
+
+public fn parse_ipv4(usize data, i64 length) -> Result<Ipv4Address, AddressError> {
+    if (data == 0 || length < 7 || length > 15) {
+        return Result<Ipv4Address, AddressError>::Error(AddressError::InvalidSyntax);
+    }
+
+    i64 parts[4];
+    i64 part = 0;
+    i64 start = 0;
+    i64 index = 0;
+
+    while (index <= length) {
+        bool boundary = index == length;
+
+        if (!boundary) {
+            boundary = core::bytes::load_u8(data + index) == 46;
+        }
+        if (boundary) {
+            if (part >= 4) {
+                return Result<Ipv4Address, AddressError>::Error(AddressError::InvalidSyntax);
+            }
+
+            Result<i64, AddressError> parsed = parse_octet(data, start, index);
+
+            match parsed {
+                Result<i64, AddressError>::Ok(value) => {
+                    parts[part] = value;
+                }
+                Result<i64, AddressError>::Error(error) => {
+                    return Result<Ipv4Address, AddressError>::Error(error);
+                }
+            }
+            part += 1;
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if (part != 4) {
+        return Result<Ipv4Address, AddressError>::Error(AddressError::InvalidSyntax);
+    }
+    return ipv4(parts[0], parts[1], parts[2], parts[3]);
+}
+
+fn append_decimal(String&mut output, i64 value) -> bool {
+    if (value < 0) {
+        return false;
+    }
+
+    i64 divisor = 1;
+
+    while (value / divisor >= 10) {
+        divisor *= 10;
+    }
+    while (divisor > 0) {
+        if (!alloc::string::push_byte(output, 48 + (value / divisor) % 10)) {
+            return false;
+        }
+        divisor /= 10;
+    }
+    return true;
+}
+
+public fn ipv4_to_string(Ipv4Address& address) -> String {
+    String output = alloc::string::with_capacity(15);
+
+    append_decimal(&mut output, ipv4_first(address));
+    alloc::string::push_byte(&mut output, 46);
+    append_decimal(&mut output, ipv4_second(address));
+    alloc::string::push_byte(&mut output, 46);
+    append_decimal(&mut output, ipv4_third(address));
+    alloc::string::push_byte(&mut output, 46);
+    append_decimal(&mut output, ipv4_fourth(address));
+    return move output;
+}
+
+public fn socket_address_to_string(SocketAddress& endpoint) -> String {
+    String output = ipv4_to_string(&endpoint.address);
+
+    alloc::string::push_byte(&mut output, 58);
+    append_decimal(&mut output, endpoint.port);
+    return move output;
+}

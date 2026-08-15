@@ -1,0 +1,26 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+if(NOT DEFINED CODEGEN OR NOT DEFINED INPUT)
+  message(FATAL_ERROR "CODEGEN and INPUT are required")
+endif()
+execute_process(COMMAND "${CODEGEN}" "${INPUT}" --stats --machine-ir
+  RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "forge-codegen failed: ${error}")
+endif()
+if(NOT output MATCHES "instructions=2")
+  message(FATAL_ERROR "expected two optimized machine instructions: ${output}")
+endif()
+if(NOT output MATCHES "instructions-before-machine-opt=4")
+  message(FATAL_ERROR "expected four pre-optimization instructions: ${output}")
+endif()
+if(NOT output MATCHES "machine-extension-chains-eliminated=2")
+  message(FATAL_ERROR "expected both extension-chain instructions eliminated: ${output}")
+endif()
+if(NOT output MATCHES "bytes=7")
+  message(FATAL_ERROR "extension cleanup encoded-size regression: ${output}")
+endif()
+if(output MATCHES "zero_extend|truncate")
+  message(FATAL_ERROR "cast survived optimized machine IR: ${output}")
+endif()

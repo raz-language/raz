@@ -1,0 +1,135 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::sync::barrier;
+import std::sync::condition;
+import std::sync::mutex;
+
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+// Reusable generation barrier implemented in Raz over native mutex/condition.
+const i64 BAR_PARTIES = 0;
+const i64 BAR_WAITING = 8;
+const i64 BAR_GENERATION = 16;
+const i64 BAR_MUTEX = 24;
+const i64 BAR_CONDITION = 32;
+const i64 BAR_BYTES = 40;
+
+fn address(i8*mut barrier) -> usize {
+    usize value = 0;
+
+    unsafe {
+        value = barrier as usize;
+    }
+    return value;
+}
+
+fn load(usize state, i64 offset) -> i64 {
+    return raz_rt_volatile_load_i64(state + offset);
+}
+
+fn store(usize state, i64 offset, i64 value) {
+    raz_rt_volatile_store_i64(state + offset, value);
+}
+
+public fn barrier_create(i64 parties) -> i8*mut {
+    if (parties <= 0) {
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+
+    usize state = raz_rt_alloc_aligned(BAR_BYTES, 8);
+
+    if (state == 0) {
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize condition = std::sync::condition::condition_create();
+
+    if (mutex == 0 || condition == 0) {
+        if (condition != 0) {
+            std::sync::condition::condition_destroy(condition);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        raz_rt_dealloc_aligned(state, 8);
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+    store(state, BAR_PARTIES, parties);
+    store(state, BAR_WAITING, 0);
+    store(state, BAR_GENERATION, 0);
+    store(state, BAR_MUTEX, mutex as i64);
+    store(state, BAR_CONDITION, condition as i64);
+    unsafe {
+        return state as i8*mut;
+    }
+}
+
+public fn barrier_destroy(i8*mut barrier) {
+    usize state = address(barrier);
+
+    if (state == 0) {
+        return;
+    }
+
+    usize condition = load(state, BAR_CONDITION)as usize;
+    usize mutex = load(state, BAR_MUTEX)as usize;
+
+    if (condition != 0) {
+        std::sync::condition::condition_destroy(condition);
+    }
+    if (mutex != 0) {
+        std::sync::mutex::mutex_destroy_raw(mutex);
+    }
+    raz_rt_dealloc_aligned(state, 8);
+}
+
+// Returns true for the last participant that completes the generation.
+public fn barrier_wait(i8*mut barrier) -> bool {
+    usize state = address(barrier);
+
+    if (state == 0) {
+        return false;
+    }
+
+    usize mutex = load(state, BAR_MUTEX)as usize;
+    usize condition = load(state, BAR_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+
+    i64 generation = load(state, BAR_GENERATION);
+    i64 waiting = load(state, BAR_WAITING) + 1;
+    i64 parties = load(state, BAR_PARTIES);
+
+    if (waiting == parties) {
+        store(state, BAR_WAITING, 0);
+        store(state, BAR_GENERATION, generation + 1);
+        std::sync::mutex::mutex_unlock_raw(mutex);
+        std::sync::condition::notify_all_raw(condition);
+        return true;
+    }
+    store(state, BAR_WAITING, waiting);
+    while (load(state, BAR_GENERATION) == generation) {
+        std::sync::condition::wait_raw(condition, mutex);
+    }
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    return false;
+}
+
+public fn barrier_parties(i8*mut barrier) -> i64 {
+    usize state = address(barrier);
+
+    if (state == 0) {
+        return 0;
+    }
+    return load(state, BAR_PARTIES);
+}

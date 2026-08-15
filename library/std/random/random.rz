@@ -1,0 +1,141 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::random;
+// Operating-system entropy. The runtime uses the platform's system RNG on the
+// supported Windows, Linux, and macOS targets.
+extern fn raz_rt_random_fill(usize output, i64 size) -> i64;
+extern fn raz_rt_random_seed() -> u64;
+
+public fn fill(usize output, i64 size) -> bool {
+    if (size < 0 || (size > 0 && output == 0)) {
+        return false;
+    }
+    return raz_rt_random_fill(output, size) == 1;
+}
+
+/// Small deterministic generator for simulations, tests, and hot loops.
+/// Seed it explicitly for reproducibility or call seed_from_system().
+public struct Rng {
+    u64 state;
+}
+
+impl Rng {
+    fn seeded(u64 seed) -> Rng {
+        if (seed == 0) {
+            seed = 6364136223846793005;
+        }
+        return Rng {
+            state: seed
+        };
+    }
+    fn seed_from_system(Rng&mut self) -> bool {
+        u64 seed = raz_rt_random_seed();
+
+        if (seed == 0) {
+            return false;
+        }
+        self.state = seed;
+        return true;
+    }
+    fn next_u64(Rng&mut self) -> u64 {
+        u64 value = self.state;
+
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        self.state = value;
+        return value * 2685821657736338717;
+    }
+    fn next_i64(Rng&mut self) -> i64 {
+        return (self.next_u64() & 9223372036854775807)as i64;
+    }
+    fn next_bool(Rng&mut self) -> bool {
+        return (self.next_u64() & 1) == 1;
+    }
+    /// Unbiased bounded integer helper using rejection sampling. Invalid or
+    /// empty ranges return minimum rather than trapping.
+    fn range_i64(Rng&mut self, i64 minimum, i64 maximum) -> i64 {
+        if (maximum <= minimum) {
+            return minimum;
+        }
+
+        u64 bound = (maximum as u64) - (minimum as u64);
+        u64 threshold = ((0 as u64) - bound) % bound;
+        u64 sample = self.next_u64();
+
+        while (sample < threshold) {
+            sample = self.next_u64();
+        }
+        return ((minimum as u64) + (sample % bound))as i64;
+    }
+}
+
+// Free-function surface is the stable cross-module API. The inherent methods
+// above remain convenient inside the defining module and for future method
+// interface work.
+public fn rng_seeded(u64 seed) -> Rng {
+    if (seed == 0) {
+        seed = 6364136223846793005;
+    }
+    return Rng {
+        state: seed
+    };
+}
+
+public fn rng_seed_from_system(Rng&mut rng) -> bool {
+    u64 seed = raz_rt_random_seed();
+
+    if (seed == 0) {
+        return false;
+    }
+    rng.state = seed;
+    return true;
+}
+
+public fn rng_next_u64(Rng&mut rng) -> u64 {
+    u64 value = rng.state;
+
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^= value >> 27;
+    rng.state = value;
+    return value * 2685821657736338717;
+}
+
+public fn rng_next_i64(Rng&mut rng) -> i64 {
+    return (rng_next_u64(rng) & 9223372036854775807)as i64;
+}
+
+public fn rng_next_bool(Rng&mut rng) -> bool {
+    return (rng_next_u64(rng) & 1) == 1;
+}
+
+public fn rng_range_i64(Rng&mut rng, i64 minimum, i64 maximum) -> i64 {
+    if (maximum <= minimum) {
+        return minimum;
+    }
+
+    u64 bound = (maximum as u64) - (minimum as u64);
+    u64 threshold = ((0 as u64) - bound) % bound;
+    u64 sample = rng_next_u64(rng);
+
+    while (sample < threshold) {
+        sample = rng_next_u64(rng);
+    }
+    return ((minimum as u64) + (sample % bound))as i64;
+}
+
+public fn rng_range_u64(Rng&mut rng, u64 bound) -> u64 {
+    if (bound == 0) {
+        return 0;
+    }
+
+    u64 threshold = ((0 as u64) - bound) % bound;
+    u64 sample = rng_next_u64(rng);
+
+    while (sample < threshold) {
+        sample = rng_next_u64(rng);
+    }
+    return sample % bound;
+}

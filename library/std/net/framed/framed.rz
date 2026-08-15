@@ -1,0 +1,64 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::framed;
+import core::result;
+import std::io::buffer;
+import std::net::buffered;
+/// Writes one unsigned 32-bit big-endian length-prefixed frame. The maximum
+/// is mandatory at the call site so untrusted peers cannot request unbounded
+/// allocations on the receiving side.
+public fn write_frame(
+    BufferedTcpStream&mut stream,
+    usize data,
+    i64 length,
+    i64 maximum,
+) -> Result<bool, StreamError> {
+    if (length < 0 || length > 4294967295 || (maximum >= 0 && length > maximum)) {
+        return Result<bool, StreamError>::Error(StreamError::LimitExceeded);
+    }
+
+    i64 shift = 24;
+
+    while (shift >= 0) {
+        u8 byte = ((length >> shift) & 255)as u8;
+
+        std::net::buffered::write_byte(stream, byte)?;
+        shift -= 8;
+    }
+    std::net::buffered::write(stream, data, length)?;
+    return std::net::buffered::flush(stream);
+}
+
+/// Reads one frame into `output`, replacing any previous readable content.
+public fn read_frame(
+    BufferedTcpStream&mut stream,
+    ByteBuffer&mut output,
+    i64 maximum,
+) -> Result<i64, StreamError> {
+    i64 length = 0;
+    i64 count = 0;
+
+    while (count < 4) {
+        u8 byte = std::net::buffered::read_byte(stream)?;
+
+        length = (length << 8) | (byte as i64);
+        count += 1;
+    }
+    if (length < 0 || (maximum >= 0 && length > maximum)) {
+        return Result<i64, StreamError>::Error(StreamError::LimitExceeded);
+    }
+    byte_buffer_clear(output);
+    if (length == 0) {
+        return Result<i64, StreamError>::Ok(0);
+    }
+
+    usize destination = byte_buffer_tail(output, length);
+
+    if (destination == 0) {
+        return Result<i64, StreamError>::Error(StreamError::OutOfMemory);
+    }
+    std::net::buffered::read_exact(stream, destination, length)?;
+    byte_buffer_commit(output, length);
+    return Result<i64, StreamError>::Ok(length);
+}

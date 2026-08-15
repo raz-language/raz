@@ -1,0 +1,438 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_ownership_move_state;
+public import raz_compiler_mir_ownership_moves;
+// Path-sensitive whole-local move analysis. HIR remains the user-facing
+// diagnostic authority during migration; this verifier proves that semantic MIR
+// independently reaches the same initialized/moved legality for represented
+// whole-local moves.
+fn mir_ownership_event_for_instruction(MirModule& mir, i64 instruction, i64 kind) -> i64 {
+  i64 event = 0;
+
+  while (event < mir.ownership_event_count) {
+    if (
+    raz_rt_stage1_arena_get(mir.ownership_event_instructions, event) == instruction &&
+    raz_rt_stage1_arena_get(mir.ownership_event_kinds, event) == kind &&
+    raz_rt_stage1_arena_get(mir.ownership_event_path_counts, event) == 0
+    ) {
+      return raz_rt_stage1_arena_get(mir.ownership_event_slots, event);
+    }
+    event += 1;
+  }
+  return -1;
+}
+
+fn mir_cfg_max_local_count(MirModule& mir) -> i64 {
+  i64 maximum = 0;
+  i64 function_index = 0;
+
+  while (function_index < mir.function_count) {
+    i64 count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+    if (count > maximum) {
+      maximum = count;
+    }
+    function_index += 1;
+  }
+  return maximum;
+}
+
+fn mir_state_matrix_get(i64 matrix, i64 width, i64 block, i64 slot) -> i64 {
+  return raz_rt_stage1_arena_get(matrix, block * width + slot);
+}
+
+fn mir_state_matrix_set(i64 matrix, i64 width, i64 block, i64 slot, i64 value) {
+  raz_rt_stage1_arena_set(matrix, block * width + slot, value);
+}
+
+fn mir_state_matrix_copy_to_local(i64 matrix, i64 width, i64 block, MirLocalState&mut state, bool moved) {
+  i64 slot = 0;
+
+  while (slot < state.count) {
+    i64 value = mir_state_matrix_get(matrix, width, block, slot);
+
+    if (moved) {
+      raz_rt_stage1_arena_set(state.moved, slot, value);
+    } else {
+      raz_rt_stage1_arena_set(state.initialized, slot, value);
+    }
+    slot += 1;
+  }
+}
+
+fn mir_state_matrix_copy_from_local(
+i64 matrix,
+i64 width,
+i64 block,
+MirLocalState& state,
+bool moved,
+) -> bool {
+  bool changed = false;
+  i64 slot = 0;
+
+  while (slot < state.count) {
+    i64 value = 0;
+
+    if (moved) {
+      value = raz_rt_stage1_arena_get(state.moved, slot);
+    } else {
+      value = raz_rt_stage1_arena_get(state.initialized, slot);
+    }
+    if (mir_state_matrix_get(matrix, width, block, slot) != value) {
+      mir_state_matrix_set(matrix, width, block, slot, value);
+      changed = true;
+    }
+    slot += 1;
+  }
+  return changed;
+}
+
+fn mir_block_has_predecessor(MirCfg& cfg, i64 candidate, i64 block) -> bool {
+  return (
+  raz_rt_stage1_arena_get(cfg.successor_a, candidate) == block ||
+  raz_rt_stage1_arena_get(cfg.successor_b, candidate) == block
+  );
+}
+
+fn mir_apply_local_move_block(
+MirModule& mir,
+MirCfg& cfg,
+i64 block,
+i64 whole_move_slots,
+MirLocalState&mut state,
+) -> bool {
+  i64 ip = raz_rt_stage1_arena_get(cfg.block_starts, block);
+  i64 end = raz_rt_stage1_arena_get(cfg.block_ends, block);
+
+  while (ip < end) {
+    i64 opcode = raz_rt_stage1_arena_get(mir.opcodes, ip);
+
+    if (opcode == 3 || opcode == 25) {
+      i64 local_slot = raz_rt_stage1_arena_get(mir.op_a, ip);
+
+      if (!mir_local_state_readable(state, local_slot)) {
+        return false;
+      }
+    }
+    if (opcode == 9) {
+      if (!mir_local_state_store(state, raz_rt_stage1_arena_get(mir.op_a, ip))) {
+        return false;
+      }
+    }
+
+    i64 moved_slot = raz_rt_stage1_arena_get(whole_move_slots, ip);
+
+    if (moved_slot >= 0 && !mir_local_state_move(state, moved_slot)) {
+      return false;
+    }
+    ip += 1;
+  }
+  return true;
+}
+
+fn mir_reset_local_state(MirLocalState&mut state) {
+  i64 slot = 0;
+
+  while (slot < state.count) {
+    raz_rt_stage1_arena_set(state.initialized, slot, 0);
+    raz_rt_stage1_arena_set(state.moved, slot, 0);
+    slot += 1;
+  }
+}
+
+fn verify_mir_local_move_dataflow(MirModule& mir) -> bool {
+  MirCfg cfg;
+
+  if (!build_mir_cfg(mir, &mut cfg)) {
+    return false;
+  }
+  if (cfg.block_count == 0) {
+    destroy_mir_cfg(&mut cfg);
+    return true;
+  }
+
+  // Map whole-local moves directly by instruction once. Ownership event
+  // lookup must not rescan the event table in the inner dataflow loop.
+  i64 whole_move_slots = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+
+  if (whole_move_slots == 0) {
+    destroy_mir_cfg(&mut cfg);
+    return false;
+  }
+
+  i64 clear = 0;
+
+  while (clear < mir.instruction_count + 1) {
+    raz_rt_stage1_arena_set(whole_move_slots, clear, -1);
+    clear += 1;
+  }
+
+  i64 ownership_event = 0;
+
+  while (ownership_event < mir.ownership_event_count) {
+    if (
+    raz_rt_stage1_arena_get(mir.ownership_event_kinds, ownership_event) == 1 &&
+    raz_rt_stage1_arena_get(mir.ownership_event_path_counts, ownership_event) == 0
+    ) {
+      i64 instruction = raz_rt_stage1_arena_get(
+      mir.ownership_event_instructions,
+      ownership_event,
+      );
+
+      if (instruction >= 0 && instruction < mir.instruction_count) {
+        raz_rt_stage1_arena_set(
+        whole_move_slots,
+        instruction,
+        raz_rt_stage1_arena_get(mir.ownership_event_slots, ownership_event),
+        );
+      }
+    }
+    ownership_event += 1;
+  }
+
+  bool valid = true;
+  i64 function_index = 0;
+
+  while (function_index < mir.function_count && valid) {
+    i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+    i64 first_block = raz_rt_stage1_arena_get(cfg.function_block_starts, function_index);
+    i64 block_count = raz_rt_stage1_arena_get(cfg.function_block_counts, function_index);
+
+    if (local_count == 0 || block_count == 0) {
+      function_index += 1;
+      continue;
+    }
+
+    MirLocalState state;
+
+    if (!init_mir_local_state(&mut state, local_count)) {
+      valid = false;
+      break;
+    }
+
+    // Most compiler functions are straight-line at MIR block granularity.
+    // Avoid all fixed-point storage and queue setup for that common case.
+    if (block_count == 1) {
+      valid = mir_apply_local_move_block(
+      mir,
+      &cfg,
+      first_block,
+      whole_move_slots,
+      &mut state,
+      );
+      destroy_mir_local_state(&mut state);
+      function_index += 1;
+      continue;
+    }
+
+    i64 matrix_count = block_count * local_count + 1;
+    i64 out_initialized = raz_rt_stage1_arena_create(matrix_count);
+    i64 out_moved = raz_rt_stage1_arena_create(matrix_count);
+    i64 ready = raz_rt_stage1_arena_create(block_count + 1);
+    i64 queue = raz_rt_stage1_arena_create(block_count + 1);
+    i64 in_queue = raz_rt_stage1_arena_create(block_count + 1);
+
+    if (
+    out_initialized == 0 ||
+    out_moved == 0 ||
+    ready == 0 ||
+    queue == 0 ||
+    in_queue == 0
+    ) {
+      if (out_initialized != 0) { raz_rt_stage1_arena_destroy(out_initialized); }
+      if (out_moved != 0) { raz_rt_stage1_arena_destroy(out_moved); }
+      if (ready != 0) { raz_rt_stage1_arena_destroy(ready); }
+      if (queue != 0) { raz_rt_stage1_arena_destroy(queue); }
+      if (in_queue != 0) { raz_rt_stage1_arena_destroy(in_queue); }
+      destroy_mir_local_state(&mut state);
+      valid = false;
+      break;
+    }
+
+    clear = 0;
+    while (clear < matrix_count) {
+      raz_rt_stage1_arena_set(out_initialized, clear, 0);
+      raz_rt_stage1_arena_set(out_moved, clear, 0);
+      clear += 1;
+    }
+    clear = 0;
+    while (clear < block_count + 1) {
+      raz_rt_stage1_arena_set(ready, clear, 0);
+      raz_rt_stage1_arena_set(in_queue, clear, 0);
+      clear += 1;
+    }
+
+    i64 queue_capacity = block_count + 1;
+    i64 queue_head = 0;
+    i64 queue_tail = 0;
+    i64 queue_count = 1;
+    i64 processed = 0;
+    i64 process_limit = block_count * (local_count + 2) * 8 + 64;
+
+    raz_rt_stage1_arena_set(queue, queue_tail, 0);
+    raz_rt_stage1_arena_set(in_queue, 0, 1);
+    queue_tail = (queue_tail + 1) % queue_capacity;
+
+    while (queue_count > 0 && valid && processed < process_limit) {
+      i64 local_block = raz_rt_stage1_arena_get(queue, queue_head);
+      queue_head = (queue_head + 1) % queue_capacity;
+      queue_count -= 1;
+      raz_rt_stage1_arena_set(in_queue, local_block, 0);
+      processed += 1;
+
+      mir_reset_local_state(&mut state);
+      i64 block = first_block + local_block;
+
+      if (local_block != 0) {
+        i64 predecessor_start = raz_rt_stage1_arena_get(cfg.predecessor_starts, block);
+        i64 predecessor_count = raz_rt_stage1_arena_get(cfg.predecessor_counts, block);
+        i64 predecessor_offset = 0;
+        bool have_predecessor = false;
+
+        while (predecessor_offset < predecessor_count) {
+          i64 predecessor = raz_rt_stage1_arena_get(
+          cfg.predecessors,
+          predecessor_start + predecessor_offset,
+          );
+          i64 predecessor_local = predecessor - first_block;
+
+          if (
+          predecessor_local >= 0 &&
+          predecessor_local < block_count &&
+          raz_rt_stage1_arena_get(ready, predecessor_local) != 0
+          ) {
+            i64 slot = 0;
+
+            if (!have_predecessor) {
+              while (slot < local_count) {
+                raz_rt_stage1_arena_set(
+                state.initialized,
+                slot,
+                mir_state_matrix_get(
+                out_initialized,
+                local_count,
+                predecessor_local,
+                slot,
+                ),
+                );
+                raz_rt_stage1_arena_set(
+                state.moved,
+                slot,
+                mir_state_matrix_get(
+                out_moved,
+                local_count,
+                predecessor_local,
+                slot,
+                ),
+                );
+                slot += 1;
+              }
+              have_predecessor = true;
+            } else {
+              while (slot < local_count) {
+                if (
+                mir_state_matrix_get(
+                out_initialized,
+                local_count,
+                predecessor_local,
+                slot,
+                ) == 0
+                ) {
+                  raz_rt_stage1_arena_set(state.initialized, slot, 0);
+                }
+                if (
+                mir_state_matrix_get(
+                out_moved,
+                local_count,
+                predecessor_local,
+                slot,
+                ) != 0
+                ) {
+                  raz_rt_stage1_arena_set(state.moved, slot, 1);
+                }
+                slot += 1;
+              }
+            }
+          }
+          predecessor_offset += 1;
+        }
+        if (!have_predecessor) {
+          continue;
+        }
+      }
+
+      if (!mir_apply_local_move_block(mir, &cfg, block, whole_move_slots, &mut state)) {
+        valid = false;
+        break;
+      }
+
+      bool was_ready = raz_rt_stage1_arena_get(ready, local_block) != 0;
+      bool out_changed = false;
+
+      if (
+      mir_state_matrix_copy_from_local(
+      out_initialized,
+      local_count,
+      local_block,
+      &state,
+      false,
+      )
+      ) {
+        out_changed = true;
+      }
+      if (
+      mir_state_matrix_copy_from_local(
+      out_moved,
+      local_count,
+      local_block,
+      &state,
+      true,
+      )
+      ) {
+        out_changed = true;
+      }
+      if (!was_ready) {
+        raz_rt_stage1_arena_set(ready, local_block, 1);
+        out_changed = true;
+      }
+
+      if (out_changed) {
+        i64 successor = raz_rt_stage1_arena_get(cfg.successor_a, block);
+        i64 successor_slot = 0;
+
+        while (successor_slot < 2) {
+          if (successor_slot == 1) {
+            successor = raz_rt_stage1_arena_get(cfg.successor_b, block);
+          }
+          if (successor >= first_block && successor < first_block + block_count) {
+            i64 successor_local = successor - first_block;
+
+            if (raz_rt_stage1_arena_get(in_queue, successor_local) == 0) {
+              raz_rt_stage1_arena_set(queue, queue_tail, successor_local);
+              queue_tail = (queue_tail + 1) % queue_capacity;
+              queue_count += 1;
+              raz_rt_stage1_arena_set(in_queue, successor_local, 1);
+            }
+          }
+          successor_slot += 1;
+        }
+      }
+    }
+    if (processed >= process_limit && queue_count > 0) {
+      valid = false;
+    }
+
+    raz_rt_stage1_arena_destroy(out_initialized);
+    raz_rt_stage1_arena_destroy(out_moved);
+    raz_rt_stage1_arena_destroy(ready);
+    raz_rt_stage1_arena_destroy(queue);
+    raz_rt_stage1_arena_destroy(in_queue);
+    destroy_mir_local_state(&mut state);
+    function_index += 1;
+  }
+
+  raz_rt_stage1_arena_destroy(whole_move_slots);
+  destroy_mir_cfg(&mut cfg);
+  return valid;
+}

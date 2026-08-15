@@ -1,0 +1,272 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::buffered;
+import core::bytes;
+import core::result;
+import alloc::string;
+import std::io::error;
+import std::io::buffer;
+import std::net;
+import std::net::address;
+/// Higher-level stream failures. I/O errors retain the operation and native
+/// error code while buffering-specific failures remain platform-independent.
+public enum StreamError {
+    Io(IoError),
+    OutOfMemory,
+    UnexpectedEof,
+    LimitExceeded,
+}
+
+/// Owning buffered TCP stream. The contained TcpStream remains responsible for
+/// closing the socket; byte buffers are released automatically.
+public struct BufferedTcpStream {
+    TcpStream stream;
+    ByteBuffer input;
+    ByteBuffer output;
+    i64 buffer_capacity;
+}
+
+public fn from_stream(TcpStream stream, i64 capacity) -> Result<BufferedTcpStream, StreamError> {
+    if (capacity <= 0) {
+        return Result<BufferedTcpStream, StreamError>::Error(StreamError::LimitExceeded);
+    }
+
+    ByteBuffer input = byte_buffer_with_capacity(capacity);
+    ByteBuffer output = byte_buffer_with_capacity(capacity);
+
+    if (byte_buffer_tail(&mut input, capacity) == 0 || byte_buffer_tail(&mut output, capacity) == 0) {
+        return Result<BufferedTcpStream, StreamError>::Error(StreamError::OutOfMemory);
+    }
+    return Result<BufferedTcpStream, StreamError>::Ok(BufferedTcpStream {
+        stream: move stream,
+        input: move input,
+        output: move output,
+        buffer_capacity: capacity,
+    }
+    );
+}
+
+public fn connect(
+    usize host,
+    i64 host_length,
+    i64 port,
+    i64 capacity,
+) -> Result<BufferedTcpStream, StreamError> {
+    Result<TcpStream, IoError> connected = try_tcp_stream_connect(host, host_length, port);
+
+    match connected {
+        Result<TcpStream, IoError>::Ok(stream) => {
+            return from_stream(move stream, capacity);
+        }
+        Result<TcpStream, IoError>::Error(error) => {
+            return Result<BufferedTcpStream, StreamError>::Error(StreamError::Io(error));
+        }
+    }
+}
+
+public fn connect_address(SocketAddress& endpoint, i64 capacity) -> Result<BufferedTcpStream, StreamError> {
+    Ipv4Address address = std::net::address::socket_address_ipv4(endpoint);
+    String host = std::net::address::ipv4_to_string(&address);
+
+    return connect(
+        alloc::string::data_ptr(&host),
+        alloc::string::len(&host),
+        std::net::address::socket_address_port(endpoint),
+        capacity,
+    );
+}
+
+public fn flush(BufferedTcpStream&mut value) -> Result<bool, StreamError> {
+    i64 length = byte_buffer_readable(&value.output);
+
+    if (length == 0) {
+        return Result<bool, StreamError>::Ok(true);
+    }
+    Result<bool, IoError> sent = try_tcp_stream_send_all(
+        &value.stream,
+        byte_buffer_data(&value.output),
+        length,
+    );
+    match sent {
+        Result<bool, IoError>::Ok(_) => {
+            byte_buffer_clear(&mut value.output);
+            return Result<bool, StreamError>::Ok(true);
+        }
+        Result<bool, IoError>::Error(error) => {
+            return Result<bool, StreamError>::Error(StreamError::Io(error));
+        }
+    }
+}
+
+public fn write(BufferedTcpStream&mut value, usize data, i64 size) -> Result<bool, StreamError> {
+    if (size < 0 || (size > 0 && data == 0)) {
+        return Result<bool, StreamError>::Error(StreamError::LimitExceeded);
+    }
+    if (size == 0) {
+        return Result<bool, StreamError>::Ok(true);
+    }
+
+    i64 buffered = byte_buffer_readable(&value.output);
+
+    if (size >= value.buffer_capacity) {
+        flush(value)?;
+
+        Result<bool, IoError> sent = try_tcp_stream_send_all(&value.stream, data, size);
+
+        match sent {
+            Result<bool, IoError>::Ok(_) => {
+                return Result<bool, StreamError>::Ok(true);
+            }
+            Result<bool, IoError>::Error(error) => {
+                return Result<bool, StreamError>::Error(StreamError::Io(error));
+            }
+        }
+    }
+    if (buffered + size > value.buffer_capacity) {
+        flush(value)?;
+    }
+    if (!byte_buffer_append(&mut value.output, data, size)) {
+        return Result<bool, StreamError>::Error(StreamError::OutOfMemory);
+    }
+    return Result<bool, StreamError>::Ok(true);
+}
+
+public fn write_byte(BufferedTcpStream&mut value, u8 byte) -> Result<bool, StreamError> {
+    if (byte_buffer_readable(&value.output) >= value.buffer_capacity) {
+        flush(value)?;
+    }
+    if (!byte_buffer_push(&mut value.output, byte as i64)) {
+        return Result<bool, StreamError>::Error(StreamError::OutOfMemory);
+    }
+    return Result<bool, StreamError>::Ok(true);
+}
+
+fn fill(BufferedTcpStream&mut value) -> Result<i64, StreamError> {
+    if (byte_buffer_readable(&value.input) > 0) {
+        return Result<i64, StreamError>::Ok(byte_buffer_readable(&value.input));
+    }
+    byte_buffer_clear(&mut value.input);
+
+    usize destination = byte_buffer_tail(&mut value.input, value.buffer_capacity);
+
+    if (destination == 0) {
+        return Result<i64, StreamError>::Error(StreamError::OutOfMemory);
+    }
+
+    Result<i64, IoError> received = try_tcp_stream_receive(&value.stream, destination, value.buffer_capacity);
+
+    match received {
+        Result<i64, IoError>::Ok(count) => {
+            if (count > 0) {
+                byte_buffer_commit(&mut value.input, count);
+            }
+            return Result<i64, StreamError>::Ok(count);
+        }
+        Result<i64, IoError>::Error(error) => {
+            return Result<i64, StreamError>::Error(StreamError::Io(error));
+        }
+    }
+}
+
+public fn read(BufferedTcpStream&mut value, usize output, i64 requested) -> Result<i64, StreamError> {
+    if (requested < 0 || (requested > 0 && output == 0)) {
+        return Result<i64, StreamError>::Error(StreamError::LimitExceeded);
+    }
+    if (requested == 0) {
+        return Result<i64, StreamError>::Ok(0);
+    }
+    if (byte_buffer_readable(&value.input) > 0) {
+        return Result<i64, StreamError>::Ok(byte_buffer_read_into(&mut value.input, output, requested));
+    }
+    if (requested >= value.buffer_capacity) {
+        Result<i64, IoError> direct = try_tcp_stream_receive(&value.stream, output, requested);
+
+        match direct {
+            Result<i64, IoError>::Ok(count) => {
+                return Result<i64, StreamError>::Ok(count);
+            }
+            Result<i64, IoError>::Error(error) => {
+                return Result<i64, StreamError>::Error(StreamError::Io(error));
+            }
+        }
+    }
+
+    i64 available = fill(value)?;
+
+    if (available <= 0) {
+        return Result<i64, StreamError>::Ok(available);
+    }
+    return Result<i64, StreamError>::Ok(byte_buffer_read_into(&mut value.input, output, requested));
+}
+
+public fn read_exact(BufferedTcpStream&mut value, usize output, i64 requested) -> Result<bool, StreamError> {
+    if (requested < 0 || (requested > 0 && output == 0)) {
+        return Result<bool, StreamError>::Error(StreamError::LimitExceeded);
+    }
+
+    i64 total = 0;
+
+    while (total < requested) {
+        i64 count = read(value, output + total, requested - total)?;
+
+        if (count <= 0) {
+            return Result<bool, StreamError>::Error(StreamError::UnexpectedEof);
+        }
+        total += count;
+    }
+    return Result<bool, StreamError>::Ok(true);
+}
+
+public fn read_byte(BufferedTcpStream&mut value) -> Result<u8, StreamError> {
+    i64 available = fill(value)?;
+
+    if (available <= 0) {
+        return Result<u8, StreamError>::Error(StreamError::UnexpectedEof);
+    }
+
+    usize address = byte_buffer_view(&value.input).data;
+    u8 output = core_byte_at(address);
+
+    byte_buffer_consume(&mut value.input, 1);
+    return Result<u8, StreamError>::Ok(output);
+}
+
+fn core_byte_at(usize address) -> u8 {
+    return core::bytes::load_u8(address)as u8;
+}
+
+/// Reads through delimiter (delimiter included). `maximum` bounds memory use.
+public fn read_until(
+    BufferedTcpStream&mut value,
+    u8 delimiter,
+    ByteBuffer&mut output,
+    i64 maximum,
+) -> Result<i64, StreamError> {
+    if (maximum < 0) {
+        return Result<i64, StreamError>::Error(StreamError::LimitExceeded);
+    }
+
+    i64 written = 0;
+
+    while (written < maximum) {
+        u8 byte = read_byte(value)?;
+
+        if (!byte_buffer_push(output, byte as i64)) {
+            return Result<i64, StreamError>::Error(StreamError::OutOfMemory);
+        }
+        written += 1;
+        if (byte == delimiter) {
+            return Result<i64, StreamError>::Ok(written);
+        }
+    }
+    return Result<i64, StreamError>::Error(StreamError::LimitExceeded);
+}
+
+/// Flushes pending output, shuts down the socket, then closes it.
+public fn close(BufferedTcpStream&mut value) -> Result<bool, StreamError> {
+    flush(value)?;
+    tcp_stream_shutdown(&value.stream);
+    tcp_stream_close(&mut value.stream);
+    return Result<bool, StreamError>::Ok(true);
+}

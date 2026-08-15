@@ -1,0 +1,965 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::encoding::json;
+import alloc::string;
+import core::bytes;
+import core::result;
+import std::fmt;
+
+public enum JsonError {
+    None,
+    UnexpectedEnd,
+    UnexpectedToken,
+    InvalidString,
+    InvalidEscape,
+    InvalidUnicodeEscape,
+    InvalidNumber,
+    TrailingData,
+    DepthExceeded,
+    OutOfMemory,
+}
+
+public enum JsonTokenKind {
+    LeftBrace,
+    RightBrace,
+    LeftBracket,
+    RightBracket,
+    Colon,
+    Comma,
+    String,
+    Number,
+    True,
+    False,
+    Null,
+    End,
+    Error,
+}
+
+public struct JsonToken {
+    JsonTokenKind kind;
+    BytesView lexeme;
+    i64 offset;
+    JsonError error;
+}
+
+public struct JsonLexer {
+    BytesView source;
+    i64 cursor;
+}
+
+fn byte_at(JsonLexer& lexer, i64 index) -> i64 {
+    return core::bytes::byte_at(lexer.source, index);
+}
+
+fn whitespace(i64 byte) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13;
+}
+
+fn skip_whitespace(JsonLexer&mut lexer) {
+    while (lexer.cursor < lexer.source.length && whitespace(byte_at(lexer, lexer.cursor))) {
+        lexer.cursor += 1;
+    }
+}
+
+fn hex_value(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 70) {
+        return byte - 65 + 10;
+    }
+    if (byte >= 97 && byte <= 102) {
+        return byte - 97 + 10;
+    }
+    return -1;
+}
+
+fn scan_hex4(JsonLexer& lexer, i64 offset) -> i64 {
+    if (offset < 0 || offset + 4 > lexer.source.length) {
+        return -1;
+    }
+
+    i64 value = 0;
+    i64 index = 0;
+
+    while (index < 4) {
+        i64 digit = hex_value(byte_at(lexer, offset + index));
+
+        if (digit < 0) {
+            return -1;
+        }
+        value = value * 16 + digit;
+        index += 1;
+    }
+    return value;
+}
+
+fn scan_string(JsonLexer&mut lexer, i64 start) -> JsonToken {
+    // cursor points at the opening quote. The returned lexeme excludes quotes
+    // and remains borrowed from the original input.
+    lexer.cursor += 1;
+
+    i64 content_start = lexer.cursor;
+
+    while (lexer.cursor < lexer.source.length) {
+        i64 byte = byte_at(lexer, lexer.cursor);
+
+        if (byte == 34) {
+            i64 end = lexer.cursor;
+
+            if (!alloc::string::valid_utf8_bytes(lexer.source.data + content_start, end - content_start)) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::InvalidString,
+                };
+            }
+            lexer.cursor += 1;
+            return JsonToken {
+                kind: JsonTokenKind::String,
+                lexeme: BytesView {
+                    data: lexer.source.data + content_start,
+                    length: end - content_start
+                },
+                offset: start,
+                error: JsonError::None,
+            };
+        }
+        if (byte < 32) {
+            return JsonToken {
+                kind: JsonTokenKind::Error,
+                lexeme: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                offset: start,
+                error: JsonError::InvalidString,
+            };
+        }
+        if (byte == 92) {
+            lexer.cursor += 1;
+            if (lexer.cursor >= lexer.source.length) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::UnexpectedEnd,
+                };
+            }
+
+            i64 escape = byte_at(lexer, lexer.cursor);
+
+            if (
+                escape == 34 ||
+                escape == 92 ||
+                escape == 47 ||
+                escape == 98 ||
+                escape == 102 ||
+                escape == 110 ||
+                escape == 114 ||
+                escape == 116
+            ) {
+                lexer.cursor += 1;
+                continue;
+            }
+            if (escape != 117) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::InvalidEscape,
+                };
+            }
+
+            i64 code = scan_hex4(lexer, lexer.cursor + 1);
+
+            if (code < 0) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::InvalidUnicodeEscape,
+                };
+            }
+            lexer.cursor += 5;
+            if (code >= 55296 && code <= 56319) {
+                if (
+                    lexer.cursor + 6 > lexer.source.length ||
+                    byte_at(lexer, lexer.cursor) != 92 ||
+                    byte_at(lexer, lexer.cursor + 1) != 117
+                ) {
+                    return JsonToken {
+                        kind: JsonTokenKind::Error,
+                        lexeme: BytesView {
+                            data: 0,
+                            length: 0
+                        },
+                        offset: start,
+                        error: JsonError::InvalidUnicodeEscape,
+                    };
+                }
+
+                i64 low = scan_hex4(lexer, lexer.cursor + 2);
+
+                if (low < 56320 || low > 57343) {
+                    return JsonToken {
+                        kind: JsonTokenKind::Error,
+                        lexeme: BytesView {
+                            data: 0,
+                            length: 0
+                        },
+                        offset: start,
+                        error: JsonError::InvalidUnicodeEscape,
+                    };
+                }
+                lexer.cursor += 6;
+            } else if (code >= 56320 && code <= 57343) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::InvalidUnicodeEscape,
+                };
+            }
+            continue;
+        }
+        lexer.cursor += 1;
+    }
+    return JsonToken {
+        kind: JsonTokenKind::Error,
+        lexeme: BytesView {
+            data: 0,
+            length: 0
+        },
+        offset: start,
+        error: JsonError::UnexpectedEnd,
+    };
+}
+
+fn scan_number(JsonLexer&mut lexer, i64 start) -> JsonToken {
+    i64 cursor = lexer.cursor;
+
+    if (byte_at(lexer, cursor) == 45) {
+        cursor += 1;
+        if (cursor >= lexer.source.length) {
+            return JsonToken {
+                kind: JsonTokenKind::Error,
+                lexeme: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                offset: start,
+                error: JsonError::InvalidNumber,
+            };
+        }
+    }
+
+    i64 first = byte_at(lexer, cursor);
+
+    if (first == 48) {
+        cursor += 1;
+        if (cursor < lexer.source.length) {
+            i64 next = byte_at(lexer, cursor);
+
+            if (next >= 48 && next <= 57) {
+                return JsonToken {
+                    kind: JsonTokenKind::Error,
+                    lexeme: BytesView {
+                        data: 0,
+                        length: 0
+                    },
+                    offset: start,
+                    error: JsonError::InvalidNumber,
+                };
+            }
+        }
+    } else if (first >= 49 && first <= 57) {
+        cursor += 1;
+        while (cursor < lexer.source.length) {
+            i64 digit = byte_at(lexer, cursor);
+
+            if (digit < 48 || digit > 57) {
+                break;
+            }
+            cursor += 1;
+        }
+    } else {
+        return JsonToken {
+            kind: JsonTokenKind::Error,
+            lexeme: BytesView {
+                data: 0,
+                length: 0
+            },
+            offset: start,
+            error: JsonError::InvalidNumber,
+        };
+    }
+    if (cursor < lexer.source.length && byte_at(lexer, cursor) == 46) {
+        cursor += 1;
+        if (cursor >= lexer.source.length || byte_at(lexer, cursor) < 48 || byte_at(lexer, cursor) > 57) {
+            return JsonToken {
+                kind: JsonTokenKind::Error,
+                lexeme: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                offset: start,
+                error: JsonError::InvalidNumber,
+            };
+        }
+        while (cursor < lexer.source.length) {
+            i64 digit = byte_at(lexer, cursor);
+
+            if (digit < 48 || digit > 57) {
+                break;
+            }
+            cursor += 1;
+        }
+    }
+    if (cursor < lexer.source.length && (byte_at(lexer, cursor) == 101 || byte_at(lexer, cursor) == 69)) {
+        cursor += 1;
+        if (cursor < lexer.source.length && (byte_at(lexer, cursor) == 43 || byte_at(lexer, cursor) == 45)) {
+            cursor += 1;
+        }
+        if (cursor >= lexer.source.length || byte_at(lexer, cursor) < 48 || byte_at(lexer, cursor) > 57) {
+            return JsonToken {
+                kind: JsonTokenKind::Error,
+                lexeme: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                offset: start,
+                error: JsonError::InvalidNumber,
+            };
+        }
+        while (cursor < lexer.source.length) {
+            i64 digit = byte_at(lexer, cursor);
+
+            if (digit < 48 || digit > 57) {
+                break;
+            }
+            cursor += 1;
+        }
+    }
+    lexer.cursor = cursor;
+    return JsonToken {
+        kind: JsonTokenKind::Number,
+        lexeme: BytesView {
+            data: lexer.source.data + start,
+            length: cursor - start
+        },
+        offset: start,
+        error: JsonError::None,
+    };
+}
+
+fn literal_matches(JsonLexer& lexer, i64 start, i64 a, i64 b, i64 c, i64 d, i64 e, i64 length) -> bool {
+    if (start + length > lexer.source.length) {
+        return false;
+    }
+    if (length > 0 && byte_at(lexer, start) != a) {
+        return false;
+    }
+    if (length > 1 && byte_at(lexer, start + 1) != b) {
+        return false;
+    }
+    if (length > 2 && byte_at(lexer, start + 2) != c) {
+        return false;
+    }
+    if (length > 3 && byte_at(lexer, start + 3) != d) {
+        return false;
+    }
+    if (length > 4 && byte_at(lexer, start + 4) != e) {
+        return false;
+    }
+    return true;
+}
+
+public fn lexer(usize data, i64 length) -> JsonLexer {
+    return JsonLexer {
+        source: BytesView {
+            data: data,
+            length: length
+        },
+        cursor: 0
+    };
+}
+
+public fn next(JsonLexer&mut value) -> JsonToken {
+    skip_whitespace(value);
+    if (value.cursor >= value.source.length) {
+        return JsonToken {
+            kind: JsonTokenKind::End,
+            lexeme: BytesView {
+                data: value.source.data + value.source.length,
+                length: 0
+            },
+            offset: value.cursor,
+            error: JsonError::None,
+        };
+    }
+
+    i64 start = value.cursor;
+    i64 byte = byte_at(value, start);
+
+    if (byte == 123) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::LeftBrace,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 125) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::RightBrace,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 91) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::LeftBracket,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 93) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::RightBracket,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 58) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::Colon,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 44) {
+        value.cursor += 1;
+        return JsonToken {
+            kind: JsonTokenKind::Comma,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 1
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (byte == 34) {
+        return scan_string(value, start);
+    }
+    if (byte == 45 || (byte >= 48 && byte <= 57)) {
+        return scan_number(value, start);
+    }
+    if (literal_matches(value, start, 116, 114, 117, 101, 0, 4)) {
+        value.cursor += 4;
+        return JsonToken {
+            kind: JsonTokenKind::True,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 4
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (literal_matches(value, start, 102, 97, 108, 115, 101, 5)) {
+        value.cursor += 5;
+        return JsonToken {
+            kind: JsonTokenKind::False,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 5
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    if (literal_matches(value, start, 110, 117, 108, 108, 0, 4)) {
+        value.cursor += 4;
+        return JsonToken {
+            kind: JsonTokenKind::Null,
+            lexeme: BytesView {
+                data: value.source.data + start,
+                length: 4
+            },
+            offset: start,
+            error: JsonError::None,
+        };
+    }
+    return JsonToken {
+        kind: JsonTokenKind::Error,
+        lexeme: BytesView {
+            data: 0,
+            length: 0
+        },
+        offset: start,
+        error: JsonError::UnexpectedToken,
+    };
+}
+
+fn skip_value_inner(JsonLexer&mut value, i64 depth, i64 max_depth) -> JsonError {
+    if (depth > max_depth) {
+        return JsonError::DepthExceeded;
+    }
+
+    JsonToken token = next(value);
+
+    if (token.kind == JsonTokenKind::Error) {
+        return token.error;
+    }
+    if (
+        token.kind == JsonTokenKind::String ||
+        token.kind == JsonTokenKind::Number ||
+        token.kind == JsonTokenKind::True ||
+        token.kind == JsonTokenKind::False ||
+        token.kind == JsonTokenKind::Null
+    ) {
+        return JsonError::None;
+    }
+    if (token.kind == JsonTokenKind::LeftBracket) {
+        JsonToken look = next(value);
+
+        if (look.kind == JsonTokenKind::RightBracket) {
+            return JsonError::None;
+        }
+        value.cursor = look.offset;
+        while (true) {
+            JsonError nested = skip_value_inner(value, depth + 1, max_depth);
+
+            if (nested != JsonError::None) {
+                return nested;
+            }
+
+            JsonToken separator = next(value);
+
+            if (separator.kind == JsonTokenKind::RightBracket) {
+                return JsonError::None;
+            }
+            if (separator.kind != JsonTokenKind::Comma) {
+                return JsonError::UnexpectedToken;
+            }
+        }
+    }
+    if (token.kind == JsonTokenKind::LeftBrace) {
+        JsonToken look = next(value);
+
+        if (look.kind == JsonTokenKind::RightBrace) {
+            return JsonError::None;
+        }
+        value.cursor = look.offset;
+        while (true) {
+            JsonToken key = next(value);
+
+            if (key.kind == JsonTokenKind::Error) {
+                return key.error;
+            }
+            if (key.kind != JsonTokenKind::String) {
+                return JsonError::UnexpectedToken;
+            }
+
+            JsonToken colon = next(value);
+
+            if (colon.kind != JsonTokenKind::Colon) {
+                return JsonError::UnexpectedToken;
+            }
+
+            JsonError nested = skip_value_inner(value, depth + 1, max_depth);
+
+            if (nested != JsonError::None) {
+                return nested;
+            }
+
+            JsonToken separator = next(value);
+
+            if (separator.kind == JsonTokenKind::RightBrace) {
+                return JsonError::None;
+            }
+            if (separator.kind != JsonTokenKind::Comma) {
+                return JsonError::UnexpectedToken;
+            }
+        }
+    }
+    return JsonError::UnexpectedToken;
+}
+
+public fn validate(usize data, i64 length, i64 max_depth) -> JsonError {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return JsonError::UnexpectedEnd;
+    }
+    if (max_depth <= 0) {
+        max_depth = 256;
+    }
+
+    JsonLexer value = lexer(data, length);
+    JsonError error = skip_value_inner(&mut value, 0, max_depth);
+
+    if (error != JsonError::None) {
+        return error;
+    }
+
+    JsonToken tail = next(&mut value);
+
+    if (tail.kind != JsonTokenKind::End) {
+        return JsonError::TrailingData;
+    }
+    return JsonError::None;
+}
+
+fn append_hex4(String&mut output, i64 value) -> bool {
+    i64 shift = 12;
+
+    while (shift >= 0) {
+        i64 nibble = (value >> shift) & 15;
+        i64 byte = 48 + nibble;
+
+        if (nibble >= 10) {
+            byte = 97 + nibble - 10;
+        }
+        if (!alloc::string::push_byte(output, byte)) {
+            return false;
+        }
+        shift -= 4;
+    }
+    return true;
+}
+
+public fn append_escaped_string(String&mut output, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+    if (!alloc::string::push_byte(output, 34)) {
+        return false;
+    }
+
+    i64 index = 0;
+    i64 run_start = 0;
+
+    while (index < length) {
+        i64 byte = core::bytes::load_u8(data + index);
+        bool escape = byte == 34 || byte == 92 || byte < 32;
+
+        if (!escape) {
+            index += 1;
+            continue;
+        }
+        if (index > run_start && !alloc::string::append_bytes(output, data + run_start, index - run_start)) {
+            return false;
+        }
+        if (byte == 34 || byte == 92) {
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, byte)) {
+                return false;
+            }
+        } else if (byte == 8) {
+            if (!alloc::string::append_bytes(output, data + index, 0)) {
+                return false;
+            }
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, 98)) {
+                return false;
+            }
+        } else if (byte == 9) {
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, 116)) {
+                return false;
+            }
+        } else if (byte == 10) {
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, 110)) {
+                return false;
+            }
+        } else if (byte == 12) {
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, 102)) {
+                return false;
+            }
+        } else if (byte == 13) {
+            if (!alloc::string::push_byte(output, 92) || !alloc::string::push_byte(output, 114)) {
+                return false;
+            }
+        } else {
+            if (
+                !alloc::string::push_byte(output, 92) ||
+                !alloc::string::push_byte(output, 117) ||
+                !append_hex4(output, byte)
+            ) {
+                return false;
+            }
+        }
+        index += 1;
+        run_start = index;
+    }
+    if (index > run_start && !alloc::string::append_bytes(output, data + run_start, index - run_start)) {
+        return false;
+    }
+    return alloc::string::push_byte(output, 34);
+}
+
+public fn append_null(String&mut output) -> bool {
+    i64 bytes[4] = [110, 117, 108, 108];
+    i64 i = 0;
+
+    while (i < 4) {
+        if (!alloc::string::push_byte(output, bytes[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+public fn append_bool(String&mut output, bool value) -> bool {
+    return std::fmt::append_bool(output, value);
+}
+
+public fn append_i64(String&mut output, i64 value) -> bool {
+    return std::fmt::append_i64(output, value);
+}
+
+public fn append_u64(String&mut output, u64 value) -> bool {
+    return std::fmt::append_u64(output, value);
+}
+
+/// Parses an integer JSON number without allocating. Fractions/exponents are
+/// rejected so callers never receive a silently rounded value.
+public fn token_i64(JsonToken& token, i64&mut output) -> bool {
+    if (token.kind != JsonTokenKind::Number || token.lexeme.length <= 0) {
+        return false;
+    }
+
+    i64 index = 0;
+    bool negative = false;
+
+    if (core::bytes::load_u8(token.lexeme.data) == 45) {
+        negative = true;
+        index = 1;
+    }
+    if (index >= token.lexeme.length) {
+        return false;
+    }
+
+    i64 value = 0;
+
+    while (index < token.lexeme.length) {
+        i64 byte = core::bytes::load_u8(token.lexeme.data + index);
+
+        if (byte < 48 || byte > 57) {
+            return false;
+        }
+
+        i64 digit = byte - 48;
+
+        // Accumulate negatively to make i64::MIN representable without a
+        // positive overflow intermediate.
+
+        i64 final_digit = 7;
+
+        if (negative) {
+            final_digit = 8;
+        }
+        if (value < -922337203685477580 || (value == -922337203685477580 && digit > final_digit)) {
+            return false;
+        }
+        value = value * 10 - digit;
+        index += 1;
+    }
+    if (!negative) {
+        value = -value;
+    }
+    *output = value;
+    return true;
+}
+
+public fn token_bool(JsonToken& token, bool&mut output) -> bool {
+    if (token.kind == JsonTokenKind::True) {
+        *output = true;
+        return true;
+    }
+    if (token.kind == JsonTokenKind::False) {
+        *output = false;
+        return true;
+    }
+    return false;
+}
+
+fn append_utf8_codepoint(String&mut output, i64 codepoint) -> bool {
+    if (codepoint < 0 || codepoint > 1114111 || (codepoint >= 55296 && codepoint <= 57343)) {
+        return false;
+    }
+    if (codepoint <= 127) {
+        return alloc::string::push_byte(output, codepoint);
+    }
+    if (codepoint <= 2047) {
+        return (
+            alloc::string::push_byte(output, 192 | (codepoint >> 6)) &&
+            alloc::string::push_byte(output, 128 | (codepoint & 63))
+        );
+    }
+    if (codepoint <= 65535) {
+        return (
+            alloc::string::push_byte(output, 224 | (codepoint >> 12)) &&
+            alloc::string::push_byte(output, 128 | ((codepoint >> 6) & 63)) &&
+            alloc::string::push_byte(output, 128 | (codepoint & 63))
+        );
+    }
+    return (
+        alloc::string::push_byte(output, 240 | (codepoint >> 18)) &&
+        alloc::string::push_byte(output, 128 | ((codepoint >> 12) & 63)) &&
+        alloc::string::push_byte(output, 128 | ((codepoint >> 6) & 63)) &&
+        alloc::string::push_byte(output, 128 | (codepoint & 63))
+    );
+}
+
+/// Decodes a String token into caller-owned UTF-8 storage. The token lexeme is
+/// the raw bytes between quotes. On error the output is rolled back.
+public fn decode_string(JsonToken& token, String&mut output) -> bool {
+    if (token.kind != JsonTokenKind::String) {
+        return false;
+    }
+
+    i64 original = alloc::string::len(output);
+
+    if (!alloc::string::reserve(output, original + token.lexeme.length)) {
+        return false;
+    }
+
+    i64 index = 0;
+    i64 run = 0;
+
+    while (index < token.lexeme.length) {
+        i64 byte = core::bytes::load_u8(token.lexeme.data + index);
+
+        if (byte != 92) {
+            index += 1;
+            continue;
+        }
+        if (index > run && !alloc::string::append_bytes(output, token.lexeme.data + run, index - run)) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        index += 1;
+        if (index >= token.lexeme.length) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+
+        i64 escape = core::bytes::load_u8(token.lexeme.data + index);
+        i64 decoded = -1;
+
+        if (escape == 34 || escape == 92 || escape == 47) {
+            decoded = escape;
+        } else if (escape == 98) {
+            decoded = 8;
+        } else if (escape == 102) {
+            decoded = 12;
+        } else if (escape == 110) {
+            decoded = 10;
+        } else if (escape == 114) {
+            decoded = 13;
+        } else if (escape == 116) {
+            decoded = 9;
+        }
+        if (decoded >= 0) {
+            if (!alloc::string::push_byte(output, decoded)) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+            index += 1;
+            run = index;
+            continue;
+        }
+        if (escape != 117 || index + 4 >= token.lexeme.length) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        JsonLexer local = JsonLexer {
+            source: token.lexeme,
+            cursor: 0
+        };
+
+        i64 high = scan_hex4(&local, index + 1);
+
+        if (high < 0) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        index += 5;
+
+        i64 codepoint = high;
+
+        if (high >= 55296 && high <= 56319) {
+            if (
+                index + 5 >= token.lexeme.length ||
+                core::bytes::load_u8(token.lexeme.data + index) != 92 ||
+                core::bytes::load_u8(token.lexeme.data + index + 1) != 117
+            ) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+
+            i64 low = scan_hex4(&local, index + 2);
+
+            if (low < 56320 || low > 57343) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+            codepoint = 65536 + (high - 55296) * 1024 + (low - 56320);
+            index += 6;
+        } else if (high >= 56320 && high <= 57343) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        if (!append_utf8_codepoint(output, codepoint)) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        run = index;
+    }
+    if (index > run && !alloc::string::append_bytes(output, token.lexeme.data + run, index - run)) {
+        alloc::string::truncate(output, original);
+        return false;
+    }
+    return true;
+}

@@ -1,0 +1,485 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::channel;
+import std::sync::condition;
+import std::sync::mutex;
+import std::thread::cancellation;
+import std::time;
+// Raz-owned bounded MPMC i64 channel. The native runtime provides only the
+// permanent OS synchronization/allocation primitives; queue policy, capacity
+// growth normalization, FIFO indexing, closure, timeout accounting, and
+// lifecycle ownership live here in Raz.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+
+public struct ReceiveI64 {
+    bool received;
+    i64 value;
+}
+
+public struct ChannelI64 {
+    usize data;
+    i64 capacity;
+    i64 mask;
+    i64 head;
+    i64 tail;
+    i64 count;
+    usize mutex;
+    usize not_empty;
+    usize not_full;
+    bool closed;
+}
+
+fn normalized_capacity(i64 requested) -> i64 {
+    if (requested <= 0) {
+        return 0;
+    }
+
+    i64 capacity = 1;
+
+    while (capacity < requested) {
+        if (capacity > 576460752303423487) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    return capacity;
+}
+
+public fn create(i64 requested_capacity) -> ChannelI64 {
+    i64 capacity = normalized_capacity(requested_capacity);
+
+    if (capacity == 0) {
+        return ChannelI64 {
+            data: 0,
+            capacity: 0,
+            mask: 0,
+            head: 0,
+            tail: 0,
+            count: 0,
+            mutex: 0,
+            not_empty: 0,
+            not_full: 0,
+            closed: true,
+        };
+    }
+
+    usize data = raz_rt_alloc_aligned(capacity * 8, 8);
+
+    if (data == 0) {
+        return ChannelI64 {
+            data: 0,
+            capacity: 0,
+            mask: 0,
+            head: 0,
+            tail: 0,
+            count: 0,
+            mutex: 0,
+            not_empty: 0,
+            not_full: 0,
+            closed: true,
+        };
+    }
+
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize not_empty = std::sync::condition::condition_create();
+    usize not_full = std::sync::condition::condition_create();
+
+    if (mutex == 0 || not_empty == 0 || not_full == 0) {
+        if (not_empty != 0) {
+            std::sync::condition::condition_destroy(not_empty);
+        }
+        if (not_full != 0) {
+            std::sync::condition::condition_destroy(not_full);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        raz_rt_dealloc_aligned(data, 8);
+        return ChannelI64 {
+            data: 0,
+            capacity: 0,
+            mask: 0,
+            head: 0,
+            tail: 0,
+            count: 0,
+            mutex: 0,
+            not_empty: 0,
+            not_full: 0,
+            closed: true,
+        };
+    }
+    return ChannelI64 {
+        data: data,
+        capacity: capacity,
+        mask: capacity - 1,
+        head: 0,
+        tail: 0,
+        count: 0,
+        mutex: mutex,
+        not_empty: not_empty,
+        not_full: not_full,
+        closed: false,
+    };
+}
+
+public fn valid(ChannelI64& channel) -> bool {
+    return channel.data != 0 && channel.capacity > 0 && channel.mutex != 0;
+}
+
+public fn capacity(ChannelI64& channel) -> i64 {
+    return channel.capacity;
+}
+
+public fn len(ChannelI64& channel) -> i64 {
+    if (!valid(channel)) {
+        return 0;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+
+    i64 result = channel.count;
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    return result;
+}
+
+public fn is_empty(ChannelI64& channel) -> bool {
+    return len(channel) == 0;
+}
+
+public fn is_closed(ChannelI64& channel) -> bool {
+    if (!valid(channel)) {
+        return true;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+
+    bool result = channel.closed;
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    return result;
+}
+
+fn push_locked(ChannelI64&mut channel, i64 value) {
+    i64 slot = channel.tail & channel.mask;
+
+    raz_rt_volatile_store_i64(channel.data + slot * 8, value);
+    channel.tail += 1;
+    channel.count += 1;
+}
+
+fn pop_locked(ChannelI64&mut channel) -> i64 {
+    i64 slot = channel.head & channel.mask;
+    i64 value = raz_rt_volatile_load_i64(channel.data + slot * 8);
+
+    channel.head += 1;
+    channel.count -= 1;
+    return value;
+}
+
+public fn try_send(ChannelI64&mut channel, i64 value) -> bool {
+    if (!valid(channel)) {
+        return false;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    if (channel.closed || channel.count >= channel.capacity) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return false;
+    }
+    push_locked(channel, value);
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_empty);
+    return true;
+}
+
+public fn send(ChannelI64&mut channel, i64 value) -> bool {
+    if (!valid(channel)) {
+        return false;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (!channel.closed && channel.count >= channel.capacity) {
+        std::sync::condition::wait_raw(channel.not_full, channel.mutex);
+    }
+    if (channel.closed) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return false;
+    }
+    push_locked(channel, value);
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_empty);
+    return true;
+}
+
+fn deadline_nanos(i64 timeout_millis) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (timeout_millis <= 0) {
+        return now;
+    }
+    if (timeout_millis > 9223372036854) {
+        return 9223372036854775807;
+    }
+
+    i64 delta = timeout_millis * 1000000;
+
+    if (now > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return now + delta;
+}
+
+fn remaining_millis(i64 deadline) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (now >= deadline) {
+        return 0;
+    }
+
+    i64 remaining = deadline - now;
+    i64 millis = remaining / 1000000;
+
+    if (remaining % 1000000 != 0) {
+        millis += 1;
+    }
+    return millis;
+}
+
+public fn send_millis(ChannelI64&mut channel, i64 value, i64 timeout_millis) -> bool {
+    if (!valid(channel) || timeout_millis < 0) {
+        return false;
+    }
+
+    i64 deadline = deadline_nanos(timeout_millis);
+
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (!channel.closed && channel.count >= channel.capacity) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            std::sync::mutex::mutex_unlock_raw(channel.mutex);
+            return false;
+        }
+        std::sync::condition::wait_millis_raw(channel.not_full, channel.mutex, remaining);
+    }
+    if (channel.closed) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return false;
+    }
+    push_locked(channel, value);
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_empty);
+    return true;
+}
+
+public fn try_receive(ChannelI64&mut channel) -> ReceiveI64 {
+    if (!valid(channel)) {
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    if (channel.count <= 0) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+
+    i64 value = pop_locked(channel);
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_full);
+    return ReceiveI64 {
+        received: true,
+        value: value
+    };
+}
+
+public fn receive(ChannelI64&mut channel) -> ReceiveI64 {
+    if (!valid(channel)) {
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (channel.count <= 0 && !channel.closed) {
+        std::sync::condition::wait_raw(channel.not_empty, channel.mutex);
+    }
+    if (channel.count <= 0) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+
+    i64 value = pop_locked(channel);
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_full);
+    return ReceiveI64 {
+        received: true,
+        value: value
+    };
+}
+
+public fn receive_millis(ChannelI64&mut channel, i64 timeout_millis) -> ReceiveI64 {
+    if (!valid(channel) || timeout_millis < 0) {
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+
+    i64 deadline = deadline_nanos(timeout_millis);
+
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (channel.count <= 0 && !channel.closed) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            std::sync::mutex::mutex_unlock_raw(channel.mutex);
+            return ReceiveI64 {
+                received: false,
+                value: 0
+            };
+        }
+        std::sync::condition::wait_millis_raw(channel.not_empty, channel.mutex, remaining);
+    }
+    if (channel.count <= 0) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return ReceiveI64 {
+            received: false,
+            value: 0
+        };
+    }
+
+    i64 value = pop_locked(channel);
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_full);
+    return ReceiveI64 {
+        received: true,
+        value: value
+    };
+}
+
+public fn close(ChannelI64&mut channel) {
+    if (!valid(channel)) {
+        return;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    channel.closed = true;
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_all_raw(channel.not_empty);
+    std::sync::condition::notify_all_raw(channel.not_full);
+}
+
+public fn destroy(ChannelI64&mut channel) {
+    if (channel.mutex != 0) {
+        close(channel);
+        std::sync::condition::condition_destroy(channel.not_empty);
+        std::sync::condition::condition_destroy(channel.not_full);
+        std::sync::mutex::mutex_destroy_raw(channel.mutex);
+        raz_rt_dealloc_aligned(channel.data, 8);
+    }
+    channel.data = 0;
+    channel.capacity = 0;
+    channel.mask = 0;
+    channel.head = 0;
+    channel.tail = 0;
+    channel.count = 0;
+    channel.mutex = 0;
+    channel.not_empty = 0;
+    channel.not_full = 0;
+    channel.closed = true;
+}
+
+public struct CancellableReceiveI64 {
+    i64 status;
+    i64 value;
+}
+
+// status: 1 sent, 0 closed/invalid, -1 cancelled. Cancellation polling is
+// deliberately bounded to 5 ms, matching the previous native policy while
+// keeping the queue state machine entirely in Raz.
+public fn send_cancellable(ChannelI64&mut channel, i64 value, CancellationToken& token) -> i64 {
+    if (!valid(channel) || !std::thread::cancellation::valid(token)) {
+        return 0;
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (!channel.closed && channel.count >= channel.capacity) {
+        if (std::thread::cancellation::requested(token)) {
+            std::sync::mutex::mutex_unlock_raw(channel.mutex);
+            return -1;
+        }
+        std::sync::condition::wait_millis_raw(channel.not_full, channel.mutex, 5);
+    }
+    if (std::thread::cancellation::requested(token)) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return -1;
+    }
+    if (channel.closed) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return 0;
+    }
+    push_locked(channel, value);
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_empty);
+    return 1;
+}
+
+// status: 1 received, 0 closed/invalid, -1 cancelled.
+public fn receive_cancellable(ChannelI64&mut channel, CancellationToken& token) -> CancellableReceiveI64 {
+    if (!valid(channel) || !std::thread::cancellation::valid(token)) {
+        return CancellableReceiveI64 {
+            status: 0,
+            value: 0
+        };
+    }
+    std::sync::mutex::mutex_lock_raw(channel.mutex);
+    while (!channel.closed && channel.count <= 0) {
+        if (std::thread::cancellation::requested(token)) {
+            std::sync::mutex::mutex_unlock_raw(channel.mutex);
+            return CancellableReceiveI64 {
+                status: -1,
+                value: 0
+            };
+        }
+        std::sync::condition::wait_millis_raw(channel.not_empty, channel.mutex, 5);
+    }
+    if (std::thread::cancellation::requested(token)) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return CancellableReceiveI64 {
+            status: -1,
+            value: 0
+        };
+    }
+    if (channel.count <= 0) {
+        std::sync::mutex::mutex_unlock_raw(channel.mutex);
+        return CancellableReceiveI64 {
+            status: 0,
+            value: 0
+        };
+    }
+
+    i64 value = pop_locked(channel);
+
+    std::sync::mutex::mutex_unlock_raw(channel.mutex);
+    std::sync::condition::notify_one_raw(channel.not_full);
+    return CancellableReceiveI64 {
+        status: 1,
+        value: value
+    };
+}
+
+impl Drop for ChannelI64 {
+    fn drop(ChannelI64&mut self) {
+        destroy(self);
+    }
+}

@@ -1,0 +1,700 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::string;
+// Owned UTF-8 storage. String growth follows the same geometric policy as
+// RawVec so appending small chunks does not repeatedly call realloc.
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_realloc(usize pointer, i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_move(usize destination, usize source, i64 size);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
+extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
+extern fn raz_rt_bytes_equal(usize left, usize right, i64 size) -> i64;
+extern fn raz_rt_bytes_find(usize data, i64 size, i64 value) -> i64;
+extern fn raz_rt_bytes_rfind(usize data, i64 size, i64 value) -> i64;
+
+public struct String {
+    usize data;
+    i64 length;
+    i64 capacity;
+}
+
+fn allocation_size(i64 capacity) -> i64 {
+    if (capacity < 0 || capacity == 9223372036854775807) {
+        return -1;
+    }
+    return capacity + 1;
+}
+
+fn growth_capacity(i64 current, i64 required) -> i64 {
+    if (required <= current) {
+        return current;
+    }
+
+    i64 next = current;
+
+    if (next < 16) {
+        next = 16;
+    }
+    while (next < required) {
+        if (next > 2305843009213693951) {
+            return required;
+        }
+        next *= 2;
+    }
+    return next;
+}
+
+public fn with_capacity(i64 capacity) -> String {
+    if (capacity < 0) {
+        return String {
+            data: 0,
+            length: 0,
+            capacity: 0
+        };
+    }
+
+    i64 bytes = allocation_size(capacity);
+
+    if (bytes < 0) {
+        return String {
+            data: 0,
+            length: 0,
+            capacity: 0
+        };
+    }
+
+    usize data = raz_rt_alloc(bytes);
+
+    if (data != 0) {
+        raz_rt_fill(data, 0, 1);
+    }
+    return String {
+        data: data,
+        length: 0,
+        capacity: capacity
+    };
+}
+
+public fn is_empty(String& value) -> bool {
+    return value.length == 0;
+}
+
+public fn len(String& value) -> i64 {
+    return value.length;
+}
+
+public fn capacity(String& value) -> i64 {
+    return value.capacity;
+}
+
+public fn reserve_exact(String&mut value, i64 capacity) -> bool {
+    if (capacity <= value.capacity) {
+        return true;
+    }
+    if (capacity < 0) {
+        return false;
+    }
+
+    i64 bytes = allocation_size(capacity);
+
+    if (bytes < 0) {
+        return false;
+    }
+
+    usize replacement = raz_rt_realloc(value.data, bytes);
+
+    if (replacement == 0) {
+        return false;
+    }
+    value.data = replacement;
+    value.capacity = capacity;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+public fn reserve(String&mut value, i64 capacity) -> bool {
+    return reserve_exact(value, growth_capacity(value.capacity, capacity));
+}
+
+public fn shrink_to_fit(String&mut value) -> bool {
+    if (value.length == value.capacity) {
+        return true;
+    }
+
+    i64 bytes = allocation_size(value.length);
+
+    if (bytes < 0) {
+        return false;
+    }
+
+    usize replacement = raz_rt_realloc(value.data, bytes);
+
+    if (replacement == 0 && bytes > 0) {
+        return false;
+    }
+    value.data = replacement;
+    value.capacity = value.length;
+    if (value.data != 0) {
+        raz_rt_fill(value.data + value.length, 0, 1);
+    }
+    return true;
+}
+
+public fn append_bytes(String&mut value, usize source, i64 length) -> bool {
+    if (length <= 0) {
+        return length == 0;
+    }
+    if (source == 0 || value.length > 9223372036854775807 - length) {
+        return false;
+    }
+    // Preserve aliased source bytes across growth. This makes appending a
+    // substring of the same String well-defined even when reserve reallocates.
+
+    usize stable_source = source;
+    usize temporary = 0;
+
+    if (value.data != 0 && source >= value.data && source < value.data + value.length) {
+        temporary = raz_rt_alloc(length);
+        if (temporary == 0) {
+            return false;
+        }
+        raz_rt_copy(temporary, source, length);
+        stable_source = temporary;
+    }
+
+    i64 required = value.length + length;
+
+    if (!reserve(value, required)) {
+        raz_rt_dealloc(temporary);
+        return false;
+    }
+    raz_rt_copy(value.data + value.length, stable_source, length);
+    raz_rt_dealloc(temporary);
+    value.length = required;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+public fn clear(String&mut value) {
+    value.length = 0;
+    if (value.data != 0) {
+        raz_rt_fill(value.data, 0, 1);
+    }
+}
+
+public fn destroy(String&mut value) {
+    raz_rt_dealloc(value.data);
+    value.data = 0;
+    value.length = 0;
+    value.capacity = 0;
+}
+
+public fn from_bytes(usize source, i64 length) -> String {
+    if (length < 0 || (length > 0 && source == 0)) {
+        return String {
+            data: 0,
+            length: 0,
+            capacity: 0
+        };
+    }
+
+    String value = with_capacity(length);
+
+    if (length > 0 && value.data == 0) {
+        return value;
+    }
+    if (!append_bytes(&mut value, source, length)) {
+        destroy(&mut value);
+    }
+    return value;
+}
+
+public fn clone_string(String& value) -> String {
+    return from_bytes(value.data, value.length);
+}
+
+public fn data_ptr(String& value) -> usize {
+    return value.data;
+}
+
+public fn push_byte(String&mut value, i64 byte) -> bool {
+    if (value.length == 9223372036854775807) {
+        return false;
+    }
+
+    i64 required = value.length + 1;
+
+    if (!reserve(value, required)) {
+        return false;
+    }
+    if (raz_rt_store_u8(value.data + value.length, byte) != 1) {
+        return false;
+    }
+    value.length = required;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+public fn truncate(String&mut value, i64 length) -> bool {
+    if (length < 0 || length > value.length) {
+        return false;
+    }
+    value.length = length;
+    if (value.data != 0) {
+        raz_rt_fill(value.data + value.length, 0, 1);
+    }
+    return true;
+}
+
+public fn equals_bytes(String& value, usize data, i64 length) -> bool {
+    if (length != value.length || length < 0) {
+        return false;
+    }
+    return raz_rt_bytes_equal(value.data, data, length) == 1;
+}
+
+public fn starts_with_bytes(String& value, usize data, i64 length) -> bool {
+    if (length < 0 || length > value.length) {
+        return false;
+    }
+    return raz_rt_bytes_equal(value.data, data, length) == 1;
+}
+
+public fn ends_with_bytes(String& value, usize data, i64 length) -> bool {
+    if (length < 0 || length > value.length) {
+        return false;
+    }
+    return raz_rt_bytes_equal(value.data + value.length - length, data, length) == 1;
+}
+
+public fn byte_at(String& value, i64 index) -> i64 {
+    if (index < 0 || index >= value.length) {
+        return -1;
+    }
+    return raz_rt_load_u8(value.data + index);
+}
+
+public fn find_byte(String& value, i64 byte) -> i64 {
+    return raz_rt_bytes_find(value.data, value.length, byte);
+}
+
+public fn append_string(String&mut value, String& other) -> bool {
+    return append_bytes(value, other.data, other.length);
+}
+
+public fn equals(String& value, String& other) -> bool {
+    return equals_bytes(value, other.data, other.length);
+}
+
+public fn contains_bytes(String& value, usize data, i64 length) -> bool {
+    return find_bytes(value, data, length) >= 0;
+}
+
+public fn find_bytes(String& value, usize data, i64 length) -> i64 {
+    if (length < 0 || length > value.length || (length > 0 && data == 0)) {
+        return -1;
+    }
+    if (length == 0) {
+        return 0;
+    }
+    if (length == 1) {
+        return raz_rt_bytes_find(value.data, value.length, raz_rt_load_u8(data));
+    }
+
+    i64 first = raz_rt_load_u8(data);
+    i64 base = 0;
+    i64 last = value.length - length;
+
+    while (base <= last) {
+        i64 relative = raz_rt_bytes_find(value.data + base, last - base + 1, first);
+
+        if (relative < 0) {
+            return -1;
+        }
+
+        i64 candidate = base + relative;
+
+        if (raz_rt_bytes_equal(value.data + candidate, data, length) == 1) {
+            return candidate;
+        }
+        base = candidate + 1;
+    }
+    return -1;
+}
+
+public fn starts_with(String& value, String& prefix) -> bool {
+    return starts_with_bytes(value, prefix.data, prefix.length);
+}
+
+public fn ends_with(String& value, String& suffix) -> bool {
+    return ends_with_bytes(value, suffix.data, suffix.length);
+}
+
+public fn contains(String& value, String& needle) -> bool {
+    return contains_bytes(value, needle.data, needle.length);
+}
+
+public fn find(String& value, String& needle) -> i64 {
+    return find_bytes(value, needle.data, needle.length);
+}
+
+public fn rfind_byte(String& value, i64 byte) -> i64 {
+    return raz_rt_bytes_rfind(value.data, value.length, byte);
+}
+
+public fn rfind_bytes(String& value, usize data, i64 length) -> i64 {
+    if (length < 0 || length > value.length || (length > 0 && data == 0)) {
+        return -1;
+    }
+    if (length == 0) {
+        return value.length;
+    }
+    if (length == 1) {
+        return rfind_byte(value, raz_rt_load_u8(data));
+    }
+
+    i64 candidate = value.length - length;
+
+    while (candidate >= 0) {
+        if (raz_rt_bytes_equal(value.data + candidate, data, length) == 1) {
+            return candidate;
+        }
+        candidate -= 1;
+    }
+    return -1;
+}
+
+public fn rfind(String& value, String& needle) -> i64 {
+    return rfind_bytes(value, needle.data, needle.length);
+}
+
+public fn push_string(String&mut value, String& other) -> bool {
+    return append_string(value, other);
+}
+
+public fn insert_string(String&mut value, i64 index, String& other) -> bool {
+    return insert_bytes(value, index, other.data, other.length);
+}
+
+/// Replaces a byte range in-place. Replacement bytes may alias this String;
+/// aliased input is stabilized before reserve/move operations can invalidate it.
+public fn replace_range_bytes(
+    String&mut value,
+    i64 index,
+    i64 length,
+    usize replacement,
+    i64 replacement_length,
+) -> bool {
+    if (
+        index < 0 ||
+        length < 0 ||
+        replacement_length < 0 ||
+        index > value.length ||
+        length > value.length - index
+    ) {
+        return false;
+    }
+    if (replacement_length > 0 && replacement == 0) {
+        return false;
+    }
+
+    i64 retained = value.length - length;
+
+    if (retained > 9223372036854775807 - replacement_length) {
+        return false;
+    }
+
+    usize stable_replacement = replacement;
+    usize temporary = 0;
+
+    if (
+        replacement_length > 0 &&
+        value.data != 0 &&
+        replacement >= value.data &&
+        replacement < value.data + value.length
+    ) {
+        temporary = raz_rt_alloc(replacement_length);
+        if (temporary == 0) {
+            return false;
+        }
+        raz_rt_copy(temporary, replacement, replacement_length);
+        stable_replacement = temporary;
+    }
+
+    i64 old_length = value.length;
+    i64 new_length = retained + replacement_length;
+
+    if (!reserve(value, new_length)) {
+        raz_rt_dealloc(temporary);
+        return false;
+    }
+
+    i64 tail = old_length - index - length;
+
+    if (tail > 0 && replacement_length != length) {
+        raz_rt_move(value.data + index + replacement_length, value.data + index + length, tail);
+    }
+    if (replacement_length > 0) {
+        raz_rt_copy(value.data + index, stable_replacement, replacement_length);
+    }
+    raz_rt_dealloc(temporary);
+    value.length = new_length;
+    if (value.data != 0) {
+        raz_rt_fill(value.data + value.length, 0, 1);
+    }
+    return true;
+}
+
+public fn replace_range(String&mut value, i64 index, i64 length, String& replacement) -> bool {
+    return replace_range_bytes(value, index, length, replacement.data, replacement.length);
+}
+
+public fn resize(String&mut value, i64 length, i64 fill_byte) -> bool {
+    if (length < 0) {
+        return false;
+    }
+    if (length <= value.length) {
+        return truncate(value, length);
+    }
+    if (!reserve(value, length)) {
+        return false;
+    }
+    raz_rt_fill(value.data + value.length, fill_byte & 255, length - value.length);
+    value.length = length;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+/// Marks already-initialized bytes in the backing allocation as part of the
+/// String. Callers must have initialized every byte in [0, length).
+public unsafe fn set_len_initialized(String&mut value, i64 length) -> bool {
+    if (length < 0 || length > value.capacity) {
+        return false;
+    }
+    value.length = length;
+    if (value.data != 0) {
+        raz_rt_fill(value.data + value.length, 0, 1);
+    }
+    return true;
+}
+
+public fn pop_byte(String&mut value, i64&mut output) -> bool {
+    if (value.length <= 0) {
+        return false;
+    }
+    value.length -= 1;
+    *output = raz_rt_load_u8(value.data + value.length);
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+public fn insert_bytes(String&mut value, i64 index, usize source, i64 length) -> bool {
+    if (index < 0 || index > value.length || length < 0 || (length > 0 && source == 0)) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+    if (value.length > 9223372036854775807 - length) {
+        return false;
+    }
+
+    usize stable_source = source;
+    usize temporary = 0;
+
+    if (value.data != 0 && source >= value.data && source < value.data + value.length) {
+        temporary = raz_rt_alloc(length);
+        if (temporary == 0) {
+            return false;
+        }
+        raz_rt_copy(temporary, source, length);
+        stable_source = temporary;
+    }
+
+    i64 old_length = value.length;
+
+    if (!reserve(value, old_length + length)) {
+        raz_rt_dealloc(temporary);
+        return false;
+    }
+    if (index < old_length) {
+        raz_rt_move(value.data + index + length, value.data + index, old_length - index);
+    }
+    raz_rt_copy(value.data + index, stable_source, length);
+    raz_rt_dealloc(temporary);
+    value.length = old_length + length;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+public fn remove_range(String&mut value, i64 index, i64 length) -> bool {
+    if (index < 0 || length < 0 || index > value.length || length > value.length - index) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+
+    i64 tail = value.length - index - length;
+
+    if (tail > 0) {
+        raz_rt_move(value.data + index, value.data + index + length, tail);
+    }
+    value.length -= length;
+    raz_rt_fill(value.data + value.length, 0, 1);
+    return true;
+}
+
+/// Strict UTF-8 validation for external byte buffers.
+public fn valid_utf8_bytes(usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < length) {
+        i64 first = raz_rt_load_u8(data + index);
+
+        if (first < 128) {
+            index += 1;
+            continue;
+        }
+        if (first >= 194 && first <= 223) {
+            if (index + 1 >= length) {
+                return false;
+            }
+
+            i64 second = raz_rt_load_u8(data + index + 1);
+
+            if (second < 128 || second > 191) {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if (first >= 224 && first <= 239) {
+            if (index + 2 >= length) {
+                return false;
+            }
+
+            i64 second = raz_rt_load_u8(data + index + 1);
+            i64 third = raz_rt_load_u8(data + index + 2);
+
+            if (third < 128 || third > 191) {
+                return false;
+            }
+            if (first == 224) {
+                if (second < 160 || second > 191) {
+                    return false;
+                }
+            } else if (first == 237) {
+                if (second < 128 || second > 159) {
+                    return false;
+                }
+            } else if (second < 128 || second > 191) {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if (first >= 240 && first <= 244) {
+            if (index + 3 >= length) {
+                return false;
+            }
+
+            i64 second = raz_rt_load_u8(data + index + 1);
+            i64 third = raz_rt_load_u8(data + index + 2);
+            i64 fourth = raz_rt_load_u8(data + index + 3);
+
+            if (third < 128 || third > 191 || fourth < 128 || fourth > 191) {
+                return false;
+            }
+            if (first == 240) {
+                if (second < 144 || second > 191) {
+                    return false;
+                }
+            } else if (first == 244) {
+                if (second < 128 || second > 143) {
+                    return false;
+                }
+            } else if (second < 128 || second > 191) {
+                return false;
+            }
+            index += 4;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Returns the number of Unicode scalar values in a validated UTF-8 string,
+/// or -1 if the byte sequence is malformed. No allocation is performed.
+public fn utf8_char_count(String& value) -> i64 {
+    i64 index = 0;
+    i64 count = 0;
+
+    while (index < value.length) {
+        i64 first = raz_rt_load_u8(value.data + index);
+        i64 width = 0;
+
+        if (first < 128) {
+            width = 1;
+        } else if (first >= 194 && first <= 223) {
+            width = 2;
+        } else if (first >= 224 && first <= 239) {
+            width = 3;
+        } else if (first >= 240 && first <= 244) {
+            width = 4;
+        } else {
+            return -1;
+        }
+        if (index + width > value.length || !valid_utf8_bytes(value.data + index, width)) {
+            return -1;
+        }
+        index += width;
+        count += 1;
+    }
+    return count;
+}
+
+/// Returns the byte width of the UTF-8 scalar beginning at index, or -1.
+public fn utf8_char_width_at(String& value, i64 index) -> i64 {
+    if (index < 0 || index >= value.length) {
+        return -1;
+    }
+
+    i64 first = raz_rt_load_u8(value.data + index);
+    i64 width = 0;
+
+    if (first < 128) {
+        width = 1;
+    } else if (first >= 194 && first <= 223) {
+        width = 2;
+    } else if (first >= 224 && first <= 239) {
+        width = 3;
+    } else if (first >= 240 && first <= 244) {
+        width = 4;
+    } else {
+        return -1;
+    }
+    if (index + width > value.length || !valid_utf8_bytes(value.data + index, width)) {
+        return -1;
+    }
+    return width;
+}
+
+public fn is_valid_utf8(String& value) -> bool {
+    return valid_utf8_bytes(value.data, value.length);
+}
+
+impl Drop for String {
+    fn drop(String&mut self) {
+        destroy(self);
+    }
+}

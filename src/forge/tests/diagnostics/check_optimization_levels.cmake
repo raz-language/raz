@@ -1,0 +1,32 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+if(NOT DEFINED FORGE_OPT OR NOT DEFINED FORGE OR NOT DEFINED INPUT OR NOT DEFINED OUTPUT_DIR)
+  message(FATAL_ERROR "FORGE_OPT, FORGE, INPUT, and OUTPUT_DIR are required")
+endif()
+file(MAKE_DIRECTORY "${OUTPUT_DIR}")
+foreach(level O0 O1 O2 O3 Os Oz)
+  set(first "${OUTPUT_DIR}/${level}-a.fir")
+  set(second "${OUTPUT_DIR}/${level}-b.fir")
+  execute_process(COMMAND "${FORGE_OPT}" "${INPUT}" "-${level}" --stats --pass-timing
+                  OUTPUT_FILE "${first}" ERROR_VARIABLE first_stats RESULT_VARIABLE first_result)
+  if(NOT first_result EQUAL 0)
+    message(FATAL_ERROR "forge-opt -${level} failed: ${first_stats}")
+  endif()
+  execute_process(COMMAND "${FORGE_OPT}" "${INPUT}" "-${level}"
+                  OUTPUT_FILE "${second}" ERROR_VARIABLE second_error RESULT_VARIABLE second_result)
+  if(NOT second_result EQUAL 0)
+    message(FATAL_ERROR "second forge-opt -${level} failed: ${second_error}")
+  endif()
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${first}" "${second}" RESULT_VARIABLE compare_result)
+  if(NOT compare_result EQUAL 0)
+    message(FATAL_ERROR "-${level} output is not deterministic")
+  endif()
+  execute_process(COMMAND "${FORGE}" verify "${first}" OUTPUT_QUIET ERROR_VARIABLE verify_error RESULT_VARIABLE verify_result)
+  if(NOT verify_result EQUAL 0)
+    message(FATAL_ERROR "-${level} output failed verification: ${verify_error}")
+  endif()
+  if(NOT first_stats MATCHES "pipeline[ ]+-${level}")
+    message(FATAL_ERROR "-${level} statistics did not identify the selected pipeline: ${first_stats}")
+  endif()
+endforeach()

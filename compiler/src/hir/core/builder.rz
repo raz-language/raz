@@ -1,0 +1,597 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_hir_core_builder;
+public import raz_compiler_hir_core_model;
+// Type resolution, signatures, generics, and the first semantic passes over HIR.
+// Most errors here are about what a program means rather than how it was written.
+fn hir_fail(HirBuilder&mut builder, DiagnosticCode code) {
+    if (builder.last_error.code == DiagnosticCode::None) {
+        set_diagnostic(&mut builder.last_error, code, builder.current.offset);
+    }
+}
+
+fn hir_advance(HirBuilder&mut builder) {
+    next_token(&mut builder.scan, &mut builder.current);
+}
+
+fn init_hir_builder(HirBuilder&mut out, Source input, HirModule&mut module) {
+    init_lexer(&mut out.scan, input);
+    clear_diagnostic(&mut out.last_error);
+    out.module = module;
+    out.current_function = -1;
+    out.current_block = -1;
+    out.loop_depth = 0;
+    out.parameter_moved = raz_rt_stage1_arena_create(32768);
+    out.local_moved = raz_rt_stage1_arena_create(32768);
+    out.local_borrow_kinds = raz_rt_stage1_arena_create(32768);
+    out.local_borrow_source_kinds = raz_rt_stage1_arena_create(32768);
+    out.local_borrow_source_indices = raz_rt_stage1_arena_create(32768);
+    out.local_borrow_source_paths = raz_rt_stage1_arena_create(32768);
+    out.local_reference_last_uses = raz_rt_stage1_arena_create(32768);
+    out.moved_path_count = 0;
+    out.moved_path_root_kinds = raz_rt_stage1_arena_create(16384);
+    out.moved_path_root_indices = raz_rt_stage1_arena_create(16384);
+    out.moved_paths = raz_rt_stage1_arena_create(16384);
+    out.allow_moved_name = 0;
+    out.comptime_mode = 0;
+    out.generic_active = 0;
+    out.generic_template_index = -1;
+    out.generic_type_name_offset = 0;
+    out.generic_type_name_length = 0;
+    out.generic_type_structure = -1;
+    out.generic_type_kind = 0;
+    out.generic_substitution_count = 0;
+    out.generic_substitution_name_offsets = raz_rt_stage1_arena_create(32);
+    out.generic_substitution_name_lengths = raz_rt_stage1_arena_create(32);
+    out.generic_substitution_type_structs = raz_rt_stage1_arena_create(32);
+    out.generic_substitution_types = raz_rt_stage1_arena_create(32);
+    out.generic_signature_only = 0;
+    out.generic_reparse_function_index = -1;
+    out.allow_function_name_reuse = 0;
+    out.unsafe_depth = 0;
+    out.last_type_lifetime = -1;
+    out.last_type_function_signature = -1;
+    out.last_type_trait_object = -1;
+    out.pending_abi_kind = 0;
+    out.pending_link_name_offset = 0;
+    out.pending_link_name_length = 0;
+    out.pending_target_feature_offset = 0;
+    out.pending_target_feature_length = 0;
+    out.pending_effect_flags = 0;
+    out.pending_derive_copy = 0;
+    out.pending_derive_clone = 0;
+    out.pending_derive_trait_count = 0;
+    out.pending_derive_traits = raz_rt_stage1_arena_create(32);
+    out.namespace_segment_count = 0;
+    out.namespace_segment_offsets = raz_rt_stage1_arena_create(4096);
+    out.namespace_segment_hashes = raz_rt_stage1_arena_create(4096);
+    out.current_namespace_hash = 0;
+    out.package_segment_count = 0;
+    out.package_segment_offsets = raz_rt_stage1_arena_create(4096);
+    out.package_segment_hashes = raz_rt_stage1_arena_create(4096);
+    out.current_package_hash = 0;
+    out.module_segment_count = 0;
+    out.module_segment_offsets = raz_rt_stage1_arena_create(4096);
+    out.module_segment_ids = raz_rt_stage1_arena_create(4096);
+    out.current_module_id = 0;
+    out.package_dependency_count = 0;
+    out.package_dependency_owner_packages = raz_rt_stage1_arena_create(4096);
+    out.package_dependency_aliases = raz_rt_stage1_arena_create(4096);
+    out.package_dependency_targets = raz_rt_stage1_arena_create(4096);
+    out.declaration_visibility_count = 0;
+    out.declaration_visibility_offsets = raz_rt_stage1_arena_create(16384);
+    out.declaration_visibility_values = raz_rt_stage1_arena_create(16384);
+    out.namespace_import_count = 0;
+    out.namespace_import_owner_packages = raz_rt_stage1_arena_create(4096);
+    out.namespace_import_owners = raz_rt_stage1_arena_create(4096);
+    out.namespace_import_target_packages = raz_rt_stage1_arena_create(4096);
+    out.namespace_import_targets = raz_rt_stage1_arena_create(4096);
+    out.namespace_import_aliases = raz_rt_stage1_arena_create(4096);
+    out.namespace_import_flags = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_owner_packages = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_owners = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_target_packages = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_targets = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_epochs = raz_rt_stage1_arena_create(4096);
+    out.namespace_reexport_cache_results = raz_rt_stage1_arena_create(4096);
+
+    i64 reexport_cache_slot = 0;
+
+    while (reexport_cache_slot < 4096) {
+        raz_rt_stage1_arena_set(out.namespace_reexport_cache_epochs, reexport_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.namespace_reexport_cache_results, reexport_cache_slot, 0);
+        reexport_cache_slot += 1;
+    }
+    out.namespace_scope_count = 0;
+    out.namespace_scope_hashes = raz_rt_stage1_arena_create(256);
+    out.namespace_lookup_target_hash = -1;
+    out.namespace_lookup_target_package_hash = -1;
+    out.symbol_cache_kinds = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_packages = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_namespaces = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_modules = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_name_offsets = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_name_lengths = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_epochs = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_results = raz_rt_stage1_arena_create(2048);
+    out.symbol_cache_hits = 0;
+    out.symbol_cache_misses = 0;
+    out.lexical_cache_functions = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_blocks = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_name_offsets = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_name_lengths = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_parameter_epochs = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_local_epochs = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_kinds = raz_rt_stage1_arena_create(1024);
+    out.lexical_cache_slots = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_functions = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_blocks = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_before_offsets = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_name_offsets = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_name_lengths = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_parameter_epochs = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_local_epochs = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_kinds = raz_rt_stage1_arena_create(1024);
+    out.function_name_cache_indices = raz_rt_stage1_arena_create(1024);
+    out.slot_local_cache_functions = raz_rt_stage1_arena_create(1024);
+    out.slot_local_cache_slots = raz_rt_stage1_arena_create(1024);
+    out.slot_local_cache_local_epochs = raz_rt_stage1_arena_create(1024);
+    out.slot_local_cache_results = raz_rt_stage1_arena_create(1024);
+    out.field_name_cache_structures = raz_rt_stage1_arena_create(1024);
+    out.field_name_cache_name_offsets = raz_rt_stage1_arena_create(1024);
+    out.field_name_cache_name_lengths = raz_rt_stage1_arena_create(1024);
+    out.field_name_cache_field_epochs = raz_rt_stage1_arena_create(1024);
+    out.field_name_cache_results = raz_rt_stage1_arena_create(1024);
+    out.scope_cache_hits = 0;
+    out.scope_cache_misses = 0;
+
+    i64 scope_cache_slot = 0;
+
+    while (scope_cache_slot < 1024) {
+        raz_rt_stage1_arena_set(out.lexical_cache_functions, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.lexical_cache_kinds, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.function_name_cache_functions, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.function_name_cache_kinds, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.slot_local_cache_functions, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.slot_local_cache_results, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.field_name_cache_structures, scope_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.field_name_cache_results, scope_cache_slot, -2);
+        scope_cache_slot += 1;
+    }
+
+    i64 symbol_cache_slot = 0;
+
+    while (symbol_cache_slot < 2048) {
+        raz_rt_stage1_arena_set(out.symbol_cache_kinds, symbol_cache_slot, -1);
+        raz_rt_stage1_arena_set(out.symbol_cache_results, symbol_cache_slot, -1);
+        symbol_cache_slot += 1;
+    }
+    out.generic_cache_hits = 0;
+    out.generic_cache_misses = 0;
+    out.query_cache_kinds = raz_rt_stage1_arena_create(1024);
+    out.query_cache_a = raz_rt_stage1_arena_create(1024);
+    out.query_cache_b = raz_rt_stage1_arena_create(1024);
+    out.query_cache_c = raz_rt_stage1_arena_create(1024);
+    out.query_cache_epoch0 = raz_rt_stage1_arena_create(1024);
+    out.query_cache_epoch1 = raz_rt_stage1_arena_create(1024);
+    out.query_cache_result0 = raz_rt_stage1_arena_create(1024);
+    out.query_cache_result1 = raz_rt_stage1_arena_create(1024);
+    out.query_cache_states = raz_rt_stage1_arena_create(1024);
+    out.query_cache_revisions = raz_rt_stage1_arena_create(1024);
+    out.query_revision = 1;
+    out.query_input_traits_fingerprint = -1;
+    out.query_input_methods_fingerprint = -1;
+    out.query_input_aggregates_fingerprint = -1;
+    out.query_input_generics_fingerprint = -1;
+    out.query_input_functions_fingerprint = -1;
+    out.query_input_associated_fingerprint = -1;
+    out.query_invalidation_kinds = raz_rt_stage1_arena_create(4096);
+    out.query_invalidation_a = raz_rt_stage1_arena_create(4096);
+    out.query_invalidation_b = raz_rt_stage1_arena_create(4096);
+    out.query_invalidation_c = raz_rt_stage1_arena_create(4096);
+    out.query_invalidation_count = 0;
+    out.query_invalidation_total = 0;
+    out.query_active_kinds = raz_rt_stage1_arena_create(128);
+    out.query_active_a = raz_rt_stage1_arena_create(128);
+    out.query_active_b = raz_rt_stage1_arena_create(128);
+    out.query_active_c = raz_rt_stage1_arena_create(128);
+    out.query_active_count = 0;
+    out.query_dependency_count = 0;
+    out.query_dependency_parent_kinds = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_parent_a = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_parent_b = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_parent_c = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_child_kinds = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_child_a = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_child_b = raz_rt_stage1_arena_create(16384);
+    out.query_dependency_child_c = raz_rt_stage1_arena_create(16384);
+    out.query_cache_hits = 0;
+    out.query_cache_misses = 0;
+    out.query_cycle_count = 0;
+    out.query_monomorph_count = 0;
+    out.query_monomorph_entity_kinds = raz_rt_stage1_arena_create(4096);
+    out.query_monomorph_templates = raz_rt_stage1_arena_create(4096);
+    out.query_monomorph_argument_counts = raz_rt_stage1_arena_create(4096);
+    out.query_monomorph_hashes = raz_rt_stage1_arena_create(4096);
+    out.query_monomorph_argument_starts = raz_rt_stage1_arena_create(4096);
+    out.query_monomorph_argument_count = 0;
+    out.query_monomorph_argument_structures = raz_rt_stage1_arena_create(32768);
+    out.query_monomorph_argument_types = raz_rt_stage1_arena_create(32768);
+    out.query_symbol_count = 0;
+    out.query_symbol_hashes = raz_rt_stage1_arena_create(8192);
+    out.query_symbol_offsets = raz_rt_stage1_arena_create(8192);
+    out.query_symbol_lengths = raz_rt_stage1_arena_create(8192);
+    out.query_type_count = 0;
+    out.query_type_structures = raz_rt_stage1_arena_create(8192);
+    out.query_type_kinds = raz_rt_stage1_arena_create(8192);
+    out.query_type_references = raz_rt_stage1_arena_create(8192);
+    out.query_type_reference_mutable = raz_rt_stage1_arena_create(8192);
+    out.query_type_slices = raz_rt_stage1_arena_create(8192);
+    out.query_type_slice_mutable = raz_rt_stage1_arena_create(8192);
+    out.query_type_array_extents = raz_rt_stage1_arena_create(8192);
+    out.query_type_function_signatures = raz_rt_stage1_arena_create(8192);
+    out.query_type_trait_objects = raz_rt_stage1_arena_create(8192);
+    out.query_module_fingerprint_count = 0;
+    out.query_module_fingerprint_ids = raz_rt_stage1_arena_create(4096);
+    out.query_module_source_fingerprints = raz_rt_stage1_arena_create(4096);
+    out.query_module_interface_fingerprints = raz_rt_stage1_arena_create(4096);
+    out.trait_query_cache_hits = 0;
+    out.trait_query_cache_misses = 0;
+    out.resolution_cache_hits = 0;
+    out.resolution_cache_misses = 0;
+    out.layout_cache_hits = 0;
+    out.layout_cache_misses = 0;
+
+    i64 query_cache_slot = 0;
+
+    while (query_cache_slot < 1024) {
+        raz_rt_stage1_arena_set(out.query_cache_states, query_cache_slot, 0);
+        raz_rt_stage1_arena_set(out.query_cache_kinds, query_cache_slot, -1);
+        query_cache_slot += 1;
+    }
+    hir_advance(out);
+}
+
+fn destroy_hir_builder(HirBuilder&mut out) {
+    raz_rt_stage1_arena_destroy(out.parameter_moved);
+    raz_rt_stage1_arena_destroy(out.local_moved);
+    raz_rt_stage1_arena_destroy(out.local_borrow_kinds);
+    raz_rt_stage1_arena_destroy(out.local_borrow_source_kinds);
+    raz_rt_stage1_arena_destroy(out.local_borrow_source_indices);
+    raz_rt_stage1_arena_destroy(out.local_borrow_source_paths);
+    raz_rt_stage1_arena_destroy(out.local_reference_last_uses);
+    raz_rt_stage1_arena_destroy(out.moved_path_root_kinds);
+    raz_rt_stage1_arena_destroy(out.moved_path_root_indices);
+    raz_rt_stage1_arena_destroy(out.moved_paths);
+    raz_rt_stage1_arena_destroy(out.generic_substitution_name_offsets);
+    raz_rt_stage1_arena_destroy(out.generic_substitution_name_lengths);
+    raz_rt_stage1_arena_destroy(out.generic_substitution_type_structs);
+    raz_rt_stage1_arena_destroy(out.generic_substitution_types);
+    raz_rt_stage1_arena_destroy(out.pending_derive_traits);
+    raz_rt_stage1_arena_destroy(out.namespace_segment_offsets);
+    raz_rt_stage1_arena_destroy(out.namespace_segment_hashes);
+    raz_rt_stage1_arena_destroy(out.package_segment_offsets);
+    raz_rt_stage1_arena_destroy(out.package_segment_hashes);
+    raz_rt_stage1_arena_destroy(out.module_segment_offsets);
+    raz_rt_stage1_arena_destroy(out.module_segment_ids);
+    raz_rt_stage1_arena_destroy(out.package_dependency_owner_packages);
+    raz_rt_stage1_arena_destroy(out.package_dependency_aliases);
+    raz_rt_stage1_arena_destroy(out.package_dependency_targets);
+    raz_rt_stage1_arena_destroy(out.declaration_visibility_offsets);
+    raz_rt_stage1_arena_destroy(out.declaration_visibility_values);
+    raz_rt_stage1_arena_destroy(out.namespace_import_owner_packages);
+    raz_rt_stage1_arena_destroy(out.namespace_import_owners);
+    raz_rt_stage1_arena_destroy(out.namespace_import_target_packages);
+    raz_rt_stage1_arena_destroy(out.namespace_import_targets);
+    raz_rt_stage1_arena_destroy(out.namespace_import_aliases);
+    raz_rt_stage1_arena_destroy(out.namespace_import_flags);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_owner_packages);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_owners);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_target_packages);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_targets);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_epochs);
+    raz_rt_stage1_arena_destroy(out.namespace_reexport_cache_results);
+    raz_rt_stage1_arena_destroy(out.namespace_scope_hashes);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_kinds);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_packages);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_namespaces);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_modules);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_name_offsets);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_name_lengths);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_epochs);
+    raz_rt_stage1_arena_destroy(out.symbol_cache_results);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_functions);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_blocks);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_name_offsets);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_name_lengths);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_parameter_epochs);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_local_epochs);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_kinds);
+    raz_rt_stage1_arena_destroy(out.lexical_cache_slots);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_functions);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_blocks);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_before_offsets);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_name_offsets);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_name_lengths);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_parameter_epochs);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_local_epochs);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_kinds);
+    raz_rt_stage1_arena_destroy(out.function_name_cache_indices);
+    raz_rt_stage1_arena_destroy(out.slot_local_cache_functions);
+    raz_rt_stage1_arena_destroy(out.slot_local_cache_slots);
+    raz_rt_stage1_arena_destroy(out.slot_local_cache_local_epochs);
+    raz_rt_stage1_arena_destroy(out.slot_local_cache_results);
+    raz_rt_stage1_arena_destroy(out.field_name_cache_structures);
+    raz_rt_stage1_arena_destroy(out.field_name_cache_name_offsets);
+    raz_rt_stage1_arena_destroy(out.field_name_cache_name_lengths);
+    raz_rt_stage1_arena_destroy(out.field_name_cache_field_epochs);
+    raz_rt_stage1_arena_destroy(out.field_name_cache_results);
+    raz_rt_stage1_arena_destroy(out.query_cache_kinds);
+    raz_rt_stage1_arena_destroy(out.query_cache_a);
+    raz_rt_stage1_arena_destroy(out.query_cache_b);
+    raz_rt_stage1_arena_destroy(out.query_cache_c);
+    raz_rt_stage1_arena_destroy(out.query_cache_epoch0);
+    raz_rt_stage1_arena_destroy(out.query_cache_epoch1);
+    raz_rt_stage1_arena_destroy(out.query_cache_result0);
+    raz_rt_stage1_arena_destroy(out.query_cache_result1);
+    raz_rt_stage1_arena_destroy(out.query_cache_states);
+    raz_rt_stage1_arena_destroy(out.query_cache_revisions);
+    raz_rt_stage1_arena_destroy(out.query_invalidation_kinds);
+    raz_rt_stage1_arena_destroy(out.query_invalidation_a);
+    raz_rt_stage1_arena_destroy(out.query_invalidation_b);
+    raz_rt_stage1_arena_destroy(out.query_invalidation_c);
+    raz_rt_stage1_arena_destroy(out.query_active_kinds);
+    raz_rt_stage1_arena_destroy(out.query_active_a);
+    raz_rt_stage1_arena_destroy(out.query_active_b);
+    raz_rt_stage1_arena_destroy(out.query_active_c);
+    raz_rt_stage1_arena_destroy(out.query_dependency_parent_kinds);
+    raz_rt_stage1_arena_destroy(out.query_dependency_parent_a);
+    raz_rt_stage1_arena_destroy(out.query_dependency_parent_b);
+    raz_rt_stage1_arena_destroy(out.query_dependency_parent_c);
+    raz_rt_stage1_arena_destroy(out.query_dependency_child_kinds);
+    raz_rt_stage1_arena_destroy(out.query_dependency_child_a);
+    raz_rt_stage1_arena_destroy(out.query_dependency_child_b);
+    raz_rt_stage1_arena_destroy(out.query_dependency_child_c);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_entity_kinds);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_templates);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_argument_counts);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_hashes);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_argument_starts);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_argument_structures);
+    raz_rt_stage1_arena_destroy(out.query_monomorph_argument_types);
+    raz_rt_stage1_arena_destroy(out.query_symbol_hashes);
+    raz_rt_stage1_arena_destroy(out.query_symbol_offsets);
+    raz_rt_stage1_arena_destroy(out.query_symbol_lengths);
+    raz_rt_stage1_arena_destroy(out.query_type_structures);
+    raz_rt_stage1_arena_destroy(out.query_type_kinds);
+    raz_rt_stage1_arena_destroy(out.query_type_references);
+    raz_rt_stage1_arena_destroy(out.query_type_reference_mutable);
+    raz_rt_stage1_arena_destroy(out.query_type_slices);
+    raz_rt_stage1_arena_destroy(out.query_type_slice_mutable);
+    raz_rt_stage1_arena_destroy(out.query_type_array_extents);
+    raz_rt_stage1_arena_destroy(out.query_type_function_signatures);
+    raz_rt_stage1_arena_destroy(out.query_type_trait_objects);
+    raz_rt_stage1_arena_destroy(out.query_module_fingerprint_ids);
+    raz_rt_stage1_arena_destroy(out.query_module_source_fingerprints);
+    raz_rt_stage1_arena_destroy(out.query_module_interface_fingerprints);
+}
+
+// Namespace paths use a deterministic 48-bit modular rolling hash. The large
+// modulus keeps collision probability negligible while avoiding signed overflow
+// on every backend supported by the self-host compiler.
+fn hir_namespace_hash_byte(i64 hash, i64 value) -> i64 {
+    return (hash * 131 + value + 1) % 281474976710597;
+}
+
+fn hir_namespace_hash_token(HirBuilder&mut builder, i64 hash, Token& token) -> i64 {
+    return raz_rt_stage1_arena_range_hash(builder.scan.input.bytes, token.offset, token.length, hash);
+}
+
+// Parse and consume a namespace path such as `alloc::vec`.
+fn hir_parse_namespace_path(HirBuilder&mut builder, i64&mut out_hash) -> bool {
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 hash = 17;
+    bool more = true;
+
+    while (more) {
+        hash = hir_namespace_hash_token(builder, hash, &builder.current);
+        hir_advance(builder);
+        if (builder.current.kind == TokenKind::ColonColon) {
+            hash = hir_namespace_hash_byte(hash, 58);
+            hash = hir_namespace_hash_byte(hash, 58);
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+        } else {
+            more = false;
+        }
+    }
+    *out_hash = hash;
+    return true;
+}
+
+// Consume the remainder of a qualified source name after its first identifier.
+// builder.current must be the first `::`; the namespace hash covers every
+// component except the final symbol name.
+fn hir_parse_qualified_name_tail(
+    HirBuilder&mut builder,
+    i64 first_offset,
+    i64 first_length,
+    i64&mut out_namespace_hash,
+    i64&mut out_name_offset,
+    i64&mut out_name_length,
+) -> bool {
+    if (builder.current.kind != TokenKind::ColonColon) {
+        return false;
+    }
+
+    i64 hash = raz_rt_stage1_arena_range_hash(builder.scan.input.bytes, first_offset, first_length, 17);
+    bool parsing = true;
+
+    while (parsing) {
+        hir_advance(builder);
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+
+        i64 component_offset = builder.current.offset;
+        i64 component_length = builder.current.length;
+
+        hir_advance(builder);
+        if (builder.current.kind == TokenKind::ColonColon) {
+            hash = hir_namespace_hash_byte(hash, 58);
+            hash = hir_namespace_hash_byte(hash, 58);
+            hash = raz_rt_stage1_arena_range_hash(
+                builder.scan.input.bytes,
+                component_offset,
+                component_length,
+                hash,
+            );
+        } else {
+            *out_namespace_hash = hash;
+            *out_name_offset = component_offset;
+            *out_name_length = component_length;
+            parsing = false;
+        }
+    }
+    return true;
+}
+
+fn hir_begin_namespace(HirBuilder&mut builder, i64 source_offset, i64 namespace_hash) -> bool {
+    if (builder.namespace_segment_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 segment = builder.namespace_segment_count;
+
+    builder.namespace_segment_count += 1;
+    raz_rt_stage1_arena_set(builder.namespace_segment_offsets, segment, source_offset);
+    raz_rt_stage1_arena_set(builder.namespace_segment_hashes, segment, namespace_hash);
+    builder.current_namespace_hash = namespace_hash;
+    return true;
+}
+
+fn hir_push_namespace(HirBuilder&mut builder, i64 source_offset, i64 namespace_hash) -> bool {
+    if (builder.namespace_scope_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    raz_rt_stage1_arena_set(
+        builder.namespace_scope_hashes,
+        builder.namespace_scope_count,
+        builder.current_namespace_hash,
+    );
+    builder.namespace_scope_count += 1;
+    return hir_begin_namespace(builder, source_offset, namespace_hash);
+}
+
+fn hir_pop_namespace(HirBuilder&mut builder, i64 source_offset) -> bool {
+    if (builder.namespace_scope_count <= 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    builder.namespace_scope_count -= 1;
+
+    i64 parent = raz_rt_stage1_arena_get(builder.namespace_scope_hashes, builder.namespace_scope_count);
+
+    return hir_begin_namespace(builder, source_offset, parent);
+}
+
+fn hir_namespace_at_offset(HirBuilder&mut builder, i64 source_offset) -> i64 {
+    i64 low = 0;
+    i64 high = builder.namespace_segment_count;
+
+    while (low < high) {
+        i64 middle = low + (high - low) / 2;
+
+        if (raz_rt_stage1_arena_get(builder.namespace_segment_offsets, middle) <= source_offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low <= 0) {
+        return 0;
+    }
+    return raz_rt_stage1_arena_get(builder.namespace_segment_hashes, low - 1);
+}
+
+fn hir_begin_package(HirBuilder&mut builder, i64 source_offset, i64 package_hash) -> bool {
+    if (builder.package_segment_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 segment = builder.package_segment_count;
+
+    builder.package_segment_count += 1;
+    raz_rt_stage1_arena_set(builder.package_segment_offsets, segment, source_offset);
+    raz_rt_stage1_arena_set(builder.package_segment_hashes, segment, package_hash);
+    builder.current_package_hash = package_hash;
+    return true;
+}
+
+fn hir_package_at_offset(HirBuilder&mut builder, i64 source_offset) -> i64 {
+    i64 low = 0;
+    i64 high = builder.package_segment_count;
+
+    while (low < high) {
+        i64 middle = low + (high - low) / 2;
+
+        if (raz_rt_stage1_arena_get(builder.package_segment_offsets, middle) <= source_offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low <= 0) {
+        return 0;
+    }
+    return raz_rt_stage1_arena_get(builder.package_segment_hashes, low - 1);
+}
+
+fn hir_begin_module(HirBuilder&mut builder, i64 source_offset) -> bool {
+    if (builder.module_segment_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 segment = builder.module_segment_count;
+
+    builder.module_segment_count += 1;
+
+    i64 module_id = segment + 1;
+
+    raz_rt_stage1_arena_set(builder.module_segment_offsets, segment, source_offset);
+    raz_rt_stage1_arena_set(builder.module_segment_ids, segment, module_id);
+    builder.current_module_id = module_id;
+    return true;
+}
+
+fn hir_module_at_offset(HirBuilder&mut builder, i64 source_offset) -> i64 {
+    i64 low = 0;
+    i64 high = builder.module_segment_count;
+
+    while (low < high) {
+        i64 middle = low + (high - low) / 2;
+
+        if (raz_rt_stage1_arena_get(builder.module_segment_offsets, middle) <= source_offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low <= 0) {
+        return 0;
+    }
+    return raz_rt_stage1_arena_get(builder.module_segment_ids, low - 1);
+}

@@ -1,0 +1,1179 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_wasm_runtime_memory;
+public import raz_compiler_backend_wasm_simd;
+public import raz_compiler_backend_wasm_memory;
+// Low-memory layout is shared deliberately: bytes 0..511 are reserved for
+// WASI adapter scratch, while allocator metadata begins at 512. The normal
+// static-data/heap frontier remains at 1024, so host calls cannot corrupt the
+// reusable heap bookkeeping.
+fn wasm_runtime_memory_free_head_offset() -> i64 {
+    return 512;
+}
+
+fn wasm_runtime_memory_header_size() -> i64 {
+    return 12;
+}
+
+fn wasm_runtime_memory_min_split() -> i64 {
+    return 24;
+}
+
+fn wasm_runtime_memory_min_alignment() -> i64 {
+    return 16;
+}
+
+fn wasm_runtime_memory_max_alignment() -> i64 {
+    return 4096;
+}
+
+// Leave enough room for the largest supported alignment, allocator metadata,
+// and final 8-byte rounding without wrapping the wasm32 address space.
+fn wasm_runtime_memory_max_request() -> i64 {
+    return 4294963180;
+}
+
+fn wasm_runtime_memory_emit_return_zero(ForgeWriter&mut out) {
+    wasm_u8(out, 66);
+    wasm_i64(out, 0);
+    wasm_u8(out, 15);
+}
+
+fn wasm_runtime_memory_emit_return_zero_if(ForgeWriter&mut out) {
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_runtime_memory_emit_return_zero(out);
+    wasm_u8(out, 11);
+}
+
+fn wasm_runtime_memory_emit_trap_if(ForgeWriter&mut out) {
+    wasm_u8(out, 4);
+    wasm_u8(out, 64);
+    wasm_u8(out, 0);
+    wasm_u8(out, 11);
+}
+
+fn wasm_runtime_memory_name_is(
+    Source& source,
+    HirModule& hir,
+    i64 function_index,
+    i64[]name,
+    i64 length,
+) -> bool {
+    if (raz_rt_stage1_arena_get(hir.function_name_lengths, function_index) != length) {
+        return false;
+    }
+
+    i64 offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function_index);
+    i64 i = 0;
+
+    while (i < length) {
+        if (source_byte(source, offset + i) != name[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn wasm_runtime_memory_copy(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[11] = [114, 97, 122, 95, 114, 116, 95, 99, 111, 112, 121];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 11);
+}
+
+fn wasm_runtime_memory_move(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[11] = [114, 97, 122, 95, 114, 116, 95, 109, 111, 118, 101];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 11);
+}
+
+fn wasm_runtime_memory_fill(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[11] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 108];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 11);
+}
+
+fn wasm_runtime_memory_alloc(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[12] = [114, 97, 122, 95, 114, 116, 95, 97, 108, 108, 111, 99];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 12);
+}
+
+fn wasm_runtime_memory_realloc(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[14] = [114, 97, 122, 95, 114, 116, 95, 114, 101, 97, 108, 108, 111, 99];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 14);
+}
+
+fn wasm_runtime_memory_alloc_aligned(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[20] = [114, 97, 122, 95, 114, 116, 95, 97, 108, 108, 111, 99, 95, 97, 108, 105, 103, 110, 101, 100];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 20);
+}
+
+fn wasm_runtime_memory_dealloc(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[14] = [114, 97, 122, 95, 114, 116, 95, 100, 101, 97, 108, 108, 111, 99];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 14);
+}
+
+fn wasm_runtime_memory_dealloc_aligned(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[22] = [114, 97, 122, 95, 114, 116, 95, 100, 101, 97, 108, 108, 111, 99, 95, 97, 108, 105, 103, 110, 101, 100];
+
+    return wasm_runtime_memory_name_is(source, hir, function_index, &name, 22);
+}
+
+fn wasm_runtime_memory_function_supported(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return (
+        wasm_runtime_memory_copy(source, hir, function_index) ||
+        wasm_runtime_memory_move(source, hir, function_index) ||
+        wasm_runtime_memory_fill(source, hir, function_index) ||
+        wasm_runtime_memory_alloc(source, hir, function_index) ||
+        wasm_runtime_memory_realloc(source, hir, function_index) ||
+        wasm_runtime_memory_alloc_aligned(source, hir, function_index) ||
+        wasm_runtime_memory_dealloc(source, hir, function_index) ||
+        wasm_runtime_memory_dealloc_aligned(source, hir, function_index)
+    );
+}
+
+fn wasm_runtime_memory_finish(ForgeWriter&mut section, ForgeWriter&mut body) -> bool {
+    wasm_u8(body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, body);
+    return !body.failed && !section.failed;
+}
+
+fn wasm_runtime_memory_i32_const(ForgeWriter&mut out, i64 value) {
+    wasm_u8(out, 65);
+    wasm_i64(out, value);
+}
+
+fn wasm_runtime_memory_i32_load(ForgeWriter&mut out, i64 offset) {
+    wasm_u8(out, 40);
+    wasm_u32(out, 2);
+    wasm_u32(out, offset);
+}
+
+fn wasm_runtime_memory_i32_store(ForgeWriter&mut out, i64 offset) {
+    wasm_u8(out, 54);
+    wasm_u32(out, 2);
+    wasm_u32(out, offset);
+}
+
+fn wasm_runtime_memory_free_head_get(ForgeWriter&mut out) {
+    wasm_runtime_memory_i32_const(out, wasm_runtime_memory_free_head_offset());
+    wasm_runtime_memory_i32_load(out, 0);
+}
+
+fn wasm_runtime_memory_free_head_set_local(ForgeWriter&mut out, i64 local) {
+    wasm_runtime_memory_i32_const(out, wasm_runtime_memory_free_head_offset());
+    wasm_local_get(out, local);
+    wasm_runtime_memory_i32_store(out, 0);
+}
+
+fn wasm_runtime_memory_load_size(ForgeWriter&mut out, i64 block_local) {
+    wasm_local_get(out, block_local);
+    wasm_runtime_memory_i32_load(out, 0);
+}
+
+fn wasm_runtime_memory_load_next(ForgeWriter&mut out, i64 block_local) {
+    wasm_local_get(out, block_local);
+    wasm_runtime_memory_i32_load(out, 4);
+}
+
+fn wasm_runtime_memory_store_next_local(ForgeWriter&mut out, i64 block_local, i64 next_local) {
+    wasm_local_get(out, block_local);
+    wasm_local_get(out, next_local);
+    wasm_runtime_memory_i32_store(out, 4);
+}
+
+fn wasm_runtime_memory_emit_copy_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 252);
+    wasm_u32(&mut body, 10);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+
+    bool success = wasm_runtime_memory_finish(section, &mut body);
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_runtime_memory_emit_fill_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 252);
+    wasm_u32(&mut body, 11);
+    wasm_u32(&mut body, 0);
+
+    bool success = wasm_runtime_memory_finish(section, &mut body);
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+// First-fit address-ordered free-list allocator. Block header: u32 total_size,
+// u32 next_free. The original block address is stored at user_pointer-4 so
+// aligned allocations can be released without a side table.
+fn wasm_runtime_memory_emit_alloc_body(ForgeWriter&mut section, bool aligned) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+
+    i64 base = 1;
+
+    if (aligned) {
+        base = 2;
+    }
+
+    i64 align = base;
+    i64 previous = base + 1;
+    i64 current = base + 2;
+    i64 size = base + 3;
+    i64 next = base + 4;
+    i64 user = base + 5;
+    i64 need = base + 6;
+    i64 remainder = base + 7;
+    i64 split = base + 8;
+
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 9);
+    wasm_u8(&mut body, 127);
+
+    // Match the native runtime contract: non-positive sizes fail, requests must
+    // remain representable in wasm32 after header/alignment rounding, and an
+    // aligned request must be a power of two in the supported 1..4096 range.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 87);
+    wasm_runtime_memory_emit_return_zero_if(&mut body);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, wasm_runtime_memory_max_request());
+    wasm_u8(&mut body, 86);
+    wasm_runtime_memory_emit_return_zero_if(&mut body);
+    if (aligned) {
+        wasm_local_get(&mut body, 1);
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 0);
+        wasm_u8(&mut body, 87);
+        wasm_runtime_memory_emit_return_zero_if(&mut body);
+        wasm_local_get(&mut body, 1);
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, wasm_runtime_memory_max_alignment());
+        wasm_u8(&mut body, 86);
+        wasm_runtime_memory_emit_return_zero_if(&mut body);
+        wasm_local_get(&mut body, 1);
+        wasm_local_get(&mut body, 1);
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 1);
+        wasm_u8(&mut body, 125);
+        wasm_u8(&mut body, 131);
+        wasm_u8(&mut body, 80);
+        wasm_u8(&mut body, 69);
+        wasm_runtime_memory_emit_return_zero_if(&mut body);
+    }
+
+    // alignment = max(requested, max_align); normal allocation uses max_align.
+    if (aligned) {
+        wasm_local_get(&mut body, 1);
+        wasm_u8(&mut body, 167);
+    } else {
+        wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_alignment());
+    }
+    wasm_local_set(&mut body, align);
+    wasm_local_get(&mut body, align);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_alignment());
+    wasm_u8(&mut body, 73);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_alignment());
+    wasm_local_set(&mut body, align);
+    wasm_u8(&mut body, 11);
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_local_set(&mut body, previous);
+    wasm_runtime_memory_free_head_get(&mut body);
+    wasm_local_set(&mut body, current);
+
+    // First-fit scan of the address-ordered free list.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, current);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_runtime_memory_load_size(&mut body, current);
+    wasm_local_set(&mut body, size);
+    wasm_runtime_memory_load_next(&mut body, current);
+    wasm_local_set(&mut body, next);
+    // A malformed free-list link must never be allowed to form an infinite
+    // allocator loop or overlapping allocation. Trap immediately.
+    wasm_local_get(&mut body, next);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, next);
+    wasm_local_get(&mut body, current);
+    wasm_u8(&mut body, 77);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_u8(&mut body, 11);
+    // user = align_up(current + header, alignment)
+    wasm_local_get(&mut body, current);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_header_size());
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, align);
+    wasm_runtime_memory_i32_const(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, align);
+    wasm_runtime_memory_i32_const(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 115);
+    wasm_local_set(&mut body, user);
+    // need = align8((user-current)+requested)
+    wasm_local_get(&mut body, user);
+    wasm_local_get(&mut body, current);
+    wasm_u8(&mut body, 107);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, -8);
+    wasm_u8(&mut body, 113);
+    wasm_local_set(&mut body, need);
+    wasm_local_get(&mut body, size);
+    wasm_local_get(&mut body, need);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, size);
+    wasm_local_get(&mut body, need);
+    wasm_u8(&mut body, 107);
+    wasm_local_set(&mut body, remainder);
+    wasm_local_get(&mut body, remainder);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_split());
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // split = current + need; split.size=remainder; split.next=next.
+    wasm_local_get(&mut body, current);
+    wasm_local_get(&mut body, need);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, split);
+    wasm_local_get(&mut body, split);
+    wasm_local_get(&mut body, remainder);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_runtime_memory_store_next_local(&mut body, split, next);
+    wasm_local_get(&mut body, current);
+    wasm_local_get(&mut body, need);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    // Replace current in free list with split.
+    wasm_local_get(&mut body, previous);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, split);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, previous, split);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 5);
+    // Consume whole free block.
+    wasm_local_get(&mut body, previous);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, next);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, previous, next);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // user[-4] = current; return user as i64.
+    wasm_local_get(&mut body, user);
+    wasm_runtime_memory_i32_const(&mut body, 4);
+    wasm_u8(&mut body, 107);
+    wasm_local_get(&mut body, current);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, user);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, current);
+    wasm_local_set(&mut body, previous);
+    wasm_local_get(&mut body, next);
+    wasm_local_set(&mut body, current);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+
+    // Bump allocation fallback. Guard the address addition before publishing the
+    // new frontier; memory.grow failure is turned into an explicit trap by the
+    // shared capacity helper rather than corrupting allocator metadata.
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, current);
+    wasm_local_get(&mut body, current);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_header_size());
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, align);
+    wasm_runtime_memory_i32_const(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, align);
+    wasm_runtime_memory_i32_const(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 115);
+    wasm_local_set(&mut body, user);
+    wasm_local_get(&mut body, user);
+    wasm_local_get(&mut body, current);
+    wasm_u8(&mut body, 107);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, -8);
+    wasm_u8(&mut body, 113);
+    wasm_local_set(&mut body, need);
+    wasm_local_get(&mut body, current);
+    wasm_local_get(&mut body, need);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, split);
+    wasm_local_get(&mut body, split);
+    wasm_local_get(&mut body, current);
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_return_zero_if(&mut body);
+    wasm_local_get(&mut body, split);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, 0);
+    wasm_memory_emit_ensure_capacity(&mut body);
+    wasm_local_get(&mut body, current);
+    wasm_local_get(&mut body, need);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, current);
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_runtime_memory_i32_store(&mut body, 4);
+    wasm_local_get(&mut body, user);
+    wasm_runtime_memory_i32_const(&mut body, 4);
+    wasm_u8(&mut body, 107);
+    wasm_local_get(&mut body, current);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, user);
+    wasm_u8(&mut body, 173);
+
+    bool success = wasm_runtime_memory_finish(section, &mut body);
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_runtime_memory_emit_dealloc_body(ForgeWriter&mut section, Source& source, MirModule& mir) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // locals: block, size, previous, current, next, user
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 6);
+    wasm_u8(&mut body, 127);
+    // null is a no-op.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+
+    // wasm32 pointers must fit in 32 bits and point into the Raz heap rather
+    // than the reserved host/runtime area. Invalid frees are undefined at the
+    // language boundary; trapping here prevents silent free-list corruption.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4294967295);
+    wasm_u8(&mut body, 86);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, wasm_memory_heap_base(source, mir) + 16);
+    wasm_u8(&mut body, 84);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_set(&mut body, 6);
+
+    // Recover original block from user[-4].
+    wasm_local_get(&mut body, 6);
+    wasm_runtime_memory_i32_const(&mut body, 4);
+    wasm_u8(&mut body, 107);
+    wasm_runtime_memory_i32_load(&mut body, 0);
+    wasm_local_set(&mut body, 1);
+    wasm_runtime_memory_load_size(&mut body, 1);
+    wasm_local_set(&mut body, 2);
+
+    // Validate block bounds before touching the free list.
+    wasm_local_get(&mut body, 1);
+    wasm_runtime_memory_i32_const(&mut body, wasm_memory_heap_base(source, mir));
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 2);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_split());
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 75);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 6);
+    wasm_local_get(&mut body, 1);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_header_size());
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 6);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 79);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_local_set(&mut body, 3);
+    wasm_runtime_memory_free_head_get(&mut body);
+    wasm_local_set(&mut body, 4);
+    // Find address-ordered insertion point while checking list integrity and
+    // rejecting a double free of the same block.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 70);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 73);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_runtime_memory_load_next(&mut body, 4);
+    wasm_local_set(&mut body, 5);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 5);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 77);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 4);
+    wasm_local_set(&mut body, 3);
+    wasm_local_get(&mut body, 5);
+    wasm_local_set(&mut body, 4);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+
+    // Neighbor-overlap validation catches corrupted headers before insertion.
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 3);
+    wasm_runtime_memory_load_size(&mut body, 3);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 75);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 75);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_u8(&mut body, 11);
+
+    wasm_runtime_memory_store_next_local(&mut body, 1, 4);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, 1);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 3, 1);
+    wasm_u8(&mut body, 11);
+    // Coalesce with next when adjacent.
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_load_size(&mut body, 4);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 2);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_runtime_memory_load_next(&mut body, 4);
+    wasm_local_set(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 1, 5);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Coalesce with previous when adjacent; merged block becomes previous.
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_load_size(&mut body, 3);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 3);
+    wasm_runtime_memory_load_size(&mut body, 3);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_runtime_memory_load_next(&mut body, 1);
+    wasm_local_set(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 3, 5);
+    wasm_local_get(&mut body, 3);
+    wasm_local_set(&mut body, 1);
+    wasm_runtime_memory_load_size(&mut body, 1);
+    wasm_local_set(&mut body, 2);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // If the terminal free block reaches the bump pointer, return it to the
+    // bump region and unlink it. This keeps long-lived heaps compact.
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, 0);
+    // Re-scan to unlink terminal block safely after possible coalescing.
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_local_set(&mut body, 3);
+    wasm_runtime_memory_free_head_get(&mut body);
+    wasm_local_set(&mut body, 4);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 4);
+    wasm_local_set(&mut body, 3);
+    wasm_runtime_memory_load_next(&mut body, 4);
+    wasm_local_set(&mut body, 4);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_runtime_memory_load_next(&mut body, 1);
+    wasm_local_set(&mut body, 5);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, 5);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 3, 5);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+
+    bool success = wasm_runtime_memory_finish(section, &mut body);
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_runtime_memory_find_alloc(Source& source, HirModule& hir) -> i64 {
+    i64 i = 0;
+
+    while (i < hir.function_count) {
+        if (wasm_runtime_memory_alloc(source, hir, i)) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn wasm_runtime_memory_find_dealloc(Source& source, HirModule& hir) -> i64 {
+    i64 i = 0;
+
+    while (i < hir.function_count) {
+        if (wasm_runtime_memory_dealloc(source, hir, i)) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn wasm_runtime_memory_emit_realloc_body(
+    ForgeWriter&mut section,
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+) -> bool {
+    i64 alloc_function = wasm_runtime_memory_find_alloc(source, hir);
+    i64 dealloc_function = wasm_runtime_memory_find_dealloc(source, hir);
+
+    if (alloc_function < 0 || dealloc_function < 0) {
+        return false;
+    }
+
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // i32 locals: block, old_usable, block_size, user, user_offset, new_total,
+    // old_end, previous, current, next, remainder; i64 replacement.
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 11);
+    wasm_u8(&mut body, 127);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+
+    // null pointer -> alloc(size)
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_host_import_count() + alloc_function);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // size <= 0 -> free(ptr), return zero.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 87);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_host_import_count() + dealloc_function);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Oversized wasm32 requests fail without releasing the original pointer.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, wasm_runtime_memory_max_request());
+    wasm_u8(&mut body, 86);
+    wasm_runtime_memory_emit_return_zero_if(&mut body);
+
+    // Validate pointer range before recovering the block header.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4294967295);
+    wasm_u8(&mut body, 86);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, wasm_memory_heap_base(source, mir) + 16);
+    wasm_u8(&mut body, 84);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_set(&mut body, 5);
+    wasm_local_get(&mut body, 5);
+    wasm_runtime_memory_i32_const(&mut body, 4);
+    wasm_u8(&mut body, 107);
+    wasm_runtime_memory_i32_load(&mut body, 0);
+    wasm_local_set(&mut body, 2);
+    wasm_runtime_memory_load_size(&mut body, 2);
+    wasm_local_set(&mut body, 4);
+    wasm_local_get(&mut body, 2);
+    wasm_runtime_memory_i32_const(&mut body, wasm_memory_heap_base(source, mir));
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 4);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_split());
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_local_get(&mut body, 5);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 107);
+    wasm_local_set(&mut body, 6);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 107);
+    wasm_local_set(&mut body, 3);
+    // new_total = align8(user_offset + requested).
+    wasm_local_get(&mut body, 6);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_const(&mut body, -8);
+    wasm_u8(&mut body, 113);
+    wasm_local_set(&mut body, 7);
+
+    // Shrink in place. If the released tail is large enough, return it to the
+    // reusable heap; terminal shrink can simply move the bump frontier back.
+    wasm_local_get(&mut body, 7);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 77);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 107);
+    wasm_local_set(&mut body, 12);
+    wasm_local_get(&mut body, 12);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_split());
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 8);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    // Build a synthetic allocated tail and free it through the normal hardened
+    // insertion/coalescing path. new_total is 8-byte aligned.
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 10);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 12);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, 10);
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_runtime_memory_i32_store(&mut body, 4);
+    wasm_local_get(&mut body, 10);
+    wasm_runtime_memory_i32_const(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 10);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, 10);
+    wasm_runtime_memory_i32_const(&mut body, 16);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_host_import_count() + dealloc_function);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+
+    // Grow the terminal allocation in place whenever possible.
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 8);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 12);
+    wasm_local_get(&mut body, 12);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 73);
+    wasm_runtime_memory_emit_return_zero_if(&mut body);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, 0);
+    wasm_memory_emit_ensure_capacity(&mut body);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+
+    // Look for a free block immediately after this allocation. Address ordering
+    // lets us stop as soon as current >= old_end.
+    wasm_runtime_memory_i32_const(&mut body, 0);
+    wasm_local_set(&mut body, 9);
+    wasm_runtime_memory_free_head_get(&mut body);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 73);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_runtime_memory_load_next(&mut body, 10);
+    wasm_local_set(&mut body, 11);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 11);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 77);
+    wasm_runtime_memory_emit_trap_if(&mut body);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 10);
+    wasm_local_set(&mut body, 9);
+    wasm_local_get(&mut body, 11);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // remainder temporarily holds adjacent block size.
+    wasm_runtime_memory_load_size(&mut body, 10);
+    wasm_local_set(&mut body, 12);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_load_next(&mut body, 10);
+    wasm_local_set(&mut body, 11);
+    // tail = combined-new_total
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 107);
+    wasm_local_set(&mut body, 12);
+    wasm_local_get(&mut body, 12);
+    wasm_runtime_memory_i32_const(&mut body, wasm_runtime_memory_min_split());
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // Split the adjacent free block at block+new_total.
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 10);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 12);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_runtime_memory_store_next_local(&mut body, 10, 11);
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, 10);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 9, 10);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    // Consume the adjacent block whole. Preserve its full combined capacity.
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_runtime_memory_free_head_set_local(&mut body, 11);
+    wasm_u8(&mut body, 5);
+    wasm_runtime_memory_store_next_local(&mut body, 9, 11);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 4);
+    wasm_runtime_memory_load_size(&mut body, 10);
+    wasm_u8(&mut body, 106);
+    wasm_runtime_memory_i32_store(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+
+    // Fallback: allocate-copy-free. A failed allocation preserves the original
+    // block, matching realloc's failure semantics.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_host_import_count() + alloc_function);
+    wasm_local_set(&mut body, 13);
+    wasm_local_get(&mut body, 13);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 13);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 252);
+    wasm_u32(&mut body, 10);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_host_import_count() + dealloc_function);
+    wasm_local_get(&mut body, 13);
+
+    bool success = wasm_runtime_memory_finish(section, &mut body);
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_runtime_memory_emit_body(
+    ForgeWriter&mut section,
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+) -> bool {
+    if (
+        wasm_runtime_memory_copy(source, hir, function_index) ||
+        wasm_runtime_memory_move(source, hir, function_index)
+    ) {
+        return wasm_runtime_memory_emit_copy_body(section);
+    }
+    if (wasm_runtime_memory_fill(source, hir, function_index)) {
+        return wasm_runtime_memory_emit_fill_body(section);
+    }
+    if (wasm_runtime_memory_alloc(source, hir, function_index)) {
+        return wasm_runtime_memory_emit_alloc_body(section, false);
+    }
+    if (wasm_runtime_memory_realloc(source, hir, function_index)) {
+        return wasm_runtime_memory_emit_realloc_body(section, source, hir, mir);
+    }
+    if (wasm_runtime_memory_alloc_aligned(source, hir, function_index)) {
+        return wasm_runtime_memory_emit_alloc_body(section, true);
+    }
+    if (
+        wasm_runtime_memory_dealloc(source, hir, function_index) ||
+        wasm_runtime_memory_dealloc_aligned(source, hir, function_index)
+    ) {
+        return wasm_runtime_memory_emit_dealloc_body(section, source, mir);
+    }
+    return false;
+}

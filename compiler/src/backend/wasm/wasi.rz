@@ -1,0 +1,3574 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_wasm_wasi;
+public import raz_compiler_backend_wasm_cfg;
+public import raz_compiler_backend_wasm_memory;
+// WASI preview1 is kept behind Raz's permanent runtime boundary.  User code
+// continues to call std::io; the wasm backend synthesizes these tiny adapters.
+fn wasm_wasi_import_count() -> i64 {
+    return wasm_host_import_count();
+}
+
+fn wasm_wasi_defined_function(i64 function_index) -> i64 {
+    return wasm_wasi_import_count() + function_index;
+}
+
+fn wasm_wasi_name_is(Source& source, HirModule& hir, i64 function_index, i64[]name, i64 length) -> bool {
+    if (raz_rt_stage1_arena_get(hir.function_name_lengths, function_index) != length) {
+        return false;
+    }
+
+    i64 offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function_index);
+    i64 i = 0;
+
+    while (i < length) {
+        if (source_byte(source, offset + i) != name[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn wasm_wasi_last_error_global() -> i64 {
+    // Internal wasm global 1 is reserved by globals.rz for WASI errno.
+    return 1;
+}
+
+fn wasm_wasi_capture_errno(ForgeWriter&mut body) {
+    // Preserve the host errno and leave it on the operand stack so existing
+    // success/failure tests keep their original shape.
+    wasm_u8(body, 36);
+    wasm_u32(body, wasm_wasi_last_error_global());
+    wasm_u8(body, 35);
+    wasm_u32(body, wasm_wasi_last_error_global());
+}
+
+fn wasm_wasi_set_last_error(ForgeWriter&mut body, i64 code) {
+    wasm_u8(body, 65);
+    wasm_i64(body, code);
+    wasm_u8(body, 36);
+    wasm_u32(body, wasm_wasi_last_error_global());
+}
+
+fn wasm_wasi_last_error_code(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[22] = [114, 97, 122, 95, 114, 116, 95, 108, 97, 115, 116, 95, 101, 114, 114, 111, 114, 95, 99, 111, 100, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 22);
+}
+
+fn wasm_wasi_env_set(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[14] = [114, 97, 122, 95, 114, 116, 95, 101, 110, 118, 95, 115, 101, 116];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 14);
+}
+
+fn wasm_wasi_env_remove(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 101, 110, 118, 95, 114, 101, 109, 111, 118, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_process_id(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 105, 100];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_process_run(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 114, 117, 110];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_process_run_argv(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[23] = [114, 97, 122, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 114, 117, 110, 95, 97, 114, 103, 118];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 23);
+}
+
+fn wasm_wasi_stdio_read(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 115, 116, 100, 105, 111, 95, 114, 101, 97, 100];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_stdio_write(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 115, 116, 100, 105, 111, 95, 119, 114, 105, 116, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_stdio_flush(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 115, 116, 100, 105, 111, 95, 102, 108, 117, 115, 104];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_stdio_is_terminal(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[24] = [114, 97, 122, 95, 114, 116, 95, 115, 116, 100, 105, 111, 95, 105, 115, 95, 116, 101, 114, 109, 105, 110, 97, 108];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 24);
+}
+
+fn wasm_wasi_process_argc(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[19] = [114, 97, 122, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 97, 114, 103, 99];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 19);
+}
+
+fn wasm_wasi_process_arg(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 97, 114, 103];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_env_get(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[14] = [114, 97, 122, 95, 114, 116, 95, 101, 110, 118, 95, 103, 101, 116];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 14);
+}
+
+fn wasm_wasi_main_function(Source& source, HirModule& hir) -> i64 {
+    i64 name[4] = [109, 97, 105, 110];
+    i64 function_index = 0;
+
+    while (function_index < hir.function_count) {
+        if (
+            raz_rt_stage1_arena_get(hir.function_is_extern, function_index) == 0 &&
+            raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index) == 0 &&
+            wasm_wasi_name_is(source, hir, function_index, &name, 4)
+        ) {
+            return function_index;
+        }
+        function_index += 1;
+    }
+    return -1;
+}
+
+fn wasm_wasi_start_count(Source& source, HirModule& hir) -> i64 {
+    if (wasm_wasi_main_function(source, hir) >= 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn wasm_wasi_file_open(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 111, 112, 101, 110];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_file_read(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 114, 101, 97, 100];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_file_write(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 119, 114, 105, 116, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_file_close(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 99, 108, 111, 115, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_path_exists(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 112, 97, 116, 104, 95, 101, 120, 105, 115, 116, 115];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_file_seek(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 115, 101, 101, 107];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_file_tell(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 116, 101, 108, 108];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_file_flush(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 102, 108, 117, 115, 104];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_file_eof(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[15] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 101, 111, 102];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 15);
+}
+
+fn wasm_wasi_file_size(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 115, 105, 122, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_path_is_file(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[19] = [114, 97, 122, 95, 114, 116, 95, 112, 97, 116, 104, 95, 105, 115, 95, 102, 105, 108, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 19);
+}
+
+fn wasm_wasi_path_is_dir(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 112, 97, 116, 104, 95, 105, 115, 95, 100, 105, 114];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_time_unix_millis(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[23] = [114, 97, 122, 95, 114, 116, 95, 116, 105, 109, 101, 95, 117, 110, 105, 120, 95, 109, 105, 108, 108, 105, 115];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 23);
+}
+
+fn wasm_wasi_time_monotonic_nanos(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[27] = [114, 97, 122, 95, 114, 116, 95, 116, 105, 109, 101, 95, 109, 111, 110, 111, 116, 111, 110, 105, 99, 95, 110, 97, 110, 111, 115];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 27);
+}
+
+fn wasm_wasi_random_fill(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 114, 97, 110, 100, 111, 109, 95, 102, 105, 108, 108];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_random_seed(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 114, 97, 110, 100, 111, 109, 95, 115, 101, 101, 100];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_sleep_millis(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[19] = [114, 97, 122, 95, 114, 116, 95, 115, 108, 101, 101, 112, 95, 109, 105, 108, 108, 105, 115];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 19);
+}
+
+fn wasm_wasi_current_dir(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 99, 117, 114, 114, 101, 110, 116, 95, 100, 105, 114];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_dir_open(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[15] = [114, 97, 122, 95, 114, 116, 95, 100, 105, 114, 95, 111, 112, 101, 110];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 15);
+}
+
+fn wasm_wasi_dir_next(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[15] = [114, 97, 122, 95, 114, 116, 95, 100, 105, 114, 95, 110, 101, 120, 116];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 15);
+}
+
+fn wasm_wasi_dir_close(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 100, 105, 114, 95, 99, 108, 111, 115, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_fs_metadata(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 102, 115, 95, 109, 101, 116, 97, 100, 97, 116, 97];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_create_dir_one(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[21] = [114, 97, 122, 95, 114, 116, 95, 99, 114, 101, 97, 116, 101, 95, 100, 105, 114, 95, 111, 110, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 21);
+}
+
+fn wasm_wasi_remove_one(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[17] = [114, 97, 122, 95, 114, 116, 95, 114, 101, 109, 111, 118, 101, 95, 111, 110, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 17);
+}
+
+fn wasm_wasi_rename_path(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[18] = [114, 97, 122, 95, 114, 116, 95, 114, 101, 110, 97, 109, 101, 95, 112, 97, 116, 104];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 18);
+}
+
+fn wasm_wasi_copy_file(Source& source, HirModule& hir, i64 function_index) -> bool {
+    i64 name[16] = [114, 97, 122, 95, 114, 116, 95, 99, 111, 112, 121, 95, 102, 105, 108, 101];
+
+    return wasm_wasi_name_is(source, hir, function_index, &name, 16);
+}
+
+fn wasm_wasi_find_named_function(Source& source, HirModule& hir, i64[]name, i64 length) -> i64 {
+    i64 function_index = 0;
+
+    while (function_index < hir.function_count) {
+        if (wasm_wasi_name_is(source, hir, function_index, name, length)) {
+            return function_index;
+        }
+        function_index += 1;
+    }
+    return -1;
+}
+
+fn wasm_wasi_runtime_function_supported(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return (
+        wasm_wasi_stdio_read(source, hir, function_index) ||
+        wasm_wasi_stdio_write(source, hir, function_index) ||
+        wasm_wasi_stdio_flush(source, hir, function_index) ||
+        wasm_wasi_stdio_is_terminal(source, hir, function_index) ||
+        wasm_wasi_process_argc(source, hir, function_index) ||
+        wasm_wasi_process_arg(source, hir, function_index) ||
+        wasm_wasi_process_id(source, hir, function_index) ||
+        wasm_wasi_process_run(source, hir, function_index) ||
+        wasm_wasi_process_run_argv(source, hir, function_index) ||
+        wasm_wasi_env_get(source, hir, function_index) ||
+        wasm_wasi_env_set(source, hir, function_index) ||
+        wasm_wasi_env_remove(source, hir, function_index) ||
+        wasm_wasi_last_error_code(source, hir, function_index) ||
+        wasm_wasi_file_open(source, hir, function_index) ||
+        wasm_wasi_file_read(source, hir, function_index) ||
+        wasm_wasi_file_write(source, hir, function_index) ||
+        wasm_wasi_file_close(source, hir, function_index) ||
+        wasm_wasi_file_seek(source, hir, function_index) ||
+        wasm_wasi_file_tell(source, hir, function_index) ||
+        wasm_wasi_file_flush(source, hir, function_index) ||
+        wasm_wasi_file_eof(source, hir, function_index) ||
+        wasm_wasi_file_size(source, hir, function_index) ||
+        wasm_wasi_path_exists(source, hir, function_index) ||
+        wasm_wasi_path_is_file(source, hir, function_index) ||
+        wasm_wasi_path_is_dir(source, hir, function_index) ||
+        wasm_wasi_time_unix_millis(source, hir, function_index) ||
+        wasm_wasi_time_monotonic_nanos(source, hir, function_index) ||
+        wasm_wasi_random_fill(source, hir, function_index) ||
+        wasm_wasi_random_seed(source, hir, function_index) ||
+        wasm_wasi_sleep_millis(source, hir, function_index) ||
+        wasm_wasi_current_dir(source, hir, function_index) ||
+        wasm_wasi_dir_open(source, hir, function_index) ||
+        wasm_wasi_dir_next(source, hir, function_index) ||
+        wasm_wasi_dir_close(source, hir, function_index) ||
+        wasm_wasi_fs_metadata(source, hir, function_index) ||
+        wasm_wasi_create_dir_one(source, hir, function_index) ||
+        wasm_wasi_remove_one(source, hir, function_index) ||
+        wasm_wasi_rename_path(source, hir, function_index) ||
+        wasm_wasi_copy_file(source, hir, function_index)
+    );
+}
+
+fn wasm_wasi_emit_import(
+    ForgeWriter&mut section,
+    i64[]module_name,
+    i64 module_length,
+    i64[]name,
+    i64 name_length,
+    i64 type_index,
+) {
+    wasm_name(section, module_name, module_length);
+    wasm_name(section, name, name_length);
+    wasm_u8(section, 0);
+    wasm_u32(section, type_index);
+}
+
+fn wasm_wasi_emit_import_section(ForgeWriter&mut module, HirModule& hir) -> bool {
+    ForgeWriter section;
+
+    writer_init(&mut section);
+    if (section.failed) {
+        return false;
+    }
+    wasm_u32(&mut section, wasm_wasi_import_count());
+
+    i64 module_name[22] = [119, 97, 115, 105, 95, 115, 110, 97, 112, 115, 104, 111, 116, 95, 112, 114, 101, 118, 105, 101, 119, 49];
+    i64 fd_write[8] = [102, 100, 95, 119, 114, 105, 116, 101];
+    i64 fd_read[7] = [102, 100, 95, 114, 101, 97, 100];
+    i64 args_sizes_get[14] = [97, 114, 103, 115, 95, 115, 105, 122, 101, 115, 95, 103, 101, 116];
+    i64 args_get[8] = [97, 114, 103, 115, 95, 103, 101, 116];
+    i64 environ_sizes_get[17] = [101, 110, 118, 105, 114, 111, 110, 95, 115, 105, 122, 101, 115, 95, 103, 101, 116];
+    i64 environ_get[11] = [101, 110, 118, 105, 114, 111, 110, 95, 103, 101, 116];
+    i64 clock_time_get[14] = [99, 108, 111, 99, 107, 95, 116, 105, 109, 101, 95, 103, 101, 116];
+    i64 random_get[10] = [114, 97, 110, 100, 111, 109, 95, 103, 101, 116];
+    i64 proc_exit[9] = [112, 114, 111, 99, 95, 101, 120, 105, 116];
+    i64 path_open[9] = [112, 97, 116, 104, 95, 111, 112, 101, 110];
+    i64 fd_close[8] = [102, 100, 95, 99, 108, 111, 115, 101];
+    i64 path_filestat_get[17] = [112, 97, 116, 104, 95, 102, 105, 108, 101, 115, 116, 97, 116, 95, 103, 101, 116];
+    i64 fd_seek[7] = [102, 100, 95, 115, 101, 101, 107];
+    i64 fd_tell[7] = [102, 100, 95, 116, 101, 108, 108];
+    i64 fd_sync[7] = [102, 100, 95, 115, 121, 110, 99];
+    i64 fd_filestat_get[15] = [102, 100, 95, 102, 105, 108, 101, 115, 116, 97, 116, 95, 103, 101, 116];
+    i64 poll_oneoff[11] = [112, 111, 108, 108, 95, 111, 110, 101, 111, 102, 102];
+    i64 fd_prestat_get[14] = [102, 100, 95, 112, 114, 101, 115, 116, 97, 116, 95, 103, 101, 116];
+    i64 fd_prestat_dir_name[19] = [102, 100, 95, 112, 114, 101, 115, 116, 97, 116, 95, 100, 105, 114, 95, 110, 97, 109, 101];
+    i64 fd_readdir[10] = [102, 100, 95, 114, 101, 97, 100, 100, 105, 114];
+    i64 path_create_directory[21] = [112, 97, 116, 104, 95, 99, 114, 101, 97, 116, 101, 95, 100, 105, 114, 101, 99, 116, 111, 114, 121];
+    i64 path_unlink_file[16] = [112, 97, 116, 104, 95, 117, 110, 108, 105, 110, 107, 95, 102, 105, 108, 101];
+    i64 path_remove_directory[21] = [112, 97, 116, 104, 95, 114, 101, 109, 111, 118, 101, 95, 100, 105, 114, 101, 99, 116, 111, 114, 121];
+    i64 path_rename[11] = [112, 97, 116, 104, 95, 114, 101, 110, 97, 109, 101];
+    i64 base = hir.function_count + hir.function_type_count * 2;
+
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_write, 8, base);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_read, 7, base);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &args_sizes_get, 14, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &args_get, 8, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &environ_sizes_get, 17, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &environ_get, 11, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &clock_time_get, 14, base + 2);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &random_get, 10, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &proc_exit, 9, base + 3);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_open, 9, base + 4);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_close, 8, base + 5);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_filestat_get, 17, base + 6);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_seek, 7, base + 8);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_tell, 7, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_sync, 7, base + 5);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_filestat_get, 15, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &poll_oneoff, 11, base);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_prestat_get, 14, base + 1);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_prestat_dir_name, 19, base + 9);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &fd_readdir, 10, base + 10);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_create_directory, 21, base + 9);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_unlink_file, 16, base + 9);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_remove_directory, 21, base + 9);
+    wasm_wasi_emit_import(&mut section, &module_name, 22, &path_rename, 11, base + 11);
+    wasm_section(module, 2, &section);
+
+    bool success = !section.failed && !module.failed;
+
+    writer_destroy(&mut section);
+    return success;
+}
+
+fn wasm_wasi_emit_i32_store(ForgeWriter&mut body, i64 address, i64 local_index) {
+    wasm_u8(body, 65);
+    wasm_i64(body, address);
+    wasm_local_get(body, local_index);
+    wasm_u8(body, 167);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+}
+
+fn wasm_wasi_emit_stdio_body(ForgeWriter&mut section, bool read) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // Reserved linear-memory scratch:
+    // 16..23 = wasi iovec, 24..27 = bytes read/written.
+    wasm_wasi_emit_i32_store(&mut body, 16, 1);
+    wasm_wasi_emit_i32_store(&mut body, 20, 2);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 16);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 24);
+    wasm_u8(&mut body, 16);
+    if (read) {
+        wasm_u32(&mut body, 1);
+    } else {
+        wasm_u32(&mut body, 0);
+    }
+    wasm_wasi_capture_errno(&mut body);
+    // errno != 0 -> return -1.
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 24);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_constant_i64_body(ForgeWriter&mut section, i64 value) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, value);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_last_error_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, wasm_wasi_last_error_global());
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_unsupported_i64_body(ForgeWriter&mut section, i64 value) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // WASI preview1 has no environment mutation or child-process spawn API.
+    // Preserve Raz's fallible boundary contracts and expose ENOTSUP through
+    // std::io::last_error instead of silently succeeding.
+    wasm_wasi_set_last_error(&mut body, 58);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, value);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_process_argc_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 36);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 2);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_clock_body(ForgeWriter&mut section, bool realtime) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    if (realtime) {
+        wasm_i64(&mut body, 0);
+    } else {
+        wasm_i64(&mut body, 1);
+    }
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 6);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    if (realtime) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 1000000);
+        wasm_u8(&mut body, 127);
+    }
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_random_fill_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 7);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_random_seed_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 8);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 7);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 32);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_i32_load(ForgeWriter&mut body, i64 address) {
+    wasm_u8(body, 65);
+    wasm_i64(body, address);
+    wasm_u8(body, 40);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+}
+
+fn wasm_wasi_emit_materialize_pair(ForgeWriter&mut body, i64 sizes_import, i64 get_import, i64 base) {
+    // Locals 3..8: count, bytes, table, data, end, pages (all i32).
+    wasm_u8(body, 65);
+    wasm_i64(body, 32);
+    wasm_u8(body, 65);
+    wasm_i64(body, 36);
+    wasm_u8(body, 16);
+    wasm_u32(body, sizes_import);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, base + 1);
+    wasm_u8(body, 64);
+    wasm_u8(body, 0);
+    wasm_u8(body, 11);
+    wasm_wasi_emit_i32_load(body, 32);
+    wasm_local_set(body, base);
+    wasm_wasi_emit_i32_load(body, 36);
+    wasm_local_set(body, base + 1);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_local_set(body, base + 2);
+    wasm_local_get(body, base + 2);
+    wasm_local_get(body, base);
+    wasm_u8(body, 65);
+    wasm_i64(body, base + 1);
+    wasm_u8(body, 108);
+    wasm_u8(body, 106);
+    wasm_local_set(body, base + 3);
+    wasm_local_get(body, base + 3);
+    wasm_local_get(body, base + 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, base + 4);
+    // required_pages = (end + 65535) >> 16.
+    wasm_local_get(body, base + 4);
+    wasm_u8(body, 65);
+    wasm_i64(body, 65535);
+    wasm_u8(body, 106);
+    wasm_u8(body, 65);
+    wasm_i64(body, 16);
+    wasm_u8(body, 118);
+    wasm_local_set(body, base + 5);
+    // Grow only when the temporary argv/env image exceeds current memory.
+    wasm_local_get(body, base + 5);
+    wasm_u8(body, 63);
+    wasm_u8(body, 0);
+    wasm_u8(body, 75);
+    wasm_u8(body, base + 1);
+    wasm_u8(body, 64);
+    wasm_local_get(body, base + 5);
+    wasm_u8(body, 63);
+    wasm_u8(body, 0);
+    wasm_u8(body, 107);
+    wasm_u8(body, 64);
+    wasm_u8(body, 0);
+    wasm_u8(body, 26);
+    wasm_u8(body, 11);
+    wasm_local_get(body, base + 2);
+    wasm_local_get(body, base + 3);
+    wasm_u8(body, 16);
+    wasm_u32(body, get_import);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, base + 1);
+    wasm_u8(body, 64);
+    wasm_u8(body, 0);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_process_arg_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // Ten i32 temporaries after the three i64 parameters.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 10);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_materialize_pair(&mut body, 2, 3, 3);
+    // index must be non-negative and less than argc.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 83);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 73);
+    wasm_u8(&mut body, 113);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 5);
+    // src = *(table + index*4).
+    wasm_local_get(&mut body, 5);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 108);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 9);
+    // len=0; scan to NUL.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 9);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // If capacity>0 copy min(len, capacity-1), NUL terminate. Return full len.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 85);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 75);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 127);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 5);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 11);
+    wasm_local_set(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 12);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 9);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_env_get_body(ForgeWriter&mut section) -> bool {
+    // Environment lookup uses WASI's packed environment. The current adapter
+    // delegates lookup to a compact generated scanner emitted by the backend in
+    // the same representation as argv. Until mutation APIs are introduced,
+    // environ_get is authoritative and read-only.
+
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // Locals 4..13: count/bytes/table/data/end/pages/entry/name-index/value-length/entry-index.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 10);
+    wasm_u8(&mut body, 127);
+    // Reuse scratch size slots then materialize environment at bump pointer.
+    wasm_wasi_emit_materialize_pair(&mut body, 4, 5, 4);
+    // entry index = 0.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 13);
+    // Scan entries. A match is NAME followed by '='; then copy value.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 13);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    // entry pointer from table.
+    wasm_local_get(&mut body, 6);
+    wasm_local_get(&mut body, 13);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 108);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 10);
+    // Compare requested name bytes.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 11);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 71);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 2);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 11);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Confirm '=' immediately after name.
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 61);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // value pointer = entry + name_length + 1; scan len into local 11.
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Copy min(value_len, capacity-1). This is intentionally inlined so the
+    // native copy_text return contract (full source length) is preserved.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 11);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 85);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 11);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 79);
+    wasm_local_get(&mut body, 11);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 79);
+    wasm_u8(&mut body, 113);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_local_get(&mut body, 10);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 11);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // no match: next entry.
+    wasm_local_get(&mut body, 13);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 106);
+    wasm_local_set(&mut body, 13);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_find_preopen(ForgeWriter&mut body, i64 fd_local) {
+    // Preview1 does not promise that the first directory preopen is descriptor 3.
+    // Scan the host descriptor range and keep the first successful prestat.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 73);
+    // i32.lt_u
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 12);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    // i32.ge_u
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_find_named_preopen(ForgeWriter&mut body, i64 path_local, i64 length_local, i64 fd_local) {
+    // If a caller supplies a guest-visible mount path such as
+    // "/workspace/src/main.rz", match the named preopen "/workspace" and
+    // rewrite the path locals to "src/main.rz" before issuing path_* calls.
+    // The preopen name itself is materialized transiently at the current heap
+    // frontier; the frontier is not advanced, so routing never leaks memory.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    // fd >= 256 -> exhausted.
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    // Candidate block: any failed test falls through to fd++.
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    // fd_prestat_get(fd, &prestat@256).
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Empty names cannot establish a virtual prefix.
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // name_len > path_len cannot match.
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 73);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Temporarily grow memory so [heap_frontier, heap_frontier+name_len) is a
+    // valid scratch range, then restore the frontier before the host writes.
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 106);
+    wasm_u8(body, 36);
+    wasm_u32(body, 0);
+    wasm_memory_emit_ensure_capacity(body);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 107);
+    wasm_u8(body, 36);
+    wasm_u32(body, 0);
+    // fd_prestat_dir_name(fd, heap_frontier, name_len).
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 16);
+    wasm_u32(body, 18);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // scratch index @272 = 0.
+    wasm_u8(body, 65);
+    wasm_i64(body, 272);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    // Compare preopen name bytes to the leading path bytes.
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 71);
+    wasm_u8(body, 13);
+    wasm_u32(body, 2);
+    wasm_u8(body, 65);
+    wasm_i64(body, 272);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    // Exact mount-name path resolves to the preopen root itself. Materialize
+    // "." in reserved scratch so Preview1 receives a non-empty relative path.
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, 280);
+    wasm_u8(body, 65);
+    wasm_i64(body, 46);
+    wasm_u8(body, 58);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 66);
+    wasm_i64(body, 280);
+    wasm_local_set(body, path_local);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_local_set(body, length_local);
+    wasm_u8(body, 12);
+    // Inside the exact-match if: depth 3 exits if + candidate + scan loop
+    // and lands at the outer scan block.
+    wasm_u32(body, 3);
+    wasm_u8(body, 11);
+    // Otherwise require a path-segment boundary after the mount name.
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 47);
+    wasm_u8(body, 71);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Strip "mount/" from the pointer/length pair in place.
+    wasm_local_get(body, path_local);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 173);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_u8(body, 124);
+    wasm_u8(body, 124);
+    wasm_local_set(body, path_local);
+    wasm_local_get(body, length_local);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 173);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_u8(body, 124);
+    wasm_u8(body, 125);
+    wasm_local_set(body, length_local);
+    // Success exits the outer scan block with fd_local naming the owner.
+    wasm_u8(body, 12);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_find_preopen_for_path(
+    ForgeWriter&mut body,
+    i64 path_local,
+    i64 length_local,
+    i64 fd_local,
+) {
+    // Resolve an existing relative path against every directory preopen instead
+    // of assuming the first host mount owns it. Scratch 64 holds filestat.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_u8(body, 65);
+    wasm_i64(body, 64);
+    wasm_u8(body, 16);
+    wasm_u32(body, 11);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_resolve_preopen(
+    ForgeWriter&mut body,
+    i64 path_local,
+    i64 length_local,
+    i64 fd_local,
+    bool allow_missing,
+) {
+    // First preserve the fast path for already-relative guest paths.
+    wasm_wasi_emit_find_preopen_for_path(body, path_local, length_local, fd_local);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    // If relative lookup failed, route an absolute/virtual guest path by its
+    // named preopen prefix and strip that prefix from the path locals.
+    wasm_wasi_emit_find_named_preopen(body, path_local, length_local, fd_local);
+    wasm_u8(body, 11);
+    if (!allow_missing) {
+        // Prefix routing establishes authority, but existing-path operations
+        // still verify that the stripped target exists beneath that preopen.
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_u8(body, 71);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, 0);
+        wasm_local_get(body, path_local);
+        wasm_u8(body, 167);
+        wasm_local_get(body, length_local);
+        wasm_u8(body, 167);
+        wasm_u8(body, 65);
+        wasm_i64(body, 64);
+        wasm_u8(body, 16);
+        wasm_u32(body, 11);
+        wasm_wasi_capture_errno(body);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_local_set(body, fd_local);
+        wasm_u8(body, 11);
+        wasm_u8(body, 11);
+    } else {
+        // A missing create target with no matching named mount falls back to the
+        // first directory capability, preserving existing relative-path behavior.
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_u8(body, 70);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_wasi_emit_find_preopen(body, fd_local);
+        wasm_u8(body, 11);
+    }
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    if (allow_missing) {
+        // Create operations only reach this point when the host exposed no
+        // directory capability at all.
+        wasm_wasi_set_last_error(body, 76);
+    } else {
+        // Existing-path operations had filesystem authority but found no target.
+        wasm_wasi_set_last_error(body, 44);
+    }
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_file_open_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // local 3: oflags, local 4: fdflags, local 5: discovered preopen fd.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 3);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 5, true);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 4);
+    // Raz create bit 8 -> WASI O_CREAT=1.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 8);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    // Raz truncate bit 16 -> WASI O_TRUNC=8.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 16);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 8);
+    wasm_u8(&mut body, 114);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    // Raz append bit 4 -> WASI FDFLAG_APPEND=1.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 4);
+    wasm_u8(&mut body, 11);
+    // Open relative to the discovered directory preopen.
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 127);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 9);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_wasi_emit_i32_load(&mut body, 40);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_close_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 10);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 26);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_seek_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 12);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_tell_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 13);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_flush_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 14);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_eof_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // fd_tell(fd, &offset@40)
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 13);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    // fd_filestat_get(fd, &stat@64)
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 15);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 96);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 81);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_path_filestat_body(ForgeWriter&mut section, i64 mode) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    if (mode == 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, -1);
+    } else {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    if (mode == 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, -1);
+    } else {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 5);
+    if (mode == 0) {
+        // __wasi_filestat_t.filesize is the u64 at byte offset 32.
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 96);
+        wasm_u8(&mut body, 41);
+        wasm_u32(&mut body, 3);
+        wasm_u32(&mut body, 0);
+    } else {
+        // __wasi_filestat_t.filetype is the byte at offset 16: directory=3, regular_file=4.
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 80);
+        wasm_u8(&mut body, 45);
+        wasm_u32(&mut body, 0);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 65);
+        if (mode == 1) {
+            wasm_i64(&mut body, 4);
+        } else {
+            wasm_i64(&mut body, 3);
+        }
+        wasm_u8(&mut body, 70);
+        wasm_u8(&mut body, 173);
+    }
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_path_exists_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_start_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    i64 main_function = wasm_wasi_main_function(source, hir);
+
+    if (main_function < 0) {
+        return false;
+    }
+
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(main_function));
+    if (raz_rt_stage1_arena_get(hir.function_returns_value, main_function) != 0) {
+        wasm_u8(&mut body, 167);
+    } else {
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 8);
+    wasm_u8(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+public fn wasm_wasi_emit_poll_delay(ForgeWriter&mut body, i64 milliseconds) {
+    // One monotonic relative timer subscription. This is also used by the
+    // generated async command executor to yield to the WASI host between polls.
+    wasm_u8(body, 65);
+    wasm_i64(body, 128);
+    wasm_u8(body, 66);
+    wasm_i64(body, 0);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 136);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 58);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 144);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 152);
+    wasm_u8(body, 66);
+    wasm_i64(body, milliseconds * 1000000);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 160);
+    wasm_u8(body, 66);
+    wasm_i64(body, 0);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 168);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 59);
+    wasm_u32(body, 1);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 128);
+    wasm_u8(body, 65);
+    wasm_i64(body, 176);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 65);
+    wasm_i64(body, 208);
+    wasm_u8(body, 16);
+    wasm_u32(body, 16);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 26);
+}
+
+public fn wasm_wasi_emit_poll_delay_local(ForgeWriter&mut body, i64 milliseconds_local) {
+    // Dynamic variant used by the WASM future kernel. The subscription layout
+    // is identical to wasm_wasi_emit_poll_delay; only the timeout is local.
+    wasm_u8(body, 65);
+    wasm_i64(body, 128);
+    wasm_u8(body, 66);
+    wasm_i64(body, 0);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 136);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 58);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 144);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 152);
+    wasm_local_get(body, milliseconds_local);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1000000);
+    wasm_u8(body, 126);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 160);
+    wasm_u8(body, 66);
+    wasm_i64(body, 0);
+    wasm_u8(body, 55);
+    wasm_u32(body, 3);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 168);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 59);
+    wasm_u32(body, 1);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 128);
+    wasm_u8(body, 65);
+    wasm_i64(body, 176);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 65);
+    wasm_i64(body, 208);
+    wasm_u8(body, 16);
+    wasm_u32(body, 16);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 26);
+}
+
+fn wasm_wasi_emit_sleep_millis_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // Non-positive sleeps are no-ops.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 87);
+    // i64.le_s
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // __wasi_subscription_t at 128: userdata=0, type=CLOCK(0),
+    // clock.id=MONOTONIC(1), relative timeout=milliseconds*1e6,
+    // precision=0, flags=0. Event output starts at 176; nevents at 208.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 128);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 136);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 144);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 54);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 152);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1000000);
+    wasm_u8(&mut body, 126);
+    // i64.mul
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 160);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 168);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 59);
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 0);
+    // poll_oneoff(&subscription, &event, 1, &nevents)
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 128);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 176);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 208);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 16);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 26);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_current_dir_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // local 2 = preopen name length, local 3 = bytes copied, local 4 = preopen fd.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 3);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_find_preopen(&mut body, 4);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // fd_prestat_get(discovered, &prestat@256)
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 256);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 17);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // prestat.dir.pr_name_len at byte offset 4.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 260);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 2);
+    // Query mode: output==0 or capacity==0 returns required length.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // copied = min(name_len, capacity - 1).
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 73);
+    // i32.lt_u
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 127);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 5);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 107);
+    wasm_u8(&mut body, 11);
+    wasm_local_set(&mut body, 3);
+    // fd_prestat_dir_name(discovered, output, copied)
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 18);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // NUL terminate at output + copied.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_fs_metadata_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // i32 locals 4..5: preopen fd and filetype; i64 local 6: Raz kind.
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 127);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+    // output must provide the six stable i64 metadata fields.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 6);
+    wasm_u8(&mut body, 83);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 4, false);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // filetype and kind.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 80);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4);
+    wasm_local_set(&mut body, 6);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 6);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 3);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 2);
+    wasm_local_set(&mut body, 6);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 7);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 3);
+    wasm_local_set(&mut body, 6);
+    wasm_u8(&mut body, 11);
+    // kind.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    // size: regular files only.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 96);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 8);
+    // modified millis.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 112);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1000000);
+    wasm_u8(&mut body, 127);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 16);
+    // readonly is not represented by preview1 filestat permissions: conservative false.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 24);
+    // symlink.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 7);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 32);
+    // exists.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 40);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_create_dir_one_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // local 2 = discovered preopen fd.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, true);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Existing paths return 0, matching create_directory semantics.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 20);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_remove_one_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // locals 2 = preopen fd, 3 = filetype, 4 = stat errno.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 3);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Missing paths are a successful no-op (0), matching native remove_one.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_local_set(&mut body, 4);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // WASI ENOENT=44 is the native remove(false-without-error) case.
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 44);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 80);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 3);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 3);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 127);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 22);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 21);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_rename_path_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // local 4 = discovered preopen fd.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 4, false);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 4);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 23);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_copy_file_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    i64 open_name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 111, 112, 101, 110];
+    i64 read_name[16] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 114, 101, 97, 100];
+    i64 write_name[17] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 119, 114, 105, 116, 101];
+    i64 close_name[17] = [114, 97, 122, 95, 114, 116, 95, 102, 105, 108, 101, 95, 99, 108, 111, 115, 101];
+    i64 exists_name[18] = [114, 97, 122, 95, 114, 116, 95, 112, 97, 116, 104, 95, 101, 120, 105, 115, 116, 115];
+    i64 open_function = wasm_wasi_find_named_function(source, hir, &open_name, 16);
+    i64 read_function = wasm_wasi_find_named_function(source, hir, &read_name, 16);
+    i64 write_function = wasm_wasi_find_named_function(source, hir, &write_name, 17);
+    i64 close_function = wasm_wasi_find_named_function(source, hir, &close_name, 17);
+    i64 exists_function = wasm_wasi_find_named_function(source, hir, &exists_name, 18);
+
+    if (
+        open_function < 0 ||
+        read_function < 0 ||
+        write_function < 0 ||
+        close_function < 0 ||
+        exists_function < 0
+    ) {
+        return false;
+    }
+
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // locals 5..10: source fd, destination fd, read count, written count,
+    // write chunk, final status. Copy payload uses reserved WASI scratch 320..479.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 6);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 6);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 10);
+    // One exit block guarantees both descriptors are closed on every path.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    // If overwrite is disabled, an existing destination is a clean false result.
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(exists_function));
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 81);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // source = file_open(from, read).
+    wasm_local_get(&mut body, 0);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(open_function));
+    wasm_local_set(&mut body, 5);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    // destination = file_open(to, write|create|truncate).
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 26);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(open_function));
+    wasm_local_set(&mut body, 6);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    // Chunked streaming copy.
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 320);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 160);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(read_function));
+    wasm_local_set(&mut body, 7);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 83);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 8);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 8);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 89);
+    wasm_u8(&mut body, 13);
+    wasm_u32(&mut body, 1);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 320);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 124);
+    wasm_local_get(&mut body, 7);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 125);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(write_function));
+    wasm_local_set(&mut body, 9);
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 87);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 8);
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 124);
+    wasm_local_set(&mut body, 8);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Close destination/source if they were opened.
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(close_function));
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(close_function));
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_dir_open_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // local 2 = preopen fd (i32), local 3 = iterator-state pointer (i64).
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // path_open(root, 0, path, len, OFLAGS_DIRECTORY=2,
+    // rights=FD_READDIR|PATH_FILESTAT_GET, inheriting=0, fdflags=0, &fd@40).
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 278528);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 9);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+
+    i64 alloc_name[12] = [114, 97, 122, 95, 114, 116, 95, 97, 108, 108, 111, 99];
+    i64 alloc_function = wasm_wasi_find_named_function(source, hir, &alloc_name, 12);
+
+    if (alloc_function >= 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 16);
+        wasm_u8(&mut body, 16);
+        wasm_u32(&mut body, wasm_wasi_defined_function(alloc_function));
+        wasm_local_set(&mut body, 3);
+    } else {
+        // Minimal fallback for freestanding programs that did not link alloc.
+        wasm_u8(&mut body, 35);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 173);
+        wasm_local_set(&mut body, 3);
+        wasm_u8(&mut body, 35);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 16);
+        wasm_u8(&mut body, 106);
+        wasm_u8(&mut body, 36);
+        wasm_u32(&mut body, 0);
+        wasm_memory_emit_ensure_capacity(&mut body);
+    }
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    // Allocation failed: close the directory descriptor and return 0.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 10);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 26);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // state.fd = opened descriptor; state.cookie = 0.
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_wasi_emit_i32_load(&mut body, 40);
+    wasm_u8(&mut body, 54);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 8);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_dir_next_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    // i32 locals 5..9: fd, used, name_len, filetype, errno.
+    // i64 locals 10..14: work_cookie, next_cookie, kind, size, modified_ms.
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 5);
+    wasm_u8(&mut body, 127);
+    wasm_u32(&mut body, 5);
+    wasm_u8(&mut body, 126);
+    // Validate handle, metadata pointer and six-slot metadata capacity.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 6);
+    wasm_u8(&mut body, 83);
+    // i64.lt_s
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Load fd and current cookie from iterator state.
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 5);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 8);
+    wasm_local_set(&mut body, 10);
+    // Skip dot entries without consuming the externally visible iterator cookie.
+    wasm_u8(&mut body, 2);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    // fd_readdir(fd, scratch@224, 288, cookie, &used@216)
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 224);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 288);
+    wasm_local_get(&mut body, 10);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 216);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 19);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_local_set(&mut body, 9);
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_wasi_emit_i32_load(&mut body, 216);
+    wasm_local_set(&mut body, 6);
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Parse first __wasi_dirent_t: d_next@0, d_namlen@16, d_type@20, name@24.
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 224);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 240);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 7);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 244);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 8);
+    // Reject a truncated dirent rather than exposing partial UTF-8 names.
+    wasm_local_get(&mut body, 6);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 24);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 73);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Skip ".".
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 248);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 46);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 11);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Skip "..".
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 2);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 248);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 46);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 249);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 46);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 113);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 11);
+    wasm_local_set(&mut body, 10);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Non-dot entry found.
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    // Fetch stat relative to the opened directory descriptor.
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 248);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_local_set(&mut body, 9);
+    // Defaults if metadata lookup is unavailable for the entry.
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 13);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_local_set(&mut body, 14);
+    wasm_local_get(&mut body, 9);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 80);
+    wasm_u8(&mut body, 45);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 8);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 96);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_local_set(&mut body, 13);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 112);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1000000);
+    wasm_u8(&mut body, 127);
+    wasm_local_set(&mut body, 14);
+    wasm_u8(&mut body, 11);
+    // Map WASI filetype to Raz metadata kind: file=1, dir=2, symlink=3, other=4.
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4);
+    wasm_local_set(&mut body, 12);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 3);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 2);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 7);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 3);
+    wasm_local_set(&mut body, 12);
+    wasm_u8(&mut body, 11);
+    // metadata[0..5] = kind,size,modified_ms,readonly,symlink,exists.
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 12);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 13);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 8);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 14);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 16);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 24);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 8);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 7);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 32);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 40);
+    // Sizing/short-buffer calls do not consume the entry.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 88);
+    // i64.le_u: capacity <= required
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    // Copy the name, terminate, then commit d_next into state.cookie.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 248);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 252);
+    wasm_u32(&mut body, 10);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 58);
+    wasm_u32(&mut body, 0);
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 11);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 8);
+    wasm_local_get(&mut body, 7);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_dir_close_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    ForgeWriter body;
+
+    writer_init(&mut body);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 40);
+    wasm_u32(&mut body, 2);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 10);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 26);
+
+    i64 dealloc_name[14] = [114, 97, 122, 95, 114, 116, 95, 100, 101, 97, 108, 108, 111, 99];
+    i64 dealloc_function = wasm_wasi_find_named_function(source, hir, &dealloc_name, 14);
+
+    if (dealloc_function >= 0) {
+        wasm_local_get(&mut body, 0);
+        wasm_u8(&mut body, 16);
+        wasm_u32(&mut body, wasm_wasi_defined_function(dealloc_function));
+    }
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_runtime_body(
+    ForgeWriter&mut section,
+    Source& source,
+    HirModule& hir,
+    i64 function_index,
+) -> bool {
+    if (wasm_wasi_stdio_write(source, hir, function_index)) {
+        return wasm_wasi_emit_stdio_body(section, false);
+    }
+    if (wasm_wasi_stdio_read(source, hir, function_index)) {
+        return wasm_wasi_emit_stdio_body(section, true);
+    }
+    if (wasm_wasi_stdio_flush(source, hir, function_index)) {
+        return wasm_wasi_emit_constant_i64_body(section, 1);
+    }
+    if (wasm_wasi_stdio_is_terminal(source, hir, function_index)) {
+        // Preview1 has no portable isatty primitive. Keep the stdlib contract
+        // conservative; hosts can still provide terminal policy above WASI.
+        return wasm_wasi_emit_constant_i64_body(section, 0);
+    }
+    if (wasm_wasi_process_argc(source, hir, function_index)) {
+        return wasm_wasi_emit_process_argc_body(section);
+    }
+    if (wasm_wasi_process_arg(source, hir, function_index)) {
+        return wasm_wasi_emit_process_arg_body(section);
+    }
+    if (wasm_wasi_env_get(source, hir, function_index)) {
+        return wasm_wasi_emit_env_get_body(section);
+    }
+    if (wasm_wasi_last_error_code(source, hir, function_index)) {
+        return wasm_wasi_emit_last_error_body(section);
+    }
+    if (wasm_wasi_env_set(source, hir, function_index) || wasm_wasi_env_remove(source, hir, function_index)) {
+        return wasm_wasi_emit_unsupported_i64_body(section, 0);
+    }
+    if (wasm_wasi_process_id(source, hir, function_index)) {
+        return wasm_wasi_emit_unsupported_i64_body(section, 0);
+    }
+    if (
+        wasm_wasi_process_run(source, hir, function_index) ||
+        wasm_wasi_process_run_argv(source, hir, function_index)
+    ) {
+        return wasm_wasi_emit_unsupported_i64_body(section, -1);
+    }
+    if (wasm_wasi_file_open(source, hir, function_index)) {
+        return wasm_wasi_emit_file_open_body(section);
+    }
+    if (wasm_wasi_file_read(source, hir, function_index)) {
+        return wasm_wasi_emit_stdio_body(section, true);
+    }
+    if (wasm_wasi_file_write(source, hir, function_index)) {
+        return wasm_wasi_emit_stdio_body(section, false);
+    }
+    if (wasm_wasi_file_close(source, hir, function_index)) {
+        return wasm_wasi_emit_file_close_body(section);
+    }
+    if (wasm_wasi_file_seek(source, hir, function_index)) {
+        return wasm_wasi_emit_file_seek_body(section);
+    }
+    if (wasm_wasi_file_tell(source, hir, function_index)) {
+        return wasm_wasi_emit_file_tell_body(section);
+    }
+    if (wasm_wasi_file_flush(source, hir, function_index)) {
+        return wasm_wasi_emit_file_flush_body(section);
+    }
+    if (wasm_wasi_file_eof(source, hir, function_index)) {
+        return wasm_wasi_emit_file_eof_body(section);
+    }
+    if (wasm_wasi_file_size(source, hir, function_index)) {
+        return wasm_wasi_emit_path_filestat_body(section, 0);
+    }
+    if (wasm_wasi_path_is_file(source, hir, function_index)) {
+        return wasm_wasi_emit_path_filestat_body(section, 1);
+    }
+    if (wasm_wasi_path_is_dir(source, hir, function_index)) {
+        return wasm_wasi_emit_path_filestat_body(section, 2);
+    }
+    if (wasm_wasi_path_exists(source, hir, function_index)) {
+        return wasm_wasi_emit_path_exists_body(section);
+    }
+    if (wasm_wasi_time_unix_millis(source, hir, function_index)) {
+        return wasm_wasi_emit_clock_body(section, true);
+    }
+    if (wasm_wasi_time_monotonic_nanos(source, hir, function_index)) {
+        return wasm_wasi_emit_clock_body(section, false);
+    }
+    if (wasm_wasi_random_fill(source, hir, function_index)) {
+        return wasm_wasi_emit_random_fill_body(section);
+    }
+    if (wasm_wasi_random_seed(source, hir, function_index)) {
+        return wasm_wasi_emit_random_seed_body(section);
+    }
+    if (wasm_wasi_sleep_millis(source, hir, function_index)) {
+        return wasm_wasi_emit_sleep_millis_body(section);
+    }
+    if (wasm_wasi_current_dir(source, hir, function_index)) {
+        return wasm_wasi_emit_current_dir_body(section);
+    }
+    if (wasm_wasi_dir_open(source, hir, function_index)) {
+        return wasm_wasi_emit_dir_open_body(section, source, hir);
+    }
+    if (wasm_wasi_dir_next(source, hir, function_index)) {
+        return wasm_wasi_emit_dir_next_body(section);
+    }
+    if (wasm_wasi_dir_close(source, hir, function_index)) {
+        return wasm_wasi_emit_dir_close_body(section, source, hir);
+    }
+    if (wasm_wasi_fs_metadata(source, hir, function_index)) {
+        return wasm_wasi_emit_fs_metadata_body(section);
+    }
+    if (wasm_wasi_create_dir_one(source, hir, function_index)) {
+        return wasm_wasi_emit_create_dir_one_body(section);
+    }
+    if (wasm_wasi_remove_one(source, hir, function_index)) {
+        return wasm_wasi_emit_remove_one_body(section);
+    }
+    if (wasm_wasi_rename_path(source, hir, function_index)) {
+        return wasm_wasi_emit_rename_path_body(section);
+    }
+    if (wasm_wasi_copy_file(source, hir, function_index)) {
+        return wasm_wasi_emit_copy_file_body(section, source, hir);
+    }
+    return false;
+}

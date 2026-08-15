@@ -1,0 +1,105 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::read_dir;
+import alloc::string;
+import core::result;
+import std::fs::metadata;
+import std::io::error;
+
+struct RawDirMetadata {
+    i64 kind;
+    i64 size;
+    i64 modified_millis;
+    i64 readonly;
+    i64 symlink;
+    i64 exists;
+}
+
+extern fn raz_rt_dir_open(usize path, i64 length) -> usize;
+extern fn raz_rt_dir_next(
+    usize handle,
+    usize output,
+    i64 capacity,
+    RawDirMetadata&mut metadata,
+    i64 metadata_capacity,
+) -> i64;
+extern fn raz_rt_dir_close(usize handle);
+
+public struct ReadDir {
+    usize handle;
+    bool finished;
+}
+
+public fn open(usize path, i64 length) -> Result<ReadDir, IoError> {
+    usize handle = raz_rt_dir_open(path, length);
+
+    if (handle == 0) {
+        return Result<ReadDir, IoError>::Error(std::io::error::last_error(IoOperation::Open));
+    }
+    return Result<ReadDir, IoError>::Ok(ReadDir {
+        handle: handle,
+        finished: false
+    }
+    );
+}
+
+// Returns 1 for an entry, 0 at end-of-directory, -1 on error. The caller owns
+// and reuses `name`, so a large directory normally allocates only when a longer
+// filename than any previously seen is encountered.
+public fn next(ReadDir&mut iterator, String&mut name, Metadata&mut metadata) -> i64 {
+    if (iterator.handle == 0 || iterator.finished) {
+        return 0;
+    }
+    RawDirMetadata raw = RawDirMetadata {
+        kind: 0,
+        size: 0,
+        modified_millis: 0,
+        readonly: 0,
+        symlink: 0,
+        exists: 0
+    };
+
+    i64 required = raz_rt_dir_next(iterator.handle, 0, 0, &mut raw, 6);
+
+    if (required == -1) {
+        iterator.finished = true;
+        return 0;
+    }
+    if (required < 0) {
+        return -1;
+    }
+    if (!alloc::string::reserve_exact(name, required)) {
+        return -1;
+    }
+
+    i64 fetched = raz_rt_dir_next(iterator.handle, name.data, required + 1, &mut raw, 6);
+
+    if (fetched < 0) {
+        return -1;
+    }
+    name.length = fetched;
+    *metadata = Metadata {
+        kind: raw.kind,
+        size: raw.size,
+        modified_millis: raw.modified_millis,
+        readonly: raw.readonly == 1,
+        symlink: raw.symlink == 1,
+        exists: raw.exists == 1,
+    };
+    return 1;
+}
+
+public fn close(ReadDir&mut iterator) {
+    if (iterator.handle != 0) {
+        raz_rt_dir_close(iterator.handle);
+        iterator.handle = 0;
+        iterator.finished = true;
+    }
+}
+
+impl Drop for ReadDir {
+    fn drop(ReadDir&mut self) {
+        close(self);
+    }
+}

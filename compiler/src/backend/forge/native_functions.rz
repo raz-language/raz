@@ -1,0 +1,2091 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_backend_forge_native_functions;
+public import raz_compiler_backend_forge_native_operations;
+import raz_compiler_backend_forge_function_codegen;
+
+fn forge_native_emit_scalar_function(
+i64 session,
+i64 function_handle,
+Source& source,
+HirModule& hir,
+MirModule& mir,
+i64 function_index,
+i64 block_handles,
+i64 image_pointer_values,
+ForgeWriter&mut result,
+ForgeWriter&mut opcode,
+ForgeWriter&mut operand,
+) -> bool {
+  forge_native_scratch_reset(operand);
+
+  i64 entry_text[5] = [101, 110, 116, 114, 121];
+
+  writer_chars(operand, &entry_text, 5);
+  i64 entry = raz_compiler_forge_session_add_block_i64(
+  session,
+  function_handle,
+  operand.data,
+  operand.length,
+  );
+  if (entry == 0) {
+    return false;
+  }
+
+  i64 instruction = raz_rt_stage1_arena_get(mir.function_instruction_starts, function_index);
+  i64 end = instruction + raz_rt_stage1_arena_get(mir.function_instruction_counts, function_index);
+  i64 scan = instruction;
+
+  while (scan < end) {
+    if (raz_rt_stage1_arena_get(mir.opcodes, scan) == 24) {
+      forge_native_scratch_reset(operand);
+      forge_native_writer_block_name(operand, scan);
+      i64 block = raz_compiler_forge_session_add_block_i64(
+      session,
+      function_handle,
+      operand.data,
+      operand.length,
+      );
+      if (block == 0) {
+        return false;
+      }
+      raz_rt_stage1_arena_set(block_handles, scan, block);
+      if (raz_rt_stage1_arena_get(mir.op_a, scan) != 0) {
+        forge_native_scratch_reset(operand);
+        writer_register(operand, scan);
+        if (
+        raz_compiler_forge_block_add_parameter_i64(
+        block,
+        operand.data,
+        operand.length,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ) == 0
+        ) {
+          return false;
+        }
+      }
+    }
+    scan += 1;
+  }
+  if (
+  !forge_native_append_const(entry, result, opcode, operand, 999999, 0, 0) ||
+  !forge_native_append_const(entry, result, opcode, operand, 999998, 0, 1)
+  ) {
+    return false;
+  }
+
+  i64 local_slot = 0;
+  i64 local_count = raz_rt_stage1_arena_get(mir.function_local_counts, function_index);
+
+  while (local_slot < local_count) {
+    i64 local_type = forge_native_scalar_local_type(hir, function_index, local_slot);
+    i64 storage_size = forge_native_scalar_storage_size(local_type);
+
+    if (local_type < 0 || storage_size <= 0) {
+      return false;
+    }
+    forge_native_scratch_reset(result);
+    writer_register(result, forge_native_local_address_register(local_slot));
+    forge_native_scratch_reset(opcode);
+    forge_native_writer_word(opcode, 8);
+
+    i64 allocation = forge_native_append_operation(entry, result, opcode, 8);
+
+    if (
+    allocation == 0 ||
+    !forge_native_add_literal_operand(entry, allocation, operand, storage_size) ||
+    raz_compiler_forge_operation_set_alignment_i64(entry, allocation, storage_size) == 0
+    ) {
+      return false;
+    }
+    if (
+    local_type == 14 &&
+    forge_native_local_uses_callback_storage(hir, mir, function_index, local_slot)
+    ) {
+      i64 local_signature = forge_native_scalar_local_signature(hir, function_index, local_slot);
+
+      if (local_signature < 0) {
+        return false;
+      }
+      forge_native_scratch_reset(result);
+
+      i64 attribute_name[18] = [99, 97, 108, 108, 98, 97, 99, 107, 46, 115, 105, 103, 110, 97, 116, 117, 114, 101];
+
+      writer_chars(result, &attribute_name, 18);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_signature_name(
+      opcode,
+      forge_native_canonical_signature(hir, local_signature),
+      false,
+      );
+      if (
+      raz_compiler_forge_operation_add_attribute_i64(
+      entry,
+      allocation,
+      result.data,
+      result.length,
+      opcode.data,
+      opcode.length,
+      ) == 0
+      ) {
+        return false;
+      }
+    }
+    local_slot += 1;
+  }
+
+  i64 current_block = entry;
+  bool block_terminated = false;
+
+  while (instruction < end) {
+    i64 mir_opcode = raz_rt_stage1_arena_get(mir.opcodes, instruction);
+
+    if (mir_opcode == 24) {
+      if (!block_terminated) {
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 6);
+
+        i64 jump = forge_native_append_operation(current_block, result, opcode, 0);
+
+        if (jump == 0 || !forge_native_add_successor(current_block, jump, operand, instruction)) {
+          return false;
+        }
+      }
+      current_block = raz_rt_stage1_arena_get(block_handles, instruction);
+      block_terminated = false;
+    } else if (block_terminated) {} else if (mir_opcode == 1) {
+      if (
+      !forge_native_append_mir_const(
+      current_block,
+      source,
+      hir,
+      mir,
+      function_index,
+      image_pointer_values,
+      result,
+      opcode,
+      operand,
+      instruction,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 42) {
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 11);
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 8);
+
+      if (
+      operation == 0 ||
+      !forge_native_add_string_operand(current_block, operation, operand, instruction)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 43) {
+      i64 target = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 encoded_signature = raz_rt_stage1_arena_get(hir.function_pointer_signatures, target);
+
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+
+      i64 address_text[12] = [102, 117, 110, 99, 46, 97, 100, 100, 114, 101, 115, 115];
+
+      writer_chars(opcode, &address_text, 12);
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 8);
+
+      if (
+      operation == 0 ||
+      !forge_native_add_function_operand(current_block, operation, operand, source, hir, target)
+      ) {
+        return false;
+      }
+      if (
+      encoded_signature > 0 &&
+      !forge_native_add_signature_operand(
+      current_block,
+      operation,
+      operand,
+      hir,
+      encoded_signature - 1,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 50) {
+      if (
+      !forge_native_append_callable_create(
+      current_block,
+      source,
+      hir,
+      mir,
+      instruction,
+      result,
+      opcode,
+      operand,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 44) {
+      i64 signature = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+
+      i64 indirect_text[13] = [99, 97, 108, 108, 46, 105, 110, 100, 105, 114, 101, 99, 116];
+
+      writer_chars(opcode, &indirect_text, 13);
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(raz_rt_stage1_arena_get(mir.op_types, instruction)),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      ) ||
+      !forge_native_add_signature_operand(current_block, operation, operand, hir, signature)
+      ) {
+        return false;
+      }
+
+      i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, instruction);
+      i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, instruction);
+      i64 argument = 0;
+
+      while (argument < argument_count) {
+        if (
+        !forge_native_add_register_operand(
+        current_block,
+        operation,
+        operand,
+        raz_rt_stage1_arena_get(mir.call_arguments, argument_start + argument),
+        )
+        ) {
+          return false;
+        }
+        argument += 1;
+      }
+      i64 return_signature = raz_rt_stage1_arena_get(
+      hir.function_type_return_function_types,
+      signature,
+      );
+      if (return_signature >= 0) {
+        forge_native_scratch_reset(result);
+
+        i64 attribute_name[18] = [99, 97, 108, 108, 98, 97, 99, 107, 46, 115, 105, 103, 110, 97, 116, 117, 114, 101];
+
+        writer_chars(result, &attribute_name, 18);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_signature_name(
+        opcode,
+        forge_native_canonical_signature(hir, return_signature),
+        false,
+        );
+        if (
+        raz_compiler_forge_operation_add_attribute_i64(
+        current_block,
+        operation,
+        result.data,
+        result.length,
+        opcode.data,
+        opcode.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 2) {
+      i64 parameter = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 parameter_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
+
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 2);
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(parameter_type),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_parameter_operand(current_block, operation, operand, parameter)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 3) {
+      i64 local_slot = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 local_type = forge_native_scalar_local_type(hir, function_index, local_slot);
+      i64 alignment = forge_native_scalar_storage_size(local_type);
+
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 9);
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(local_type),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      forge_native_local_address_register(local_slot),
+      ) ||
+      raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+      ) {
+        return false;
+      }
+    } else if ((mir_opcode >= 4 && mir_opcode <= 7) || (mir_opcode >= 34 && mir_opcode <= 39)) {
+      if (!forge_native_append_binary(current_block, result, opcode, operand, mir, instruction)) {
+        return false;
+      }
+    } else if (mir_opcode == 40) {
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      writer_numeric_cast_opcode(
+      opcode,
+      raz_rt_stage1_arena_get(mir.op_b, instruction),
+      raz_rt_stage1_arena_get(mir.op_types, instruction),
+      );
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(raz_rt_stage1_arena_get(mir.op_types, instruction)),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 8) {
+      i64 target = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 argument_start = raz_rt_stage1_arena_get(mir.op_b, instruction);
+      i64 argument_count = raz_rt_stage1_arena_get(mir.op_c, instruction);
+      i64 target_parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, target);
+      i64 target_parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, target);
+
+      if (argument_count != target_parameter_count) {
+        return false;
+      }
+
+      i64 argument = 0;
+
+      while (argument < argument_count) {
+        i64 parameter_index = target_parameter_start + argument;
+
+        i64 argument_register = raz_rt_stage1_arena_get(
+        mir.call_arguments,
+        argument_start + argument,
+        );
+        if (
+        !forge_native_materialize_call_aggregate(
+        current_block,
+        source,
+        hir,
+        parameter_index,
+        argument_register,
+        instruction,
+        argument,
+        result,
+        opcode,
+        operand,
+        )
+        ) {
+          return false;
+        }
+        argument += 1;
+      }
+
+      bool void_call = raz_rt_stage1_arena_get(hir.function_returns_value, target) == 0;
+
+      forge_native_scratch_reset(result);
+      if (!void_call) {
+        writer_register(result, instruction);
+      }
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 3);
+
+      i64 return_type = 0;
+
+      if (!void_call) {
+        i64 call_return_type = forge_native_function_return_type(hir, target);
+
+        if (call_return_type < 0) {
+          return false;
+        }
+        return_type = forge_native_type(call_return_type);
+      }
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, return_type);
+
+      if (
+      operation == 0 ||
+      !forge_native_add_function_operand(current_block, operation, operand, source, hir, target)
+      ) {
+        return false;
+      }
+      argument = 0;
+      while (argument < argument_count) {
+        i64 parameter_index = target_parameter_start + argument;
+
+        i64 argument_register = raz_rt_stage1_arena_get(
+        mir.call_arguments,
+        argument_start + argument,
+        );
+        if (forge_native_parameter_is_call_aggregate(hir, parameter_index)) {
+          argument_register = forge_native_call_aggregate_register(instruction, argument);
+        }
+        if (
+        !forge_native_add_register_operand(current_block, operation, operand, argument_register)
+        ) {
+          return false;
+        }
+        argument += 1;
+      }
+
+      i64 return_signature = raz_rt_stage1_arena_get(hir.function_return_function_types, target);
+
+      if (!void_call && return_signature >= 0) {
+        forge_native_scratch_reset(result);
+
+        i64 attribute_name[18] = [99, 97, 108, 108, 98, 97, 99, 107, 46, 115, 105, 103, 110, 97, 116, 117, 114, 101];
+
+        writer_chars(result, &attribute_name, 18);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_signature_name(
+        opcode,
+        forge_native_canonical_signature(hir, return_signature),
+        false,
+        );
+        if (
+        raz_compiler_forge_operation_add_attribute_i64(
+        current_block,
+        operation,
+        result.data,
+        result.length,
+        opcode.data,
+        opcode.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      }
+      if (
+      void_call &&
+      !forge_native_append_const(current_block, result, opcode, operand, instruction, 0, 0)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode >= 11 && mir_opcode <= 16) {
+      if (!forge_native_append_compare(current_block, result, opcode, operand, mir, instruction)) {
+        return false;
+      }
+    } else if (mir_opcode == 17) {
+      if (
+      !forge_native_append_logical_select(
+      current_block,
+      result,
+      opcode,
+      operand,
+      mir,
+      instruction,
+      false,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 18) {
+      if (
+      !forge_native_append_logical_select(
+      current_block,
+      result,
+      opcode,
+      operand,
+      mir,
+      instruction,
+      true,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 19 || mir_opcode == 20) {
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      if (mir_opcode == 19) {
+        writer_operator(opcode, 35, 0);
+      } else {
+        writer_operator(opcode, 36, 0);
+      }
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 5);
+
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      ) ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_b, instruction),
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 47) {
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 global_type = raz_rt_stage1_arena_get(mir.op_types, instruction);
+      i64 address_register = writer_synthetic_register(9, instruction);
+
+      if (
+      !forge_native_append_global_address(
+      current_block,
+      source,
+      hir,
+      global_index,
+      address_register,
+      result,
+      opcode,
+      operand,
+      )
+      ) {
+        return false;
+      }
+      if (forge_native_global_is_aggregate(hir, global_index)) {
+        forge_native_scratch_reset(result);
+        writer_register(result, instruction);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 2);
+
+        i64 copy = forge_native_append_operation(current_block, result, opcode, 8);
+
+        if (
+        copy == 0 ||
+        !forge_native_add_register_operand(current_block, copy, operand, address_register)
+        ) {
+          return false;
+        }
+      } else {
+        i64 alignment = forge_native_scalar_storage_size(global_type);
+
+        forge_native_scratch_reset(result);
+        writer_register(result, instruction);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 9);
+        i64 operation = forge_native_append_operation(
+        current_block,
+        result,
+        opcode,
+        forge_native_type(global_type),
+        );
+        if (
+        operation == 0 ||
+        !forge_native_add_register_operand(current_block, operation, operand, address_register) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 48) {
+      i64 global_index = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 global_type = raz_rt_stage1_arena_get(mir.op_types, instruction);
+      i64 address_register = writer_synthetic_register(9, instruction);
+
+      if (
+      !forge_native_append_global_address(
+      current_block,
+      source,
+      hir,
+      global_index,
+      address_register,
+      result,
+      opcode,
+      operand,
+      )
+      ) {
+        return false;
+      }
+      if (forge_native_global_is_aggregate(hir, global_index)) {
+        i64 count_register = writer_synthetic_register(14, instruction);
+        i64 byte_count = forge_native_aggregate_global_slot_count(hir, global_index) * 8;
+
+        if (
+        !forge_native_append_const(
+        current_block,
+        result,
+        opcode,
+        operand,
+        count_register,
+        0,
+        byte_count,
+        )
+        ) {
+          return false;
+        }
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 13);
+
+        i64 operation = forge_native_append_operation(current_block, result, opcode, 0);
+
+        if (
+        operation == 0 ||
+        !forge_native_add_register_operand(current_block, operation, operand, address_register) ||
+        !forge_native_add_register_operand(
+        current_block,
+        operation,
+        operand,
+        raz_rt_stage1_arena_get(mir.op_b, instruction),
+        ) ||
+        !forge_native_add_register_operand(current_block, operation, operand, count_register)
+        ) {
+          return false;
+        }
+      } else {
+        i64 alignment = forge_native_scalar_storage_size(global_type);
+
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 10);
+        i64 operation = forge_native_append_operation(
+        current_block,
+        result,
+        opcode,
+        forge_native_type(global_type),
+        );
+        if (
+        operation == 0 ||
+        !forge_native_add_register_operand(
+        current_block,
+        operation,
+        operand,
+        raz_rt_stage1_arena_get(mir.op_b, instruction),
+        ) ||
+        !forge_native_add_register_operand(current_block, operation, operand, address_register) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 9) {
+      i64 local_slot = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 local_type = forge_native_scalar_local_type(hir, function_index, local_slot);
+      i64 alignment = forge_native_scalar_storage_size(local_type);
+
+      forge_native_scratch_reset(result);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 10);
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(local_type),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_b, instruction),
+      ) ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      forge_native_local_address_register(local_slot),
+      ) ||
+      raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 25) {
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 12);
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 8);
+
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      forge_native_local_address_register(raz_rt_stage1_arena_get(mir.op_a, instruction)),
+      ) ||
+      !forge_native_add_literal_operand(current_block, operation, operand, 0)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 26) {
+      i64 value_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
+
+      if (
+      value_type == 12 &&
+      raz_rt_stage1_arena_get(image_pointer_values, instruction) != 0
+      ) {
+        forge_native_scratch_reset(result);
+        writer_register(result, instruction);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 2);
+
+        i64 operation = forge_native_append_operation(current_block, result, opcode, 8);
+
+        if (
+        operation == 0 ||
+        !forge_native_add_register_operand(
+        current_block,
+        operation,
+        operand,
+        raz_rt_stage1_arena_get(mir.op_a, instruction),
+        )
+        ) {
+          return false;
+        }
+      } else {
+        i64 alignment = forge_native_scalar_storage_size(value_type);
+
+        forge_native_scratch_reset(result);
+        writer_register(result, instruction);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 9);
+        i64 operation = forge_native_append_operation(
+        current_block,
+        result,
+        opcode,
+        forge_native_type(value_type),
+        );
+        if (
+        operation == 0 ||
+        !forge_native_add_register_operand(
+        current_block,
+        operation,
+        operand,
+        raz_rt_stage1_arena_get(mir.op_a, instruction),
+        ) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 27) {
+      i64 stored_register = raz_rt_stage1_arena_get(mir.op_b, instruction);
+      i64 value_type = forge_native_register_type_fast(hir, mir, function_index, stored_register, image_pointer_values);
+      i64 alignment = forge_native_scalar_storage_size(value_type);
+
+      forge_native_scratch_reset(result);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 10);
+      i64 operation = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(value_type),
+      );
+      if (
+      operation == 0 ||
+      !forge_native_add_register_operand(current_block, operation, operand, stored_register) ||
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      ) ||
+      raz_compiler_forge_operation_set_alignment_i64(current_block, operation, alignment) == 0
+      ) {
+        return false;
+      }
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 2);
+      i64 copy = forge_native_append_operation(
+      current_block,
+      result,
+      opcode,
+      forge_native_type(value_type),
+      );
+      if (
+      copy == 0 ||
+      !forge_native_add_register_operand(current_block, copy, operand, stored_register)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 28) {
+      i64 address_register = forge_native_append_arena_address(
+      current_block,
+      source,
+      hir,
+      mir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      raz_rt_stage1_arena_get(mir.op_b, instruction),
+      instruction,
+      result,
+      opcode,
+      operand,
+      );
+      if (address_register < 0) {
+        return false;
+      }
+      i64 nested_structure = forge_native_register_structure_id(
+      hir,
+      mir,
+      function_index,
+      instruction,
+      0,
+      );
+
+      i64 nested_extent = -1;
+      i64 nested_element_type = -1;
+      i64 nested_element_structure = -1;
+
+      bool nested_array = forge_native_register_array_info(
+      hir,
+      mir,
+      function_index,
+      instruction,
+      0,
+      &mut nested_extent,
+      &mut nested_element_type,
+      &mut nested_element_structure,
+      );
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      if (nested_structure >= 0 || nested_array) {
+        // Legacy MIR 'get' returns an aggregate image handle. Native
+        // structured lowering returns the inline child's address.
+        forge_native_writer_word(opcode, 2);
+
+        i64 copy = forge_native_append_operation(current_block, result, opcode, 8);
+
+        if (
+        copy == 0 ||
+        !forge_native_add_register_operand(current_block, copy, operand, address_register)
+        ) {
+          return false;
+        }
+      } else {
+        i64 value_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
+        i64 alignment = forge_native_scalar_storage_size(value_type);
+
+        forge_native_writer_word(opcode, 9);
+        i64 load = forge_native_append_operation(
+        current_block,
+        result,
+        opcode,
+        forge_native_type(value_type),
+        );
+        if (
+        load == 0 ||
+        !forge_native_add_register_operand(current_block, load, operand, address_register) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, load, alignment) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 29) {
+      i64 base_register = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 index_register = raz_rt_stage1_arena_get(mir.op_b, instruction);
+      i64 stored_register = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+      i64 address_register = forge_native_append_arena_address(
+      current_block,
+      source,
+      hir,
+      mir,
+      function_index,
+      base_register,
+      index_register,
+      instruction,
+      result,
+      opcode,
+      operand,
+      );
+      if (address_register < 0) {
+        return false;
+      }
+      // MIR arena stores have two distinct meanings. A store into a real
+      // native aggregate field/element is a by-value aggregate copy; a
+      // store into a compatibility image (for example a slice's two-slot
+      // {data,length} image) stores the aggregate handle/pointer itself.
+      // Classify from the destination shape rather than the source shape.
+      i64 destination_structure = forge_native_register_structure_id(
+      hir,
+      mir,
+      function_index,
+      base_register,
+      0,
+      );
+
+      i64 copy_kind = 0;
+      i64 copy_structure = -1;
+      i64 copy_extent = -1;
+      i64 copy_element_type = -1;
+      i64 copy_element_structure = -1;
+      bool copy_slice = false;
+
+      if (destination_structure >= 0) {
+        i64 field_index = forge_native_constant_index(mir, index_register);
+
+        if (
+        field_index < 0 ||
+        field_index >= raz_rt_stage1_arena_get(hir.struct_field_counts, destination_structure)
+        ) {
+          return false;
+        }
+        i64 metadata =
+        raz_rt_stage1_arena_get(hir.struct_field_starts, destination_structure) +
+        field_index;
+        if (raz_rt_stage1_arena_get(hir.struct_field_references, metadata) == 0) {
+          if (raz_rt_stage1_arena_get(hir.struct_field_slices, metadata) != 0) {
+            copy_kind = 1;
+            copy_slice = true;
+          } else {
+            copy_extent = raz_rt_stage1_arena_get(hir.struct_field_array_extents, metadata);
+            copy_structure = raz_rt_stage1_arena_get(hir.struct_field_type_structs, metadata);
+            copy_element_type = raz_rt_stage1_arena_get(hir.struct_field_types, metadata);
+            if (copy_extent >= 0) {
+              copy_kind = 2;
+              copy_element_structure = copy_structure;
+            } else if (copy_structure >= 0) {
+              copy_kind = 1;
+            }
+          }
+        }
+      } else {
+        i64 destination_extent = -1;
+        i64 destination_element_type = -1;
+        i64 destination_element_structure = -1;
+
+        if (
+        forge_native_register_array_info(
+        hir,
+        mir,
+        function_index,
+        base_register,
+        0,
+        &mut destination_extent,
+        &mut destination_element_type,
+        &mut destination_element_structure,
+        ) &&
+        destination_element_structure >= 0
+        ) {
+          copy_kind = 1;
+          copy_structure = destination_element_structure;
+        }
+      }
+      if (copy_kind != 0) {
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+
+        i64 copy_opcode = 16;
+
+        if (copy_kind == 2) {
+          copy_opcode = 17;
+        }
+        forge_native_writer_word(opcode, copy_opcode);
+
+        i64 copy = forge_native_append_operation(current_block, result, opcode, 0);
+
+        if (
+        copy == 0 ||
+        !forge_native_add_register_operand(current_block, copy, operand, address_register) ||
+        !forge_native_add_register_operand(current_block, copy, operand, stored_register)
+        ) {
+          return false;
+        }
+        forge_native_scratch_reset(operand);
+        if (copy_slice) {
+          forge_native_writer_slice_name(operand);
+        } else if (copy_kind == 1) {
+          writer_put(operand, 64);
+          writer_structure_name(operand, source, hir, copy_structure);
+        } else {
+          forge_native_write_array_aggregate_name(
+          operand,
+          copy_extent,
+          copy_element_type,
+          copy_element_structure,
+          );
+        }
+        if (
+        raz_compiler_forge_operation_add_operand_i64(
+        current_block,
+        copy,
+        operand.data,
+        operand.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      } else {
+        i64 value_type = forge_native_register_type_fast(hir, mir, function_index, stored_register, image_pointer_values);
+        i64 alignment = forge_native_scalar_storage_size(value_type);
+
+        if (value_type < 0) {
+          return false;
+        }
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+        forge_native_writer_word(opcode, 10);
+        i64 store = forge_native_append_operation(
+        current_block,
+        result,
+        opcode,
+        forge_native_type(value_type),
+        );
+        if (
+        store == 0 ||
+        !forge_native_add_register_operand(current_block, store, operand, stored_register) ||
+        !forge_native_add_register_operand(current_block, store, operand, address_register) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, store, alignment) == 0
+        ) {
+          return false;
+        }
+      }
+    } else if (mir_opcode == 30) {
+      i64 count = raz_rt_stage1_arena_get(mir.op_a, instruction);
+      i64 aggregate_marker = raz_rt_stage1_arena_get(mir.op_b, instruction);
+      i64 aggregate_structure = raz_rt_stage1_arena_get(mir.op_c, instruction);
+      i64 aggregate_element_type = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+      bool native_structure =
+      aggregate_marker == 1 &&
+      forge_native_flat_return_structure_supported(hir, aggregate_structure);
+      bool native_array =
+      aggregate_marker == 2 &&
+      forge_native_array_supported(hir, count, aggregate_element_type, aggregate_structure);
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+
+      i64 allocation = 0;
+
+      if (native_array) {
+        i64 stack_array_text[17] = [115, 116, 97, 99, 107, 46, 97, 108, 108, 111, 99, 46, 97, 114, 114, 97, 121];
+
+        writer_chars(opcode, &stack_array_text, 17);
+        allocation = forge_native_append_operation(current_block, result, opcode, 8);
+        if (allocation == 0) {
+          return false;
+        }
+        forge_native_scratch_reset(operand);
+        forge_native_write_array_aggregate_name(
+        operand,
+        count,
+        aggregate_element_type,
+        aggregate_structure,
+        );
+
+        i64 array_ok = 0;
+
+        if (aggregate_structure >= 0) {
+          ForgeWriter element_name;
+
+          if (!forge_native_scratch_init(&mut element_name)) {
+            return false;
+          }
+          writer_structure_name(&mut element_name, source, hir, aggregate_structure);
+          array_ok = raz_compiler_forge_session_add_aggregate_array_i64(
+          session,
+          operand.data,
+          operand.length,
+          1,
+          element_name.data,
+          element_name.length,
+          count,
+          0,
+          );
+          writer_destroy(&mut element_name);
+        } else {
+          array_ok = raz_compiler_forge_session_add_array_i64(
+          session,
+          operand.data,
+          operand.length,
+          forge_native_type(aggregate_element_type),
+          count,
+          0,
+          );
+        }
+        if (
+        array_ok == 0 ||
+        raz_compiler_forge_operation_add_operand_i64(
+        current_block,
+        allocation,
+        operand.data,
+        operand.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      } else if (native_structure) {
+        i64 stack_struct_text[18] = [115, 116, 97, 99, 107, 46, 97, 108, 108, 111, 99, 46, 115, 116, 114, 117, 99, 116];
+
+        writer_chars(opcode, &stack_struct_text, 18);
+        allocation = forge_native_append_operation(current_block, result, opcode, 8);
+        if (allocation == 0) {
+          return false;
+        }
+        forge_native_scratch_reset(operand);
+        writer_put(operand, 64);
+        writer_structure_name(operand, source, hir, aggregate_structure);
+        if (
+        raz_compiler_forge_operation_add_operand_i64(
+        current_block,
+        allocation,
+        operand.data,
+        operand.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      } else {
+        forge_native_writer_word(opcode, 8);
+        allocation = forge_native_append_operation(current_block, result, opcode, 8);
+        if (
+        allocation == 0 ||
+        !forge_native_add_literal_operand(current_block, allocation, operand, count * 8) ||
+        raz_compiler_forge_operation_set_alignment_i64(current_block, allocation, 8) == 0
+        ) {
+          return false;
+        }
+      }
+      // Stage-1 aggregate arenas are zero-initialized. Native named
+      // aggregates use Forge's typed recursive zero operation so nested
+      // layouts are initialized by their real byte layout, not 8-byte
+      // legacy image slots.
+      if (native_structure || native_array) {
+        forge_native_scratch_reset(result);
+        forge_native_scratch_reset(opcode);
+
+        i64 zero_opcode = 19;
+
+        if (native_structure) {
+          zero_opcode = 18;
+        }
+        forge_native_writer_word(opcode, zero_opcode);
+
+        i64 zero = forge_native_append_operation(current_block, result, opcode, 0);
+
+        if (
+        zero == 0 ||
+        !forge_native_add_register_operand(current_block, zero, operand, instruction)
+        ) {
+          return false;
+        }
+        forge_native_scratch_reset(operand);
+        if (native_structure) {
+          writer_put(operand, 64);
+          writer_structure_name(operand, source, hir, aggregate_structure);
+        } else {
+          forge_native_write_array_aggregate_name(
+          operand,
+          count,
+          aggregate_element_type,
+          aggregate_structure,
+          );
+        }
+        if (
+        raz_compiler_forge_operation_add_operand_i64(
+        current_block,
+        zero,
+        operand.data,
+        operand.length,
+        ) == 0
+        ) {
+          return false;
+        }
+      } else {
+        i64 zero_slot = 0;
+
+        while (zero_slot < count) {
+          i64 zero_address = instruction;
+
+          if (zero_slot > 0) {
+            i64 zero_offset = writer_synthetic_register(300 + zero_slot * 2, instruction);
+
+            if (
+            !forge_native_append_const(
+            current_block,
+            result,
+            opcode,
+            operand,
+            zero_offset,
+            0,
+            zero_slot * 8,
+            )
+            ) {
+              return false;
+            }
+            zero_address = writer_synthetic_register(301 + zero_slot * 2, instruction);
+            forge_native_scratch_reset(result);
+            writer_register(result, zero_address);
+            forge_native_scratch_reset(opcode);
+            forge_native_writer_word(opcode, 12);
+
+            i64 zero_pointer = forge_native_append_operation(current_block, result, opcode, 8);
+
+            if (
+            zero_pointer == 0 ||
+            !forge_native_add_register_operand(
+            current_block,
+            zero_pointer,
+            operand,
+            instruction,
+            ) ||
+            !forge_native_add_register_operand(
+            current_block,
+            zero_pointer,
+            operand,
+            zero_offset,
+            )
+            ) {
+              return false;
+            }
+          }
+          forge_native_scratch_reset(result);
+          forge_native_scratch_reset(opcode);
+          forge_native_writer_word(opcode, 10);
+
+          i64 zero_store = forge_native_append_operation(current_block, result, opcode, 5);
+
+          if (
+          zero_store == 0 ||
+          !forge_native_add_register_operand(current_block, zero_store, operand, 999999) ||
+          !forge_native_add_register_operand(current_block, zero_store, operand, zero_address) ||
+          raz_compiler_forge_operation_set_alignment_i64(current_block, zero_store, 8) == 0
+          ) {
+            return false;
+          }
+          zero_slot += 1;
+        }
+      }
+    } else if (mir_opcode == 31 || mir_opcode == 32 || mir_opcode == 33) {
+      if (!forge_native_append_const(current_block, result, opcode, operand, instruction, 0, 0)) {
+        return false;
+      }
+    } else if (mir_opcode == 45) {
+      // Borrowed array iteration is a real element address on the
+      // structured path. Aggregate images use 8-byte MIR slots, so reuse
+      // the same scaled pointer arithmetic as indexed aggregate access.
+      i64 address_register = forge_native_append_arena_address(
+      current_block,
+      source,
+      hir,
+      mir,
+      function_index,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      raz_rt_stage1_arena_get(mir.op_b, instruction),
+      instruction,
+      result,
+      opcode,
+      operand,
+      );
+      if (address_register < 0) {
+        return false;
+      }
+      forge_native_scratch_reset(result);
+      writer_register(result, instruction);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 2);
+
+      i64 copy = forge_native_append_operation(current_block, result, opcode, 8);
+
+      if (
+      copy == 0 ||
+      !forge_native_add_register_operand(current_block, copy, operand, address_register)
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 49) {
+      if (
+      !forge_native_append_global_address(
+      current_block,
+      source,
+      hir,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      instruction,
+      result,
+      opcode,
+      operand,
+      )
+      ) {
+        return false;
+      }
+    } else if (mir_opcode == 10 || mir_opcode == 21) {
+      forge_native_scratch_reset(result);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 5);
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 0);
+
+      if (operation == 0) {
+        return false;
+      }
+      if (
+      mir_opcode == 10 &&
+      !forge_native_add_register_operand(
+      current_block,
+      operation,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      )
+      ) {
+        return false;
+      }
+      block_terminated = true;
+    } else if (mir_opcode == 22) {
+      forge_native_scratch_reset(result);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 6);
+
+      i64 operation = forge_native_append_operation(current_block, result, opcode, 0);
+      i64 target = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+      if (operation == 0 || !forge_native_add_successor(current_block, operation, operand, target)) {
+        return false;
+      }
+
+      i64 argument = raz_rt_stage1_arena_get(mir.op_c, instruction);
+
+      if (
+      argument >= 0 &&
+      !forge_native_add_successor_argument(current_block, operation, 0, operand, argument)
+      ) {
+        return false;
+      }
+      block_terminated = true;
+    } else if (mir_opcode == 23) {
+      i64 zero_register = writer_synthetic_register(11, instruction);
+      i64 condition_register = 740000 + instruction;
+
+      if (!forge_native_append_const(current_block, result, opcode, operand, zero_register, 0, 0)) {
+        return false;
+      }
+      forge_native_scratch_reset(result);
+      writer_register(result, condition_register);
+      forge_native_scratch_reset(opcode);
+      writer_compare(opcode, 12, 0);
+
+      i64 compare = forge_native_append_operation(current_block, result, opcode, 5);
+
+      if (
+      compare == 0 ||
+      !forge_native_add_register_operand(
+      current_block,
+      compare,
+      operand,
+      raz_rt_stage1_arena_get(mir.op_a, instruction),
+      ) ||
+      !forge_native_add_register_operand(current_block, compare, operand, zero_register)
+      ) {
+        return false;
+      }
+      forge_native_scratch_reset(result);
+      forge_native_scratch_reset(opcode);
+      forge_native_writer_word(opcode, 7);
+
+      i64 branch = forge_native_append_operation(current_block, result, opcode, 0);
+      i64 true_target = raz_rt_stage1_arena_get(mir.op_c, instruction);
+      i64 false_target = raz_rt_stage1_arena_get(mir.op_b, instruction);
+
+      if (
+      branch == 0 ||
+      !forge_native_add_register_operand(current_block, branch, operand, condition_register) ||
+      !forge_native_add_successor(current_block, branch, operand, true_target) ||
+      !forge_native_add_successor(current_block, branch, operand, false_target)
+      ) {
+        return false;
+      }
+
+      i64 edge_argument = raz_rt_stage1_arena_get(mir.op_d, instruction);
+
+      if (
+      edge_argument >= 0 &&
+      (
+      !forge_native_add_successor_argument(current_block, branch, 0, operand, edge_argument) ||
+      !forge_native_add_successor_argument(current_block, branch, 1, operand, edge_argument)
+      )
+      ) {
+        return false;
+      }
+      block_terminated = true;
+    }
+    instruction += 1;
+  }
+  if (!block_terminated) {
+    forge_native_scratch_reset(result);
+    forge_native_scratch_reset(opcode);
+    if (raz_rt_stage1_arena_get(hir.function_returns_value, function_index) == 0) {
+      forge_native_writer_word(opcode, 5);
+      return forge_native_append_operation(current_block, result, opcode, 0) != 0;
+    }
+    if (
+    !forge_native_append_const(
+    current_block,
+    result,
+    opcode,
+    operand,
+    writer_synthetic_register(13, function_index),
+    0,
+    0,
+    )
+    ) {
+      return false;
+    }
+    forge_native_scratch_reset(result);
+    forge_native_scratch_reset(opcode);
+    forge_native_writer_word(opcode, 5);
+
+    i64 operation = forge_native_append_operation(current_block, result, opcode, 0);
+
+    return (
+    operation != 0 &&
+    forge_native_add_register_operand(
+    current_block,
+    operation,
+    operand,
+    writer_synthetic_register(13, function_index),
+    )
+    );
+  }
+  return true;
+}
+
+fn forge_native_add_wrapper_function(
+i64 session,
+ForgeWriter&mut result,
+ForgeWriter&mut opcode,
+ForgeWriter&mut operand,
+i64 name_kind,
+i64 call_kind,
+bool raz_main_void,
+) -> bool {
+  forge_native_scratch_reset(operand);
+  if (name_kind == 0) {
+    i64 name[10] = [95, 114, 97, 122, 95, 101, 110, 116, 114, 121];
+
+    writer_chars(operand, &name, 10);
+  } else {
+    i64 name[4] = [109, 97, 105, 110];
+
+    writer_chars(operand, &name, 4);
+  }
+  i64 function_handle = raz_compiler_forge_session_add_function_i64(
+  session,
+  operand.data,
+  operand.length,
+  4,
+  0,
+  0,
+  0,
+  0,
+  0,
+  -1,
+  0,
+  0,
+  );
+  if (function_handle == 0 || raz_compiler_forge_function_set_abi_i64(function_handle, 0, 0, 0, 0) == 0) {
+    return false;
+  }
+  forge_native_scratch_reset(operand);
+
+  i64 entry[5] = [101, 110, 116, 114, 121];
+
+  writer_chars(operand, &entry, 5);
+  i64 block = raz_compiler_forge_session_add_block_i64(
+  session,
+  function_handle,
+  operand.data,
+  operand.length,
+  );
+  if (block == 0) {
+    return false;
+  }
+  forge_native_scratch_reset(result);
+  if (name_kind == 0 && !raz_main_void) {
+    writer_register(result, 9000);
+  } else if (name_kind != 0) {
+    writer_register(result, 9010);
+  }
+  forge_native_scratch_reset(opcode);
+  forge_native_writer_word(opcode, 3);
+
+  i64 call_type = 4;
+
+  if (name_kind == 0) {
+    if (raz_main_void) {
+      call_type = 0;
+    } else {
+      call_type = 5;
+    }
+  }
+
+  i64 call = forge_native_append_operation(block, result, opcode, call_type);
+
+  if (call == 0) {
+    return false;
+  }
+  forge_native_scratch_reset(operand);
+  if (call_kind == 0) {
+    i64 target[11] = [64, 95, 95, 114, 97, 122, 95, 109, 97, 105, 110];
+
+    writer_chars(operand, &target, 11);
+  } else {
+    i64 target[11] = [64, 95, 114, 97, 122, 95, 101, 110, 116, 114, 121];
+
+    writer_chars(operand, &target, 11);
+  }
+  if (raz_compiler_forge_operation_add_operand_i64(block, call, operand.data, operand.length) == 0) {
+    return false;
+  }
+
+  i64 return_register = 9010;
+
+  if (name_kind == 0) {
+    return_register = 9001;
+  }
+  if (name_kind == 0) {
+    if (raz_main_void) {
+      if (!forge_native_append_const(block, result, opcode, operand, 9001, 4, 0)) {
+        return false;
+      }
+    } else {
+      forge_native_scratch_reset(result);
+      writer_register(result, 9001);
+      forge_native_scratch_reset(opcode);
+
+      i64 truncate_text[8] = [116, 114, 117, 110, 99, 97, 116, 101];
+
+      writer_chars(opcode, &truncate_text, 8);
+
+      i64 truncate = forge_native_append_operation(block, result, opcode, 4);
+
+      if (truncate == 0 || !forge_native_add_register_operand(block, truncate, operand, 9000)) {
+        return false;
+      }
+    }
+  }
+  forge_native_scratch_reset(result);
+  forge_native_scratch_reset(opcode);
+  forge_native_writer_word(opcode, 5);
+
+  i64 ret = forge_native_append_operation(block, result, opcode, 0);
+
+  return ret != 0 && forge_native_add_register_operand(block, ret, operand, return_register);
+}
+
+fn emit_forge_native_scalar_module(
+Source& source,
+HirModule& hir,
+MirModule& mir,
+i64 main_index,
+i64 output_path,
+i64 output_path_length,
+i64 optimization_level,
+) -> bool {
+  ForgeWriter result;
+  ForgeWriter opcode;
+  ForgeWriter operand;
+
+  if (
+  !forge_native_scratch_init(&mut result) ||
+  !forge_native_scratch_init(&mut opcode) ||
+  !forge_native_scratch_init(&mut operand)
+  ) {
+    writer_destroy(&mut result);
+    writer_destroy(&mut opcode);
+    writer_destroy(&mut operand);
+    return false;
+  }
+
+  i64 module_name[10] = [114, 97, 122, 95, 115, 116, 97, 103, 101, 49];
+
+  forge_native_scratch_reset(&mut operand);
+  writer_chars(&mut operand, &module_name, 10);
+
+  i64 session = raz_compiler_forge_session_create_i64(operand.data, operand.length);
+
+  if (session == 0) {
+    writer_destroy(&mut result);
+    writer_destroy(&mut opcode);
+    writer_destroy(&mut operand);
+    return false;
+  }
+
+  i64 function_handles = raz_rt_stage1_arena_create(hir.function_count + 1);
+  i64 block_handles = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+  i64 image_pointer_values = raz_rt_stage1_arena_create(mir.instruction_count + 1);
+  bool success = function_handles != 0 && block_handles != 0 && image_pointer_values != 0;
+
+  if (success) {
+    success = forge_native_build_image_pointer_values(hir, mir, image_pointer_values);
+  }
+
+  if (success) {
+    success = forge_native_emit_slice_structure(session, &mut result, &mut opcode);
+  }
+  if (success) {
+    success = forge_native_emit_return_structures(
+    session,
+    source,
+    hir,
+    &mut result,
+    &mut opcode,
+    &mut operand,
+    );
+  }
+  // String literals are immutable byte globals in structured Forge IR. Keep
+  // their stable MIR-derived names so --emit-forge-ir/debug output remains
+  // deterministic even though production codegen no longer parses FIR.
+
+  i64 string_instruction = 0;
+
+  while (success && string_instruction < mir.instruction_count) {
+    if (raz_rt_stage1_arena_get(mir.opcodes, string_instruction) == 42) {
+      forge_native_scratch_reset(&mut operand);
+      forge_native_writer_string_name(&mut operand, string_instruction, false);
+      if (
+      !forge_native_decode_string_literal(&mut result, source, mir, string_instruction) ||
+      raz_compiler_forge_session_add_bytes_global_i64(
+      session,
+      operand.data,
+      operand.length,
+      result.data,
+      result.length,
+      1,
+      1,
+      0,
+      1,
+      ) == 0
+      ) {
+        success = false;
+      }
+    }
+    string_instruction += 1;
+  }
+  // Function-pointer signatures are real Forge signature functions. They are
+  // emitted before ordinary functions so func.address/call.indirect can be
+  // verified without depending on textual declaration order.
+  if (success) {
+    success = forge_native_emit_function_signatures(session, source, hir, &mut operand, &mut result);
+  }
+
+  i64 global_index = 0;
+
+  while (success && global_index < hir.global_count) {
+    forge_native_scratch_reset(&mut operand);
+    writer_module_global_name(&mut operand, source, hir, global_index);
+    forge_native_scratch_reset(&mut result);
+
+    i64 external_global = raz_rt_stage1_arena_get(hir.global_extern_flags, global_index);
+    bool aggregate_global = forge_native_global_is_aggregate(hir, global_index);
+
+    if (
+    !aggregate_global &&
+    external_global == 0 &&
+    !forge_native_write_scalar_global_initializer(&mut result, source, hir, global_index)
+    ) {
+      success = false;
+    }
+    if (
+    aggregate_global &&
+    !forge_native_write_aggregate_global_bytes(
+    &mut result,
+    mir,
+    global_index,
+    forge_native_aggregate_global_slot_count(hir, global_index),
+    )
+    ) {
+      success = false;
+    }
+
+    i64 linkage = 0;
+
+    if (raz_rt_stage1_arena_get(hir.global_internal_flags, global_index) != 0) {
+      linkage = 1;
+    }
+
+    i64 thread_local_global = raz_rt_stage1_arena_get(hir.global_tls_flags, global_index);
+    i64 is_constant = 0;
+
+    if (
+    thread_local_global == 0 &&
+    raz_rt_stage1_arena_get(hir.global_mutable_flags, global_index) == 0
+    ) {
+      is_constant = 1;
+    }
+    if (success && aggregate_global) {
+      if (
+      raz_compiler_forge_session_add_bytes_global_ex_i64(
+      session,
+      operand.data,
+      operand.length,
+      result.data,
+      result.length,
+      is_constant,
+      thread_local_global,
+      linkage,
+      0,
+      8,
+      ) == 0
+      ) {
+        success = false;
+      }
+    } else if (
+    success &&
+    raz_compiler_forge_session_add_global_ex_i64(
+    session,
+    operand.data,
+    operand.length,
+    forge_native_type(raz_rt_stage1_arena_get(hir.global_types, global_index)),
+    0,
+    0,
+    0,
+    0,
+    0,
+    is_constant,
+    external_global,
+    thread_local_global,
+    linkage,
+    0,
+    result.data,
+    result.length,
+    1,
+    0,
+    0,
+    ) == 0
+    ) {
+      success = false;
+    }
+    global_index += 1;
+  }
+  i64 function_index = 0;
+
+  while (success && function_index < hir.function_count) {
+    i64 external_function = raz_rt_stage1_arena_get(hir.function_is_extern, function_index);
+
+    bool duplicate_external =
+    external_function != 0 &&
+    forge_extern_already_emitted(source, hir, function_index);
+    if (!duplicate_external) {
+      forge_native_scratch_reset(&mut operand);
+      writer_function_name(&mut operand, source, hir, function_index);
+
+      i64 return_type = 0;
+      i64 native_return_type = forge_native_function_return_type(hir, function_index);
+
+      if (native_return_type >= 0) {
+        return_type = forge_native_type(native_return_type);
+      }
+
+      i64 return_aggregate_kind = 0;
+      i64 return_owned = 0;
+
+      forge_native_scratch_reset(&mut result);
+
+      i64 return_structure = raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index);
+
+      if (raz_rt_stage1_arena_get(hir.function_return_slices, function_index) != 0) {
+        return_aggregate_kind = 1;
+        return_owned = 1;
+        forge_native_writer_slice_name(&mut result);
+      } else if (
+      return_structure >= 0 &&
+      forge_native_flat_return_structure_supported(hir, return_structure)
+      ) {
+        return_aggregate_kind = 1;
+        return_owned = 1;
+        writer_structure_name(&mut result, source, hir, return_structure);
+      }
+      i64 function_handle = raz_compiler_forge_session_add_function_i64(
+      session,
+      operand.data,
+      operand.length,
+      return_type,
+      return_aggregate_kind,
+      result.data,
+      result.length,
+      return_owned,
+      0,
+      -1,
+      external_function,
+      0,
+      );
+
+      i64 convention = 0;
+
+      if (external_function != 0) {
+        convention = raz_rt_stage1_arena_get(hir.function_abi_kinds, function_index);
+      }
+      if (
+      function_handle == 0 ||
+      raz_compiler_forge_function_set_abi_i64(function_handle, convention, 0, 0, 0) == 0
+      ) {
+        success = false;
+      } else {
+        i64 feature_length = raz_rt_stage1_arena_get(
+        hir.function_target_feature_lengths,
+        function_index,
+        );
+        if (feature_length > 0) {
+          forge_native_scratch_reset(&mut result);
+          writer_text(
+          &mut result,
+          source,
+          raz_rt_stage1_arena_get(hir.function_target_feature_offsets, function_index),
+          feature_length,
+          );
+          if (
+          raz_compiler_forge_function_set_target_feature_i64(
+          function_handle,
+          result.data,
+          result.length,
+          ) == 0
+          ) {
+            success = false;
+          }
+        }
+        raz_rt_stage1_arena_set(function_handles, function_index, function_handle);
+
+        i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index);
+        i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+        i64 parameter = 0;
+
+        while (success && parameter < parameter_count) {
+          forge_native_scratch_reset(&mut operand);
+          writer_parameter(&mut operand, parameter);
+          forge_native_scratch_reset(&mut result);
+          i64 function_type = raz_rt_stage1_arena_get(
+          hir.parameter_function_types,
+          parameter_start + parameter,
+          );
+          i64 source_parameter_type = raz_rt_stage1_arena_get(
+          hir.parameter_types,
+          parameter_start + parameter,
+          );
+          // Thin function pointers carry callback.signature. Fn/FnMut/FnOnce
+          // values are erased callable objects and must not be verified as
+          // raw callback pointers at the call boundary.
+          if (function_type >= 0 && !(source_parameter_type >= 16 && source_parameter_type <= 18)) {
+            forge_native_writer_signature_name(
+            &mut result,
+            forge_native_canonical_signature(hir, function_type),
+            false,
+            );
+          }
+
+          i64 parameter_index = parameter_start + parameter;
+          i64 parameter_type = forge_native_type(forge_native_parameter_type(hir, parameter_index));
+          i64 parameter_aggregate_kind = 0;
+          ForgeWriter aggregate_name;
+
+          if (!forge_native_scratch_init(&mut aggregate_name)) {
+            success = false;
+          } else {
+            i64 parameter_structure = raz_rt_stage1_arena_get(
+            hir.parameter_type_structs,
+            parameter_index,
+            );
+            i64 parameter_extent = raz_rt_stage1_arena_get(
+            hir.parameter_array_extents,
+            parameter_index,
+            );
+            if (raz_rt_stage1_arena_get(hir.parameter_slices, parameter_index) != 0) {
+              parameter_aggregate_kind = 1;
+              forge_native_writer_slice_name(&mut aggregate_name);
+            } else if (
+            raz_rt_stage1_arena_get(hir.parameter_references, parameter_index) == 0 &&
+            parameter_extent >= 0 &&
+            forge_native_parameter_array_supported(hir, parameter_index)
+            ) {
+              parameter_aggregate_kind = 2;
+              forge_native_writer_array_name(
+              &mut aggregate_name,
+              raz_rt_stage1_arena_get(hir.parameter_types, parameter_index),
+              parameter_extent,
+              );
+              if (
+              raz_compiler_forge_session_add_array_i64(
+              session,
+              aggregate_name.data,
+              aggregate_name.length,
+              forge_native_type(
+              raz_rt_stage1_arena_get(hir.parameter_types, parameter_index),
+              ),
+              parameter_extent,
+              0,
+              ) == 0
+              ) {
+                success = false;
+              }
+            } else if (
+            raz_rt_stage1_arena_get(hir.parameter_references, parameter_index) == 0 &&
+            parameter_structure >= 0 &&
+            forge_native_flat_return_structure_supported(hir, parameter_structure)
+            ) {
+              parameter_aggregate_kind = 1;
+              writer_structure_name(&mut aggregate_name, source, hir, parameter_structure);
+            }
+
+            i64 parameter_owned = 0;
+
+            if (parameter_aggregate_kind != 0) {
+              parameter_owned = 1;
+            }
+            if (
+            raz_compiler_forge_function_add_parameter_i64(
+            function_handle,
+            operand.data,
+            operand.length,
+            parameter_type,
+            parameter_aggregate_kind,
+            aggregate_name.data,
+            aggregate_name.length,
+            parameter_owned,
+            0,
+            result.data,
+            result.length,
+            ) == 0
+            ) {
+              success = false;
+            }
+            writer_destroy(&mut aggregate_name);
+          }
+          parameter += 1;
+        }
+      }
+    }
+    function_index += 1;
+  }
+  // Owned callable bodies refer to generated adapter/drop functions and the
+  // erased callable runtime. Register all of those symbols before emitting
+  // normal function bodies so Forge can verify func.address and call operands
+  // independent of source/declaration order.
+  if (success && forge_native_module_uses_owned_callables(mir)) {
+    success = forge_native_emit_callable_runtime_declarations(session, &mut result, &mut operand);
+  }
+  if (success && forge_native_module_uses_owned_callables(mir)) {
+    success = forge_native_emit_callable_support_functions(
+    session,
+    source,
+    hir,
+    mir,
+    &mut result,
+    &mut opcode,
+    &mut operand,
+    );
+  }
+  function_index = 0;
+  while (success && function_index < hir.function_count) {
+    if (function_index % 128 == 0) {
+    }
+    if (raz_rt_stage1_arena_get(hir.function_is_extern, function_index) == 0) {
+      success = forge_native_emit_scalar_function(
+      session,
+      raz_rt_stage1_arena_get(function_handles, function_index),
+      source,
+      hir,
+      mir,
+      function_index,
+      block_handles,
+      image_pointer_values,
+      &mut result,
+      &mut opcode,
+      &mut operand,
+      );
+    }
+    function_index += 1;
+  }
+
+  bool raz_main_void = raz_rt_stage1_arena_get(hir.function_returns_value, main_index) == 0;
+
+  if (success) {
+    success = forge_native_add_wrapper_function(
+    session,
+    &mut result,
+    &mut opcode,
+    &mut operand,
+    0,
+    0,
+    raz_main_void,
+    );
+  }
+  if (success) {
+    success = forge_native_add_wrapper_function(
+    session,
+    &mut result,
+    &mut opcode,
+    &mut operand,
+    1,
+    1,
+    raz_main_void,
+    );
+  }
+  if (success) {
+    success = raz_compiler_forge_session_emit_object_i64(
+    session,
+    output_path,
+    output_path_length,
+    optimization_level,
+    ) > 0;
+  }
+  if (block_handles != 0) {
+    raz_rt_stage1_arena_destroy(block_handles);
+  }
+  if (function_handles != 0) {
+    raz_rt_stage1_arena_destroy(function_handles);
+  }
+  if (image_pointer_values != 0) {
+    raz_rt_stage1_arena_destroy(image_pointer_values);
+  }
+  raz_compiler_forge_session_destroy_i64(session);
+  writer_destroy(&mut result);
+  writer_destroy(&mut opcode);
+  writer_destroy(&mut operand);
+  return success;
+}

@@ -1,0 +1,584 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::scheduler;
+import std::sync::mutex;
+import std::sync::condition;
+import std::time;
+// Raz-owned monotonic timer scheduler. The runtime provides only allocation,
+// condition variables, monotonic time, and OS thread creation. Heap ordering,
+// capacity policy, timeout handling, completion state, shutdown and cleanup are
+// implemented in Raz.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
+extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
+extern fn raz_rt_callable_into_raw(FnOnce() -> i64 operation) -> usize;
+extern fn raz_rt_callable_invoke_once_i64_raw(usize callable) -> i64;
+extern fn raz_rt_callable_destroy_raw(usize callable);
+const i64 SCHEDULER_BYTES = 96;
+const i64 RESULT_BYTES = 32;
+const i64 S_DEADLINES = 0;
+const i64 S_SEQUENCES = 8;
+const i64 S_CALLABLES = 16;
+const i64 S_RESULTS = 24;
+const i64 S_CAPACITY = 32;
+const i64 S_COUNT = 40;
+const i64 S_MUTEX = 48;
+const i64 S_CHANGED = 56;
+const i64 S_ACCEPTING = 64;
+const i64 S_STOPPING = 72;
+const i64 S_NEXT_SEQUENCE = 80;
+const i64 S_WORKER = 88;
+const i64 R_MUTEX = 0;
+const i64 R_CONDITION = 8;
+const i64 R_STATUS = 16;
+const i64 R_VALUE = 24;
+
+public struct TimerSchedulerI64 {
+    usize state;
+}
+
+public struct TimerTaskI64 {
+    usize state;
+}
+
+public struct TimerTaskResultI64 {
+    i64 status;
+    i64 value;
+}
+
+fn load(usize base, i64 offset) -> i64 {
+    return raz_rt_volatile_load_i64(base + offset);
+}
+
+fn store(usize base, i64 offset, i64 value) {
+    raz_rt_volatile_store_i64(base + offset, value);
+}
+
+fn array_get(usize array, i64 index) -> i64 {
+    return raz_rt_volatile_load_i64(array + index * 8);
+}
+
+fn array_set(usize array, i64 index, i64 value) {
+    raz_rt_volatile_store_i64(array + index * 8, value);
+}
+
+fn result_create() -> usize {
+    usize state = raz_rt_alloc_aligned(RESULT_BYTES, 8);
+
+    if (state == 0) {
+        return 0;
+    }
+
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize condition = std::sync::condition::condition_create();
+
+    if (mutex == 0 || condition == 0) {
+        if (condition != 0) {
+            std::sync::condition::condition_destroy(condition);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        raz_rt_dealloc_aligned(state, 8);
+        return 0;
+    }
+    store(state, R_MUTEX, mutex as i64);
+    store(state, R_CONDITION, condition as i64);
+    store(state, R_STATUS, 0);
+    store(state, R_VALUE, 0);
+    return state;
+}
+
+fn result_finish(usize state, i64 status, i64 value) -> bool {
+    if (state == 0) {
+        return false;
+    }
+
+    usize mutex = load(state, R_MUTEX)as usize;
+    usize condition = load(state, R_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    if (load(state, R_STATUS) != 0) {
+        std::sync::mutex::mutex_unlock_raw(mutex);
+        return false;
+    }
+    store(state, R_VALUE, value);
+    store(state, R_STATUS, status);
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    std::sync::condition::notify_all_raw(condition);
+    return true;
+}
+
+fn deadline_after(i64 delay_millis) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (delay_millis <= 0) {
+        return now;
+    }
+    if (delay_millis > 9223372036854) {
+        return 9223372036854775807;
+    }
+
+    i64 delta = delay_millis * 1000000;
+
+    if (now > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return now + delta;
+}
+
+fn remaining_millis(i64 deadline) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (now >= deadline) {
+        return 0;
+    }
+
+    i64 remaining = deadline - now;
+    i64 millis = remaining / 1000000;
+
+    if (remaining % 1000000 != 0) {
+        millis += 1;
+    }
+    return millis;
+}
+
+fn earlier(i64 deadline_a, i64 sequence_a, i64 deadline_b, i64 sequence_b) -> bool {
+    if (deadline_a < deadline_b) {
+        return true;
+    }
+    return deadline_a == deadline_b && sequence_a < sequence_b;
+}
+
+fn heap_insert(usize state, i64 deadline, i64 sequence, usize callable, usize result_state) {
+    usize deadlines = load(state, S_DEADLINES)as usize;
+    usize sequences = load(state, S_SEQUENCES)as usize;
+    usize callables = load(state, S_CALLABLES)as usize;
+    usize results = load(state, S_RESULTS)as usize;
+    i64 index = load(state, S_COUNT);
+
+    while (index > 0) {
+        i64 parent = (index - 1) / 2;
+        i64 pd = array_get(deadlines, parent);
+        i64 ps = array_get(sequences, parent);
+
+        if (!earlier(deadline, sequence, pd, ps)) {
+            break;
+        }
+        array_set(deadlines, index, pd);
+        array_set(sequences, index, ps);
+        array_set(callables, index, array_get(callables, parent));
+        array_set(results, index, array_get(results, parent));
+        index = parent;
+    }
+    array_set(deadlines, index, deadline);
+    array_set(sequences, index, sequence);
+    array_set(callables, index, callable as i64);
+    array_set(results, index, result_state as i64);
+    store(state, S_COUNT, load(state, S_COUNT) + 1);
+}
+
+// Pops the root into four caller-provided slots in scratch memory.
+fn heap_pop(usize state, usize scratch) {
+    usize deadlines = load(state, S_DEADLINES)as usize;
+    usize sequences = load(state, S_SEQUENCES)as usize;
+    usize callables = load(state, S_CALLABLES)as usize;
+    usize results = load(state, S_RESULTS)as usize;
+    i64 count = load(state, S_COUNT);
+
+    array_set(scratch, 0, array_get(deadlines, 0));
+    array_set(scratch, 1, array_get(sequences, 0));
+    array_set(scratch, 2, array_get(callables, 0));
+    array_set(scratch, 3, array_get(results, 0));
+    count -= 1;
+    store(state, S_COUNT, count);
+    if (count <= 0) {
+        return;
+    }
+
+    i64 ld = array_get(deadlines, count);
+    i64 ls = array_get(sequences, count);
+    i64 lv = array_get(callables, count);
+    i64 lr = array_get(results, count);
+    i64 index = 0;
+
+    while (true) {
+        i64 left = index * 2 + 1;
+
+        if (left >= count) {
+            break;
+        }
+
+        i64 right = left + 1;
+        i64 child = left;
+
+        if (
+            right < count &&
+            earlier(
+                array_get(deadlines, right),
+                array_get(sequences, right),
+                array_get(deadlines, left),
+                array_get(sequences, left),
+            )
+        ) {
+            child = right;
+        }
+
+        i64 cd = array_get(deadlines, child);
+        i64 cs = array_get(sequences, child);
+
+        if (!earlier(cd, cs, ld, ls)) {
+            break;
+        }
+        array_set(deadlines, index, cd);
+        array_set(sequences, index, cs);
+        array_set(callables, index, array_get(callables, child));
+        array_set(results, index, array_get(results, child));
+        index = child;
+    }
+    array_set(deadlines, index, ld);
+    array_set(sequences, index, ls);
+    array_set(callables, index, lv);
+    array_set(results, index, lr);
+}
+
+fn worker_loop(usize state) -> i64 {
+    usize mutex = load(state, S_MUTEX)as usize;
+    usize changed = load(state, S_CHANGED)as usize;
+    usize deadlines = load(state, S_DEADLINES)as usize;
+    usize scratch = raz_rt_alloc_aligned(32, 8);
+
+    if (scratch == 0) {
+        return -1;
+    }
+    while (true) {
+        std::sync::mutex::mutex_lock_raw(mutex);
+        while (load(state, S_COUNT) == 0 && load(state, S_STOPPING) == 0) {
+            std::sync::condition::wait_raw(changed, mutex);
+        }
+        if (load(state, S_COUNT) == 0 && load(state, S_STOPPING) != 0) {
+            std::sync::mutex::mutex_unlock_raw(mutex);
+            raz_rt_dealloc_aligned(scratch, 8);
+            return 0;
+        }
+
+        i64 deadline = array_get(deadlines, 0);
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining > 0) {
+            std::sync::condition::wait_millis_raw(changed, mutex, remaining);
+            std::sync::mutex::mutex_unlock_raw(mutex);
+            continue;
+        }
+        heap_pop(state, scratch);
+
+        usize result_state = array_get(scratch, 3)as usize;
+        usize callable = array_get(scratch, 2)as usize;
+
+        std::sync::mutex::mutex_unlock_raw(mutex);
+
+        i64 value = raz_rt_callable_invoke_once_i64_raw(callable);
+
+        result_finish(result_state, 1, value);
+    }
+    return 0;
+}
+
+public fn create(i64 capacity) -> TimerSchedulerI64 {
+    if (capacity <= 0 || capacity > 268435455) {
+        return TimerSchedulerI64 {
+            state: 0
+        };
+    }
+
+    usize state = raz_rt_alloc_aligned(SCHEDULER_BYTES, 8);
+    usize deadlines = raz_rt_alloc_aligned(capacity * 8, 8);
+    usize sequences = raz_rt_alloc_aligned(capacity * 8, 8);
+    usize callables = raz_rt_alloc_aligned(capacity * 8, 8);
+    usize results = raz_rt_alloc_aligned(capacity * 8, 8);
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize changed = std::sync::condition::condition_create();
+
+    if (
+        state == 0 ||
+        deadlines == 0 ||
+        sequences == 0 ||
+        callables == 0 ||
+        results == 0 ||
+        mutex == 0 ||
+        changed == 0
+    ) {
+        if (changed != 0) {
+            std::sync::condition::condition_destroy(changed);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        if (deadlines != 0) {
+            raz_rt_dealloc_aligned(deadlines, 8);
+        }
+        if (sequences != 0) {
+            raz_rt_dealloc_aligned(sequences, 8);
+        }
+        if (callables != 0) {
+            raz_rt_dealloc_aligned(callables, 8);
+        }
+        if (results != 0) {
+            raz_rt_dealloc_aligned(results, 8);
+        }
+        if (state != 0) {
+            raz_rt_dealloc_aligned(state, 8);
+        }
+        return TimerSchedulerI64 {
+            state: 0
+        };
+    }
+    store(state, S_DEADLINES, deadlines as i64);
+    store(state, S_SEQUENCES, sequences as i64);
+    store(state, S_CALLABLES, callables as i64);
+    store(state, S_RESULTS, results as i64);
+    store(state, S_CAPACITY, capacity);
+    store(state, S_COUNT, 0);
+    store(state, S_MUTEX, mutex as i64);
+    store(state, S_CHANGED, changed as i64);
+    store(state, S_ACCEPTING, 1);
+    store(state, S_STOPPING, 0);
+    store(state, S_NEXT_SEQUENCE, 0);
+    store(state, S_WORKER, 0);
+
+    usize captured = state;
+
+    auto raw_worker = raz_rt_task_spawn_callable_i64(move fn() -> i64 {
+        return worker_loop(captured);
+    }
+    );
+
+    usize worker = 0;
+
+    unsafe {
+        worker = raw_worker as usize;
+    }
+    if (worker == 0) {
+        std::sync::condition::condition_destroy(changed);
+        std::sync::mutex::mutex_destroy_raw(mutex);
+        raz_rt_dealloc_aligned(deadlines, 8);
+        raz_rt_dealloc_aligned(sequences, 8);
+        raz_rt_dealloc_aligned(callables, 8);
+        raz_rt_dealloc_aligned(results, 8);
+        raz_rt_dealloc_aligned(state, 8);
+        return TimerSchedulerI64 {
+            state: 0
+        };
+    }
+    store(state, S_WORKER, worker as i64);
+    return TimerSchedulerI64 {
+        state: state
+    };
+}
+
+public fn valid(TimerSchedulerI64& scheduler) -> bool {
+    return scheduler.state != 0;
+}
+
+public fn pending(TimerSchedulerI64& scheduler) -> i64 {
+    if (scheduler.state == 0) {
+        return 0;
+    }
+
+    usize mutex = load(scheduler.state, S_MUTEX)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+
+    i64 result = load(scheduler.state, S_COUNT);
+
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    return result;
+}
+
+public fn schedule(
+    TimerSchedulerI64&mut scheduler,
+    i64 delay_millis,
+    FnOnce() -> i64 operation,
+) -> TimerTaskI64 {
+    if (scheduler.state == 0 || delay_millis < 0) {
+        return TimerTaskI64 {
+            state: 0
+        };
+    }
+
+    usize result_state = result_create();
+
+    if (result_state == 0) {
+        return TimerTaskI64 {
+            state: 0
+        };
+    }
+
+    usize callable = raz_rt_callable_into_raw(operation);
+
+    if (callable == 0) {
+        result_finish(result_state, -1, 0);
+        return TimerTaskI64 {
+            state: result_state
+        };
+    }
+
+    usize mutex = load(scheduler.state, S_MUTEX)as usize;
+    usize changed = load(scheduler.state, S_CHANGED)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    if (
+        load(scheduler.state, S_ACCEPTING) == 0 ||
+        load(scheduler.state, S_COUNT) >= load(scheduler.state, S_CAPACITY)
+    ) {
+        std::sync::mutex::mutex_unlock_raw(mutex);
+        raz_rt_callable_destroy_raw(callable);
+        result_finish(result_state, -1, 0);
+        return TimerTaskI64 {
+            state: result_state
+        };
+    }
+
+    i64 deadline = deadline_after(delay_millis);
+    i64 sequence = load(scheduler.state, S_NEXT_SEQUENCE);
+
+    store(scheduler.state, S_NEXT_SEQUENCE, sequence + 1);
+    bool wake =
+        load(scheduler.state, S_COUNT) == 0 ||
+        earlier(
+            deadline,
+            sequence,
+            array_get(load(scheduler.state, S_DEADLINES)as usize, 0),
+            array_get(load(scheduler.state, S_SEQUENCES)as usize, 0),
+        );
+    heap_insert(scheduler.state, deadline, sequence, callable, result_state);
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    if (wake) {
+        std::sync::condition::notify_one_raw(changed);
+    }
+    return TimerTaskI64 {
+        state: result_state
+    };
+}
+
+public fn after_i64(TimerSchedulerI64&mut scheduler, i64 delay_millis, i64 value) -> TimerTaskI64 {
+    return schedule(scheduler, delay_millis, move fn() -> i64 {
+        return value;
+    }
+    );
+}
+
+public fn task_valid(TimerTaskI64& task) -> bool {
+    return task.state != 0;
+}
+
+public fn task_wait_millis(TimerTaskI64& task, i64 timeout_millis) -> TimerTaskResultI64 {
+    if (task.state == 0 || timeout_millis < 0) {
+        return TimerTaskResultI64 {
+            status: -2,
+            value: 0
+        };
+    }
+
+    i64 deadline = deadline_after(timeout_millis);
+    usize mutex = load(task.state, R_MUTEX)as usize;
+    usize condition = load(task.state, R_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    while (load(task.state, R_STATUS) == 0) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            std::sync::mutex::mutex_unlock_raw(mutex);
+            return TimerTaskResultI64 {
+                status: 0,
+                value: 0
+            };
+        }
+        std::sync::condition::wait_millis_raw(condition, mutex, remaining);
+    }
+    TimerTaskResultI64 result = TimerTaskResultI64 {
+        status: load(task.state, R_STATUS),
+        value: load(task.state, R_VALUE)
+    };
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    return result;
+}
+
+public fn task_destroy(TimerTaskI64&mut task) {
+    if (task.state == 0) {
+        return;
+    }
+
+    usize mutex = load(task.state, R_MUTEX)as usize;
+    usize condition = load(task.state, R_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    while (load(task.state, R_STATUS) == 0) {
+        std::sync::condition::wait_raw(condition, mutex);
+    }
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    std::sync::condition::condition_destroy(condition);
+    std::sync::mutex::mutex_destroy_raw(mutex);
+    raz_rt_dealloc_aligned(task.state, 8);
+    task.state = 0;
+}
+
+public fn shutdown(TimerSchedulerI64&mut scheduler, bool cancel_pending) {
+    if (scheduler.state == 0) {
+        return;
+    }
+
+    usize mutex = load(scheduler.state, S_MUTEX)as usize;
+    usize changed = load(scheduler.state, S_CHANGED)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    store(scheduler.state, S_ACCEPTING, 0);
+    if (cancel_pending) {
+        usize callables = load(scheduler.state, S_CALLABLES)as usize;
+        usize results = load(scheduler.state, S_RESULTS)as usize;
+        i64 count = load(scheduler.state, S_COUNT);
+        i64 index = 0;
+
+        while (index < count) {
+            raz_rt_callable_destroy_raw(array_get(callables, index)as usize);
+            result_finish(array_get(results, index)as usize, -1, 0);
+            index += 1;
+        }
+        store(scheduler.state, S_COUNT, 0);
+    }
+    store(scheduler.state, S_STOPPING, 1);
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    std::sync::condition::notify_all_raw(changed);
+}
+
+public fn destroy(TimerSchedulerI64&mut scheduler) {
+    if (scheduler.state == 0) {
+        return;
+    }
+    shutdown(scheduler, true);
+
+    usize worker = load(scheduler.state, S_WORKER)as usize;
+
+    if (worker != 0) {
+        unsafe {
+            raz_rt_task_join_i64(worker as i8*mut);
+        }
+    }
+
+    usize mutex = load(scheduler.state, S_MUTEX)as usize;
+    usize changed = load(scheduler.state, S_CHANGED)as usize;
+
+    std::sync::condition::condition_destroy(changed);
+    std::sync::mutex::mutex_destroy_raw(mutex);
+    raz_rt_dealloc_aligned(load(scheduler.state, S_DEADLINES)as usize, 8);
+    raz_rt_dealloc_aligned(load(scheduler.state, S_SEQUENCES)as usize, 8);
+    raz_rt_dealloc_aligned(load(scheduler.state, S_CALLABLES)as usize, 8);
+    raz_rt_dealloc_aligned(load(scheduler.state, S_RESULTS)as usize, 8);
+    raz_rt_dealloc_aligned(scheduler.state, 8);
+    scheduler.state = 0;
+}

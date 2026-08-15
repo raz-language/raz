@@ -1,0 +1,345 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::tls;
+import alloc::string;
+import core::result;
+import std::io::buffer;
+import std::io::error;
+import std::net;
+
+extern fn raz_rt_tls_available() -> i64;
+extern fn raz_rt_tls_client_create(usize host, i64 host_length) -> usize;
+extern fn raz_rt_tls_feed(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_tls_drain(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_tls_pending_encrypted(usize handle) -> i64;
+extern fn raz_rt_tls_handshake(usize handle) -> i64;
+extern fn raz_rt_tls_handshake_finished(usize handle) -> i64;
+extern fn raz_rt_tls_write_plain(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_tls_read_plain(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_tls_shutdown(usize handle) -> i64;
+extern fn raz_rt_tls_destroy(usize handle);
+
+public enum TlsError {
+    None,
+    Unavailable,
+    InvalidArgument,
+    OutOfMemory,
+    ConnectFailed,
+    HandshakeFailed,
+    Io,
+    Closed,
+}
+
+public struct TlsEngine {
+    usize handle;
+}
+
+public struct TlsStream {
+    TcpStream stream;
+    TlsEngine engine;
+    ByteBuffer scratch;
+    i64 scratch_capacity;
+    bool handshaken;
+}
+
+public fn available() -> bool {
+    return raz_rt_tls_available() == 1;
+}
+
+/// Creates an inert destination suitable for `connect`.
+public fn empty_stream() -> TlsStream {
+    return TlsStream {
+        stream: TcpStream {
+            socket: -1
+        },
+        engine: TlsEngine {
+            handle: 0
+        },
+        scratch: byte_buffer_new(),
+        scratch_capacity: 0,
+        handshaken: false,
+    };
+}
+
+public fn engine_create_client(usize host, i64 host_length) -> TlsEngine {
+    if (host == 0 || host_length <= 0) {
+        return TlsEngine {
+            handle: 0
+        };
+    }
+    return TlsEngine {
+        handle: raz_rt_tls_client_create(host, host_length)
+    };
+}
+
+public fn engine_valid(TlsEngine& engine) -> bool {
+    return engine.handle != 0;
+}
+
+public fn engine_handshaken(TlsEngine& engine) -> bool {
+    return engine.handle != 0 && raz_rt_tls_handshake_finished(engine.handle) == 1;
+}
+
+public fn engine_handshake(TlsEngine&mut engine) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_handshake(engine.handle);
+}
+
+public fn engine_feed(TlsEngine&mut engine, usize data, i64 size) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_feed(engine.handle, data, size);
+}
+
+public fn engine_drain(TlsEngine&mut engine, usize output, i64 capacity) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_drain(engine.handle, output, capacity);
+}
+
+public fn engine_pending_encrypted(TlsEngine& engine) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_pending_encrypted(engine.handle);
+}
+
+public fn engine_write(TlsEngine&mut engine, usize data, i64 size) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_write_plain(engine.handle, data, size);
+}
+
+public fn engine_read(TlsEngine&mut engine, usize output, i64 capacity) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_read_plain(engine.handle, output, capacity);
+}
+
+public fn engine_shutdown(TlsEngine&mut engine) -> i64 {
+    if (engine.handle == 0) {
+        return -1;
+    }
+    return raz_rt_tls_shutdown(engine.handle);
+}
+
+public fn engine_destroy(TlsEngine&mut engine) {
+    if (engine.handle != 0) {
+        raz_rt_tls_destroy(engine.handle);
+        engine.handle = 0;
+    }
+}
+
+impl Drop for TlsEngine {
+    fn drop(TlsEngine&mut self) {
+        engine_destroy(self);
+    }
+}
+
+fn scratch_reset(TlsStream&mut value) -> usize {
+    byte_buffer_clear(&mut value.scratch);
+    return byte_buffer_tail(&mut value.scratch, value.scratch_capacity);
+}
+
+fn flush_encrypted(TlsStream&mut value) -> bool {
+    while (engine_pending_encrypted(&value.engine) > 0) {
+        usize output = scratch_reset(value);
+
+        if (output == 0) {
+            return false;
+        }
+
+        i64 count = engine_drain(&mut value.engine, output, value.scratch_capacity);
+
+        if (count < 0) {
+            return false;
+        }
+        if (count == 0) {
+            return true;
+        }
+        if (!tcp_stream_send_all(&value.stream, output, count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn receive_encrypted(TlsStream&mut value) -> i64 {
+    usize input = scratch_reset(value);
+
+    if (input == 0) {
+        return -1;
+    }
+
+    i64 count = tcp_stream_receive(&value.stream, input, value.scratch_capacity);
+
+    if (count <= 0) {
+        return count;
+    }
+
+    i64 consumed = 0;
+
+    while (consumed < count) {
+        i64 fed = engine_feed(&mut value.engine, input + consumed, count - consumed);
+
+        if (fed <= 0) {
+            return -1;
+        }
+        consumed += fed;
+    }
+    return count;
+}
+
+fn complete_handshake(TlsStream&mut value) -> TlsError {
+    while (!engine_handshaken(&value.engine)) {
+        i64 state = engine_handshake(&mut value.engine);
+
+        if (!flush_encrypted(value)) {
+            return TlsError::Io;
+        }
+        if (state == 1) {
+            value.handshaken = true;
+            return TlsError::None;
+        }
+        if (state < 0) {
+            return TlsError::HandshakeFailed;
+        }
+        if (receive_encrypted(value) <= 0) {
+            return TlsError::Io;
+        }
+    }
+    value.handshaken = true;
+    return TlsError::None;
+}
+
+/// Establishes a verified TLS client over a blocking TCP socket. The native
+/// TLS engine performs cryptography/certificate verification; socket pumping,
+/// buffering, ownership, and retry policy remain in Raz.
+public fn connect(
+    usize host,
+    i64 host_length,
+    i64 port,
+    i64 timeout_millis,
+    i64 buffer_capacity,
+    TlsStream&mut output,
+) -> TlsError {
+    if (!available()) {
+        return TlsError::Unavailable;
+    }
+    if (host == 0 || host_length <= 0 || port <= 0 || port > 65535 || buffer_capacity < 1024) {
+        return TlsError::InvalidArgument;
+    }
+
+    Result<TcpStream, IoError> connected = try_tcp_stream_connect(host, host_length, port);
+
+    match connected {
+        Result<TcpStream, IoError>::Error(_) => {
+            return TlsError::ConnectFailed;
+        }
+        Result<TcpStream, IoError>::Ok(stream) => {
+            TlsEngine engine = engine_create_client(host, host_length);
+
+            if (!engine_valid(&engine)) {
+                return TlsError::Unavailable;
+            }
+
+            ByteBuffer scratch = byte_buffer_with_capacity(buffer_capacity);
+
+            if (byte_buffer_tail(&mut scratch, buffer_capacity) == 0) {
+                return TlsError::OutOfMemory;
+            }
+            byte_buffer_clear(&mut scratch);
+            TlsStream created = TlsStream {
+                stream: move stream,
+                engine: move engine,
+                scratch: move scratch,
+                scratch_capacity: buffer_capacity,
+                handshaken: false,
+            };
+            if (timeout_millis >= 0) {
+                set_timeout_millis(created.stream.socket, timeout_millis, timeout_millis);
+            }
+
+            TlsError handshake = complete_handshake(&mut created);
+
+            if (handshake != TlsError::None) {
+                return handshake;
+            }
+            *output = move created;
+            return TlsError::None;
+        }
+    }
+}
+
+public fn write_all(TlsStream&mut value, usize data, i64 size) -> TlsError {
+    if (!value.handshaken || size < 0 || (size > 0 && data == 0)) {
+        return TlsError::InvalidArgument;
+    }
+
+    i64 written = 0;
+
+    while (written < size) {
+        i64 count = engine_write(&mut value.engine, data + written, size - written);
+
+        if (!flush_encrypted(value)) {
+            return TlsError::Io;
+        }
+        if (count < 0) {
+            return TlsError::Io;
+        }
+        if (count > 0) {
+            written += count;
+            continue;
+        }
+        if (receive_encrypted(value) <= 0) {
+            return TlsError::Io;
+        }
+    }
+    return TlsError::None;
+}
+
+/// Reads decrypted application bytes. Returns -2 for a clean TLS close, -1
+/// for an error, otherwise the number of plaintext bytes produced.
+public fn read(TlsStream&mut value, usize output, i64 capacity) -> i64 {
+    if (!value.handshaken || capacity < 0 || (capacity > 0 && output == 0)) {
+        return -1;
+    }
+    while (true) {
+        i64 count = engine_read(&mut value.engine, output, capacity);
+
+        if (count != 0) {
+            flush_encrypted(value);
+            return count;
+        }
+        if (!flush_encrypted(value)) {
+            return -1;
+        }
+        if (receive_encrypted(value) <= 0) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+public fn close(TlsStream&mut value) {
+    if (value.engine.handle != 0) {
+        engine_shutdown(&mut value.engine);
+        flush_encrypted(value);
+        engine_destroy(&mut value.engine);
+    }
+    tcp_stream_close(&mut value.stream);
+    value.handshaken = false;
+}
+
+impl Drop for TlsStream {
+    fn drop(TlsStream&mut self) {
+        close(self);
+    }
+}

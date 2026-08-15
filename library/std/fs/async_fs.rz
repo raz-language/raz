@@ -1,0 +1,113 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::fs::async_fs;
+import alloc::string;
+import std::fs;
+import std::thread::executor;
+// Async filesystem policy is Raz-owned: the worker pool executes ordinary
+// synchronous filesystem primitives. Paths/write payloads are copied into the
+// closure so their lifetimes are independent of the submitting stack frame.
+public fn file_size(ExecutorI64&mut executor, usize path, i64 length, i64 timeout_millis) -> ExecutorTaskI64 {
+    if (length < 0 || (length > 0 && path == 0)) {
+        return std::thread::executor::invalid_task();
+    }
+
+    String owned_path = alloc::string::from_bytes(path, length);
+
+    if (length > 0 && alloc::string::len(&owned_path) != length) {
+        return std::thread::executor::invalid_task();
+    }
+    return std::thread::executor::submit(executor, move fn() -> i64 {
+        return std::fs::file_size(alloc::string::data_ptr(&owned_path), alloc::string::len(&owned_path));
+    }, timeout_millis);
+}
+
+public fn read(
+    ExecutorI64&mut executor,
+    usize path,
+    i64 length,
+    usize output,
+    i64 capacity,
+    i64 timeout_millis,
+) -> ExecutorTaskI64 {
+    if (length < 0 || capacity < 0 || (length > 0 && path == 0) || (capacity > 0 && output == 0)) {
+        return std::thread::executor::invalid_task();
+    }
+
+    String owned_path = alloc::string::from_bytes(path, length);
+
+    if (length > 0 && alloc::string::len(&owned_path) != length) {
+        return std::thread::executor::invalid_task();
+    }
+    return std::thread::executor::submit(executor, move fn() -> i64 {
+        return std::fs::read(
+            alloc::string::data_ptr(&owned_path),
+            alloc::string::len(&owned_path),
+            output,
+            capacity,
+        );
+    }, timeout_millis);
+}
+
+public fn write(
+    ExecutorI64&mut executor,
+    usize path,
+    i64 length,
+    usize data,
+    i64 size,
+    i64 timeout_millis,
+) -> ExecutorTaskI64 {
+    return write_mode(executor, path, length, data, size, false, timeout_millis);
+}
+
+public fn append(
+    ExecutorI64&mut executor,
+    usize path,
+    i64 length,
+    usize data,
+    i64 size,
+    i64 timeout_millis,
+) -> ExecutorTaskI64 {
+    return write_mode(executor, path, length, data, size, true, timeout_millis);
+}
+
+fn write_mode(
+    ExecutorI64&mut executor,
+    usize path,
+    i64 length,
+    usize data,
+    i64 size,
+    bool append_mode,
+    i64 timeout_millis,
+) -> ExecutorTaskI64 {
+    if (length < 0 || size < 0 || (length > 0 && path == 0) || (size > 0 && data == 0)) {
+        return std::thread::executor::invalid_task();
+    }
+
+    String owned_path = alloc::string::from_bytes(path, length);
+    String owned_data = alloc::string::from_bytes(data, size);
+
+    if (
+        (length > 0 && alloc::string::len(&owned_path) != length) ||
+        (size > 0 && alloc::string::len(&owned_data) != size)
+    ) {
+        return std::thread::executor::invalid_task();
+    }
+    return std::thread::executor::submit(executor, move fn() -> i64 {
+        if (append_mode) {
+            return std::fs::append(
+                alloc::string::data_ptr(&owned_path),
+                alloc::string::len(&owned_path),
+                alloc::string::data_ptr(&owned_data),
+                alloc::string::len(&owned_data),
+            );
+        }
+        return std::fs::write(
+            alloc::string::data_ptr(&owned_path),
+            alloc::string::len(&owned_path),
+            alloc::string::data_ptr(&owned_data),
+            alloc::string::len(&owned_data),
+        );
+    }, timeout_millis);
+}

@@ -1,0 +1,605 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::resolve;
+import alloc::string;
+import core::result;
+import core::bytes;
+import std::net::address;
+// Binary resolver ABI. Each record is 32 bytes:
+//   i64 family (4 or 6), u64 high, u64 low, i64 scope_id.
+// The runtime performs only getaddrinfo/OS translation. Deduplication at the
+// ABI edge prevents repeated records; ownership, representation, formatting,
+// and endpoint policy remain in Raz.
+extern fn raz_rt_dns_resolve_all(usize host, i64 host_length, usize output, i64 capacity) -> i64;
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+
+public enum ResolveError {
+    InvalidHost,
+    LookupFailed,
+    AllocationFailed,
+    InvalidAddressSyntax,
+}
+
+public struct IpAddress {
+    i64 family;
+    u64 high;
+    u64 low;
+    i64 scope_id;
+}
+
+public struct ResolvedAddresses {
+    usize data;
+    i64 length;
+    i64 capacity;
+}
+
+public fn is_ipv4(IpAddress& address) -> bool {
+    return address.family == 4;
+}
+
+public fn is_ipv6(IpAddress& address) -> bool {
+    return address.family == 6;
+}
+
+public fn family(IpAddress& address) -> i64 {
+    return address.family;
+}
+
+public fn scope_id(IpAddress& address) -> i64 {
+    return address.scope_id;
+}
+
+public fn ipv4(i64 first, i64 second, i64 third, i64 fourth) -> Result<IpAddress, ResolveError> {
+    if (
+        first < 0 ||
+        first > 255 ||
+        second < 0 ||
+        second > 255 ||
+        third < 0 ||
+        third > 255 ||
+        fourth < 0 ||
+        fourth > 255
+    ) {
+        return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidHost);
+    }
+
+    u64 packed = ((first as u64) << 24) | ((second as u64) << 16) | ((third as u64) << 8) | (fourth as u64);
+
+    return Result<IpAddress, ResolveError>::Ok(IpAddress {
+        family: 4,
+        high: 0,
+        low: packed,
+        scope_id: 0
+    }
+    );
+}
+
+public fn ipv6(u64 high, u64 low, i64 scope) -> IpAddress {
+    return IpAddress {
+        family: 6,
+        high: high,
+        low: low,
+        scope_id: scope
+    };
+}
+
+fn hex_value(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 70) {
+        return byte - 55;
+    }
+    if (byte >= 97 && byte <= 102) {
+        return byte - 87;
+    }
+    return -1;
+}
+
+fn contains_byte(usize data, i64 start, i64 end, i64 needle) -> bool {
+    i64 index = start;
+
+    while (index < end) {
+        if (core::bytes::load_u8(data + index) == needle) {
+            return true;
+        }
+        index += 1;
+    }
+    return false;
+}
+
+public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> {
+    if (data == 0 || length < 2 || length > 64) {
+        return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+    }
+
+    i64 parse_length = length;
+    i64 scope = 0;
+    i64 percent = 0;
+
+    while (percent < length && core::bytes::load_u8(data + percent) != 37) {
+        percent += 1;
+    }
+    if (percent < length) {
+        if (percent == 0 || percent + 1 >= length) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+
+        i64 scope_index = percent + 1;
+
+        while (scope_index < length) {
+            i64 byte = core::bytes::load_u8(data + scope_index);
+
+            if (byte < 48 || byte > 57 || scope > 214748364) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+            }
+            scope = scope * 10 + byte - 48;
+            scope_index += 1;
+        }
+        parse_length = percent;
+    }
+
+    i64 groups[8];
+    i64 count = 0;
+    i64 compression = -1;
+    i64 index = 0;
+
+    if (core::bytes::load_u8(data) == 58) {
+        if (parse_length < 2 || core::bytes::load_u8(data + 1) != 58) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+        compression = 0;
+        index = 2;
+    }
+    while (index < parse_length) {
+        if (count >= 8) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+
+        i64 start = index;
+
+        // IPv4-embedded tail, e.g. ::ffff:192.0.2.1. It must consume the
+        // remainder and occupies the final two 16-bit groups.
+        if (contains_byte(data, start, parse_length, 46)) {
+            if (count > 6) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+            }
+            Result<Ipv4Address, AddressError> parsed4 = std::net::address::parse_ipv4(
+                data + start,
+                parse_length - start,
+            );
+            match parsed4 {
+                Result<Ipv4Address, AddressError>::Error(_) => {
+                    return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+                }
+                Result<Ipv4Address, AddressError>::Ok(address4) => {
+                    groups[count] =
+                        (std::net::address::ipv4_first(&address4) << 8) |
+                        std::net::address::ipv4_second(&address4);
+                    groups[count + 1] =
+                        (std::net::address::ipv4_third(&address4) << 8) |
+                        std::net::address::ipv4_fourth(&address4);
+                    count += 2;
+                    index = parse_length;
+                    break;
+                }
+            }
+        }
+
+        i64 value = 0;
+        i64 digits = 0;
+
+        while (index < parse_length && core::bytes::load_u8(data + index) != 58) {
+            i64 digit = hex_value(core::bytes::load_u8(data + index));
+
+            if (digit < 0 || digits >= 4) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+            }
+            value = (value << 4) | digit;
+            digits += 1;
+            index += 1;
+        }
+        if (digits == 0) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+        groups[count] = value;
+        count += 1;
+        if (index >= parse_length) {
+            break;
+        }
+        index += 1;
+        if (index >= parse_length) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+        if (core::bytes::load_u8(data + index) == 58) {
+            if (compression >= 0) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+            }
+            compression = count;
+            index += 1;
+            if (index >= parse_length) {
+                break;
+            }
+        }
+    }
+    if (compression >= 0) {
+        i64 missing = 8 - count;
+
+        if (missing <= 0) {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+
+        i64 move_index = count - 1;
+
+        while (move_index >= compression) {
+            groups[move_index + missing] = groups[move_index];
+            move_index -= 1;
+        }
+
+        i64 zero = compression;
+
+        while (zero < compression + missing) {
+            groups[zero] = 0;
+            zero += 1;
+        }
+        count = 8;
+    }
+    if (count != 8) {
+        return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+    }
+
+    u64 high = 0;
+    u64 low = 0;
+
+    index = 0;
+    while (index < 4) {
+        high = (high << 16) | (groups[index]as u64);
+        index += 1;
+    }
+    while (index < 8) {
+        low = (low << 16) | (groups[index]as u64);
+        index += 1;
+    }
+    return Result<IpAddress, ResolveError>::Ok(IpAddress {
+        family: 6,
+        high: high,
+        low: low,
+        scope_id: scope
+    }
+    );
+}
+
+public fn parse(usize data, i64 length) -> Result<IpAddress, ResolveError> {
+    if (data == 0 || length <= 0) {
+        return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+    }
+    if (contains_byte(data, 0, length, 58)) {
+        return parse_ipv6(data, length);
+    }
+
+    Result<Ipv4Address, AddressError> parsed4 = std::net::address::parse_ipv4(data, length);
+
+    match parsed4 {
+        Result<Ipv4Address, AddressError>::Error(_) => {
+            return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+        }
+        Result<Ipv4Address, AddressError>::Ok(address4) => {
+            return ipv4(
+                std::net::address::ipv4_first(&address4),
+                std::net::address::ipv4_second(&address4),
+                std::net::address::ipv4_third(&address4),
+                std::net::address::ipv4_fourth(&address4),
+            );
+        }
+    }
+}
+
+public fn loopback_ipv6() -> IpAddress {
+    return IpAddress {
+        family: 6,
+        high: 0,
+        low: 1,
+        scope_id: 0
+    };
+}
+
+public fn unspecified_ipv6() -> IpAddress {
+    return IpAddress {
+        family: 6,
+        high: 0,
+        low: 0,
+        scope_id: 0
+    };
+}
+
+public fn loopback_ipv4() -> IpAddress {
+    return IpAddress {
+        family: 4,
+        high: 0,
+        low: 2130706433,
+        scope_id: 0
+    };
+}
+
+public fn unspecified_ipv4() -> IpAddress {
+    return IpAddress {
+        family: 4,
+        high: 0,
+        low: 0,
+        scope_id: 0
+    };
+}
+
+public fn len(ResolvedAddresses& addresses) -> i64 {
+    return addresses.length;
+}
+
+public fn is_empty(ResolvedAddresses& addresses) -> bool {
+    return addresses.length == 0;
+}
+
+public fn get(ResolvedAddresses& addresses, i64 index) -> IpAddress {
+    if (index < 0 || index >= addresses.length || addresses.data == 0) {
+        return IpAddress {
+            family: 0,
+            high: 0,
+            low: 0,
+            scope_id: 0
+        };
+    }
+
+    usize record = addresses.data + index * 32;
+    i64 family_value = raz_rt_volatile_load_i64(record);
+    u64 high_value = raz_rt_volatile_load_i64(record + 8)as u64;
+    u64 low_value = raz_rt_volatile_load_i64(record + 16)as u64;
+    i64 scope_value = raz_rt_volatile_load_i64(record + 24);
+
+    return IpAddress {
+        family: family_value,
+        high: high_value,
+        low: low_value,
+        scope_id: scope_value
+    };
+}
+
+public fn resolve(usize host, i64 host_length) -> Result<ResolvedAddresses, ResolveError> {
+    if (host == 0 || host_length <= 0) {
+        return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::InvalidHost);
+    }
+
+    i64 required = raz_rt_dns_resolve_all(host, host_length, 0, 0);
+
+    if (required <= 0 || required > 1048576) {
+        return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::LookupFailed);
+    }
+
+    i64 capacity = required;
+    usize data = raz_rt_alloc_aligned(capacity * 32, 8);
+
+    if (data == 0) {
+        return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::AllocationFailed);
+    }
+
+    i64 actual = raz_rt_dns_resolve_all(host, host_length, data, capacity);
+
+    if (actual <= 0) {
+        raz_rt_dealloc_aligned(data, 8);
+        return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::LookupFailed);
+    }
+    // DNS can change between sizing and fetch. Retry once with the new exact
+    // size rather than truncating a result set.
+    if (actual > capacity) {
+        raz_rt_dealloc_aligned(data, 8);
+        capacity = actual;
+        data = raz_rt_alloc_aligned(capacity * 32, 8);
+        if (data == 0) {
+            return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::AllocationFailed);
+        }
+        actual = raz_rt_dns_resolve_all(host, host_length, data, capacity);
+        if (actual <= 0 || actual > capacity) {
+            raz_rt_dealloc_aligned(data, 8);
+            return Result<ResolvedAddresses, ResolveError>::Error(ResolveError::LookupFailed);
+        }
+    }
+    return Result<ResolvedAddresses, ResolveError>::Ok(ResolvedAddresses {
+        data: data,
+        length: actual,
+        capacity: capacity
+    }
+    );
+}
+
+fn append_decimal(String&mut output, i64 value) -> bool {
+    if (value < 0) {
+        return false;
+    }
+
+    i64 divisor = 1;
+
+    while (value / divisor >= 10) {
+        divisor *= 10;
+    }
+    while (divisor > 0) {
+        if (!alloc::string::push_byte(output, 48 + (value / divisor) % 10)) {
+            return false;
+        }
+        divisor /= 10;
+    }
+    return true;
+}
+
+fn hex_digit(i64 value) -> i64 {
+    if (value < 10) {
+        return 48 + value;
+    }
+    return 87 + value;
+}
+
+fn append_hex_group(String&mut output, i64 value) -> bool {
+    i64 shift = 12;
+    bool started = false;
+
+    while (shift >= 0) {
+        i64 digit = (value >> shift) & 15;
+
+        if (digit != 0 || started || shift == 0) {
+            if (!alloc::string::push_byte(output, hex_digit(digit))) {
+                return false;
+            }
+            started = true;
+        }
+        shift -= 4;
+    }
+    return true;
+}
+
+fn ipv6_segment(IpAddress& address, i64 index) -> i64 {
+    if (index < 0 || index >= 8) {
+        return 0;
+    }
+    if (index < 4) {
+        i64 shift = (3 - index) * 16;
+
+        return ((address.high >> (shift as u64)) & 65535)as i64;
+    }
+
+    i64 shift = (7 - index) * 16;
+
+    return ((address.low >> (shift as u64)) & 65535)as i64;
+}
+
+fn ipv6_to_string(IpAddress& address) -> String {
+    i64 segments[8];
+    i64 index = 0;
+
+    while (index < 8) {
+        segments[index] = ipv6_segment(address, index);
+        index += 1;
+    }
+    // RFC 5952-style compression: compress the longest run of 2+ zero groups;
+    // ties select the first run.
+
+    i64 best_start = -1;
+    i64 best_length = 0;
+
+    index = 0;
+    while (index < 8) {
+        if (segments[index] != 0) {
+            index += 1;
+            continue;
+        }
+
+        i64 start = index;
+
+        while (index < 8 && segments[index] == 0) {
+            index += 1;
+        }
+
+        i64 run = index - start;
+
+        if (run >= 2 && run > best_length) {
+            best_start = start;
+            best_length = run;
+        }
+    }
+
+    String output = alloc::string::with_capacity(48);
+    bool first = true;
+    bool after_compression = false;
+
+    index = 0;
+    while (index < 8) {
+        if (index == best_start) {
+            if (!first) {
+                alloc::string::push_byte(&mut output, 58);
+            }
+            alloc::string::push_byte(&mut output, 58);
+            first = false;
+            after_compression = true;
+            index += best_length;
+            continue;
+        }
+        if (!first && !after_compression) {
+            alloc::string::push_byte(&mut output, 58);
+        }
+        append_hex_group(&mut output, segments[index]);
+        first = false;
+        after_compression = false;
+        index += 1;
+    }
+    if (address.scope_id > 0) {
+        alloc::string::push_byte(&mut output, 37);
+        append_decimal(&mut output, address.scope_id);
+    }
+    return move output;
+}
+
+public fn to_string(IpAddress& address) -> String {
+    if (address.family == 4) {
+        String output = alloc::string::with_capacity(15);
+        u64 value = address.low;
+
+        append_decimal(&mut output, ((value >> 24) & 255)as i64);
+        alloc::string::push_byte(&mut output, 46);
+        append_decimal(&mut output, ((value >> 16) & 255)as i64);
+        alloc::string::push_byte(&mut output, 46);
+        append_decimal(&mut output, ((value >> 8) & 255)as i64);
+        alloc::string::push_byte(&mut output, 46);
+        append_decimal(&mut output, (value & 255)as i64);
+        return move output;
+    }
+    if (address.family == 6) {
+        return ipv6_to_string(address);
+    }
+    return alloc::string::with_capacity(0);
+}
+
+public struct IpEndpoint {
+    IpAddress address;
+    i64 port;
+}
+
+public fn endpoint(IpAddress address, i64 port) -> Result<IpEndpoint, ResolveError> {
+    if (port < 0 || port > 65535 || (address.family != 4 && address.family != 6)) {
+        return Result<IpEndpoint, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
+    }
+    return Result<IpEndpoint, ResolveError>::Ok(IpEndpoint {
+        address: address,
+        port: port
+    }
+    );
+}
+
+public fn endpoint_to_string(IpEndpoint& endpoint) -> String {
+    String output = alloc::string::with_capacity(64);
+    String address = to_string(&endpoint.address);
+
+    if (endpoint.address.family == 6) {
+        alloc::string::push_byte(&mut output, 91);
+    }
+    alloc::string::append_string(&mut output, &address);
+    if (endpoint.address.family == 6) {
+        alloc::string::push_byte(&mut output, 93);
+    }
+    alloc::string::push_byte(&mut output, 58);
+    append_decimal(&mut output, endpoint.port);
+    return move output;
+}
+
+public fn destroy(ResolvedAddresses&mut addresses) {
+    if (addresses.data != 0) {
+        raz_rt_dealloc_aligned(addresses.data, 8);
+    }
+    addresses.data = 0;
+    addresses.length = 0;
+    addresses.capacity = 0;
+}
+
+impl Drop for ResolvedAddresses {
+    fn drop(ResolvedAddresses&mut self) {
+        destroy(self);
+    }
+}

@@ -1,0 +1,43 @@
+# Copyright 2026 Mario Vinciguerra
+# SPDX-License-Identifier: Apache-2.0
+
+execute_process(
+ COMMAND "${FORGE_CODEGEN}" "${INPUT}" --stats
+ RESULT_VARIABLE result
+ OUTPUT_VARIABLE output
+ ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+ message(FATAL_ERROR "forge-codegen failed: ${error}")
+endif()
+string(REGEX MATCH "instructions=([0-9]+)" _after_match "${output}")
+set(instructions_after "${CMAKE_MATCH_1}")
+string(REGEX MATCH "instructions-before-machine-opt=([0-9]+)" _before_match "${output}")
+set(instructions_before "${CMAKE_MATCH_1}")
+string(REGEX MATCH "machine-instructions-eliminated=([0-9]+)" _removed_match "${output}")
+set(instructions_removed "${CMAKE_MATCH_1}")
+string(REGEX MATCH "machine-immediate-forms-selected=([0-9]+)" _forms_match "${output}")
+set(immediate_forms "${CMAKE_MATCH_1}")
+string(REGEX MATCH "machine-constant-definitions-eliminated=([0-9]+)" _constants_match "${output}")
+set(constants_eliminated "${CMAKE_MATCH_1}")
+string(REGEX MATCH "bytes=([0-9]+)" _bytes_match "${output}")
+set(encoded_bytes "${CMAKE_MATCH_1}")
+if(instructions_after STREQUAL "" OR instructions_before STREQUAL "" OR instructions_removed STREQUAL "" OR immediate_forms STREQUAL "" OR constants_eliminated STREQUAL "" OR encoded_bytes STREQUAL "")
+ message(FATAL_ERROR "unable to parse immediate-form statistics: ${output}")
+endif()
+math(EXPR expected_removed "${instructions_before} - ${instructions_after}")
+if(NOT instructions_removed EQUAL expected_removed)
+ message(FATAL_ERROR "machine instruction accounting mismatch: ${instructions_removed} != ${expected_removed}")
+endif()
+if(immediate_forms LESS MIN_IMMEDIATE_FORMS)
+ message(FATAL_ERROR "immediate-form selection regression: ${immediate_forms} < ${MIN_IMMEDIATE_FORMS}")
+endif()
+if(constants_eliminated LESS MIN_CONSTANTS_ELIMINATED)
+ message(FATAL_ERROR "constant-definition elimination regression: ${constants_eliminated} < ${MIN_CONSTANTS_ELIMINATED}")
+endif()
+if(instructions_removed LESS MIN_INSTRUCTIONS_ELIMINATED)
+ message(FATAL_ERROR "immediate cleanup regression: ${instructions_removed} < ${MIN_INSTRUCTIONS_ELIMINATED}")
+endif()
+if(encoded_bytes GREATER MAX_ENCODED_BYTES)
+ message(FATAL_ERROR "immediate-form byte regression: ${encoded_bytes} > ${MAX_ENCODED_BYTES}")
+endif()
+message(STATUS "Forge immediate forms: instructions=${instructions_after}/${instructions_before}, removed=${instructions_removed}, forms=${immediate_forms}, constants=${constants_eliminated}, bytes=${encoded_bytes}/${MAX_ENCODED_BYTES}")

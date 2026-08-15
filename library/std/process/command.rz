@@ -1,0 +1,101 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::process::command;
+import alloc::string;
+import core::result;
+import std::io::error;
+// Shell-free synchronous command execution. Raz owns argument construction;
+// the runtime receives a compact NUL-separated argv blob and only performs the
+// platform process ABI transition.
+extern fn raz_rt_process_run_argv(
+    usize program,
+    i64 program_length,
+    usize blob,
+    i64 blob_length,
+    i64 argument_count,
+) -> i64;
+
+public struct ExitStatus {
+    i64 code;
+}
+
+public struct Command {
+    String program;
+    String arguments;
+    i64 argument_count;
+}
+
+public fn new(usize program, i64 length) -> Command {
+    String executable = alloc::string::from_bytes(program, length);
+    String arguments = alloc::string::with_capacity(64);
+
+    return Command {
+        program: move executable,
+        arguments: move arguments,
+        argument_count: 0
+    };
+}
+
+public fn valid(Command& command) -> bool {
+    return command.program.length > 0 && command.program.data != 0;
+}
+
+public fn arg_bytes(Command&mut command, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+    if (!alloc::string::append_bytes(&mut command.arguments, data, length)) {
+        return false;
+    }
+    if (!alloc::string::push_byte(&mut command.arguments, 0)) {
+        return false;
+    }
+    command.argument_count += 1;
+    return true;
+}
+
+public fn clear_args(Command&mut command) {
+    alloc::string::clear(&mut command.arguments);
+    command.argument_count = 0;
+}
+
+public fn status(Command& command) -> Result<ExitStatus, IoError> {
+    if (!valid(command)) {
+        return Result<ExitStatus, IoError>::Error(IoError {
+            operation: IoOperation::Open,
+            code: 22
+        }
+        );
+    }
+    i64 code = raz_rt_process_run_argv(
+        command.program.data,
+        command.program.length,
+        command.arguments.data,
+        command.arguments.length,
+        command.argument_count,
+    );
+    if (code < 0) {
+        return Result<ExitStatus, IoError>::Error(std::io::error::last_error(IoOperation::Open));
+    }
+    return Result<ExitStatus, IoError>::Ok(ExitStatus {
+        code: code
+    }
+    );
+}
+
+public fn success(ExitStatus& status) -> bool {
+    return status.code == 0;
+}
+
+public fn code(ExitStatus& status) -> i64 {
+    return status.code;
+}
+
+public fn new_string(String& program) -> Command {
+    return new(alloc::string::data_ptr(program), alloc::string::len(program));
+}
+
+public fn arg_string(Command&mut command, String& value) -> bool {
+    return arg_bytes(command, alloc::string::data_ptr(value), alloc::string::len(value));
+}

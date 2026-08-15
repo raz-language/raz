@@ -1,0 +1,194 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::task;
+// Structured task handles. The entry address is a C-ABI function of the form
+// `extern fn(void*) -> i64`; high-level typed adapters remain in Raz.
+extern fn raz_rt_task_spawn_i64(i64 entry_address, i8*mut context) -> i8*mut;
+extern fn raz_rt_task_is_ready(i8*mut task) -> i64;
+extern fn raz_rt_task_wait_millis(i8*mut task, i64 timeout_millis) -> i64;
+extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
+extern fn raz_rt_yield_now();
+
+public unsafe fn spawn_raw_i64(i64 entry_address, i8*mut context) -> i8*mut {
+    return raz_rt_task_spawn_i64(entry_address, context);
+}
+
+public fn task_ready(i8*mut task) -> bool {
+    return raz_rt_task_is_ready(task) == 1;
+}
+
+public fn wait_millis(i8*mut task, i64 timeout_millis) -> bool {
+    return raz_rt_task_wait_millis(task, timeout_millis) == 1;
+}
+
+public fn join_i64(i8*mut task) -> i64 {
+    return raz_rt_task_join_i64(task);
+}
+
+public fn yield_now() {
+    raz_rt_yield_now();
+}
+
+// Raz-owned structured scope. Native code supplies only raw thread creation,
+// readiness and join. Scope storage, admission, ownership, cancellation state,
+// joining order and cleanup policy live in Raz.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+
+public struct TaskScopeI64 {
+    usize tasks;
+    i64 count;
+    i64 capacity;
+    bool cancelled;
+}
+
+public fn scope_create(i64 capacity) -> TaskScopeI64 {
+    if (capacity <= 0 || capacity > 268435455) {
+        return TaskScopeI64 {
+            tasks: 0,
+            count: 0,
+            capacity: 0,
+            cancelled: false
+        };
+    }
+
+    usize tasks = raz_rt_alloc_aligned(capacity * 8, 8);
+
+    if (tasks == 0) {
+        return TaskScopeI64 {
+            tasks: 0,
+            count: 0,
+            capacity: 0,
+            cancelled: false
+        };
+    }
+    return TaskScopeI64 {
+        tasks: tasks,
+        count: 0,
+        capacity: capacity,
+        cancelled: false
+    };
+}
+
+public fn scope_valid(TaskScopeI64& scope) -> bool {
+    return scope.tasks != 0 && scope.capacity > 0;
+}
+
+public fn scope_count(TaskScopeI64& scope) -> i64 {
+    return scope.count;
+}
+
+public fn scope_cancelled(TaskScopeI64& scope) -> bool {
+    return scope.cancelled;
+}
+
+public fn scope_cancel(TaskScopeI64&mut scope) {
+    scope.cancelled = true;
+}
+
+public unsafe fn scope_spawn(TaskScopeI64&mut scope, i64 entry_address, i8*mut context) -> bool {
+    if (!scope_valid(scope) || scope.cancelled || scope.count >= scope.capacity || entry_address == 0) {
+        return false;
+    }
+
+    usize task = raz_rt_task_spawn_i64(entry_address, context)as usize;
+
+    if (task == 0) {
+        return false;
+    }
+    raz_rt_volatile_store_i64(scope.tasks + scope.count * 8, task as i64);
+    scope.count += 1;
+    return true;
+}
+
+// output_address is an optional contiguous i64 buffer address (0 discards results).
+public unsafe fn scope_join_all(TaskScopeI64&mut scope, usize output_address, i64 output_capacity) -> i64 {
+    if (!scope_valid(scope)) {
+        return 0;
+    }
+
+    i64 joined = 0;
+    i64 index = 0;
+
+    while (index < scope.count) {
+        i64 raw = raz_rt_volatile_load_i64(scope.tasks + index * 8);
+
+        if (raw != 0) {
+            i64 value = raz_rt_task_join_i64(raw as i8*mut);
+
+            raz_rt_volatile_store_i64(scope.tasks + index * 8, 0);
+            if (output_address != 0 && joined < output_capacity) {
+                raz_rt_volatile_store_i64(output_address + joined * 8, value);
+            }
+            joined += 1;
+        }
+        index += 1;
+    }
+    scope.count = 0;
+    return joined;
+}
+
+public unsafe fn scope_wait_all_millis(TaskScopeI64& scope, i64 timeout_millis) -> bool {
+    if (!scope_valid(scope) || timeout_millis < 0) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < scope.count) {
+        i64 raw = raz_rt_volatile_load_i64(scope.tasks + index * 8);
+
+        if (raw != 0 && raz_rt_task_wait_millis(raw as i8*mut, timeout_millis) != 1) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+// Destroy requires all children to have been joined. This avoids hidden blocking
+// in Drop and makes structured-lifetime costs explicit at the call site.
+public fn scope_destroy_empty(TaskScopeI64&mut scope) -> bool {
+    if (scope.count != 0) {
+        return false;
+    }
+    if (scope.tasks != 0) {
+        raz_rt_dealloc_aligned(scope.tasks, 8);
+    }
+    scope.tasks = 0;
+    scope.capacity = 0;
+    scope.cancelled = true;
+    return true;
+}
+
+// Safe typed task spawning. The native boundary only starts the OS thread;
+// callable dispatch, captures and destruction use Raz's erased callable ABI.
+extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
+
+public fn spawn_callable(FnOnce() -> i64 operation) -> i8*mut {
+    return raz_rt_task_spawn_callable_i64(operation);
+}
+
+// Typed scope admission. The callable is moved directly into a child task; the
+// scope stores only the resulting native thread handle, so capture ownership is
+// never represented as an integer or exposed to user code.
+public fn scope_spawn_callable(TaskScopeI64&mut scope, FnOnce() -> i64 operation) -> bool {
+    if (!scope_valid(scope) || scope.cancelled || scope.count >= scope.capacity) {
+        return false;
+    }
+
+    usize task = 0;
+
+    unsafe {
+        task = raz_rt_task_spawn_callable_i64(operation)as usize;
+    }
+    if (task == 0) {
+        return false;
+    }
+    raz_rt_volatile_store_i64(scope.tasks + scope.count * 8, task as i64);
+    scope.count += 1;
+    return true;
+}

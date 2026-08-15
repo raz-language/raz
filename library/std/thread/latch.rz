@@ -1,0 +1,217 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::latch;
+import std::sync::condition;
+import std::sync::mutex;
+import std::time;
+
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+// Countdown latch policy is implemented in Raz. Native code contributes only
+// allocation plus the OS mutex/condition primitives used by this state machine.
+const i64 LATCH_REMAINING = 0;
+const i64 LATCH_MUTEX = 8;
+const i64 LATCH_CONDITION = 16;
+const i64 LATCH_BYTES = 24;
+
+fn address(i8*mut latch) -> usize {
+    usize value = 0;
+
+    unsafe {
+        value = latch as usize;
+    }
+    return value;
+}
+
+fn load(usize state, i64 offset) -> i64 {
+    return raz_rt_volatile_load_i64(state + offset);
+}
+
+fn store(usize state, i64 offset, i64 value) {
+    raz_rt_volatile_store_i64(state + offset, value);
+}
+
+fn deadline_after(i64 timeout_millis) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (timeout_millis <= 0) {
+        return now;
+    }
+    if (timeout_millis > 9223372036854) {
+        return 9223372036854775807;
+    }
+
+    i64 delta = timeout_millis * 1000000;
+
+    if (now > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return now + delta;
+}
+
+fn remaining_millis(i64 deadline) -> i64 {
+    i64 now = std::time::monotonic_nanos();
+
+    if (now >= deadline) {
+        return 0;
+    }
+
+    i64 nanos = deadline - now;
+    i64 millis = nanos / 1000000;
+
+    if (nanos % 1000000 != 0) {
+        millis += 1;
+    }
+    return millis;
+}
+
+public fn latch_create(i64 count) -> i8*mut {
+    if (count < 0) {
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+
+    usize state = raz_rt_alloc_aligned(LATCH_BYTES, 8);
+
+    if (state == 0) {
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+
+    usize mutex = std::sync::mutex::mutex_create_raw();
+    usize condition = std::sync::condition::condition_create();
+
+    if (mutex == 0 || condition == 0) {
+        if (condition != 0) {
+            std::sync::condition::condition_destroy(condition);
+        }
+        if (mutex != 0) {
+            std::sync::mutex::mutex_destroy_raw(mutex);
+        }
+        raz_rt_dealloc_aligned(state, 8);
+        unsafe {
+            return 0 as i8*mut;
+        }
+    }
+    store(state, LATCH_REMAINING, count);
+    store(state, LATCH_MUTEX, mutex as i64);
+    store(state, LATCH_CONDITION, condition as i64);
+    unsafe {
+        return state as i8*mut;
+    }
+}
+
+public fn latch_count_down(i8*mut latch, i64 count) {
+    if (count <= 0) {
+        return;
+    }
+
+    usize state = address(latch);
+
+    if (state == 0) {
+        return;
+    }
+
+    usize mutex = load(state, LATCH_MUTEX)as usize;
+    usize condition = load(state, LATCH_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+
+    i64 remaining = load(state, LATCH_REMAINING);
+
+    if (remaining > 0) {
+        if (count >= remaining) {
+            remaining = 0;
+        } else {
+            remaining -= count;
+        }
+        store(state, LATCH_REMAINING, remaining);
+    }
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    if (remaining == 0) {
+        std::sync::condition::notify_all_raw(condition);
+    }
+}
+
+public fn latch_remaining(i8*mut latch) -> i64 {
+    usize state = address(latch);
+
+    if (state == 0) {
+        return 0;
+    }
+
+    usize mutex = load(state, LATCH_MUTEX)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+
+    i64 remaining = load(state, LATCH_REMAINING);
+
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    return remaining;
+}
+
+public fn latch_wait(i8*mut latch) {
+    usize state = address(latch);
+
+    if (state == 0) {
+        return;
+    }
+
+    usize mutex = load(state, LATCH_MUTEX)as usize;
+    usize condition = load(state, LATCH_CONDITION)as usize;
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    while (load(state, LATCH_REMAINING) > 0) {
+        std::sync::condition::wait_raw(condition, mutex);
+    }
+    std::sync::mutex::mutex_unlock_raw(mutex);
+}
+
+public fn latch_wait_millis(i8*mut latch, i64 timeout_millis) -> bool {
+    usize state = address(latch);
+
+    if (state == 0 || timeout_millis < 0) {
+        return false;
+    }
+
+    usize mutex = load(state, LATCH_MUTEX)as usize;
+    usize condition = load(state, LATCH_CONDITION)as usize;
+    i64 deadline = deadline_after(timeout_millis);
+
+    std::sync::mutex::mutex_lock_raw(mutex);
+    while (load(state, LATCH_REMAINING) > 0) {
+        i64 remaining = remaining_millis(deadline);
+
+        if (remaining <= 0) {
+            std::sync::mutex::mutex_unlock_raw(mutex);
+            return false;
+        }
+        std::sync::condition::wait_millis_raw(condition, mutex, remaining);
+    }
+    std::sync::mutex::mutex_unlock_raw(mutex);
+    return true;
+}
+
+public fn latch_destroy(i8*mut latch) {
+    usize state = address(latch);
+
+    if (state == 0) {
+        return;
+    }
+
+    usize condition = load(state, LATCH_CONDITION)as usize;
+    usize mutex = load(state, LATCH_MUTEX)as usize;
+
+    if (condition != 0) {
+        std::sync::condition::condition_destroy(condition);
+    }
+    if (mutex != 0) {
+        std::sync::mutex::mutex_destroy_raw(mutex);
+    }
+    raz_rt_dealloc_aligned(state, 8);
+}

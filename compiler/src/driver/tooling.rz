@@ -1,0 +1,426 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_tooling;
+public import raz_compiler_driver_cli;
+// Self-hosted source tooling. These transformations operate on source bytes and
+// deliberately preserve token spelling; formatting changes whitespace only.
+fn tooling_append_byte(i64 output, i64 capacity, i64 cursor, i64 value) -> i64 {
+  if (cursor < 0 || cursor >= capacity) {
+    return -1;
+  }
+  raz_rt_stage1_arena_set(output, cursor, value);
+  return cursor + 1;
+}
+
+fn tooling_line_starts_with(i64 input, i64 start, i64 end, i64[]text, i64 length) -> bool {
+  if (end - start < length) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i < length) {
+    if (raz_rt_stage1_arena_get(input, start + i) != text[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn tooling_format_source(i64 input, i64 length, i64 output, i64 capacity) -> i64 {
+  i64 cursor = 0;
+  i64 line_start = 0;
+  i64 indent = 0;
+  i64 block_comment_depth = 0;
+
+  while (line_start < length) {
+    i64 line_end = line_start;
+
+    while (line_end < length && raz_rt_stage1_arena_get(input, line_end) != 10) {
+      line_end += 1;
+    }
+
+    i64 logical_end = line_end;
+
+    if (logical_end > line_start && raz_rt_stage1_arena_get(input, logical_end - 1) == 13) {
+      logical_end -= 1;
+    }
+
+    i64 content_start = line_start;
+
+    while (content_start < logical_end) {
+      i64 b = raz_rt_stage1_arena_get(input, content_start);
+
+      if (b != 32 && b != 9) {
+        break;
+      }
+      content_start += 1;
+    }
+
+    i64 content_end = logical_end;
+
+    while (content_end > content_start) {
+      i64 b = raz_rt_stage1_arena_get(input, content_end - 1);
+
+      if (b != 32 && b != 9) {
+        break;
+      }
+      content_end -= 1;
+    }
+    if (content_start < content_end) {
+      i64 line_indent = indent;
+
+      if (raz_rt_stage1_arena_get(input, content_start) == 125 && line_indent > 0) {
+        line_indent -= 1;
+      }
+
+      i64 spaces = line_indent * 4;
+      i64 s = 0;
+
+      while (s < spaces) {
+        cursor = tooling_append_byte(output, capacity, cursor, 32);
+        if (cursor < 0) {
+          return -1;
+        }
+        s += 1;
+      }
+
+      i64 i = content_start;
+
+      while (i < content_end) {
+        cursor = tooling_append_byte(output, capacity, cursor, raz_rt_stage1_arena_get(input, i));
+        if (cursor < 0) {
+          return -1;
+        }
+        i += 1;
+      }
+
+      i64 scan = content_start;
+      i64 quote = 0;
+      bool escaped = false;
+      i64 delta = 0;
+
+      while (scan < content_end) {
+        i64 b = raz_rt_stage1_arena_get(input, scan);
+        i64 next = 0;
+
+        if (scan + 1 < content_end) {
+          next = raz_rt_stage1_arena_get(input, scan + 1);
+        }
+        if (block_comment_depth > 0) {
+          if (b == 47 && next == 42) {
+            block_comment_depth += 1;
+            scan += 2;
+          } else if (b == 42 && next == 47) {
+            block_comment_depth -= 1;
+            scan += 2;
+          } else {
+            scan += 1;
+          }
+        } else if (quote != 0) {
+          if (escaped) {
+            escaped = false;
+            scan += 1;
+          } else if (b == 92) {
+            escaped = true;
+            scan += 1;
+          } else if (b == quote) {
+            quote = 0;
+            scan += 1;
+          } else {
+            scan += 1;
+          }
+        } else if (b == 47 && next == 47) {
+          scan = content_end;
+        } else if (b == 47 && next == 42) {
+          block_comment_depth += 1;
+          scan += 2;
+        } else if (b == 34 || b == 39) {
+          quote = b;
+          scan += 1;
+        } else {
+          if (b == 123) {
+            delta += 1;
+          } else if (b == 125) {
+            delta -= 1;
+          }
+          scan += 1;
+        }
+      }
+      indent += delta;
+      if (indent < 0) {
+        indent = 0;
+      }
+    }
+    cursor = tooling_append_byte(output, capacity, cursor, 10);
+    if (cursor < 0) {
+      return -1;
+    }
+    line_start = line_end + 1;
+  }
+  if (length == 0) {
+    return 0;
+  }
+  return cursor;
+}
+
+fn tooling_buffers_equal(i64 left, i64 left_length, i64 right, i64 right_length) -> bool {
+  if (left_length != right_length) {
+    return false;
+  }
+
+  i64 i = 0;
+
+  while (i < left_length) {
+    if (raz_rt_stage1_arena_get(left, i) != raz_rt_stage1_arena_get(right, i)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+fn tooling_fmt_command(i64 argc) -> i64 {
+  bool check = false;
+  i64 path = raz_rt_stage1_arena_create(4096);
+
+  if (path == 0) {
+    return 40;
+  }
+
+  i64 path_length = 0;
+  i64 index = 2;
+
+  while (index < argc) {
+    i64 arg = raz_rt_stage1_arena_create(4096);
+
+    if (arg == 0) {
+      return 40;
+    }
+
+    i64 length = raz_rt_stage1_process_arg(index, arg, 4096);
+    i64 check_word[7] = [45, 45, 99, 104, 101, 99, 107];
+
+    if (cli_arg_equals(arg, length, &check_word, 7)) {
+      check = true;
+    } else if (path_length == 0 && length > 0) {
+      raz_rt_stage1_arena_copy(path, 0, arg, 0, length);
+      path_length = length;
+    } else {
+      raz_rt_stage1_arena_destroy(arg);
+      raz_rt_stage1_arena_destroy(path);
+      return 55;
+    }
+    raz_rt_stage1_arena_destroy(arg);
+    index += 1;
+  }
+  if (path_length <= 0 || !path_has_rz_extension(path, path_length)) {
+    raz_rt_stage1_arena_destroy(path);
+    return 55;
+  }
+
+  i64 input = raz_rt_stage1_arena_create(4194304);
+  i64 output = raz_rt_stage1_arena_create(8388608);
+
+  if (input == 0 || output == 0) {
+    return 40;
+  }
+
+  i64 length = raz_rt_stage1_read_ascii(path, path_length, input, 4194304);
+
+  if (length < 0 || length >= 4194304) {
+    return 40;
+  }
+
+  i64 formatted_length = tooling_format_source(input, length, output, 8388608);
+
+  if (formatted_length < 0) {
+    return 40;
+  }
+
+  bool same = tooling_buffers_equal(input, length, output, formatted_length);
+  i64 result = 0;
+
+  if (check) {
+    if (!same) {
+      i64 msg[24] = [110, 101, 101, 100, 115, 32, 102, 111, 114, 109, 97, 116, 116, 105, 110, 103, 58, 32, 102, 97, 105, 108, 101, 100];
+
+      cli_write(&msg, 24);
+
+      i64 nl[1] = [10];
+
+      cli_write(&nl, 1);
+      result = 1;
+    }
+  } else if (!same) {
+    if (raz_rt_stage1_write_ascii(path, path_length, output, formatted_length) != formatted_length) {
+      result = 56;
+    }
+  }
+  raz_rt_stage1_arena_destroy(input);
+  raz_rt_stage1_arena_destroy(output);
+  raz_rt_stage1_arena_destroy(path);
+  return result;
+}
+
+fn tooling_is_doc_comment(i64 input, i64 start, i64 end) -> bool {
+  i64 marker[3] = [47, 47, 47];
+
+  return tooling_line_starts_with(input, start, end, &marker, 3);
+}
+
+fn tooling_is_declaration(i64 input, i64 start, i64 end) -> bool {
+  i64 fn_word[3] = [102, 110, 32];
+  i64 struct_word[7] = [115, 116, 114, 117, 99, 116, 32];
+  i64 enum_word[5] = [101, 110, 117, 109, 32];
+  i64 trait_word[6] = [116, 114, 97, 105, 116, 32];
+  i64 const_word[6] = [99, 111, 110, 115, 116, 32];
+
+  if (
+  tooling_line_starts_with(input, start, end, &fn_word, 3) ||
+  tooling_line_starts_with(input, start, end, &struct_word, 7) ||
+  tooling_line_starts_with(input, start, end, &enum_word, 5) ||
+  tooling_line_starts_with(input, start, end, &trait_word, 6) ||
+  tooling_line_starts_with(input, start, end, &const_word, 6)
+  ) {
+    return true;
+  }
+
+  i64 public_word[7] = [112, 117, 98, 108, 105, 99, 32];
+
+  if (tooling_line_starts_with(input, start, end, &public_word, 7)) {
+    return tooling_is_declaration(input, start + 7, end);
+  }
+  return false;
+}
+
+fn tooling_doc_command(i64 argc) -> i64 {
+  if (argc < 3 || argc > 4) {
+    return 55;
+  }
+
+  i64 path = raz_rt_stage1_arena_create(4096);
+
+  if (path == 0) {
+    return 40;
+  }
+
+  i64 path_length = raz_rt_stage1_process_arg(2, path, 4096);
+
+  if (path_length <= 0 || !path_has_rz_extension(path, path_length)) {
+    return 55;
+  }
+
+  i64 input = raz_rt_stage1_arena_create(4194304);
+  i64 output = raz_rt_stage1_arena_create(8388608);
+
+  if (input == 0 || output == 0) {
+    return 40;
+  }
+
+  i64 length = raz_rt_stage1_read_ascii(path, path_length, input, 4194304);
+
+  if (length < 0) {
+    return 40;
+  }
+
+  i64 cursor = 0;
+  i64 heading[11] = [35, 32, 82, 97, 122, 32, 65, 80, 73, 10, 10];
+  i64 h = 0;
+
+  while (h < 11) {
+    cursor = tooling_append_byte(output, 8388608, cursor, heading[h]);
+    h += 1;
+  }
+
+  bool pending_docs = false;
+  i64 line_start = 0;
+
+  while (line_start < length) {
+    i64 line_end = line_start;
+
+    while (line_end < length && raz_rt_stage1_arena_get(input, line_end) != 10) {
+      line_end += 1;
+    }
+
+    i64 end = line_end;
+
+    if (end > line_start && raz_rt_stage1_arena_get(input, end - 1) == 13) {
+      end -= 1;
+    }
+
+    i64 start = line_start;
+
+    while (
+    start < end &&
+    (raz_rt_stage1_arena_get(input, start) == 32 || raz_rt_stage1_arena_get(input, start) == 9)
+    ) {
+      start += 1;
+    }
+    if (tooling_is_doc_comment(input, start, end)) {
+      i64 p = start + 3;
+
+      if (p < end && raz_rt_stage1_arena_get(input, p) == 32) {
+        p += 1;
+      }
+      while (p < end) {
+        cursor = tooling_append_byte(output, 8388608, cursor, raz_rt_stage1_arena_get(input, p));
+        p += 1;
+      }
+      cursor = tooling_append_byte(output, 8388608, cursor, 10);
+      pending_docs = true;
+    } else if (pending_docs && tooling_is_declaration(input, start, end)) {
+      i64 pre[8] = [10, 96, 96, 96, 114, 97, 122, 10];
+
+      h = 0;
+      while (h<8) {
+        cursor = tooling_append_byte(output, 8388608, cursor, pre[h]);
+        h += 1;
+      }
+
+      i64 p = start;
+
+      while (p<end) {
+        cursor = tooling_append_byte(output, 8388608, cursor, raz_rt_stage1_arena_get(input, p));
+        p += 1;
+      }
+
+      i64 post[6] = [10, 96, 96, 96, 10, 10];
+
+      h = 0;
+      while (h<6) {
+        cursor = tooling_append_byte(output, 8388608, cursor, post[h]);
+        h += 1;
+      }
+      pending_docs = false;
+    } else if (start < end) {
+      pending_docs = false;
+    }
+    line_start = line_end + 1;
+  }
+
+  i64 result = 0;
+
+  if (argc == 4) {
+    i64 out_path = raz_rt_stage1_arena_create(4096);
+
+    if (out_path == 0) {
+      return 40;
+    }
+
+    i64 out_length = raz_rt_stage1_process_arg(3, out_path, 4096);
+
+    if (out_length <= 0 || raz_rt_stage1_write_ascii(out_path, out_length, output, cursor) != cursor) {
+      result = 56;
+    }
+    raz_rt_stage1_arena_destroy(out_path);
+  } else {
+    raz_rt_stage1_stdio_write_ascii(1, output, cursor);
+  }
+  raz_rt_stage1_arena_destroy(path);
+  raz_rt_stage1_arena_destroy(input);
+  raz_rt_stage1_arena_destroy(output);
+  return result;
+}

@@ -1,0 +1,642 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::http::server;
+import alloc::string;
+import core::bytes;
+import std::fmt;
+import std::io::buffer;
+import std::net;
+import std::net::http;
+import std::net::http::headers;
+
+public enum ServerError {
+    None,
+    Io,
+    Protocol,
+    HeadersTooLarge,
+    BodyTooLarge,
+    OutOfMemory,
+    Closed,
+}
+
+public struct HttpServer {
+    TcpListener listener;
+    i64 buffer_capacity;
+    i64 max_header_bytes;
+    i64 max_body_bytes;
+    i64 timeout_millis;
+}
+
+public struct ServerConnection {
+    TcpStream stream;
+    ByteBuffer input;
+    String output;
+    i64 buffer_capacity;
+    i64 max_header_bytes;
+    i64 max_body_bytes;
+    i64 timeout_millis;
+    bool open;
+}
+
+public struct HttpRequest {
+    String method;
+    String target;
+    String headers;
+    String body;
+    bool keep_alive;
+    bool chunked;
+}
+
+public fn request_new() -> HttpRequest {
+    return HttpRequest {
+        method: alloc::string::with_capacity(8),
+        target: alloc::string::with_capacity(128),
+        headers: alloc::string::with_capacity(512),
+        body: alloc::string::with_capacity(4096),
+        keep_alive: false,
+        chunked: false,
+    };
+}
+
+public fn bind(
+    i64 port,
+    i64 backlog,
+    i64 buffer_capacity,
+    i64 max_header_bytes,
+    i64 max_body_bytes,
+    i64 timeout_millis,
+) -> HttpServer {
+    i64 capacity = buffer_capacity;
+
+    if (capacity < 1024) {
+        capacity = 16384;
+    }
+
+    i64 header_limit = max_header_bytes;
+
+    if (header_limit <= 0) {
+        header_limit = 65536;
+    }
+
+    i64 body_limit = max_body_bytes;
+
+    if (body_limit <= 0) {
+        body_limit = 16777216;
+    }
+    return HttpServer {
+        listener: tcp_listener_bind_any(port, backlog),
+        buffer_capacity: capacity,
+        max_header_bytes: header_limit,
+        max_body_bytes: body_limit,
+        timeout_millis: timeout_millis,
+    };
+}
+
+public fn valid(HttpServer& server) -> bool {
+    return tcp_listener_valid(&server.listener);
+}
+
+public fn local_port(HttpServer& server) -> i64 {
+    return std::net::local_port(server.listener.socket);
+}
+
+public fn close(HttpServer&mut server) {
+    tcp_listener_close(&mut server.listener);
+}
+
+public fn connection_empty() -> ServerConnection {
+    return ServerConnection {
+        stream: TcpStream {
+            socket: -1
+        },
+        input: byte_buffer_new(),
+        output: alloc::string::with_capacity(1024),
+        buffer_capacity: 16384,
+        max_header_bytes: 65536,
+        max_body_bytes: 16777216,
+        timeout_millis: -1,
+        open: false,
+    };
+}
+
+public fn accept(HttpServer& server, ServerConnection&mut output) -> bool {
+    TcpStream stream = tcp_listener_accept(&server.listener);
+
+    if (!tcp_stream_valid(&stream)) {
+        return false;
+    }
+    if (output.open) {
+        tcp_stream_close(&mut output.stream);
+    }
+    output.stream = move stream;
+    output.input = byte_buffer_with_capacity(server.buffer_capacity);
+    alloc::string::clear(&mut output.output);
+    output.buffer_capacity = server.buffer_capacity;
+    output.max_header_bytes = server.max_header_bytes;
+    output.max_body_bytes = server.max_body_bytes;
+    output.timeout_millis = server.timeout_millis;
+    output.open = true;
+    if (output.timeout_millis >= 0) {
+        set_timeout_millis(output.stream.socket, output.timeout_millis, output.timeout_millis);
+    }
+    return true;
+}
+
+public fn close_connection(ServerConnection&mut connection) {
+    if (connection.open) {
+        tcp_stream_close(&mut connection.stream);
+    }
+    connection.open = false;
+    byte_buffer_clear(&mut connection.input);
+}
+
+fn http11(BytesView version) -> bool {
+    if (version.length != 8) {
+        return false;
+    }
+
+    i64 expected[8] = [72, 84, 84, 80, 47, 49, 46, 49];
+    i64 i = 0;
+
+    while (i < 8) {
+        if (core::bytes::load_u8(version.data + i) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn read_more(ServerConnection&mut connection) -> i64 {
+    usize tail = byte_buffer_tail(&mut connection.input, connection.buffer_capacity);
+
+    if (tail == 0) {
+        return -1;
+    }
+
+    i64 count = tcp_stream_receive(&connection.stream, tail, connection.buffer_capacity);
+
+    if (count > 0 && !byte_buffer_commit(&mut connection.input, count)) {
+        return -1;
+    }
+    return count;
+}
+
+fn decode_chunks(HttpRequestView& view, i64 max_body, String&mut output, i64&mut consumed_body) -> HttpError {
+    alloc::string::clear(output);
+
+    ChunkCursor cursor = std::net::http::chunks(view.body);
+
+    ChunkView chunk = ChunkView {
+        data: BytesView {
+            data: 0,
+            length: 0
+        },
+        trailers: BytesView {
+            data: 0,
+            length: 0
+        },
+        final_chunk: false
+    };
+    while (true) {
+        HttpError error = std::net::http::next_chunk(&mut cursor, &mut chunk);
+
+        if (error != HttpError::None) {
+            return error;
+        }
+        if (chunk.final_chunk) {
+            *consumed_body = cursor.cursor;
+            return HttpError::None;
+        }
+        if (alloc::string::len(output) > max_body - chunk.data.length) {
+            return HttpError::BodyIncomplete;
+        }
+        if (!alloc::string::append_bytes(output, chunk.data.data, chunk.data.length)) {
+            return HttpError::BodyIncomplete;
+        }
+    }
+    return HttpError::InvalidChunk;
+}
+
+fn copy_request(HttpRequestView& view, String& decoded_chunks, HttpRequest&mut output) -> bool {
+    alloc::string::clear(&mut output.method);
+    alloc::string::clear(&mut output.target);
+    alloc::string::clear(&mut output.headers);
+    alloc::string::clear(&mut output.body);
+    if (!alloc::string::append_bytes(&mut output.method, view.method.data, view.method.length)) {
+        return false;
+    }
+    if (!alloc::string::append_bytes(&mut output.target, view.target.data, view.target.length)) {
+        return false;
+    }
+    if (!alloc::string::append_bytes(&mut output.headers, view.header_block.data, view.header_block.length)) {
+        return false;
+    }
+    if (view.chunked) {
+        if (
+            !alloc::string::append_bytes(
+                &mut output.body,
+                alloc::string::data_ptr(decoded_chunks),
+                alloc::string::len(decoded_chunks),
+            )
+        ) {
+            return false;
+        }
+    } else if (view.content_length > 0) {
+        if (!alloc::string::append_bytes(&mut output.body, view.body.data, view.content_length)) {
+            return false;
+        }
+    }
+    output.chunked = view.chunked;
+    output.keep_alive = http11(view.version) && !view.connection_close;
+    return true;
+}
+
+/// Reads exactly one request while preserving already-buffered bytes belonging
+/// to a following keep-alive request. Chunked framing is removed before the
+/// body is exposed to application code.
+public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) -> ServerError {
+    if (!connection.open) {
+        return ServerError::Closed;
+    }
+
+    String decoded = alloc::string::with_capacity(4096);
+
+    while (true) {
+        i64 readable = byte_buffer_readable(&connection.input);
+
+        if (readable > connection.max_header_bytes + connection.max_body_bytes + 65536) {
+            return ServerError::BodyTooLarge;
+        }
+        if (readable > 0) {
+            usize base = byte_buffer_data(&connection.input);
+
+            HttpRequestView view = HttpRequestView {
+                source: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                method: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                target: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                version: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                header_block: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                body: BytesView {
+                    data: 0,
+                    length: 0
+                },
+                content_length: -1,
+                chunked: false,
+                connection_close: false,
+            };
+            HttpError error = std::net::http::parse_request(
+                base,
+                readable,
+                connection.max_header_bytes,
+                &mut view,
+            );
+            if (error == HttpError::HeadersTooLarge) {
+                return ServerError::HeadersTooLarge;
+            }
+            if (
+                error != HttpError::None &&
+                error != HttpError::Incomplete &&
+                error != HttpError::BodyIncomplete
+            ) {
+                return ServerError::Protocol;
+            }
+            if (error == HttpError::None) {
+                i64 body_start = (view.body.data - base)as i64;
+                i64 consumed = body_start;
+
+                if (view.content_length > connection.max_body_bytes) {
+                    return ServerError::BodyTooLarge;
+                }
+                if (view.chunked) {
+                    i64 chunk_bytes = 0;
+
+                    HttpError chunk_error = decode_chunks(
+                        &view,
+                        connection.max_body_bytes,
+                        &mut decoded,
+                        &mut chunk_bytes,
+                    );
+                    if (chunk_error == HttpError::None) {
+                        consumed = body_start + chunk_bytes;
+                    } else if (chunk_error != HttpError::Incomplete) {
+                        if (chunk_error == HttpError::BodyIncomplete) {
+                            return ServerError::BodyTooLarge;
+                        }
+                        return ServerError::Protocol;
+                    } else {
+                        error = HttpError::Incomplete;
+                    }
+                } else if (view.content_length >= 0) {
+                    consumed = body_start + view.content_length;
+                }
+                // Requests without explicit framing have no body. This also
+                // prevents pipelined bytes from being mistaken for a body.
+                if (error == HttpError::None) {
+                    if (!copy_request(&view, &mut decoded, output)) {
+                        return ServerError::OutOfMemory;
+                    }
+                    if (!byte_buffer_consume(&mut connection.input, consumed)) {
+                        return ServerError::Protocol;
+                    }
+                    return ServerError::None;
+                }
+            }
+        }
+
+        i64 count = read_more(connection);
+
+        if (count <= 0) {
+            close_connection(connection);
+            return ServerError::Io;
+        }
+    }
+    return ServerError::Protocol;
+}
+
+fn append_crlf(String&mut output) -> bool {
+    return alloc::string::push_byte(output, 13) && alloc::string::push_byte(output, 10);
+}
+
+fn append_content_length(String&mut output, i64 length) -> bool {
+    if (
+        !alloc::string::push_byte(output, 67) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 45) ||
+        !alloc::string::push_byte(output, 76) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 103) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 104) ||
+        !alloc::string::push_byte(output, 58) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+    return std::fmt::append_i64(output, length) && append_crlf(output);
+}
+
+fn append_connection(String&mut output, bool keep_alive) -> bool {
+    if (
+        !alloc::string::push_byte(output, 67) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 101) ||
+        !alloc::string::push_byte(output, 99) ||
+        !alloc::string::push_byte(output, 116) ||
+        !alloc::string::push_byte(output, 105) ||
+        !alloc::string::push_byte(output, 111) ||
+        !alloc::string::push_byte(output, 110) ||
+        !alloc::string::push_byte(output, 58) ||
+        !alloc::string::push_byte(output, 32)
+    ) {
+        return false;
+    }
+    if (keep_alive) {
+        if (
+            !alloc::string::push_byte(output, 107) ||
+            !alloc::string::push_byte(output, 101) ||
+            !alloc::string::push_byte(output, 101) ||
+            !alloc::string::push_byte(output, 112) ||
+            !alloc::string::push_byte(output, 45) ||
+            !alloc::string::push_byte(output, 97) ||
+            !alloc::string::push_byte(output, 108) ||
+            !alloc::string::push_byte(output, 105) ||
+            !alloc::string::push_byte(output, 118) ||
+            !alloc::string::push_byte(output, 101)
+        ) {
+            return false;
+        }
+    } else {
+        if (
+            !alloc::string::push_byte(output, 99) ||
+            !alloc::string::push_byte(output, 108) ||
+            !alloc::string::push_byte(output, 111) ||
+            !alloc::string::push_byte(output, 115) ||
+            !alloc::string::push_byte(output, 101)
+        ) {
+            return false;
+        }
+    }
+    return append_crlf(output);
+}
+
+public fn send_response(
+    ServerConnection&mut connection,
+    i64 status,
+    usize reason,
+    i64 reason_length,
+    HeaderBlock& headers,
+    usize body,
+    i64 body_length,
+    bool keep_alive,
+) -> ServerError {
+    if (!connection.open) {
+        return ServerError::Closed;
+    }
+    if (
+        body_length < 0 ||
+        (body_length > 0 && body == 0) ||
+        !std::net::http::headers::safe_for_managed_framing(headers)
+    ) {
+        return ServerError::Protocol;
+    }
+    alloc::string::clear(&mut connection.output);
+    if (!std::net::http::append_response_line(&mut connection.output, status, reason, reason_length)) {
+        return ServerError::Protocol;
+    }
+    if (
+        !append_content_length(&mut connection.output, body_length) ||
+        !append_connection(&mut connection.output, keep_alive)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !std::net::http::headers::append_to(headers, &mut connection.output) ||
+        !std::net::http::end_headers(&mut connection.output)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (body_length > 0 && !alloc::string::append_bytes(&mut connection.output, body, body_length)) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !tcp_stream_send_all(
+            &connection.stream,
+            alloc::string::data_ptr(&connection.output),
+            alloc::string::len(&connection.output),
+        )
+    ) {
+        close_connection(connection);
+        return ServerError::Io;
+    }
+    if (!keep_alive) {
+        close_connection(connection);
+    }
+    return ServerError::None;
+}
+
+fn append_transfer_chunked(String&mut output) -> bool {
+    // "Transfer-Encoding: chunked\r\n"
+
+    i64 bytes[28] = [84, 114, 97, 110, 115, 102, 101, 114, 45, 69, 110, 99, 111, 100, 105, 110, 103, 58, 32, 99, 104, 117, 110, 107, 101, 100, 13, 10];
+    i64 i = 0;
+
+    while (i<28) {
+        if (!alloc::string::push_byte(output, bytes[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Starts a streaming chunked response. Framing fields are managed by the
+/// engine; callers may add ordinary application headers only.
+public fn begin_chunked_response(
+    ServerConnection&mut connection,
+    i64 status,
+    usize reason,
+    i64 reason_length,
+    HeaderBlock& headers,
+    bool keep_alive,
+) -> ServerError {
+    if (!connection.open) {
+        return ServerError::Closed;
+    }
+    if (!std::net::http::headers::safe_for_managed_framing(headers)) {
+        return ServerError::Protocol;
+    }
+    alloc::string::clear(&mut connection.output);
+    if (!std::net::http::append_response_line(&mut connection.output, status, reason, reason_length)) {
+        return ServerError::Protocol;
+    }
+    if (
+        !append_transfer_chunked(&mut connection.output) ||
+        !append_connection(&mut connection.output, keep_alive)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !std::net::http::headers::append_to(headers, &mut connection.output) ||
+        !std::net::http::end_headers(&mut connection.output)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !tcp_stream_send_all(
+            &connection.stream,
+            alloc::string::data_ptr(&connection.output),
+            alloc::string::len(&connection.output),
+        )
+    ) {
+        close_connection(connection);
+        return ServerError::Io;
+    }
+    return ServerError::None;
+}
+
+public fn write_chunk(ServerConnection&mut connection, usize data, i64 length) -> ServerError {
+    if (!connection.open) {
+        return ServerError::Closed;
+    }
+    if (length <= 0 || data == 0) {
+        return ServerError::Protocol;
+    }
+    alloc::string::clear(&mut connection.output);
+    if (
+        !std::fmt::append_hex_u64(&mut connection.output, length as u64, false) ||
+        !append_crlf(&mut connection.output)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !alloc::string::append_bytes(&mut connection.output, data, length) ||
+        !append_crlf(&mut connection.output)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !tcp_stream_send_all(
+            &connection.stream,
+            alloc::string::data_ptr(&connection.output),
+            alloc::string::len(&connection.output),
+        )
+    ) {
+        close_connection(connection);
+        return ServerError::Io;
+    }
+    return ServerError::None;
+}
+
+public fn finish_chunked_response(
+    ServerConnection&mut connection,
+    HeaderBlock& trailers,
+    bool keep_alive,
+) -> ServerError {
+    if (!connection.open) {
+        return ServerError::Closed;
+    }
+    if (!std::net::http::headers::safe_for_managed_framing(trailers)) {
+        return ServerError::Protocol;
+    }
+    alloc::string::clear(&mut connection.output);
+    if (!alloc::string::push_byte(&mut connection.output, 48) || !append_crlf(&mut connection.output)) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !std::net::http::headers::append_to(trailers, &mut connection.output) ||
+        !std::net::http::end_headers(&mut connection.output)
+    ) {
+        return ServerError::OutOfMemory;
+    }
+    if (
+        !tcp_stream_send_all(
+            &connection.stream,
+            alloc::string::data_ptr(&connection.output),
+            alloc::string::len(&connection.output),
+        )
+    ) {
+        close_connection(connection);
+        return ServerError::Io;
+    }
+    if (!keep_alive) {
+        close_connection(connection);
+    }
+    return ServerError::None;
+}
+
+impl Drop for ServerConnection {
+    fn drop(ServerConnection&mut self) {
+        close_connection(self);
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(HttpServer&mut self) {
+        close(self);
+    }
+}

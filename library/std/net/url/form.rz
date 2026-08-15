@@ -1,0 +1,185 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::url::form;
+import alloc::string;
+import core::bytes;
+
+fn unreserved(i64 byte) -> bool {
+    return (
+        (byte >= 65 && byte <= 90) ||
+        (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) ||
+        byte == 45 ||
+        byte == 46 ||
+        byte == 95 ||
+        byte == 126
+    );
+}
+
+fn hex_digit(i64 value) -> i64 {
+    if (value < 10) {
+        return 48 + value;
+    }
+    return 65 + value - 10;
+}
+
+fn hex_value(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 70) {
+        return byte - 65 + 10;
+    }
+    if (byte >= 97 && byte <= 102) {
+        return byte - 97 + 10;
+    }
+    return -1;
+}
+
+/// RFC 3986 percent encoding. Appends directly to caller-owned storage and
+/// performs no temporary allocation.
+public fn percent_encode(String&mut output, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+    if (length > 0 && !alloc::string::reserve(output, alloc::string::len(output) + length)) {
+        return false;
+    }
+
+    i64 index = 0;
+    i64 run = 0;
+
+    while (index < length) {
+        i64 byte = core::bytes::load_u8(data + index);
+
+        if (unreserved(byte)) {
+            index += 1;
+            continue;
+        }
+        if (index > run && !alloc::string::append_bytes(output, data + run, index - run)) {
+            return false;
+        }
+        if (
+            !alloc::string::push_byte(output, 37) ||
+            !alloc::string::push_byte(output, hex_digit((byte >> 4) & 15)) ||
+            !alloc::string::push_byte(output, hex_digit(byte & 15))
+        ) {
+            return false;
+        }
+        index += 1;
+        run = index;
+    }
+    if (index > run && !alloc::string::append_bytes(output, data + run, index - run)) {
+        return false;
+    }
+    return true;
+}
+
+/// application/x-www-form-urlencoded encoder: space becomes '+'.
+public fn form_encode(String&mut output, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+
+    i64 index = 0;
+    i64 run = 0;
+
+    while (index < length) {
+        i64 byte = core::bytes::load_u8(data + index);
+
+        if (unreserved(byte)) {
+            index += 1;
+            continue;
+        }
+        if (index > run && !alloc::string::append_bytes(output, data + run, index - run)) {
+            return false;
+        }
+        if (byte == 32) {
+            if (!alloc::string::push_byte(output, 43)) {
+                return false;
+            }
+        } else {
+            if (
+                !alloc::string::push_byte(output, 37) ||
+                !alloc::string::push_byte(output, hex_digit((byte >> 4) & 15)) ||
+                !alloc::string::push_byte(output, hex_digit(byte & 15))
+            ) {
+                return false;
+            }
+        }
+        index += 1;
+        run = index;
+    }
+    if (index > run && !alloc::string::append_bytes(output, data + run, index - run)) {
+        return false;
+    }
+    return true;
+}
+
+/// Decodes into caller-owned String storage. Invalid '%' escapes are rejected
+/// without publishing partially-decoded bytes beyond the previous length.
+public fn decode(String&mut output, usize data, i64 length, bool plus_as_space) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+
+    i64 original = alloc::string::len(output);
+
+    if (!alloc::string::reserve(output, original + length)) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < length) {
+        i64 byte = core::bytes::load_u8(data + index);
+
+        if (byte == 37) {
+            if (index + 2 >= length) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+
+            i64 high = hex_value(core::bytes::load_u8(data + index + 1));
+            i64 low = hex_value(core::bytes::load_u8(data + index + 2));
+
+            if (high < 0 || low < 0) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+            if (!alloc::string::push_byte(output, high * 16 + low)) {
+                alloc::string::truncate(output, original);
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if (plus_as_space && byte == 43) {
+            byte = 32;
+        }
+        if (!alloc::string::push_byte(output, byte)) {
+            alloc::string::truncate(output, original);
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn append_pair(
+    String&mut output,
+    usize key,
+    i64 key_length,
+    usize value,
+    i64 value_length,
+    bool first,
+) -> bool {
+    if (!first && !alloc::string::push_byte(output, 38)) {
+        return false;
+    }
+    if (!form_encode(output, key, key_length) || !alloc::string::push_byte(output, 61)) {
+        return false;
+    }
+    return form_encode(output, value, value_length);
+}
