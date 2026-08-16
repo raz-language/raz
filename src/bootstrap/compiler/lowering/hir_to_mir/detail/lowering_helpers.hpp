@@ -1942,7 +1942,7 @@ class FunctionLowerer final {
           const auto expected_slice = parse_slice_type(expected_type);
           const auto& argument_node = node.children[index];
           // A fixed-array borrow coerced to T[] is a two-word slice value, not
-          // the raw array pointer. The self-hosted MIR has always materialized
+          // the raw array pointer. The compilered MIR has always materialized
           // this descriptor (HIR node kind 37); keep the bootstrap path ABI-
           // equivalent so compiler source can freely use the current language.
           if (expected_slice && argument_node.kind == SyntaxKind::unary_expression &&

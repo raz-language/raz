@@ -52,10 +52,10 @@ import collections::hash_set;
 import collections::hash_map;
 import core::hash;
 
-extern fn raz_rt_stage1_arena_create(i64 count) -> i64;
-extern fn raz_rt_stage1_arena_destroy(i64 handle);
-extern fn raz_rt_stage1_arena_get(i64 handle, i64 index) -> i64;
-extern fn raz_rt_stage1_arena_set(i64 handle, i64 index, i64 value);
+extern fn raz_compiler_rt_arena_create(i64 count) -> i64;
+extern fn raz_compiler_rt_arena_destroy(i64 handle);
+extern fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64;
+extern fn raz_compiler_rt_arena_set(i64 handle, i64 index, i64 value);
 
 struct Triple { i64 a; i64 b; i64 c; }
 @align(32)struct AlignedTriple { i64 a; i64 b; i64 c; }
@@ -64,8 +64,8 @@ struct Triple { i64 a; i64 b; i64 c; }
 
 impl Drop for OwnedAligned {
     fn drop(OwnedAligned&mut self) {
-        i64 count = raz_rt_stage1_arena_get(self.tracker, 0);
-        raz_rt_stage1_arena_set(self.tracker, 0, count + 1);
+        i64 count = raz_compiler_rt_arena_get(self.tracker, 0);
+        raz_compiler_rt_arena_set(self.tracker, 0, count + 1);
     }
 }
 
@@ -188,14 +188,14 @@ fn main() -> i64 {
     }
     if (entry_sum != 288 || map.len() != 20 || map.capacity() < 20) { return 22; }
 
-    i64 tracker = raz_rt_stage1_arena_create(1);
+    i64 tracker = raz_compiler_rt_arena_create(1);
     if (tracker == 0) { return 23; }
     if (exercise_owned_vector(tracker) != 0) { return 24; }
-    if (raz_rt_stage1_arena_get(tracker, 0) != 20) { return 25; }
+    if (raz_compiler_rt_arena_get(tracker, 0) != 20) { return 25; }
     if (exercise_owned_map(tracker) != 0) { return 26; }
     // 20 vector values + 20 final map values + one replaced map value.
-    if (raz_rt_stage1_arena_get(tracker, 0) != 41) { return 27; }
-    raz_rt_stage1_arena_destroy(tracker);
+    if (raz_compiler_rt_arena_get(tracker, 0) != 41) { return 27; }
+    raz_compiler_rt_arena_destroy(tracker);
     return 0;
 }
 ]=])

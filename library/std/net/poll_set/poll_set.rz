@@ -1,0 +1,163 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::net::poll_set;
+// Reusable batch readiness polling. Records are kept in one contiguous buffer
+// and the whole set crosses the OS boundary once per wait. This is the low-
+// allocation path for servers that manage many nonblocking sockets directly.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_realloc_aligned(usize pointer, i64 old_size, i64 new_size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_socket_poll_many(usize records, i64 count, i64 timeout_millis) -> i64;
+
+public const i64 readable = 1;
+public const i64 writable = 2;
+public const i64 error = 4;
+
+const i64 record_bytes = 24;
+const i64 record_socket = 0;
+const i64 record_interests = 8;
+const i64 record_events = 16;
+const i64 max_records = 1048576;
+
+public struct PollSet {
+    usize data;
+    i64 length;
+    i64 capacity;
+}
+
+fn load_i64(usize address) -> i64 {
+    unsafe {
+        return *((address)as i64*const);
+    }
+}
+
+fn store_i64(usize address, i64 value) {
+    unsafe {
+        *((address)as i64*mut) = value;
+    }
+}
+
+public fn create(i64 capacity) -> PollSet {
+    if (capacity <= 0 || capacity > max_records) {
+        return PollSet { data: 0, length: 0, capacity: 0 };
+    }
+    usize data = raz_rt_alloc_aligned(capacity * record_bytes, 8);
+
+    if (data == 0) {
+        return PollSet { data: 0, length: 0, capacity: 0 };
+    }
+    return PollSet { data: data, length: 0, capacity: capacity };
+}
+
+public fn valid(PollSet& set) -> bool {
+    return set.data != 0 && set.capacity > 0;
+}
+
+public fn len(PollSet& set) -> i64 {
+    return set.length;
+}
+
+public fn capacity(PollSet& set) -> i64 {
+    return set.capacity;
+}
+
+public fn clear(PollSet&mut set) {
+    set.length = 0;
+}
+
+public fn reserve_exact(PollSet&mut set, i64 requested) -> bool {
+    if (!valid(set) || requested <= set.capacity) {
+        return valid(set);
+    }
+    if (requested <= 0 || requested > max_records || requested > 384307168202282325) {
+        return false;
+    }
+    usize replacement = raz_rt_realloc_aligned(
+        set.data,
+        set.capacity * record_bytes,
+        requested * record_bytes,
+        8,
+    );
+    if (replacement == 0) {
+        return false;
+    }
+    set.data = replacement;
+    set.capacity = requested;
+    return true;
+}
+
+public fn reserve(PollSet&mut set, i64 requested) -> bool {
+    if (!valid(set) || requested <= set.capacity) {
+        return valid(set);
+    }
+    i64 next = set.capacity;
+    while (next < requested) {
+        if (next >= max_records) {
+            next = max_records;
+            break;
+        }
+        if (next > max_records / 2) {
+            next = max_records;
+        } else {
+            next *= 2;
+        }
+    }
+    return reserve_exact(set, next);
+}
+
+public fn push(PollSet&mut set, i64 socket, i64 interests) -> bool {
+    if (!valid(set) || set.length >= set.capacity || socket < 0 || (interests & 3) == 0) {
+        return false;
+    }
+    usize record = set.data + set.length * record_bytes;
+
+    store_i64(record + record_socket, socket);
+    store_i64(record + record_interests, interests & 3);
+    store_i64(record + record_events, 0);
+    set.length += 1;
+    return true;
+}
+
+public fn socket(PollSet& set, i64 index) -> i64 {
+    if (index < 0 || index >= set.length) {
+        return -1;
+    }
+    return load_i64(set.data + index * record_bytes + record_socket);
+}
+
+public fn interests(PollSet& set, i64 index) -> i64 {
+    if (index < 0 || index >= set.length) {
+        return 0;
+    }
+    return load_i64(set.data + index * record_bytes + record_interests);
+}
+
+public fn events(PollSet& set, i64 index) -> i64 {
+    if (index < 0 || index >= set.length) {
+        return 0;
+    }
+    return load_i64(set.data + index * record_bytes + record_events);
+}
+
+public fn wait(PollSet&mut set, i64 timeout_millis) -> i64 {
+    if (!valid(set) || set.length <= 0 || timeout_millis < -1) {
+        return -1;
+    }
+    return raz_rt_socket_poll_many(set.data, set.length, timeout_millis);
+}
+
+public fn destroy(PollSet&mut set) {
+    if (set.data != 0) {
+        raz_rt_dealloc_aligned(set.data, 8);
+    }
+    set.data = 0;
+    set.length = 0;
+    set.capacity = 0;
+}
+
+impl Drop for PollSet {
+    fn drop(PollSet&mut self) {
+        destroy(self);
+    }
+}

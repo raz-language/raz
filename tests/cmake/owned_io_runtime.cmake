@@ -4,22 +4,9 @@
 if(NOT DEFINED RAZ_EXE OR NOT DEFINED SOURCE_ROOT OR NOT DEFINED WORK_ROOT)
   message(FATAL_ERROR "Owned I/O runtime requires RAZ_EXE, SOURCE_ROOT, WORK_ROOT")
 endif()
+include("${SOURCE_ROOT}/tests/cmake/copy_stdlib_closure.cmake")
 file(REMOVE_RECURSE "${WORK_ROOT}")
-file(MAKE_DIRECTORY
-  "${WORK_ROOT}/src/core/bytes" "${WORK_ROOT}/src/core/option" "${WORK_ROOT}/src/core/result"
-  "${WORK_ROOT}/src/alloc/box" "${WORK_ROOT}/src/alloc/string"
-  "${WORK_ROOT}/src/std/env/owned" "${WORK_ROOT}/src/std/env"
-  "${WORK_ROOT}/src/std/process/owned" "${WORK_ROOT}/src/std/process"
-  "${WORK_ROOT}/src/std/fs/text" "${WORK_ROOT}/src/std/fs" "${WORK_ROOT}/src/std/io")
-foreach(source_file
-    library/core/bytes/bytes.rz library/core/option/option.rz library/core/result/result.rz
-    library/alloc/box/box.rz library/alloc/string/string.rz
-    library/std/env/env.rz library/std/env/owned/owned.rz
-    library/std/process/process.rz library/std/process/owned/owned.rz
-    library/std/fs/fs.rz library/std/fs/text/text.rz library/std/io/error.rz)
-  string(REGEX REPLACE "^library/" "src/" destination "${source_file}")
-  configure_file("${SOURCE_ROOT}/${source_file}" "${WORK_ROOT}/${destination}" COPYONLY)
-endforeach()
+file(MAKE_DIRECTORY "${WORK_ROOT}/src")
 file(WRITE "${WORK_ROOT}/raz.toml" [=[
 [package]
 name = "passk_owned_io"
@@ -55,6 +42,7 @@ fn main() -> i64 {
     std::fs::remove(path, 9); alloc::box::deallocate(raw); alloc::box::deallocate(path); return 0;
 }
 ]=])
+raz_copy_stdlib_closure()
 execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)

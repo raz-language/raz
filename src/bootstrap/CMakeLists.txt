@@ -76,31 +76,33 @@ foreach(RAZ_DIAGNOSTIC_CODE IN LISTS RAZ_DIAGNOSTIC_CODES)
 endforeach()
 
 if(RAZ_BUILD_TOOLS)
-  add_executable(razc0 tools/razc/main.cpp)
-  target_link_libraries(razc0 PRIVATE Raz::bootstrap_compiler)
+  add_executable(razc_host tools/razc/main.cpp)
+  target_link_libraries(razc_host PRIVATE Raz::bootstrap_compiler)
+  set_target_properties(razc_host PROPERTIES OUTPUT_NAME "razc-host")
 
-  add_executable(raz0 tools/raz/main.cpp)
-  target_link_libraries(raz0 PRIVATE Raz::bootstrap_compiler)
-  target_include_directories(raz0 PRIVATE "${RAZ_DIAGNOSTIC_CATALOG_DIR}")
+  add_executable(raz_host tools/raz/main.cpp)
+  target_link_libraries(raz_host PRIVATE Raz::bootstrap_compiler)
+  set_target_properties(raz_host PROPERTIES OUTPUT_NAME "raz-host")
+  target_include_directories(raz_host PRIVATE "${RAZ_DIAGNOSTIC_CATALOG_DIR}")
 
-  # The self-host compiler intentionally uses recursive syntax/HIR lowering.
+  # The production compiler intentionally uses recursive syntax/HIR lowering.
   # Linux normally provides an ~8 MiB process stack, while PE/COFF defaults to
   # only 1 MiB.  Reserve the same 8 MiB on Windows so compiler-sized inputs do
   # not fail with STATUS_STACK_OVERFLOW (0xC00000FD).
   if(MSVC)
-    target_link_options(razc0 PRIVATE /STACK:8388608)
-    target_link_options(raz0 PRIVATE /STACK:8388608)
+    target_link_options(razc_host PRIVATE /STACK:8388608)
+    target_link_options(raz_host PRIVATE /STACK:8388608)
   endif()
-  target_compile_definitions(raz0 PRIVATE
+  target_compile_definitions(raz_host PRIVATE
     RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>"
     RAZ_FORGE_BRIDGE_LIBRARY_PATH="$<TARGET_FILE:raz_forge_bridge>"
     RAZ_FORGE_LIBRARY_PATH="$<TARGET_FILE:forge>"
     RAZ_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
-    target_compile_definitions(raz0 PRIVATE
+    target_compile_definitions(raz_host PRIVATE
       RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::SSL>"
       RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::Crypto>")
   endif()
-  add_dependencies(raz0 raz_runtime raz_forge_bridge forge)
+  add_dependencies(raz_host raz_runtime raz_forge_bridge forge)
 endif()

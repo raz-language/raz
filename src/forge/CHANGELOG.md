@@ -169,7 +169,7 @@ Forge exposes native ABI classification for frontend lowering decisions. Named a
 
 ## 1.1.0 - 2026-07-27
 
-### Frontend Development Kit
+### Frontend Integration API
 
 - Added reusable source management, structured diagnostics, nested scopes, symbols, semantic declarations, and safe control-flow builders.
 - Added `forge new-language` project scaffolding.
@@ -183,6 +183,6 @@ Forge exposes native ABI classification for frontend lowering decisions. Named a
 - Established the stable public compiler-core, frontend SDK, interpreter, x86-64 backend, object writers, incremental build pipeline, and release-quality contract.
 - Added deterministic ELF64 and COFF AMD64 output, JIT/interpreter differential testing, cache-aware native linking, installed-package consumers, fuzz-smoke tests, and professional open-source documentation.
 
-## Pre-1.0 development
+## Earlier releases
 
 Before 1.0, Forge developed its verified IR, interpreter, JIT, backend optimizations, object writers, frontend SDK, and incremental build system through pre-release revisions. That history is intentionally consolidated here so the public changelog begins with the stable 1.0 API and support contract.

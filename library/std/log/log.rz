@@ -1,0 +1,86 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::log;
+import alloc::string;
+import core::bytes;
+import std::fmt;
+import std::time;
+
+/// Allocation-reusing structured log record builder. Callers own the backing
+/// String and can retain it for the lifetime of a worker/thread.
+public struct LogBuffer {
+    String line;
+}
+
+public fn with_capacity(i64 capacity) -> LogBuffer {
+    i64 requested = capacity;
+    if (requested < 256) {
+        requested = 256;
+    }
+    return LogBuffer { line: alloc::string::with_capacity(requested) };
+}
+
+public fn clear(LogBuffer&mut buffer) {
+    alloc::string::clear(&mut buffer.line);
+}
+
+fn append_literal(String&mut output, usize data, i64 length) -> bool {
+    return alloc::string::append_bytes(output, data, length);
+}
+
+/// Begins a compact line with a numeric Unix timestamp and level. No temporary
+/// strings are allocated; the existing buffer capacity is reused.
+public fn begin(LogBuffer&mut buffer, usize level, i64 level_length) -> bool {
+    clear(buffer);
+    if (!std::fmt::append_i64(&mut buffer.line, std::time::unix_millis())) {
+        return false;
+    }
+    if (!alloc::string::push_byte(&mut buffer.line, 32)) {
+        return false;
+    }
+    if (!append_literal(&mut buffer.line, level, level_length)) {
+        return false;
+    }
+    return alloc::string::push_byte(&mut buffer.line, 32);
+}
+
+public fn message(LogBuffer&mut buffer, usize data, i64 length) -> bool {
+    return append_literal(&mut buffer.line, data, length);
+}
+
+public fn field_bytes(
+    LogBuffer&mut buffer,
+    usize key,
+    i64 key_length,
+    usize value,
+    i64 value_length,
+) -> bool {
+    return (
+        alloc::string::push_byte(&mut buffer.line, 32) &&
+        append_literal(&mut buffer.line, key, key_length) &&
+        alloc::string::push_byte(&mut buffer.line, 61) &&
+        append_literal(&mut buffer.line, value, value_length)
+    );
+}
+
+public fn field_i64(LogBuffer&mut buffer, usize key, i64 key_length, i64 value) -> bool {
+    return (
+        alloc::string::push_byte(&mut buffer.line, 32) &&
+        append_literal(&mut buffer.line, key, key_length) &&
+        alloc::string::push_byte(&mut buffer.line, 61) &&
+        std::fmt::append_i64(&mut buffer.line, value)
+    );
+}
+
+public fn finish(LogBuffer&mut buffer) -> bool {
+    return alloc::string::push_byte(&mut buffer.line, 10);
+}
+
+public fn bytes(LogBuffer& buffer) -> BytesView {
+    return BytesView { data: alloc::string::data_ptr(&buffer.line), length: alloc::string::len(&buffer.line) };
+}
+
+public fn len(LogBuffer& buffer) -> i64 {
+    return alloc::string::len(&buffer.line);
+}

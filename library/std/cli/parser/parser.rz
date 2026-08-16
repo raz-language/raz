@@ -1,0 +1,91 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::cli::parser;
+import core::bytes;
+
+/// Allocation-free view over one command-line token.
+public struct ArgView {
+    usize data;
+    i64 length;
+}
+
+/// Result of splitting `--name=value`. `has_value` is false for `--name`.
+public struct LongOption {
+    ArgView name;
+    ArgView value;
+    bool has_value;
+}
+
+public fn view(usize data, i64 length) -> ArgView {
+    return ArgView { data: data, length: length };
+}
+
+public fn valid(ArgView arg) -> bool {
+    return arg.length >= 0 && (arg.length == 0 || arg.data != 0);
+}
+
+public fn is_terminator(ArgView arg) -> bool {
+    if (arg.length != 2 || arg.data == 0) {
+        return false;
+    }
+    unsafe {
+        return (*(arg.data as u8*const)) == 45 && (*((arg.data + 1)as u8*const)) == 45;
+    }
+}
+
+public fn is_long_option(ArgView arg) -> bool {
+    if (arg.length < 3 || arg.data == 0) {
+        return false;
+    }
+    unsafe {
+        return (*(arg.data as u8*const)) == 45 && (*((arg.data + 1)as u8*const)) == 45;
+    }
+}
+
+public fn is_short_option(ArgView arg) -> bool {
+    if (arg.length < 2 || arg.data == 0) {
+        return false;
+    }
+    unsafe {
+        return (*(arg.data as u8*const)) == 45 && (*((arg.data + 1)as u8*const)) != 45;
+    }
+}
+
+/// Splits a long option without allocating or copying. Leading `--` is removed
+/// from the name. Embedded '=' is found through the bulk byte scanner.
+public fn split_long_option(ArgView arg) -> LongOption {
+    if (!is_long_option(arg)) {
+        return LongOption {
+            name: ArgView { data: 0, length: 0 },
+            value: ArgView { data: 0, length: 0 },
+            has_value: false,
+        };
+    }
+
+    BytesView body = BytesView { data: arg.data + 2, length: arg.length - 2 };
+    i64 equal = core::bytes::find_byte(body, 61);
+
+    if (equal < 0) {
+        return LongOption {
+            name: ArgView { data: body.data, length: body.length },
+            value: ArgView { data: 0, length: 0 },
+            has_value: false,
+        };
+    }
+    return LongOption {
+        name: ArgView { data: body.data, length: equal },
+        value: ArgView { data: body.data + equal + 1, length: body.length - equal - 1 },
+        has_value: true,
+    };
+}
+
+public fn equals(ArgView arg, usize bytes, i64 length) -> bool {
+    if (!valid(arg) || length < 0 || arg.length != length) {
+        return false;
+    }
+    return core::bytes::equal(
+        BytesView { data: arg.data, length: arg.length },
+        BytesView { data: bytes, length: length },
+    );
+}

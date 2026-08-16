@@ -1,5 +1,9 @@
-# Native bootstrap seed
+# Raz host compiler
 
-This directory contains the native **Stage 0** seed used only to bootstrap and qualify the Raz-written compiler in `compiler/`.
+This directory contains the native host compiler and host-side tool entry points used to construct the production Raz compiler from a clean source checkout.
 
-It is not the production Raz frontend. New language semantics belong in the Raz compiler. Native changes here should be limited to bootstrap compatibility, permanent host/ABI boundaries, or qualification support.
+The host compiler is not the installed Raz compiler and does not define the evolving language surface. Language semantics, package behavior, diagnostics, optimization policy, and developer tooling belong to the Raz-written compiler under `compiler/`.
+
+Native host code is compatibility-pinned and limited to the source contract required to construct the production compiler plus permanent runtime/backend integration boundaries.
+
+Release qualification verifies this boundary with `tests/data/host-compiler-contract.sha256`.

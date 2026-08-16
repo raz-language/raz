@@ -6,6 +6,7 @@ import alloc::string;
 import core::result;
 import core::bytes;
 import std::net::address;
+import std::time;
 // Binary resolver ABI. Each record is 32 bytes:
 //   i64 family (4 or 6), u64 high, u64 low, i64 scope_id.
 // The runtime performs only getaddrinfo/OS translation. Deduplication at the
@@ -14,7 +15,15 @@ import std::net::address;
 extern fn raz_rt_dns_resolve_all(usize host, i64 host_length, usize output, i64 capacity) -> i64;
 extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
-extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+
+
+fn load_byte_fast(usize address) -> i64 {
+    unsafe { return (*(address as u8*const))as i64; }
+}
+
+fn load_i64_fast(usize address) -> i64 {
+    unsafe { return *(address as i64*const); }
+}
 
 public enum ResolveError {
     InvalidHost,
@@ -103,7 +112,7 @@ fn contains_byte(usize data, i64 start, i64 end, i64 needle) -> bool {
     i64 index = start;
 
     while (index < end) {
-        if (core::bytes::load_u8(data + index) == needle) {
+        if (load_byte_fast(data + index) == needle) {
             return true;
         }
         index += 1;
@@ -120,7 +129,7 @@ public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> 
     i64 scope = 0;
     i64 percent = 0;
 
-    while (percent < length && core::bytes::load_u8(data + percent) != 37) {
+    while (percent < length && load_byte_fast(data + percent) != 37) {
         percent += 1;
     }
     if (percent < length) {
@@ -131,7 +140,7 @@ public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> 
         i64 scope_index = percent + 1;
 
         while (scope_index < length) {
-            i64 byte = core::bytes::load_u8(data + scope_index);
+            i64 byte = load_byte_fast(data + scope_index);
 
             if (byte < 48 || byte > 57 || scope > 214748364) {
                 return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
@@ -147,8 +156,8 @@ public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> 
     i64 compression = -1;
     i64 index = 0;
 
-    if (core::bytes::load_u8(data) == 58) {
-        if (parse_length < 2 || core::bytes::load_u8(data + 1) != 58) {
+    if (load_byte_fast(data) == 58) {
+        if (parse_length < 2 || load_byte_fast(data + 1) != 58) {
             return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
         }
         compression = 0;
@@ -192,8 +201,8 @@ public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> 
         i64 value = 0;
         i64 digits = 0;
 
-        while (index < parse_length && core::bytes::load_u8(data + index) != 58) {
-            i64 digit = hex_value(core::bytes::load_u8(data + index));
+        while (index < parse_length && load_byte_fast(data + index) != 58) {
+            i64 digit = hex_value(load_byte_fast(data + index));
 
             if (digit < 0 || digits >= 4) {
                 return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
@@ -214,7 +223,7 @@ public fn parse_ipv6(usize data, i64 length) -> Result<IpAddress, ResolveError> 
         if (index >= parse_length) {
             return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
         }
-        if (core::bytes::load_u8(data + index) == 58) {
+        if (load_byte_fast(data + index) == 58) {
             if (compression >= 0) {
                 return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidAddressSyntax);
             }
@@ -352,10 +361,10 @@ public fn get(ResolvedAddresses& addresses, i64 index) -> IpAddress {
     }
 
     usize record = addresses.data + index * 32;
-    i64 family_value = raz_rt_volatile_load_i64(record);
-    u64 high_value = raz_rt_volatile_load_i64(record + 8)as u64;
-    u64 low_value = raz_rt_volatile_load_i64(record + 16)as u64;
-    i64 scope_value = raz_rt_volatile_load_i64(record + 24);
+    i64 family_value = load_i64_fast(record);
+    u64 high_value = load_i64_fast(record + 8)as u64;
+    u64 low_value = load_i64_fast(record + 16)as u64;
+    i64 scope_value = load_i64_fast(record + 24);
 
     return IpAddress {
         family: family_value,
@@ -602,4 +611,173 @@ impl Drop for ResolvedAddresses {
     fn drop(ResolvedAddresses&mut self) {
         destroy(self);
     }
+}
+
+/// Small bounded DNS cache for high-throughput clients. It intentionally uses
+/// four inline entries instead of a heap map: common HTTP/RPC workloads touch
+/// a tiny host working set and this keeps cache lookup/allocation predictable.
+public struct DnsCacheEntry {
+    String host;
+    ResolvedAddresses addresses;
+    i64 expires_at_nanos;
+    bool valid;
+}
+
+public struct DnsCache {
+    DnsCacheEntry slot0;
+    DnsCacheEntry slot1;
+    DnsCacheEntry slot2;
+    DnsCacheEntry slot3;
+    i64 next_slot;
+    i64 ttl_nanos;
+    i64 hits;
+    i64 misses;
+}
+
+fn empty_resolved() -> ResolvedAddresses {
+    return ResolvedAddresses { data: 0, length: 0, capacity: 0 };
+}
+
+fn empty_cache_entry() -> DnsCacheEntry {
+    return DnsCacheEntry {
+        host: alloc::string::with_capacity(64),
+        addresses: empty_resolved(),
+        expires_at_nanos: 0,
+        valid: false,
+    };
+}
+
+public fn cache_new(i64 ttl_millis) -> DnsCache {
+    i64 ttl = ttl_millis;
+    if (ttl <= 0) {
+        ttl = 60000;
+    }
+    if (ttl > 9223372036854) {
+        ttl = 9223372036854;
+    }
+    return DnsCache {
+        slot0: empty_cache_entry(),
+        slot1: empty_cache_entry(),
+        slot2: empty_cache_entry(),
+        slot3: empty_cache_entry(),
+        next_slot: 0,
+        ttl_nanos: ttl * 1000000,
+        hits: 0,
+        misses: 0,
+    };
+}
+
+fn cache_entry_hit(DnsCacheEntry& entry, usize host, i64 host_length, i64 now_nanos) -> bool {
+    return (
+        entry.valid &&
+        entry.expires_at_nanos > now_nanos &&
+        alloc::string::equals_bytes(&entry.host, host, host_length)
+    );
+}
+
+fn cached_first(DnsCacheEntry& entry) -> IpAddress {
+    return get(&entry.addresses, 0);
+}
+
+fn cache_store(
+    DnsCacheEntry&mut entry,
+    usize host,
+    i64 host_length,
+    i64 expires_at_nanos,
+    ResolvedAddresses addresses,
+) -> bool {
+    destroy(&mut entry.addresses);
+    alloc::string::clear(&mut entry.host);
+    if (!alloc::string::append_bytes(&mut entry.host, host, host_length)) {
+        entry.valid = false;
+        return false;
+    }
+    entry.addresses = move addresses;
+    entry.expires_at_nanos = expires_at_nanos;
+    entry.valid = true;
+    return true;
+}
+
+/// Resolves the first address while caching up to four hot hosts. Cache hits do
+/// not allocate and do not enter the OS resolver. Replacement is round-robin,
+/// which avoids bookkeeping and branch-heavy LRU maintenance on the hot path.
+public fn resolve_first_cached(
+    DnsCache&mut cache,
+    usize host,
+    i64 host_length,
+) -> Result<IpAddress, ResolveError> {
+    if (host == 0 || host_length <= 0) {
+        return Result<IpAddress, ResolveError>::Error(ResolveError::InvalidHost);
+    }
+
+    i64 now_nanos = std::time::monotonic_nanos();
+    if (cache_entry_hit(&cache.slot0, host, host_length, now_nanos)) {
+        cache.hits += 1;
+        return Result<IpAddress, ResolveError>::Ok(cached_first(&cache.slot0));
+    }
+    if (cache_entry_hit(&cache.slot1, host, host_length, now_nanos)) {
+        cache.hits += 1;
+        return Result<IpAddress, ResolveError>::Ok(cached_first(&cache.slot1));
+    }
+    if (cache_entry_hit(&cache.slot2, host, host_length, now_nanos)) {
+        cache.hits += 1;
+        return Result<IpAddress, ResolveError>::Ok(cached_first(&cache.slot2));
+    }
+    if (cache_entry_hit(&cache.slot3, host, host_length, now_nanos)) {
+        cache.hits += 1;
+        return Result<IpAddress, ResolveError>::Ok(cached_first(&cache.slot3));
+    }
+
+    cache.misses += 1;
+    Result<ResolvedAddresses, ResolveError> looked_up = resolve(host, host_length);
+    match looked_up {
+        Result<ResolvedAddresses, ResolveError>::Error(error) => {
+            return Result<IpAddress, ResolveError>::Error(error);
+        }
+        Result<ResolvedAddresses, ResolveError>::Ok(addresses) => {
+            if (len(&addresses) <= 0) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::LookupFailed);
+            }
+            IpAddress first = get(&addresses, 0);
+            i64 expires = now_nanos + cache.ttl_nanos;
+            if (expires < now_nanos) {
+                expires = 9223372036854775807;
+            }
+            bool stored = false;
+            if (cache.next_slot == 0) {
+                stored = cache_store(&mut cache.slot0, host, host_length, expires, move addresses);
+            } else if (cache.next_slot == 1) {
+                stored = cache_store(&mut cache.slot1, host, host_length, expires, move addresses);
+            } else if (cache.next_slot == 2) {
+                stored = cache_store(&mut cache.slot2, host, host_length, expires, move addresses);
+            } else {
+                stored = cache_store(&mut cache.slot3, host, host_length, expires, move addresses);
+            }
+            if (!stored) {
+                return Result<IpAddress, ResolveError>::Error(ResolveError::AllocationFailed);
+            }
+            cache.next_slot = (cache.next_slot + 1) & 3;
+            return Result<IpAddress, ResolveError>::Ok(first);
+        }
+    }
+}
+
+public fn cache_hits(DnsCache& cache) -> i64 {
+    return cache.hits;
+}
+
+public fn cache_misses(DnsCache& cache) -> i64 {
+    return cache.misses;
+}
+
+public fn cache_clear(DnsCache&mut cache) {
+    destroy(&mut cache.slot0.addresses);
+    destroy(&mut cache.slot1.addresses);
+    destroy(&mut cache.slot2.addresses);
+    destroy(&mut cache.slot3.addresses);
+    cache.slot0.valid = false;
+    cache.slot1.valid = false;
+    cache.slot2.valid = false;
+    cache.slot3.valid = false;
+    cache.next_slot = 0;
 }

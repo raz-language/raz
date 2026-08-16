@@ -5,16 +5,16 @@ namespace raz_compiler_backend_rxe_optimize;
 public import raz_compiler_backend_rxe_registers;
 
 fn rxe_optimizer_clear_instruction(RxeModule&mut module, i64 ip) {
-    raz_rt_stage1_arena_set(module.opcodes, ip, rxe_op_nop());
-    raz_rt_stage1_arena_set(module.dst, ip, 0);
-    raz_rt_stage1_arena_set(module.src0, ip, 0);
-    raz_rt_stage1_arena_set(module.src1, ip, 0);
-    raz_rt_stage1_arena_set(module.immediates, ip, 0);
+    raz_compiler_rt_arena_set(module.opcodes, ip, rxe_op_nop());
+    raz_compiler_rt_arena_set(module.dst, ip, 0);
+    raz_compiler_rt_arena_set(module.src0, ip, 0);
+    raz_compiler_rt_arena_set(module.src1, ip, 0);
+    raz_compiler_rt_arena_set(module.immediates, ip, 0);
 }
 
 fn rxe_optimizer_instruction_writes_register(RxeModule& module, i64 ip, i64 reg) -> bool {
-    i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
-    return rxe_opcode_writes_dst(op) && raz_rt_stage1_arena_get(module.dst, ip) == reg;
+    i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+    return rxe_opcode_writes_dst(op) && raz_compiler_rt_arena_get(module.dst, ip) == reg;
 }
 
 // Conservative block-local allocation provenance. Positive values identify the
@@ -22,18 +22,18 @@ fn rxe_optimizer_instruction_writes_register(RxeModule& module, i64 ip, i64 reg)
 // joins and arbitrary arithmetic therefore never become alias proofs.
 fn rxe_optimizer_build_alloc_provenance(RxeModule& module, i64 start, i64 end, i64 provenance) {
     i64 reg = 0;
-    while (reg < rxe_register_count()) { raz_rt_stage1_arena_set(provenance, reg, 0); reg += 1; }
+    while (reg < rxe_register_count()) { raz_compiler_rt_arena_set(provenance, reg, 0); reg += 1; }
     i64 ip = start;
     while (ip < end) {
-        i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
-        i64 d = raz_rt_stage1_arena_get(module.dst, ip);
+        i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+        i64 d = raz_compiler_rt_arena_get(module.dst, ip);
         if (op == rxe_op_alloc()) {
-            raz_rt_stage1_arena_set(provenance, d, ip + 1);
+            raz_compiler_rt_arena_set(provenance, d, ip + 1);
         } else if (op == rxe_op_mov()) {
-            i64 source = raz_rt_stage1_arena_get(module.src0, ip);
-            raz_rt_stage1_arena_set(provenance, d, raz_rt_stage1_arena_get(provenance, source));
+            i64 source = raz_compiler_rt_arena_get(module.src0, ip);
+            raz_compiler_rt_arena_set(provenance, d, raz_compiler_rt_arena_get(provenance, source));
         } else if (rxe_opcode_writes_dst(op)) {
-            raz_rt_stage1_arena_set(provenance, d, 0);
+            raz_compiler_rt_arena_set(provenance, d, 0);
         }
         ip += 1;
     }
@@ -47,17 +47,17 @@ fn rxe_optimizer_copy_triplet(
     i64&mut source_base
 ) -> bool {
     if (ip + 2 >= module.instruction_count) { return false; }
-    if (raz_rt_stage1_arena_get(module.opcodes, ip) != rxe_op_movi()) { return false; }
-    if (raz_rt_stage1_arena_get(module.immediates, ip) != expected_index) { return false; }
-    i64 index_reg = raz_rt_stage1_arena_get(module.dst, ip);
-    if (raz_rt_stage1_arena_get(module.opcodes, ip + 1) != rxe_op_index_load()) { return false; }
-    if (raz_rt_stage1_arena_get(module.src1, ip + 1) != index_reg) { return false; }
-    i64 value_reg = raz_rt_stage1_arena_get(module.dst, ip + 1);
-    if (raz_rt_stage1_arena_get(module.opcodes, ip + 2) != rxe_op_index_store()) { return false; }
-    if (raz_rt_stage1_arena_get(module.src1, ip + 2) != index_reg) { return false; }
-    if (raz_rt_stage1_arena_get(module.immediates, ip + 2) != value_reg) { return false; }
-    i64 src = raz_rt_stage1_arena_get(module.src0, ip + 1);
-    i64 dst = raz_rt_stage1_arena_get(module.src0, ip + 2);
+    if (raz_compiler_rt_arena_get(module.opcodes, ip) != rxe_op_movi()) { return false; }
+    if (raz_compiler_rt_arena_get(module.immediates, ip) != expected_index) { return false; }
+    i64 index_reg = raz_compiler_rt_arena_get(module.dst, ip);
+    if (raz_compiler_rt_arena_get(module.opcodes, ip + 1) != rxe_op_index_load()) { return false; }
+    if (raz_compiler_rt_arena_get(module.src1, ip + 1) != index_reg) { return false; }
+    i64 value_reg = raz_compiler_rt_arena_get(module.dst, ip + 1);
+    if (raz_compiler_rt_arena_get(module.opcodes, ip + 2) != rxe_op_index_store()) { return false; }
+    if (raz_compiler_rt_arena_get(module.src1, ip + 2) != index_reg) { return false; }
+    if (raz_compiler_rt_arena_get(module.immediates, ip + 2) != value_reg) { return false; }
+    i64 src = raz_compiler_rt_arena_get(module.src0, ip + 1);
+    i64 dst = raz_compiler_rt_arena_get(module.src0, ip + 2);
     if (expected_index == 0) {
         *destination_base = dst;
         *source_base = src;
@@ -74,23 +74,23 @@ fn rxe_optimizer_copy_triplet(
 // the INDEX_LOADs after the copy so any later use of their result registers is
 // unchanged; only redundant stores and index constants are removed.
 fn rxe_optimize_aggregate_copy_runs(RxeModule&mut module) -> bool {
-    i64 provenance = raz_rt_stage1_arena_create(rxe_register_count());
+    i64 provenance = raz_compiler_rt_arena_create(rxe_register_count());
     if (provenance == 0) { return false; }
     i64 block = 0;
     while (block < module.block_count) {
-        i64 start = raz_rt_stage1_arena_get(module.block_code_starts, block);
-        i64 end = start + raz_rt_stage1_arena_get(module.block_code_counts, block);
+        i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
+        i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
         // Build provenance incrementally up to each candidate; block entries are
         // unknown by construction, which keeps cross-block aliasing conservative.
         i64 reg = 0;
-        while (reg < rxe_register_count()) { raz_rt_stage1_arena_set(provenance, reg, 0); reg += 1; }
+        while (reg < rxe_register_count()) { raz_compiler_rt_arena_set(provenance, reg, 0); reg += 1; }
         i64 ip = start;
         while (ip < end) {
             i64 destination = -1;
             i64 source = -1;
             if (rxe_optimizer_copy_triplet(module, ip, 0, &mut destination, &mut source)) {
-                i64 dst_prov = raz_rt_stage1_arena_get(provenance, destination);
-                i64 src_prov = raz_rt_stage1_arena_get(provenance, source);
+                i64 dst_prov = raz_compiler_rt_arena_get(provenance, destination);
+                i64 src_prov = raz_compiler_rt_arena_get(provenance, source);
                 if (dst_prov > 0 && src_prov > 0 && dst_prov != src_prov) {
                     i64 count = 1;
                     while (ip + count * 3 + 2 < end) {
@@ -106,11 +106,11 @@ fn rxe_optimize_aggregate_copy_runs(RxeModule&mut module) -> bool {
                         // destination are distinct allocations, making the later
                         // element stores redundant without changing overlap rules.
                         i64 copy_ip = ip + 2;
-                        raz_rt_stage1_arena_set(module.opcodes, copy_ip, rxe_op_mem_copy());
-                        raz_rt_stage1_arena_set(module.dst, copy_ip, destination);
-                        raz_rt_stage1_arena_set(module.src0, copy_ip, destination);
-                        raz_rt_stage1_arena_set(module.src1, copy_ip, source);
-                        raz_rt_stage1_arena_set(module.immediates, copy_ip, count);
+                        raz_compiler_rt_arena_set(module.opcodes, copy_ip, rxe_op_mem_copy());
+                        raz_compiler_rt_arena_set(module.dst, copy_ip, destination);
+                        raz_compiler_rt_arena_set(module.src0, copy_ip, destination);
+                        raz_compiler_rt_arena_set(module.src1, copy_ip, source);
+                        raz_compiler_rt_arena_set(module.immediates, copy_ip, count);
                         i64 item = 1;
                         while (item < count) {
                             rxe_optimizer_clear_instruction(module, ip + item * 3 + 2);
@@ -120,20 +120,20 @@ fn rxe_optimize_aggregate_copy_runs(RxeModule&mut module) -> bool {
                 }
             }
 
-            i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
-            i64 d = raz_rt_stage1_arena_get(module.dst, ip);
+            i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+            i64 d = raz_compiler_rt_arena_get(module.dst, ip);
             if (op == rxe_op_alloc()) {
-                raz_rt_stage1_arena_set(provenance, d, ip + 1);
+                raz_compiler_rt_arena_set(provenance, d, ip + 1);
             } else if (op == rxe_op_mov()) {
-                raz_rt_stage1_arena_set(provenance, d, raz_rt_stage1_arena_get(provenance, raz_rt_stage1_arena_get(module.src0, ip)));
+                raz_compiler_rt_arena_set(provenance, d, raz_compiler_rt_arena_get(provenance, raz_compiler_rt_arena_get(module.src0, ip)));
             } else if (rxe_opcode_writes_dst(op)) {
-                raz_rt_stage1_arena_set(provenance, d, 0);
+                raz_compiler_rt_arena_set(provenance, d, 0);
             }
             ip += 1;
         }
         block += 1;
     }
-    raz_rt_stage1_arena_destroy(provenance);
+    raz_compiler_rt_arena_destroy(provenance);
     return true;
 }
 
@@ -144,44 +144,44 @@ fn rxe_optimize_aggregate_copy_runs(RxeModule&mut module) -> bool {
 fn rxe_optimizer_u32_constant_ok(i64 value) -> bool { return value >= 0 && value <= 4294967295; }
 
 fn rxe_optimizer_set_movi(RxeModule&mut module, i64 ip, i64 reg, i64 value) {
-    raz_rt_stage1_arena_set(module.opcodes, ip, rxe_op_movi());
-    raz_rt_stage1_arena_set(module.dst, ip, reg);
-    raz_rt_stage1_arena_set(module.src0, ip, 0);
-    raz_rt_stage1_arena_set(module.src1, ip, 0);
-    raz_rt_stage1_arena_set(module.immediates, ip, value);
+    raz_compiler_rt_arena_set(module.opcodes, ip, rxe_op_movi());
+    raz_compiler_rt_arena_set(module.dst, ip, reg);
+    raz_compiler_rt_arena_set(module.src0, ip, 0);
+    raz_compiler_rt_arena_set(module.src1, ip, 0);
+    raz_compiler_rt_arena_set(module.immediates, ip, value);
 }
 
 // Block-local constant propagation deliberately folds only operations whose
 // result is representable by MOVI's canonical u32 immediate. Wider values stay
 // in the normal instruction stream / constant pool.
 fn rxe_optimize_block_constants(RxeModule&mut module) -> bool {
-    i64 known = raz_rt_stage1_arena_create(rxe_register_count() + 1);
-    i64 values = raz_rt_stage1_arena_create(rxe_register_count() + 1);
+    i64 known = raz_compiler_rt_arena_create(rxe_register_count() + 1);
+    i64 values = raz_compiler_rt_arena_create(rxe_register_count() + 1);
     if (known == 0 || values == 0) {
-        if (known != 0) { raz_rt_stage1_arena_destroy(known); }
-        if (values != 0) { raz_rt_stage1_arena_destroy(values); }
+        if (known != 0) { raz_compiler_rt_arena_destroy(known); }
+        if (values != 0) { raz_compiler_rt_arena_destroy(values); }
         return false;
     }
     i64 block = 0;
     while (block < module.block_count) {
         i64 reg = 0;
-        while (reg < rxe_register_count()) { raz_rt_stage1_arena_set(known, reg, 0); reg += 1; }
-        i64 start = raz_rt_stage1_arena_get(module.block_code_starts, block);
-        i64 end = start + raz_rt_stage1_arena_get(module.block_code_counts, block);
+        while (reg < rxe_register_count()) { raz_compiler_rt_arena_set(known, reg, 0); reg += 1; }
+        i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
+        i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
         i64 ip = start;
         while (ip < end) {
-            i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
-            i64 d = raz_rt_stage1_arena_get(module.dst, ip);
-            i64 a = raz_rt_stage1_arena_get(module.src0, ip);
-            i64 b = raz_rt_stage1_arena_get(module.src1, ip);
-            i64 imm = raz_rt_stage1_arena_get(module.immediates, ip);
+            i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+            i64 d = raz_compiler_rt_arena_get(module.dst, ip);
+            i64 a = raz_compiler_rt_arena_get(module.src0, ip);
+            i64 b = raz_compiler_rt_arena_get(module.src1, ip);
+            i64 imm = raz_compiler_rt_arena_get(module.immediates, ip);
             i64 folded = -1;
             bool can_fold = false;
             if (op == rxe_op_movi()) { folded = imm; can_fold = true; }
-            else if (op == rxe_op_mov() && raz_rt_stage1_arena_get(known, a) != 0) { folded = raz_rt_stage1_arena_get(values, a); can_fold = true; }
-            else if (raz_rt_stage1_arena_get(known, a) != 0 && raz_rt_stage1_arena_get(known, b) != 0) {
-                i64 av = raz_rt_stage1_arena_get(values, a);
-                i64 bv = raz_rt_stage1_arena_get(values, b);
+            else if (op == rxe_op_mov() && raz_compiler_rt_arena_get(known, a) != 0) { folded = raz_compiler_rt_arena_get(values, a); can_fold = true; }
+            else if (raz_compiler_rt_arena_get(known, a) != 0 && raz_compiler_rt_arena_get(known, b) != 0) {
+                i64 av = raz_compiler_rt_arena_get(values, a);
+                i64 bv = raz_compiler_rt_arena_get(values, b);
                 if (op == rxe_op_add64() && av + bv <= 4294967295) { folded = av + bv; can_fold = true; }
                 else if (op == rxe_op_sub64() && av >= bv) { folded = av - bv; can_fold = true; }
                 else if (op == rxe_op_and64()) { folded = av & bv; can_fold = true; }
@@ -196,17 +196,17 @@ fn rxe_optimize_block_constants(RxeModule&mut module) -> bool {
             }
             if (can_fold && rxe_optimizer_u32_constant_ok(folded) && rxe_opcode_writes_dst(op)) {
                 rxe_optimizer_set_movi(module, ip, d, folded);
-                raz_rt_stage1_arena_set(known, d, 1);
-                raz_rt_stage1_arena_set(values, d, folded);
+                raz_compiler_rt_arena_set(known, d, 1);
+                raz_compiler_rt_arena_set(values, d, folded);
             } else if (rxe_opcode_writes_dst(op) && d >= 0 && d < rxe_register_count()) {
-                raz_rt_stage1_arena_set(known, d, 0);
+                raz_compiler_rt_arena_set(known, d, 0);
             }
             ip += 1;
         }
         block += 1;
     }
-    raz_rt_stage1_arena_destroy(known);
-    raz_rt_stage1_arena_destroy(values);
+    raz_compiler_rt_arena_destroy(known);
+    raz_compiler_rt_arena_destroy(values);
     return true;
 }
 
@@ -217,8 +217,8 @@ fn rxe_optimizer_register_used_before_write(RxeModule& module, i64 start, i64 en
     i64 ip = start;
     while (ip < end) {
         if (rxe_instruction_reads_register(module, ip, reg)) { return true; }
-        i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
-        if (rxe_opcode_writes_dst(op) && raz_rt_stage1_arena_get(module.dst, ip) == reg) { return false; }
+        i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+        if (rxe_opcode_writes_dst(op) && raz_compiler_rt_arena_get(module.dst, ip) == reg) { return false; }
         ip += 1;
     }
     return false;
@@ -227,45 +227,45 @@ fn rxe_optimizer_register_used_before_write(RxeModule& module, i64 start, i64 en
 fn rxe_optimize_post_copy_loads(RxeModule&mut module) -> bool {
     i64 function = 0;
     while (function < module.function_count) {
-        i64 first = raz_rt_stage1_arena_get(module.function_block_starts, function);
-        i64 block_count = raz_rt_stage1_arena_get(module.function_block_counts, function);
+        i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
+        i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
         i64 cells = block_count * rxe_register_count() + 1;
-        i64 uses = raz_rt_stage1_arena_create(cells);
-        i64 defs = raz_rt_stage1_arena_create(cells);
-        i64 live_in = raz_rt_stage1_arena_create(cells);
-        i64 live_out = raz_rt_stage1_arena_create(cells);
+        i64 uses = raz_compiler_rt_arena_create(cells);
+        i64 defs = raz_compiler_rt_arena_create(cells);
+        i64 live_in = raz_compiler_rt_arena_create(cells);
+        i64 live_out = raz_compiler_rt_arena_create(cells);
         if (uses == 0 || defs == 0 || live_in == 0 || live_out == 0) {
-            if (uses != 0) { raz_rt_stage1_arena_destroy(uses); }
-            if (defs != 0) { raz_rt_stage1_arena_destroy(defs); }
-            if (live_in != 0) { raz_rt_stage1_arena_destroy(live_in); }
-            if (live_out != 0) { raz_rt_stage1_arena_destroy(live_out); }
+            if (uses != 0) { raz_compiler_rt_arena_destroy(uses); }
+            if (defs != 0) { raz_compiler_rt_arena_destroy(defs); }
+            if (live_in != 0) { raz_compiler_rt_arena_destroy(live_in); }
+            if (live_out != 0) { raz_compiler_rt_arena_destroy(live_out); }
             return false;
         }
         if (!rxe_dataflow_build_register_sets(module, function, uses, defs, live_in, live_out)) {
-            raz_rt_stage1_arena_destroy(uses); raz_rt_stage1_arena_destroy(defs);
-            raz_rt_stage1_arena_destroy(live_in); raz_rt_stage1_arena_destroy(live_out);
+            raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
+            raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out);
             return false;
         }
         i64 local = 0;
         while (local < block_count) {
             i64 block = first + local;
-            i64 start = raz_rt_stage1_arena_get(module.block_code_starts, block);
-            i64 end = start + raz_rt_stage1_arena_get(module.block_code_counts, block);
+            i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
+            i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
             i64 copy_source = -1;
             i64 copy_count = 0;
             i64 ip = start;
             while (ip < end) {
-                i64 op = raz_rt_stage1_arena_get(module.opcodes, ip);
+                i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
                 if (op == rxe_op_mem_copy()) {
-                    copy_source = raz_rt_stage1_arena_get(module.src1, ip);
-                    copy_count = raz_rt_stage1_arena_get(module.immediates, ip);
+                    copy_source = raz_compiler_rt_arena_get(module.src1, ip);
+                    copy_count = raz_compiler_rt_arena_get(module.immediates, ip);
                 } else if (
                     copy_source >= 0 && copy_count > 0 && op == rxe_op_index_load() &&
-                    raz_rt_stage1_arena_get(module.src0, ip) == copy_source
+                    raz_compiler_rt_arena_get(module.src0, ip) == copy_source
                 ) {
-                    i64 d = raz_rt_stage1_arena_get(module.dst, ip);
+                    i64 d = raz_compiler_rt_arena_get(module.dst, ip);
                     bool live_after = rxe_optimizer_register_used_before_write(module, ip + 1, end, d);
-                    if (!live_after && raz_rt_stage1_arena_get(live_out, rxe_dataflow_register_cell(local, d)) == 0) {
+                    if (!live_after && raz_compiler_rt_arena_get(live_out, rxe_dataflow_register_cell(local, d)) == 0) {
                         // The preceding MEM_COPY has already bounds-checked the
                         // complete source range; the distinct-allocation proof
                         // used by fusion guarantees that copy does not mutate it.
@@ -279,8 +279,8 @@ fn rxe_optimize_post_copy_loads(RxeModule&mut module) -> bool {
             }
             local += 1;
         }
-        raz_rt_stage1_arena_destroy(uses); raz_rt_stage1_arena_destroy(defs);
-        raz_rt_stage1_arena_destroy(live_in); raz_rt_stage1_arena_destroy(live_out);
+        raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
+        raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out);
         function += 1;
     }
     return true;
@@ -293,12 +293,12 @@ fn rxe_superinstruction_candidate_count(RxeModule& module) -> i64 {
     i64 count = 0;
     i64 block = 0;
     while (block < module.block_count) {
-        i64 start = raz_rt_stage1_arena_get(module.block_code_starts, block);
-        i64 end = start + raz_rt_stage1_arena_get(module.block_code_counts, block);
+        i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
+        i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
         i64 ip = start;
         while (ip + 1 < end) {
-            i64 op0 = raz_rt_stage1_arena_get(module.opcodes, ip);
-            i64 op1 = raz_rt_stage1_arena_get(module.opcodes, ip + 1);
+            i64 op0 = raz_compiler_rt_arena_get(module.opcodes, ip);
+            i64 op1 = raz_compiler_rt_arena_get(module.opcodes, ip + 1);
             if (
                 (op0 == rxe_op_load_ref() && (op1 == rxe_op_add64() || op1 == rxe_op_sub64())) ||
                 (op0 == rxe_op_index_load() && (op1 == rxe_op_add64() || op1 == rxe_op_sub64())) ||
@@ -319,10 +319,10 @@ fn rxe_optimize_module(RxeModule&mut module) -> bool {
     if (!rxe_dataflow_eliminate_dead_register_results(module)) { return false; }
     i64 i = 0;
     while (i < module.instruction_count) {
-        i64 op = raz_rt_stage1_arena_get(module.opcodes, i);
+        i64 op = raz_compiler_rt_arena_get(module.opcodes, i);
         if (op == rxe_op_mov()) {
-            i64 d = raz_rt_stage1_arena_get(module.dst, i);
-            i64 a = raz_rt_stage1_arena_get(module.src0, i);
+            i64 d = raz_compiler_rt_arena_get(module.dst, i);
+            i64 a = raz_compiler_rt_arena_get(module.src0, i);
             if (d == a) { rxe_optimizer_clear_instruction(module, i); }
         }
         i += 1;

@@ -41,6 +41,9 @@
 #if defined(_WIN32) || defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
 
 namespace {
 using raz::compiler::BuildProfile;
@@ -99,18 +102,25 @@ int main(int argc, char** argv) {
     return Compiler{}.run(Session(std::move(session)));
   }
   Options options;
-  if (!parse(argc, argv, options) || options.command == "help" || options.command == "--help") { usage(); return argc < 2 ? 2 : 0; }
+  if (!parse(argc, argv, options)) return 2;
   g_color_mode = options.color;
   g_quiet = options.quiet || options.diagnostic_format == DiagnosticFormat::json;
   configure_child_color(options.color);
-  if (options.command == "version" || options.command == "--version") {
+  if (options.show_help) {
+    if (options.help_command.empty()) usage();
+    else usage_command(options.help_command);
+    return 0;
+  }
+  if (options.command == "version") {
     std::cout << "raz 1.0.0\n";
     return 0;
   }
 
   if (options.command == "new") return create_project(options);
+  if (options.command == "init") return create_project(options, true);
   if (options.command == "lsp") return run_lsp();
   if (options.command == "diagnostics") return diagnostic_catalog(options);
+  if (options.command == "doctor") return doctor_toolchain(options);
   ProjectGraph graph;
   ProjectError error;
   if (!raz::compiler::discover_project(options.project, graph, error)) { cli_error(error.message); return 1; }
@@ -128,7 +138,6 @@ int main(int argc, char** argv) {
 
   if (options.command == "metadata") return metadata(graph);
   if (options.command == "graph") return dependency_graph(graph);
-  if (options.command == "doctor") return doctor_project(graph);
   if (options.command == "cache") return cache_project(graph, options);
   if (options.command == "lock") return write_lockfile(graph);
   if (options.command == "verify") return verify_project(graph);
@@ -152,9 +161,13 @@ int main(int argc, char** argv) {
   if (options.command == "doc") return document_project(graph);
   if (options.command == "spec") return emit_language_spec(graph);
   if (options.command == "clean") {
-    std::filesystem::remove_all(graph.manifest.root / "target");
-    std::filesystem::remove_all(graph.manifest.root / ".raz");
-    cli_status("Cleaned", graph.manifest.name, raz::terminal::green); return 0;
+    std::error_code clean_error;
+    const auto target_removed = std::filesystem::remove_all(graph.manifest.root / "target", clean_error);
+    if (clean_error) { cli_errorf("could not clean build artifacts: ", clean_error.message()); return 1; }
+    const auto cache_removed = std::filesystem::remove_all(graph.manifest.root / ".raz", clean_error);
+    if (clean_error) { cli_errorf("could not clean compiler cache: ", clean_error.message()); return 1; }
+    cli_status("Cleaned", graph.manifest.name + " (" + std::to_string(target_removed + cache_removed) + " entries removed)", raz::terminal::green);
+    return 0;
   }
 
   if (write_lockfile(graph, true) != 0) return 1;
@@ -183,7 +196,11 @@ int main(int argc, char** argv) {
     return build_ok ? 0 : 1;
   }
 
-  if (!build_ok) return 1;
+  if (!build_ok) {
+    if (options.diagnostic_format != DiagnosticFormat::json)
+      cli_errorf("could not ", check_only ? "check" : "compile", " package '", graph.manifest.name, "'");
+    return 1;
+  }
   if (!current_workspace.save(workspace_state_path)) {
     cli_errorf("failed to persist workspace graph ", workspace_state_path);
     return 1;
@@ -249,7 +266,13 @@ int main(int argc, char** argv) {
       cli_error("only executable packages can be run");
       return 2;
     }
-    return execute_shell_command(shell_quote(native_artifact_path(graph, options)));
+    const auto artifact = native_artifact_path(graph, options);
+    cli_status("Running", artifact.string(), raz::terminal::green);
+    std::ostringstream command;
+    command << shell_quote(artifact);
+    for (const auto& argument : options.program_args)
+      command << ' ' << shell_quote(std::filesystem::path(argument));
+    return execute_shell_command(command.str());
   }
   return 0;
 }

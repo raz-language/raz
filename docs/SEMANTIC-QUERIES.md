@@ -87,7 +87,7 @@ per-module function views; MIR preserves the same ownership through optimization
 These views define the serialization and code-generation boundary for
 module-granular incremental compilation.
 
-The self-hosted project loader derives deterministic ordering for acyclic
+The production project loader derives deterministic ordering for acyclic
 same-package module graphs from declared namespace imports. Filesystem discovery
 order is not a semantic dependency. Packages with cyclic module imports retain a
 conservative fallback until interface-first strongly connected component
@@ -109,6 +109,6 @@ generation. Cache readers must treat unknown or malformed state as a miss.
 
 ## Bootstrap boundary
 
-The semantic query database is implemented in Raz. The frozen native Stage 0
-compiler remains a bootstrap seed and does not acquire production query,
+The semantic query database is implemented in Raz. The compatibility-pinned native host compiler
+compiler remains a host compiler and does not acquire production query,
 generic, trait, or invalidation policy.

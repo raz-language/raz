@@ -1,6 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -9,6 +10,15 @@
 #include <string>
 
 extern "C" {
+void* raz_rt_alloc_aligned(std::int64_t size, std::int64_t alignment);
+void* raz_rt_realloc_aligned(void* pointer, std::int64_t old_size, std::int64_t new_size, std::int64_t alignment);
+void raz_rt_dealloc_aligned(void* pointer, std::int64_t alignment);
+std::int64_t raz_rt_hash_bytes(std::uintptr_t data, std::int64_t size);
+std::int64_t raz_rt_atomic_exchange_i64_ordered(std::int64_t* value, std::int64_t desired, std::int64_t order);
+std::int64_t raz_rt_atomic_compare_exchange_i64_ordered(std::int64_t* value, std::int64_t expected, std::int64_t desired, std::int64_t success_order, std::int64_t failure_order);
+void raz_rt_cpu_relax();
+struct RazPollRecord { std::int64_t socket; std::int64_t interests; std::int64_t events; };
+std::int64_t raz_rt_socket_poll_many(RazPollRecord* records, std::int64_t count, std::int64_t timeout_millis);
 std::int64_t raz_rt_load_u8(std::uintptr_t address);
 std::int64_t raz_rt_store_u8(std::uintptr_t address, std::int64_t value);
 std::int64_t raz_rt_bytes_equal(std::uintptr_t left, std::uintptr_t right, std::int64_t size);
@@ -55,6 +65,35 @@ bool expect(bool condition, const char* message) {
 
 int main() {
     bool ok = true;
+
+    // Allocation growth keeps ordinary alignments on malloc/realloc and
+    // preserves all bytes across capacity changes.
+    auto* allocation = static_cast<std::uint8_t*>(raz_rt_alloc_aligned(32, 8));
+    ok &= expect(allocation != nullptr, "alloc_aligned");
+    if (allocation != nullptr) {
+        for (std::size_t i = 0; i < 32; ++i) allocation[i] = static_cast<std::uint8_t>(i);
+        allocation = static_cast<std::uint8_t*>(raz_rt_realloc_aligned(allocation, 32, 256, 8));
+        ok &= expect(allocation != nullptr, "realloc_aligned grow");
+        if (allocation != nullptr) {
+            bool preserved = true;
+            for (std::size_t i = 0; i < 32; ++i) preserved &= allocation[i] == static_cast<std::uint8_t>(i);
+            ok &= expect(preserved, "realloc_aligned preserves contents");
+            raz_rt_dealloc_aligned(allocation, 8);
+        }
+    }
+
+    const char hash_input[] = "raz-stdlib-hash";
+    const auto hash_a = raz_rt_hash_bytes(reinterpret_cast<std::uintptr_t>(hash_input), 15);
+    const auto hash_b = raz_rt_hash_bytes(reinterpret_cast<std::uintptr_t>(hash_input), 15);
+    const char hash_other[] = "raz-stdlib-hasi";
+    const auto hash_c = raz_rt_hash_bytes(reinterpret_cast<std::uintptr_t>(hash_other), 15);
+    ok &= expect(hash_a == hash_b && hash_a != hash_c, "hash_bytes deterministic/discriminating");
+
+    alignas(8) std::int64_t atomic_value = 11;
+    ok &= expect(raz_rt_atomic_exchange_i64_ordered(&atomic_value, 17, 3) == 11 && atomic_value == 17, "atomic ordered exchange");
+    ok &= expect(raz_rt_atomic_compare_exchange_i64_ordered(&atomic_value, 17, 23, 3, 1) == 1 && atomic_value == 23, "atomic ordered compare_exchange success");
+    ok &= expect(raz_rt_atomic_compare_exchange_i64_ordered(&atomic_value, 17, 29, 3, 1) == 0 && atomic_value == 23, "atomic ordered compare_exchange failure");
+    raz_rt_cpu_relax();
 
     char bytes[4]{1, 2, 3, 4};
     char same[4]{1, 2, 3, 4};
@@ -151,6 +190,18 @@ int main() {
         const char datagram[] = "udp42";
         ok &= expect(port > 0, "udp local port");
         ok &= expect(raz_rt_udp_send_to(sender, "127.0.0.1", 9, port, datagram, 5) == 5, "udp send_to");
+        RazPollRecord poll_records[2]{{receiver, 1, 0}, {sender, 2, 0}};
+        const auto ready = raz_rt_socket_poll_many(poll_records, 2, 1000);
+        ok &= expect(ready >= 1, "socket_poll_many ready");
+        ok &= expect((poll_records[0].events & 1) != 0, "socket_poll_many readable");
+        ok &= expect((poll_records[1].events & 2) != 0, "socket_poll_many writable");
+        std::array<RazPollRecord, 300> large_poll{};
+        large_poll[0] = RazPollRecord{receiver, 1, 0};
+        for (std::size_t i = 1; i < large_poll.size(); ++i) large_poll[i] = RazPollRecord{sender, 2, 0};
+        const auto large_ready = raz_rt_socket_poll_many(large_poll.data(), static_cast<std::int64_t>(large_poll.size()), 1000);
+        ok &= expect(large_ready >= 1, "socket_poll_many dynamic batch ready");
+        ok &= expect((large_poll[0].events & 1) != 0 && (large_poll[299].events & 2) != 0,
+                     "socket_poll_many dynamic batch events");
         char received[16]{};
         char address[64]{};
         std::int64_t source_port = -1;

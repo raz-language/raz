@@ -77,16 +77,16 @@ fn main() -> i64 {
     u32 checksum = std::encoding::checksum::crc32(source, 5);
     if (checksum != (0x3610a686 as u32)) { return 10; }
 
-    i64 url_bytes[44] = [104, 116, 116, 112, 115, 58, 47, 47, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 58, 56, 52, 52, 51, 47, 97, 112, 105, 47, 118, 49, 63, 113, 61, 114, 97, 122, 35, 116, 111, 112, 33, 33];
+    i64 url_bytes[44] = [104, 116, 116, 112, 115, 58, 47, 47, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 58, 56, 52, 52, 51, 47, 97, 112, 105, 47, 118, 49, 63, 113, 61, 114, 97, 122, 35, 116, 111, 112, 33, 33, 33];
     // Parse only through "top"; the trailing sentinel bytes prove the supplied length is honored.
     index = 0;
     while (index < 44) { core::bytes::store_u8(source + index, url_bytes[index]); index += 1; }
-    match std::net::url::parse(source, 42) {
+    match std::net::url::parse(source, 41) {
         Result<UrlView, UrlError>::Error(_) => { return 11; }
         Result<UrlView, UrlError>::Ok(value) => {
             if (!std::net::url::is_https(&value)) { return 12; }
             if (value.host.length != 11 || value.port != 8443 || !value.explicit_port) { return 13; }
-            if (value.path.length != 7 || value.query.length != 6 || value.fragment.length != 3) { return 14; }
+            if (value.path.length != 7 || value.query.length != 5 || value.fragment.length != 3) { return 14; }
         }
     }
 

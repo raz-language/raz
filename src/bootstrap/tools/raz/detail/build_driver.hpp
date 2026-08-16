@@ -514,7 +514,11 @@ int execute_shell_command(const std::string& command) {
   // so cmd receives the conventional: cmd /c ""C:\\Program Files\\..." args".
   return std::system((std::string("\"") + command + "\"").c_str());
 #else
-  return std::system(command.c_str());
+  const int status = std::system(command.c_str());
+  if (status == -1) return 127;
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 1;
 #endif
 }
 
@@ -1678,6 +1682,12 @@ bool write_ordered_semantic_source(const ProjectGraph& graph, const Options& opt
 
 std::string read_text_file(const std::filesystem::path& path);
 
+std::string build_package_display(const ProjectGraph& graph) {
+  std::string text = graph.manifest.name;
+  if (!graph.manifest.version.empty()) text += " v" + graph.manifest.version;
+  return text;
+}
+
 bool build_ordered_compilation_unit(const ProjectGraph& graph, const Options& options,
                                     const BuildProfile& profile,
                                     const std::filesystem::path& module_root,
@@ -1720,9 +1730,10 @@ bool build_ordered_compilation_unit(const ProjectGraph& graph, const Options& op
     return true;
   }
 
-  if (options.verbose) {
-    cli_status(check_only ? "Checking" : "Compiling", graph.manifest.name + " (ordered compilation unit)", raz::terminal::cyan);
-  }
+  cli_status(check_only ? "Checking" : "Compiling", build_package_display(graph),
+             check_only ? raz::terminal::cyan : raz::terminal::green);
+  if (options.verbose)
+    cli_status("Unit", graph.manifest.name + " (ordered compilation unit)", raz::terminal::cyan);
 
   SessionOptions session;
   session.input = source_path;
@@ -1819,6 +1830,7 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
       std::future<int> status;
     };
     std::deque<PendingModuleCompile> active;
+    bool package_announced = false;
 
     auto finish_front = [&]() -> bool {
       if (active.empty()) return true;
@@ -1874,9 +1886,13 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
         continue;
       }
 
+      if (!package_announced) {
+        cli_status(check_only ? "Checking" : "Compiling", build_package_display(graph),
+                   check_only ? raz::terminal::cyan : raz::terminal::green);
+        package_announced = true;
+      }
       if (options.verbose)
-        cli_status(check_only ? "Checking" : "Compiling", graph.manifest.name + "::" + module.logical_name,
-                   raz::terminal::cyan);
+        cli_status("Module", graph.manifest.name + "::" + module.logical_name, raz::terminal::cyan);
 
       SessionOptions session;
       const auto semantic_input = semantic_input_for_module(graph, module, options, cache_root);

@@ -12,13 +12,14 @@ raz backends
 raz targets
 ```
 
-`raz doctor` reports the host platform, built-in backend availability, and external LLVM/Clang tools when relevant.
+`raz doctor` can run outside a project. It checks the host architecture, native linker driver, and Raz driver location. When a project path is supplied (or a project is discovered), it also validates the package entry/modules and writes `target/doctor/doctor.json`.
 
 ## Build and execute
 
 ```text
 raz build [options] <input> [output]
 raz run <input>
+raz run <input> -- <program-args...>
 raz check <input>
 raz test <input>
 raz lint <input>
@@ -51,7 +52,7 @@ Use `raz forge --help` or `raz llvm --help` for backend-specific target, optimiz
 
 ```text
 raz new <name>
-raz init
+raz init [path]
 raz clean
 raz fmt [--check] <file.rz>
 raz doc <file.rz> [output.md]
@@ -62,10 +63,13 @@ raz doc <file.rz> [output.md]
 ## Package commands
 
 ```text
+raz search <query>
+raz info <package>
 raz add <package>[@<constraint>]
 raz add <alias> <path>
 raz add <alias> registry:<name>@<constraint>
 raz remove <alias>
+raz outdated
 raz update
 raz lock
 raz metadata
@@ -75,9 +79,33 @@ raz pack [output.dpk]
 raz publish
 ```
 
-`raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `.raz-publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
+`raz search` and `raz info` inspect the static official index without materializing package archives. `raz outdated` compares tracked registry dependencies with the newest published versions and reports the newest version still compatible with each recorded constraint. `raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `.raz-publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
 
 See [Package management](PACKAGE-MANAGEMENT.md) for the official registry, private registries, mirror fallback, package archives, publishing, the shared content-addressed store, lockfiles, and offline behavior.
+
+## Workspace commands
+
+A root manifest can coordinate multiple member packages:
+
+```toml
+[workspace]
+members = ["crates/core", "apps/cli"]
+```
+
+Run workspace operations from the directory containing that root manifest:
+
+```text
+raz build --workspace
+raz check --workspace
+raz test --workspace
+raz update --workspace
+raz fetch --workspace
+raz lock --workspace
+raz metadata --workspace
+raz graph --workspace
+```
+
+The workspace uses one root `raz.lock`. Build/check/test options such as `--features=...`, `--all-features`, `--no-default-features`, backend selection, and target options are forwarded to each member.
 
 ### `raz keygen [prefix]`
 
@@ -85,11 +113,15 @@ Generate an Ed25519 package-signing key pair. The default prefix is `raz`, produ
 
 ## Terminal output
 
-Raz keeps normal command output intentionally compact. A successful build prints a single aligned status line; `--verbose` adds per-module actions and `--quiet` suppresses non-error status output.
+Raz keeps normal command output compact and action-oriented. Work is shown at package granularity by default, while `--verbose` adds per-module incremental actions. Packages that are completely fresh do not produce noisy compile lines. `--quiet` suppresses non-error status output.
 
 ```text
-  Finished app [release, host] (3 compiled, 8 fresh) in 412 ms
+   Compiling core v0.4.2
+   Compiling app v1.0.0
+    Finished app [release, host] (3 compiled, 8 fresh) in 412 ms
 ```
+
+`raz run` adds a final aligned `Running` line before transferring control to the built executable. Arguments after `--` are forwarded unchanged to the program, and the program's exit status is preserved. Status labels remain aligned across build, test, package, install, and tooling commands.
 
 Color is automatic when stdout/stderr is attached to a terminal. It can be controlled explicitly:
 
@@ -101,6 +133,36 @@ raz build --quiet
 ```
 
 The standard `NO_COLOR` environment variable disables automatic diagnostic color. `RAZ_COLOR=always|never|auto` can also control compiler diagnostics launched by Raz.
+
+## Command errors and help
+
+Command parsing fails before project discovery or build work begins. Common command and option typos include a close-match suggestion and a short help hint instead of dumping the full help screen.
+
+```text
+$ raz biuld
+error: no such command: 'biuld'
+  help: a similar command exists: 'build'
+  help: view all commands with 'raz --help'
+
+$ raz build --relase
+error: unexpected argument '--relase'
+  help: a similar option exists: '--release'
+  help: run 'raz build --help' for command usage
+```
+
+General and command-specific help are available through equivalent forms:
+
+```text
+raz --help
+raz -h
+raz help build
+raz build --help
+raz build -h
+raz --version
+raz -V
+```
+
+Options that require values diagnose a missing value directly. Long value options accept both `--option value` and `--option=value` forms for profile, target, jobs, color, diagnostic format, install prefix, reports, registry paths, and numeric benchmark/fuzz controls.
 
 ## Diagnostics
 

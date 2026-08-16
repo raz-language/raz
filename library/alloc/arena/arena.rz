@@ -1,0 +1,137 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::arena;
+
+// Fixed-capacity monotonic arena. Allocation is pointer arithmetic only after
+// construction: no locks, no freelist traversal, and no allocator crossing.
+// Returned pointers remain stable until rewind/reset/destroy.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
+
+public struct BumpArena {
+    usize data;
+    i64 capacity;
+    i64 offset;
+    i64 max_alignment;
+}
+
+fn valid_alignment(i64 alignment) -> bool {
+    return alignment > 0 && alignment <= 4096 && (alignment & (alignment - 1)) == 0;
+}
+
+fn align_up(i64 value, i64 alignment) -> i64 {
+    if (value < 0 || !valid_alignment(alignment) || value > 9223372036854775807 - (alignment - 1)) {
+        return -1;
+    }
+    return (value + alignment - 1) & (0 - alignment);
+}
+
+/// Creates a fixed-capacity arena. `max_alignment` is the strongest alignment
+/// any allocation from this arena may request.
+public fn create_aligned(i64 capacity, i64 max_alignment) -> BumpArena {
+    if (capacity <= 0 || !valid_alignment(max_alignment)) {
+        return BumpArena { data: 0, capacity: 0, offset: 0, max_alignment: max_alignment };
+    }
+    usize data = raz_rt_alloc_aligned(capacity, max_alignment);
+    if (data == 0) {
+        return BumpArena { data: 0, capacity: 0, offset: 0, max_alignment: max_alignment };
+    }
+    return BumpArena {
+        data: data,
+        capacity: capacity,
+        offset: 0,
+        max_alignment: max_alignment,
+    };
+}
+
+/// Creates an arena suitable for ordinary cacheline-aligned data structures.
+public fn create(i64 capacity) -> BumpArena {
+    return create_aligned(capacity, 64);
+}
+
+public fn valid(BumpArena& arena) -> bool {
+    return arena.data != 0 && arena.capacity > 0 && arena.offset >= 0 && arena.offset <= arena.capacity;
+}
+
+public fn capacity(BumpArena& arena) -> i64 {
+    return arena.capacity;
+}
+
+public fn used(BumpArena& arena) -> i64 {
+    return arena.offset;
+}
+
+public fn remaining(BumpArena& arena) -> i64 {
+    if (!valid(arena)) {
+        return 0;
+    }
+    return arena.capacity - arena.offset;
+}
+
+/// Allocates `size` bytes with the requested alignment. On success this is a
+/// handful of integer operations; the host allocator is not called.
+public fn allocate(BumpArena&mut arena, i64 size, i64 alignment) -> usize {
+    if (!valid(arena) || size < 0 || !valid_alignment(alignment) || alignment > arena.max_alignment) {
+        return 0;
+    }
+    i64 start = align_up(arena.offset, alignment);
+    if (start < 0 || size > arena.capacity - start) {
+        return 0;
+    }
+    usize output = arena.data + start;
+    arena.offset = start + size;
+    return output;
+}
+
+public fn allocate_zeroed(BumpArena&mut arena, i64 size, i64 alignment) -> usize {
+    usize output = allocate(arena, size, alignment);
+    if (output != 0 && size > 0) {
+        raz_rt_fill(output, 0, size);
+    }
+    return output;
+}
+
+/// Captures a cheap stack-like checkpoint for scoped scratch allocations.
+public fn mark(BumpArena& arena) -> i64 {
+    return arena.offset;
+}
+
+/// Releases every allocation made after `checkpoint` in O(1).
+public fn rewind(BumpArena&mut arena, i64 checkpoint) -> bool {
+    if (!valid(arena) || checkpoint < 0 || checkpoint > arena.offset) {
+        return false;
+    }
+    arena.offset = checkpoint;
+    return true;
+}
+
+/// Releases all arena allocations in O(1) while retaining the backing block.
+public fn reset(BumpArena&mut arena) {
+    if (arena.data != 0) {
+        arena.offset = 0;
+    }
+}
+
+public fn contains(BumpArena& arena, usize pointer) -> bool {
+    if (!valid(arena) || pointer < arena.data) {
+        return false;
+    }
+    return pointer < arena.data + arena.capacity;
+}
+
+public fn destroy(BumpArena&mut arena) {
+    if (arena.data != 0) {
+        raz_rt_dealloc_aligned(arena.data, arena.max_alignment);
+    }
+    arena.data = 0;
+    arena.capacity = 0;
+    arena.offset = 0;
+}
+
+impl Drop for BumpArena {
+    fn drop(BumpArena&mut self) {
+        destroy(self);
+    }
+}

@@ -478,37 +478,45 @@ void raz_rt_i8x16_add(const std::int8_t* lhs, const std::int8_t* rhs, std::int8_
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = static_cast<std::int8_t>(static_cast<std::uint8_t>(lhs[lane]) + static_cast<std::uint8_t>(rhs[lane]));
 }
+
 void raz_rt_i8x16_sub(const std::int8_t* lhs, const std::int8_t* rhs, std::int8_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = static_cast<std::int8_t>(static_cast<std::uint8_t>(lhs[lane]) - static_cast<std::uint8_t>(rhs[lane]));
 }
+
 void raz_rt_i8x16_min(const std::int8_t* lhs, const std::int8_t* rhs, std::int8_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = lhs[lane] < rhs[lane] ? lhs[lane] : rhs[lane];
 }
+
 void raz_rt_i8x16_max(const std::int8_t* lhs, const std::int8_t* rhs, std::int8_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = lhs[lane] > rhs[lane] ? lhs[lane] : rhs[lane];
 }
+
 void raz_rt_i8x16_equal(const std::int8_t* lhs, const std::int8_t* rhs, std::int8_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = lhs[lane] == rhs[lane] ? static_cast<std::int8_t>(-1) : 0;
 }
+
 std::int32_t raz_rt_i8x16_all_true(const std::int8_t* value) {
   if (value == nullptr) return 0;
   for (std::size_t lane = 0; lane < 16; ++lane) if (value[lane] == 0) return 0;
   return 1;
 }
+
 void raz_rt_i8x16_shl(const std::int8_t* value, std::int32_t count, std::int8_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 7U;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = static_cast<std::int8_t>(static_cast<std::uint8_t>(value[lane]) << shift);
 }
+
 void raz_rt_i8x16_shr_s(const std::int8_t* value, std::int32_t count, std::int8_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 7U;
   for (std::size_t lane = 0; lane < 16; ++lane) output[lane] = static_cast<std::int8_t>(value[lane] >> shift);
 }
+
 void raz_rt_i8x16_shr_u(const std::uint8_t* value, std::int32_t count, std::uint8_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 7U;
@@ -519,51 +527,62 @@ void raz_rt_i16x8_add(const std::int16_t* lhs, const std::int16_t* rhs, std::int
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::int16_t>(static_cast<std::uint16_t>(lhs[lane]) + static_cast<std::uint16_t>(rhs[lane]));
 }
+
 void raz_rt_i16x8_sub(const std::int16_t* lhs, const std::int16_t* rhs, std::int16_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::int16_t>(static_cast<std::uint16_t>(lhs[lane]) - static_cast<std::uint16_t>(rhs[lane]));
 }
+
 void raz_rt_i16x8_mul(const std::int16_t* lhs, const std::int16_t* rhs, std::int16_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::int16_t>(static_cast<std::uint16_t>(lhs[lane]) * static_cast<std::uint16_t>(rhs[lane]));
 }
+
 void raz_rt_i16x8_min(const std::int16_t* lhs, const std::int16_t* rhs, std::int16_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = lhs[lane] < rhs[lane] ? lhs[lane] : rhs[lane];
 }
+
 void raz_rt_i16x8_max(const std::int16_t* lhs, const std::int16_t* rhs, std::int16_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = lhs[lane] > rhs[lane] ? lhs[lane] : rhs[lane];
 }
+
 void raz_rt_i16x8_equal(const std::int16_t* lhs, const std::int16_t* rhs, std::int16_t* output) {
   if (lhs == nullptr || rhs == nullptr || output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = lhs[lane] == rhs[lane] ? static_cast<std::int16_t>(-1) : 0;
 }
+
 void raz_rt_i16x8_splat(std::int16_t value, std::int16_t* output) {
   if (output == nullptr) return;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = value;
 }
+
 std::int32_t raz_rt_i16x8_all_true(const std::int16_t* value) {
   if (value == nullptr) return 0;
   for (std::size_t lane = 0; lane < 8; ++lane) if (value[lane] == 0) return 0;
   return 1;
 }
+
 std::int32_t raz_rt_i16x8_bitmask(const std::int16_t* value) {
   if (value == nullptr) return 0;
   std::int32_t mask = 0;
   for (std::size_t lane = 0; lane < 8; ++lane) if (value[lane] < 0) mask |= static_cast<std::int32_t>(1U << lane);
   return mask;
 }
+
 void raz_rt_i16x8_shl(const std::int16_t* value, std::int32_t count, std::int16_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 15U;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::int16_t>(static_cast<std::uint16_t>(value[lane]) << shift);
 }
+
 void raz_rt_i16x8_shr_s(const std::int16_t* value, std::int32_t count, std::int16_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 15U;
   for (std::size_t lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::int16_t>(value[lane] >> shift);
 }
+
 void raz_rt_i16x8_shr_u(const std::uint16_t* value, std::int32_t count, std::uint16_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 15U;
@@ -575,11 +594,13 @@ void raz_rt_i32x4_shl(const std::int32_t* value, std::int32_t count, std::int32_
   const auto shift = static_cast<unsigned>(count) & 31U;
   for (std::size_t lane = 0; lane < 4; ++lane) output[lane] = static_cast<std::int32_t>(static_cast<std::uint32_t>(value[lane]) << shift);
 }
+
 void raz_rt_i32x4_shr_s(const std::int32_t* value, std::int32_t count, std::int32_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 31U;
   for (std::size_t lane = 0; lane < 4; ++lane) output[lane] = value[lane] >> shift;
 }
+
 void raz_rt_i32x4_shr_u(const std::uint32_t* value, std::int32_t count, std::uint32_t* output) {
   if (value == nullptr || output == nullptr) return;
   const auto shift = static_cast<unsigned>(count) & 31U;
@@ -725,6 +746,28 @@ extern "C" std::int64_t raz_rt_host_platform() {
   return 2;
 #else
   return 0;
+#endif
+}
+
+extern "C" std::int64_t raz_rt_host_arch() {
+#if defined(__x86_64__) || defined(_M_X64)
+  return 1;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return 2;
+#else
+  return 0;
+#endif
+}
+
+extern "C" std::int64_t raz_rt_sha256(const unsigned char* data, std::int64_t length,
+                                        unsigned char* output, std::int64_t capacity) {
+  if (length < 0 || capacity < 32 || output == nullptr || (length > 0 && data == nullptr)) return -1;
+#if defined(RAZ_HAVE_OPENSSL)
+  unsigned int digest_length = 0;
+  if (EVP_Digest(data, static_cast<std::size_t>(length), output, &digest_length, EVP_sha256(), nullptr) != 1) return -1;
+  return digest_length == 32 ? 32 : -1;
+#else
+  return -2;
 #endif
 }
 

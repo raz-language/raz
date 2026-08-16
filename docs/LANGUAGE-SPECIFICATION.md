@@ -369,7 +369,7 @@ The use of Forge does not change Raz's source-level semantics. Backend substitut
 
 Programs outside the stable surface must be rejected deterministically rather than silently assigned unspecified semantics. Implementations may optimize freely provided observable behavior, ownership guarantees, ABI contracts, deterministic compile-time behavior, and accepted program semantics remain unchanged.
 
-Stable compatibility is defined jointly by this document, `STABLE-LANGUAGE-SCOPE.md`, and the repository's conformance suite.
+Stable compatibility is defined jointly by this document, `LANGUAGE-STABILITY.md`, and the repository's conformance suite.
 
 ## MIR lifetime regions
 

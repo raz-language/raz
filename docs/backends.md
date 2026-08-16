@@ -4,7 +4,7 @@ Raz lowers source through one typed HIR and one backend-neutral MIR. Backend sel
 
 ## Forge
 
-Forge is the default native backend and is linked directly into the self-hosted compiler. It supports textual and structured IR paths, native x86-64 object emission, register allocation, target ABI lowering, aggregate layout, module storage, TLS, external calls, function pointers, control flow, scalar and aggregate operations, and native object formats used by supported hosts.
+Forge is the default native backend and is linked directly into the production compiler. It supports textual and structured IR paths, native x86-64 object emission, register allocation, target ABI lowering, aggregate layout, module storage, TLS, external calls, function pointers, control flow, scalar and aggregate operations, and native object formats used by supported hosts.
 
 Typical commands:
 

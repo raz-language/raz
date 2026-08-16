@@ -1,0 +1,211 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace std::thread::spsc;
+
+// Bounded single-producer/single-consumer i64 ring. Head and tail live on
+// separate atomic words and monotonically advance; power-of-two capacity keeps
+// index calculation to a mask. Bulk operations synchronize once per batch and
+// copy wrapped regions in at most two spans.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_atomic_load_i64_ordered(usize value, i64 order) -> i64;
+extern fn raz_rt_atomic_store_i64_ordered(usize value, i64 desired, i64 order);
+
+const i64 relaxed_order = 0;
+const i64 acquire_order = 1;
+const i64 release_order = 2;
+
+public struct SpscReceiveI64 {
+    bool received;
+    i64 value;
+}
+
+public struct SpscI64 {
+    usize state;
+    usize data;
+    i64 capacity;
+    i64 mask;
+}
+
+fn normalized_capacity(i64 requested) -> i64 {
+    if (requested <= 0) {
+        return 0;
+    }
+    i64 capacity = 2;
+    while (capacity < requested) {
+        if (capacity > 576460752303423487) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    return capacity;
+}
+
+fn store_plain_i64(usize address, i64 value) {
+    unsafe {
+        *(address as i64*mut) = value;
+    }
+}
+
+fn load_plain_i64(usize address) -> i64 {
+    unsafe {
+        return *(address as i64*const);
+    }
+}
+
+public fn create(i64 requested_capacity) -> SpscI64 {
+    i64 capacity = normalized_capacity(requested_capacity);
+    if (capacity == 0 || capacity > 1152921504606846973) {
+        return SpscI64 { state: 0, data: 0, capacity: 0, mask: 0 };
+    }
+
+    // Two cacheline-separated counters avoid false sharing between producer
+    // and consumer. Data begins after the second 64-byte line.
+    i64 bytes = 128 + capacity * 8;
+    usize state = raz_rt_alloc_aligned(bytes, 64);
+    if (state == 0) {
+        return SpscI64 { state: 0, data: 0, capacity: 0, mask: 0 };
+    }
+    store_plain_i64(state, 0);
+    store_plain_i64(state + 64, 0);
+    return SpscI64 {
+        state: state,
+        data: state + 128,
+        capacity: capacity,
+        mask: capacity - 1,
+    };
+}
+
+public fn valid(SpscI64& channel) -> bool {
+    return channel.state != 0 && channel.data != 0 && channel.capacity > 0;
+}
+
+public fn capacity(SpscI64& channel) -> i64 {
+    return channel.capacity;
+}
+
+public fn len(SpscI64& channel) -> i64 {
+    if (!valid(channel)) {
+        return 0;
+    }
+    i64 head = raz_rt_atomic_load_i64_ordered(channel.state, acquire_order);
+    i64 tail = raz_rt_atomic_load_i64_ordered(channel.state + 64, acquire_order);
+    i64 count = tail - head;
+    if (count < 0) {
+        return 0;
+    }
+    if (count > channel.capacity) {
+        return channel.capacity;
+    }
+    return count;
+}
+
+public fn is_empty(SpscI64& channel) -> bool {
+    return len(channel) == 0;
+}
+
+public fn try_send(SpscI64& channel, i64 value) -> bool {
+    if (!valid(channel)) {
+        return false;
+    }
+    i64 tail = raz_rt_atomic_load_i64_ordered(channel.state + 64, relaxed_order);
+    i64 head = raz_rt_atomic_load_i64_ordered(channel.state, acquire_order);
+    if (tail - head >= channel.capacity) {
+        return false;
+    }
+    store_plain_i64(channel.data + (tail & channel.mask) * 8, value);
+    raz_rt_atomic_store_i64_ordered(channel.state + 64, tail + 1, release_order);
+    return true;
+}
+
+public fn try_receive(SpscI64& channel) -> SpscReceiveI64 {
+    if (!valid(channel)) {
+        return SpscReceiveI64 { received: false, value: 0 };
+    }
+    i64 head = raz_rt_atomic_load_i64_ordered(channel.state, relaxed_order);
+    i64 tail = raz_rt_atomic_load_i64_ordered(channel.state + 64, acquire_order);
+    if (head == tail) {
+        return SpscReceiveI64 { received: false, value: 0 };
+    }
+    i64 value = load_plain_i64(channel.data + (head & channel.mask) * 8);
+    raz_rt_atomic_store_i64_ordered(channel.state, head + 1, release_order);
+    return SpscReceiveI64 { received: true, value: value };
+}
+
+/// Enqueues up to `count` contiguous i64 values. One acquire and one release
+/// cover the whole batch; the ring copy is at most two spans.
+public fn try_send_many(SpscI64& channel, usize values, i64 count) -> i64 {
+    if (!valid(channel) || count <= 0 || values == 0) {
+        return 0;
+    }
+    i64 tail = raz_rt_atomic_load_i64_ordered(channel.state + 64, relaxed_order);
+    i64 head = raz_rt_atomic_load_i64_ordered(channel.state, acquire_order);
+    i64 available = channel.capacity - (tail - head);
+    i64 amount = count;
+    if (amount > available) {
+        amount = available;
+    }
+    if (amount <= 0) {
+        return 0;
+    }
+
+    i64 slot = tail & channel.mask;
+    i64 first = channel.capacity - slot;
+    if (first > amount) {
+        first = amount;
+    }
+    raz_rt_copy(channel.data + slot * 8, values, first * 8);
+    i64 second = amount - first;
+    if (second > 0) {
+        raz_rt_copy(channel.data, values + first * 8, second * 8);
+    }
+    raz_rt_atomic_store_i64_ordered(channel.state + 64, tail + amount, release_order);
+    return amount;
+}
+
+/// Dequeues up to `count` values into caller-owned contiguous i64 storage.
+public fn try_receive_many(SpscI64& channel, usize output, i64 count) -> i64 {
+    if (!valid(channel) || count <= 0 || output == 0) {
+        return 0;
+    }
+    i64 head = raz_rt_atomic_load_i64_ordered(channel.state, relaxed_order);
+    i64 tail = raz_rt_atomic_load_i64_ordered(channel.state + 64, acquire_order);
+    i64 amount = tail - head;
+    if (amount > count) {
+        amount = count;
+    }
+    if (amount <= 0) {
+        return 0;
+    }
+
+    i64 slot = head & channel.mask;
+    i64 first = channel.capacity - slot;
+    if (first > amount) {
+        first = amount;
+    }
+    raz_rt_copy(output, channel.data + slot * 8, first * 8);
+    i64 second = amount - first;
+    if (second > 0) {
+        raz_rt_copy(output + first * 8, channel.data, second * 8);
+    }
+    raz_rt_atomic_store_i64_ordered(channel.state, head + amount, release_order);
+    return amount;
+}
+
+public fn destroy(SpscI64&mut channel) {
+    if (channel.state != 0) {
+        raz_rt_dealloc_aligned(channel.state, 64);
+    }
+    channel.state = 0;
+    channel.data = 0;
+    channel.capacity = 0;
+    channel.mask = 0;
+}
+
+impl Drop for SpscI64 {
+    fn drop(SpscI64&mut self) {
+        destroy(self);
+    }
+}

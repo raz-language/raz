@@ -68,6 +68,6 @@ int main() {
     require(text.find("  if.then.0:") != std::string::npos, "then block emitted");
     require(text.find("  if.else.1:") != std::string::npos, "else block emitted");
 
-    std::cout << "frontend development kit tests passed\n";
+    std::cout << "frontend integration tests passed\n";
     return 0;
 }

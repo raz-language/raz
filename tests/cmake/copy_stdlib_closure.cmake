@@ -6,7 +6,7 @@ function(raz_copy_stdlib_closure)
     message(FATAL_ERROR "stdlib closure copy requires PYTHON_EXECUTABLE")
   endif()
   execute_process(
-    COMMAND "${PYTHON_EXECUTABLE}" "${SOURCE_ROOT}/scripts/copy-stdlib-closure.py"
+    COMMAND "${PYTHON_EXECUTABLE}" "${SOURCE_ROOT}/tests/python/copy-stdlib-closure.py"
       --library "${SOURCE_ROOT}/library"
       --entry "${WORK_ROOT}/src/main.rz"
       --output "${WORK_ROOT}/src"

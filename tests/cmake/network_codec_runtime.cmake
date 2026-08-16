@@ -123,9 +123,9 @@ fn main() -> i64 {
     usize host = alloc::box::allocate(9);
     i64 host_bytes[9] = [49,50,55,46,48,46,48,46,49];
     i64 index = 0; while (index < 9) { core::bytes::store_u8(host + index, host_bytes[index]); index += 1; }
-    usize payload = alloc::box::allocate(11);
-    i64 payload_bytes[11] = [104, 101, 108, 108, 111, 32, 114, 97, 122, 33];
-    index = 0; while (index < 11) { core::bytes::store_u8(payload + index, payload_bytes[index]); index += 1; }
+    usize payload = alloc::box::allocate(10);
+    i64 payload_bytes[10] = [104, 101, 108, 108, 111, 32, 114, 97, 122, 33];
+    index = 0; while (index < 10) { core::bytes::store_u8(payload + index, payload_bytes[index]); index += 1; }
     Result<TcpListener, IoError> listen_result = std::net::try_tcp_listener_bind(0, 8);
     match listen_result {
       Result<TcpListener, IoError>::Error(_) => { return 50; }
@@ -149,26 +149,26 @@ fn main() -> i64 {
                     match server_buffered {
                       Result<BufferedTcpStream, StreamError>::Error(_) => { return 55; }
                       Result<BufferedTcpStream, StreamError>::Ok(server) => {
-                        Result<bool, StreamError> sent = std::net::framed::write_frame(&mut client, payload, 11, 1024);
+                        Result<bool, StreamError> sent = std::net::framed::write_frame(&mut client, payload, 10, 1024);
                         match sent { Result<bool, StreamError>::Error(_) => { return 56; } Result<bool, StreamError>::Ok(_) => {} }
                         ByteBuffer received = byte_buffer_with_capacity(32);
                         Result<i64, StreamError> frame = std::net::framed::read_frame(&mut server, &mut received, 1024);
                         match frame {
                           Result<i64, StreamError>::Error(_) => { return 57; }
                           Result<i64, StreamError>::Ok(length) => {
-                            if (length != 11 || !core::bytes::equal(byte_buffer_view(&received), BytesView { data: payload, length: 11 })) { return 58; }
+                            if (length != 10 || !core::bytes::equal(byte_buffer_view(&received), BytesView { data: payload, length: 10 })) { return 58; }
                           }
                         }
-                        Result<bool, StreamError> reply = std::net::framed::write_frame(&mut server, payload, 11, 1024);
+                        Result<bool, StreamError> reply = std::net::framed::write_frame(&mut server, payload, 10, 1024);
                         match reply { Result<bool, StreamError>::Error(_) => { return 59; } Result<bool, StreamError>::Ok(_) => {} }
                         ByteBuffer echoed = byte_buffer_new();
                         Result<i64, StreamError> echoed_frame = std::net::framed::read_frame(&mut client, &mut echoed, 1024);
                         match echoed_frame {
                           Result<i64, StreamError>::Error(_) => { return 60; }
-                          Result<i64, StreamError>::Ok(length) => { if (length != 11 || !core::bytes::equal(byte_buffer_view(&echoed), BytesView { data: payload, length: 11 })) { return 61; } }
+                          Result<i64, StreamError>::Ok(length) => { if (length != 10 || !core::bytes::equal(byte_buffer_view(&echoed), BytesView { data: payload, length: 10 })) { return 61; } }
                         }
                         // Oversized frame rejects before touching the transport.
-                        Result<bool, StreamError> oversized = std::net::framed::write_frame(&mut client, payload, 11, 10);
+                        Result<bool, StreamError> oversized = std::net::framed::write_frame(&mut client, payload, 10, 9);
                         match oversized { Result<bool, StreamError>::Ok(_) => { return 62; } Result<bool, StreamError>::Error(_) => {} }
                       }
                     }

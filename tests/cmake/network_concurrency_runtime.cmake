@@ -20,7 +20,10 @@ import core::result;
 import std::net;
 import std::net::resolve;
 import std::net::vectored;
+import std::net::poll_set;
 import std::thread::channel;
+import std::thread::spsc;
+import std::thread::mpmc;
 import std::thread::cancellation;
 import std::thread::future;
 
@@ -47,6 +50,44 @@ fn main() -> i64 {
     if (!preserved.received || preserved.value != 44) { return 33; }
     CancellableReceiveI64 cancelled_receive = std::thread::channel::receive_cancellable(&mut cancellable, &cancel_token);
     if (cancelled_receive.status != -1) { return 34; }
+
+    SpscI64 fast = std::thread::spsc::create(3);
+    if (!std::thread::spsc::valid(&fast) || std::thread::spsc::capacity(&fast) != 4) { return 35; }
+    usize fast_input = raz_rt_alloc(40); usize fast_output = raz_rt_alloc(40);
+    unsafe {
+      *(fast_input as i64*mut) = 101; *((fast_input + 8)as i64*mut) = 102; *((fast_input + 16)as i64*mut) = 103;
+      *((fast_input + 24)as i64*mut) = 104; *((fast_input + 32)as i64*mut) = 105;
+    }
+    if (std::thread::spsc::try_send_many(&mut fast, fast_input, 3) != 3) { return 36; }
+    SpscReceiveI64 fast_first = std::thread::spsc::try_receive(&mut fast);
+    SpscReceiveI64 fast_second = std::thread::spsc::try_receive(&mut fast);
+    if (!fast_first.received || fast_first.value != 101 || !fast_second.received || fast_second.value != 102) { return 37; }
+    if (std::thread::spsc::try_send_many(&mut fast, fast_input + 16, 3) != 3) { return 38; }
+    if (std::thread::spsc::try_receive_many(&mut fast, fast_output, 4) != 4) { return 39; }
+    unsafe {
+      if (*(fast_output as i64*const) != 103 || *((fast_output + 8)as i64*const) != 103 ||
+          *((fast_output + 16)as i64*const) != 104 || *((fast_output + 24)as i64*const) != 105) { return 40; }
+    }
+    std::thread::spsc::destroy(&mut fast); raz_rt_dealloc(fast_output); raz_rt_dealloc(fast_input);
+
+    MpmcI64 shared = std::thread::mpmc::create(3);
+    if (!std::thread::mpmc::valid(&shared) || std::thread::mpmc::capacity(&shared) != 4) { return 44; }
+    if (!std::thread::mpmc::try_send(&mut shared, 201) || !std::thread::mpmc::try_send(&mut shared, 202) ||
+        !std::thread::mpmc::try_send(&mut shared, 203) || !std::thread::mpmc::try_send(&mut shared, 204) ||
+        std::thread::mpmc::try_send(&mut shared, 205)) { return 45; }
+    MpmcReceiveI64 shared_first = std::thread::mpmc::try_receive(&mut shared);
+    MpmcReceiveI64 shared_second = std::thread::mpmc::try_receive(&mut shared);
+    if (!shared_first.received || shared_first.value != 201 || !shared_second.received || shared_second.value != 202) { return 46; }
+    if (!std::thread::mpmc::try_send(&mut shared, 205) || !std::thread::mpmc::try_send(&mut shared, 206)) { return 47; }
+    i64 shared_expected[4] = [203,204,205,206];
+    i64 shared_index = 0;
+    while (shared_index < 4) {
+        MpmcReceiveI64 item = std::thread::mpmc::try_receive(&mut shared);
+        if (!item.received || item.value != shared_expected[shared_index]) { return 48; }
+        shared_index += 1;
+    }
+    if (!std::thread::mpmc::is_empty(&shared) || std::thread::mpmc::try_receive(&mut shared).received) { return 49; }
+    std::thread::mpmc::destroy(&mut shared);
 
     FutureI64 completed = std::thread::future::create();
     FutureResultI64 pending = std::thread::future::wait_millis(&mut completed, 0);
@@ -125,6 +166,17 @@ fn main() -> i64 {
     IoVector sendv = std::net::vectored::create(2);
     if (!std::net::vectored::push(&mut sendv,left,2) || !std::net::vectored::push(&mut sendv,right,3)) { return 24; }
     if (std::net::vectored::send(sender,&sendv) != 5) { return 25; }
+    PollSet scalable_pollset = std::net::poll_set::create(512);
+    if (!std::net::poll_set::valid(&scalable_pollset) || std::net::poll_set::capacity(&scalable_pollset) != 512 ||
+        !std::net::poll_set::reserve(&mut scalable_pollset, 1024) || std::net::poll_set::capacity(&scalable_pollset) < 1024) { return 43; }
+    std::net::poll_set::destroy(&mut scalable_pollset);
+    PollSet pollset = std::net::poll_set::create(2);
+    if (!std::net::poll_set::push(&mut pollset, receiver, std::net::poll_set::readable) ||
+        !std::net::poll_set::push(&mut pollset, sender, std::net::poll_set::writable)) { return 41; }
+    if (std::net::poll_set::wait(&mut pollset, 1000) < 1 ||
+        (std::net::poll_set::events(&pollset, 0) & std::net::poll_set::readable) == 0 ||
+        (std::net::poll_set::events(&pollset, 1) & std::net::poll_set::writable) == 0) { return 42; }
+    std::net::poll_set::destroy(&mut pollset);
     usize received = raz_rt_alloc(5);
     if (std::net::receive(receiver,received,5) != 5 || raz_rt_load_u8(received) != 65 || raz_rt_load_u8(received+4) != 69) { return 26; }
 

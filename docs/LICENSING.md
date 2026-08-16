@@ -13,7 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 
 The comment marker follows the file format (`//`, `#`, or `REM`). Shebangs and required batch preambles remain first when necessary.
 
-The repository check `scripts/check-license-headers.py` verifies this policy and is part of CTest. Data formats that do not support comments (for example JSON and lock files), generated/intermediate fixtures, documentation prose, and binary artifacts do not receive source headers.
+The repository check `tests/python/check-license-headers.py` verifies this policy and is part of CTest. Data formats that do not support comments (for example JSON and lock files), generated/intermediate fixtures, documentation prose, and binary artifacts do not receive source headers.
 
 ## Contributions
 

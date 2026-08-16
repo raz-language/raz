@@ -1,7 +1,7 @@
 # Mid-level Intermediate Representation
 
 MIR is Raz's canonical executable semantic boundary. HIR may diagnose errors
-earlier, but Forge, LLVM, and the interpreter consume only MIR that has passed
+earlier, but Forge, LLVM, and the interpreter consume only MIR that has satisfied
 independent structural and ownership verification.
 
 ## Pipeline

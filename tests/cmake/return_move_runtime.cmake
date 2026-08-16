@@ -14,16 +14,16 @@ kind = "executable"
 entry = "src/main.rz"
 ]=])
 file(WRITE "${WORK_ROOT}/src/main.rz" [=[
-extern fn raz_rt_stage1_arena_create(i64 count) -> i64;
-extern fn raz_rt_stage1_arena_destroy(i64 handle);
-extern fn raz_rt_stage1_arena_get(i64 handle, i64 index) -> i64;
-extern fn raz_rt_stage1_arena_set(i64 handle, i64 index, i64 value);
+extern fn raz_compiler_rt_arena_create(i64 count) -> i64;
+extern fn raz_compiler_rt_arena_destroy(i64 handle);
+extern fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64;
+extern fn raz_compiler_rt_arena_set(i64 handle, i64 index, i64 value);
 
 struct Owner { i64 tracker; }
 impl Drop for Owner {
     fn drop(Owner&mut self) {
-        i64 count = raz_rt_stage1_arena_get(self.tracker, 0);
-        raz_rt_stage1_arena_set(self.tracker, 0, count + 1);
+        i64 count = raz_compiler_rt_arena_get(self.tracker, 0);
+        raz_compiler_rt_arena_set(self.tracker, 0, count + 1);
     }
 }
 
@@ -34,17 +34,17 @@ fn make_owner(i64 tracker) -> Owner {
 
 fn exercise(i64 tracker) -> i64 {
     Owner value = make_owner(tracker);
-    if (raz_rt_stage1_arena_get(tracker, 0) != 0) { return 1; }
+    if (raz_compiler_rt_arena_get(tracker, 0) != 0) { return 1; }
     return 0;
 }
 
 fn main() -> i64 {
-    i64 tracker = raz_rt_stage1_arena_create(1);
+    i64 tracker = raz_compiler_rt_arena_create(1);
     if (tracker == 0) { return 2; }
     i64 result = exercise(tracker);
     if (result != 0) { return result; }
-    if (raz_rt_stage1_arena_get(tracker, 0) != 1) { return 3; }
-    raz_rt_stage1_arena_destroy(tracker);
+    if (raz_compiler_rt_arena_get(tracker, 0) != 1) { return 3; }
+    raz_compiler_rt_arena_destroy(tracker);
     return 0;
 }
 ]=])

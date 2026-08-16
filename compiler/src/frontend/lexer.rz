@@ -144,6 +144,8 @@ extern fn raz_rt_stdio_write(i64 stream, usize data, i64 size) -> i64;
 extern fn raz_rt_env_get(usize name, i64 name_length, usize output, i64 capacity) -> i64;
 extern fn raz_rt_path_exists(usize path, i64 length) -> i64;
 extern fn raz_rt_process_run(usize command, i64 length) -> i64;
+extern fn raz_rt_process_run_argv(usize program, i64 program_length, usize blob, i64 blob_length, i64 argument_count) -> i64;
+extern fn raz_rt_process_run_argv_cwd(usize program, i64 program_length, usize blob, i64 blob_length, i64 argument_count, usize working_directory, i64 working_directory_length) -> i64;
 extern fn raz_rt_tcp_connect(usize host, i64 host_length, i64 port) -> i64;
 extern fn raz_rt_socket_set_timeout_millis(i64 socket, i64 receive_millis, i64 send_millis) -> i64;
 extern fn raz_rt_socket_send(i64 socket, usize data, i64 size) -> i64;
@@ -166,10 +168,10 @@ extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
 extern fn raz_rt_file_close(usize handle);
 extern fn raz_rt_load_u8(usize address) -> i64;
 extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
-// Self-host compiler arena. The first 24 bytes intentionally preserve the
+// Production compiler arena. The first 24 bytes intentionally preserve the
 // bootstrap arena ABI header so the few remaining Stage-1 OS/string adapters
 // can consume arena-backed buffers while arena ownership itself lives in Raz.
-fn raz_rt_stage1_arena_create(i64 count) -> i64 {
+fn raz_compiler_rt_arena_create(i64 count) -> i64 {
   if (count <= 0 || count > 1152921504606846972) {
     return 0;
   }
@@ -188,7 +190,7 @@ fn raz_rt_stage1_arena_create(i64 count) -> i64 {
   return (allocation + 24)as i64;
 }
 
-fn raz_rt_stage1_arena_destroy(i64 handle) {
+fn raz_compiler_rt_arena_destroy(i64 handle) {
   if (handle == 0) {
     return;
   }
@@ -202,7 +204,7 @@ fn raz_rt_stage1_arena_destroy(i64 handle) {
   raz_rt_dealloc_aligned(allocation, 8);
 }
 
-fn raz_rt_stage1_arena_count(i64 handle) -> i64 {
+fn raz_compiler_rt_arena_count(i64 handle) -> i64 {
   if (handle == 0) {
     return 0;
   }
@@ -217,8 +219,8 @@ fn raz_rt_stage1_arena_count(i64 handle) -> i64 {
   }
 }
 
-fn raz_rt_stage1_arena_get(i64 handle, i64 index) -> i64 {
-  i64 count = raz_rt_stage1_arena_count(handle);
+fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64 {
+  i64 count = raz_compiler_rt_arena_count(handle);
 
   if (index < 0 || index >= count) {
     return 0;
@@ -228,8 +230,8 @@ fn raz_rt_stage1_arena_get(i64 handle, i64 index) -> i64 {
   }
 }
 
-fn raz_rt_stage1_arena_set(i64 handle, i64 index, i64 value) {
-  i64 count = raz_rt_stage1_arena_count(handle);
+fn raz_compiler_rt_arena_set(i64 handle, i64 index, i64 value) {
+  i64 count = raz_compiler_rt_arena_count(handle);
 
   if (index < 0 || index >= count) {
     return;
@@ -239,8 +241,8 @@ fn raz_rt_stage1_arena_set(i64 handle, i64 index, i64 value) {
   }
 }
 
-fn raz_rt_stage1_arena_range_equal(i64 handle, i64 left, i64 right, i64 count) -> i64 {
-  i64 capacity = raz_rt_stage1_arena_count(handle);
+fn raz_compiler_rt_arena_range_equal(i64 handle, i64 left, i64 right, i64 count) -> i64 {
+  i64 capacity = raz_compiler_rt_arena_count(handle);
 
   if (
   left < 0 ||
@@ -256,8 +258,8 @@ fn raz_rt_stage1_arena_range_equal(i64 handle, i64 left, i64 right, i64 count) -
   return raz_rt_bytes_equal((handle as usize) + left * 8, (handle as usize) + right * 8, count * 8);
 }
 
-fn raz_rt_stage1_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed) -> i64 {
-  i64 capacity = raz_rt_stage1_arena_count(handle);
+fn raz_compiler_rt_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed) -> i64 {
+  i64 capacity = raz_compiler_rt_arena_count(handle);
 
   if (offset < 0 || count < 0 || offset > capacity || count > capacity - offset) {
     return seed;
@@ -273,21 +275,21 @@ fn raz_rt_stage1_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed) -
   i64 index = 0;
 
   while (index < count) {
-    hash = (hash * 131 + raz_rt_stage1_arena_get(handle, offset + index) + 1) % modulus;
+    hash = (hash * 131 + raz_compiler_rt_arena_get(handle, offset + index) + 1) % modulus;
     index += 1;
   }
   return hash;
 }
 
-fn raz_rt_stage1_arena_copy(
+fn raz_compiler_rt_arena_copy(
 i64 destination,
 i64 destination_offset,
 i64 source,
 i64 source_offset,
 i64 count,
 ) -> i64 {
-  i64 destination_count = raz_rt_stage1_arena_count(destination);
-  i64 source_count = raz_rt_stage1_arena_count(source);
+  i64 destination_count = raz_compiler_rt_arena_count(destination);
+  i64 source_count = raz_compiler_rt_arena_count(source);
 
   if (
   destination_offset < 0 ||
@@ -310,8 +312,8 @@ i64 count,
   return count;
 }
 
-fn stage1_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
-  i64 capacity = raz_rt_stage1_arena_count(handle);
+fn compiler_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
+  i64 capacity = raz_compiler_rt_arena_count(handle);
 
   if (offset < 0 || length < 0 || offset > capacity || length > capacity - offset) {
     return 0;
@@ -327,7 +329,7 @@ fn stage1_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
 
   while (index < length) {
     unsafe {
-      *((bytes + index)as u8*mut) = (raz_rt_stage1_arena_get(handle, offset + index) & 255)as u8;
+      *((bytes + index)as u8*mut) = (raz_compiler_rt_arena_get(handle, offset + index) & 255)as u8;
     }
     index += 1;
   }
@@ -337,8 +339,8 @@ fn stage1_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
   return bytes;
 }
 
-fn stage1_ascii_unpack(i64 handle, i64 offset, usize bytes, i64 length) -> bool {
-  i64 capacity = raz_rt_stage1_arena_count(handle);
+fn compiler_ascii_unpack(i64 handle, i64 offset, usize bytes, i64 length) -> bool {
+  i64 capacity = raz_compiler_rt_arena_count(handle);
 
   if (
   offset < 0 ||
@@ -354,20 +356,20 @@ fn stage1_ascii_unpack(i64 handle, i64 offset, usize bytes, i64 length) -> bool 
 
   while (index < length) {
     unsafe {
-      raz_rt_stage1_arena_set(handle, offset + index, (*((bytes + index)as u8*const))as i64);
+      raz_compiler_rt_arena_set(handle, offset + index, (*((bytes + index)as u8*const))as i64);
     }
     index += 1;
   }
   return true;
 }
 
-fn raz_rt_stage1_write_ascii(i64 path, i64 path_length, i64 data, i64 size) -> i64 {
+fn raz_compiler_rt_write_ascii(i64 path, i64 path_length, i64 data, i64 size) -> i64 {
   if (path_length < 0 || size < 0) {
     return -1;
   }
 
-  usize path_bytes = stage1_ascii_pack(path, 0, path_length);
-  usize data_bytes = stage1_ascii_pack(data, 0, size);
+  usize path_bytes = compiler_ascii_pack(path, 0, path_length);
+  usize data_bytes = compiler_ascii_pack(data, 0, size);
 
   if ((path_length > 0 && path_bytes == 0) || (size > 0 && data_bytes == 0)) {
     if (path_bytes != 0) {
@@ -416,12 +418,12 @@ fn raz_rt_stage1_write_ascii(i64 path, i64 path_length, i64 data, i64 size) -> i
   return written;
 }
 
-fn raz_rt_stage1_read_ascii(i64 path, i64 path_length, i64 data, i64 capacity) -> i64 {
+fn raz_compiler_rt_read_ascii(i64 path, i64 path_length, i64 data, i64 capacity) -> i64 {
   if (path_length < 0 || capacity < 0) {
     return -1;
   }
 
-  usize path_bytes = stage1_ascii_pack(path, 0, path_length);
+  usize path_bytes = compiler_ascii_pack(path, 0, path_length);
 
   if (path_length > 0 && path_bytes == 0) {
     return -1;
@@ -462,17 +464,17 @@ fn raz_rt_stage1_read_ascii(i64 path, i64 path_length, i64 data, i64 capacity) -
   }
   raz_rt_file_close(file);
   if (total > 0) {
-    stage1_ascii_unpack(data, 0, bytes, total);
+    compiler_ascii_unpack(data, 0, bytes, total);
   }
   raz_rt_dealloc_aligned(bytes, 8);
   return total;
 }
 
-fn raz_rt_stage1_process_argc() -> i64 {
+fn raz_compiler_rt_process_argc() -> i64 {
   return raz_rt_process_argc();
 }
 
-fn raz_rt_stage1_process_arg(i64 index, i64 output, i64 capacity) -> i64 {
+fn raz_compiler_rt_process_arg(i64 index, i64 output, i64 capacity) -> i64 {
   if (capacity < 0) {
     return -1;
   }
@@ -486,14 +488,14 @@ fn raz_rt_stage1_process_arg(i64 index, i64 output, i64 capacity) -> i64 {
   i64 result = raz_rt_process_arg(index, bytes, capacity + 1);
 
   if (result >= 0 && result <= capacity) {
-    stage1_ascii_unpack(output, 0, bytes, result);
+    compiler_ascii_unpack(output, 0, bytes, result);
   }
   raz_rt_dealloc_aligned(bytes, 8);
   return result;
 }
 
-fn raz_rt_stage1_stdio_write_ascii(i64 stream, i64 data, i64 size) -> i64 {
-  usize bytes = stage1_ascii_pack(data, 0, size);
+fn raz_compiler_rt_stdio_write_ascii(i64 stream, i64 data, i64 size) -> i64 {
+  usize bytes = compiler_ascii_pack(data, 0, size);
 
   if (size > 0 && bytes == 0) {
     return -1;
@@ -507,8 +509,8 @@ fn raz_rt_stage1_stdio_write_ascii(i64 stream, i64 data, i64 size) -> i64 {
   return result;
 }
 
-fn raz_rt_stage1_env_get_ascii(i64 name, i64 name_length, i64 output, i64 capacity) -> i64 {
-  usize name_bytes = stage1_ascii_pack(name, 0, name_length);
+fn raz_compiler_rt_env_get_ascii(i64 name, i64 name_length, i64 output, i64 capacity) -> i64 {
+  usize name_bytes = compiler_ascii_pack(name, 0, name_length);
 
   if (name_length > 0 && name_bytes == 0) {
     return -1;
@@ -526,7 +528,7 @@ fn raz_rt_stage1_env_get_ascii(i64 name, i64 name_length, i64 output, i64 capaci
   i64 result = raz_rt_env_get(name_bytes, name_length, output_bytes, capacity + 1);
 
   if (result >= 0 && result <= capacity) {
-    stage1_ascii_unpack(output, 0, output_bytes, result);
+    compiler_ascii_unpack(output, 0, output_bytes, result);
   }
   raz_rt_dealloc_aligned(output_bytes, 8);
   if (name_bytes != 0) {
@@ -535,8 +537,8 @@ fn raz_rt_stage1_env_get_ascii(i64 name, i64 name_length, i64 output, i64 capaci
   return result;
 }
 
-fn raz_rt_stage1_path_exists_ascii(i64 path, i64 path_length) -> i64 {
-  usize bytes = stage1_ascii_pack(path, 0, path_length);
+fn raz_compiler_rt_path_exists_ascii(i64 path, i64 path_length) -> i64 {
+  usize bytes = compiler_ascii_pack(path, 0, path_length);
 
   if (path_length > 0 && bytes == 0) {
     return 0;
@@ -550,8 +552,8 @@ fn raz_rt_stage1_path_exists_ascii(i64 path, i64 path_length) -> i64 {
   return result;
 }
 
-fn raz_rt_stage1_process_run_ascii(i64 command, i64 length) -> i64 {
-  usize bytes = stage1_ascii_pack(command, 0, length);
+fn raz_compiler_rt_process_run_ascii(i64 command, i64 length) -> i64 {
+  usize bytes = compiler_ascii_pack(command, 0, length);
 
   if (length > 0 && bytes == 0) {
     return -1;
@@ -565,8 +567,8 @@ fn raz_rt_stage1_process_run_ascii(i64 command, i64 length) -> i64 {
   return result;
 }
 
-fn raz_rt_stage1_tcp_connect_ascii(i64 host, i64 host_length, i64 port) -> i64 {
-  usize bytes = stage1_ascii_pack(host, 0, host_length);
+fn raz_compiler_rt_tcp_connect_ascii(i64 host, i64 host_length, i64 port) -> i64 {
+  usize bytes = compiler_ascii_pack(host, 0, host_length);
 
   if (host_length > 0 && bytes == 0) {
     return -1;
@@ -580,12 +582,12 @@ fn raz_rt_stage1_tcp_connect_ascii(i64 host, i64 host_length, i64 port) -> i64 {
   return result;
 }
 
-fn raz_rt_stage1_socket_set_timeout_millis(i64 socket, i64 receive_millis, i64 send_millis) -> i64 {
+fn raz_compiler_rt_socket_set_timeout_millis(i64 socket, i64 receive_millis, i64 send_millis) -> i64 {
   return raz_rt_socket_set_timeout_millis(socket, receive_millis, send_millis);
 }
 
-fn raz_rt_stage1_socket_send_ascii(i64 socket, i64 data, i64 offset, i64 size) -> i64 {
-  usize bytes = stage1_ascii_pack(data, offset, size);
+fn raz_compiler_rt_socket_send_ascii(i64 socket, i64 data, i64 offset, i64 size) -> i64 {
+  usize bytes = compiler_ascii_pack(data, offset, size);
 
   if (size > 0 && bytes == 0) {
     return -1;
@@ -613,7 +615,7 @@ fn raz_rt_stage1_socket_send_ascii(i64 socket, i64 data, i64 offset, i64 size) -
   return sent;
 }
 
-fn raz_rt_stage1_socket_receive_ascii(i64 socket, i64 output, i64 offset, i64 capacity) -> i64 {
+fn raz_compiler_rt_socket_receive_ascii(i64 socket, i64 output, i64 offset, i64 capacity) -> i64 {
   usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
 
   if (bytes == 0) {
@@ -623,22 +625,22 @@ fn raz_rt_stage1_socket_receive_ascii(i64 socket, i64 output, i64 offset, i64 ca
   i64 count = raz_rt_socket_receive(socket, bytes, capacity);
 
   if (count > 0) {
-    stage1_ascii_unpack(output, offset, bytes, count);
+    compiler_ascii_unpack(output, offset, bytes, count);
   }
   raz_rt_dealloc_aligned(bytes, 8);
   return count;
 }
 
-fn raz_rt_stage1_socket_close(i64 socket) {
+fn raz_compiler_rt_socket_close(i64 socket) {
   raz_rt_socket_close(socket);
 }
 
-fn raz_rt_stage1_tls_available() -> i64 {
+fn raz_compiler_rt_tls_available() -> i64 {
   return raz_rt_tls_available();
 }
 
-fn raz_rt_stage1_tls_client_create_ascii(i64 host, i64 host_length) -> usize {
-  usize bytes = stage1_ascii_pack(host, 0, host_length);
+fn raz_compiler_rt_tls_client_create_ascii(i64 host, i64 host_length) -> usize {
+  usize bytes = compiler_ascii_pack(host, 0, host_length);
 
   if (host_length > 0 && bytes == 0) {
     return 0;
@@ -652,8 +654,8 @@ fn raz_rt_stage1_tls_client_create_ascii(i64 host, i64 host_length) -> usize {
   return handle;
 }
 
-fn raz_rt_stage1_tls_feed_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
-  usize bytes = stage1_ascii_pack(data, offset, size);
+fn raz_compiler_rt_tls_feed_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
+  usize bytes = compiler_ascii_pack(data, offset, size);
 
   if (size > 0 && bytes == 0) {
     return -1;
@@ -667,7 +669,7 @@ fn raz_rt_stage1_tls_feed_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i
   return result;
 }
 
-fn raz_rt_stage1_tls_drain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
+fn raz_compiler_rt_tls_drain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
   usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
 
   if (bytes == 0) {
@@ -677,26 +679,26 @@ fn raz_rt_stage1_tls_drain_ascii(i64 handle, i64 output, i64 offset, i64 capacit
   i64 count = raz_rt_tls_drain(handle as usize, bytes, capacity);
 
   if (count > 0) {
-    stage1_ascii_unpack(output, offset, bytes, count);
+    compiler_ascii_unpack(output, offset, bytes, count);
   }
   raz_rt_dealloc_aligned(bytes, 8);
   return count;
 }
 
-fn raz_rt_stage1_tls_pending_encrypted(i64 handle) -> i64 {
+fn raz_compiler_rt_tls_pending_encrypted(i64 handle) -> i64 {
   return raz_rt_tls_pending_encrypted(handle as usize);
 }
 
-fn raz_rt_stage1_tls_handshake(i64 handle) -> i64 {
+fn raz_compiler_rt_tls_handshake(i64 handle) -> i64 {
   return raz_rt_tls_handshake(handle as usize);
 }
 
-fn raz_rt_stage1_tls_handshake_finished(i64 handle) -> i64 {
+fn raz_compiler_rt_tls_handshake_finished(i64 handle) -> i64 {
   return raz_rt_tls_handshake_finished(handle as usize);
 }
 
-fn raz_rt_stage1_tls_write_plain_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
-  usize bytes = stage1_ascii_pack(data, offset, size);
+fn raz_compiler_rt_tls_write_plain_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
+  usize bytes = compiler_ascii_pack(data, offset, size);
 
   if (size > 0 && bytes == 0) {
     return -1;
@@ -710,7 +712,7 @@ fn raz_rt_stage1_tls_write_plain_ascii(i64 handle, i64 data, i64 offset, i64 siz
   return result;
 }
 
-fn raz_rt_stage1_tls_read_plain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
+fn raz_compiler_rt_tls_read_plain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
   usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
 
   if (bytes == 0) {
@@ -720,17 +722,17 @@ fn raz_rt_stage1_tls_read_plain_ascii(i64 handle, i64 output, i64 offset, i64 ca
   i64 count = raz_rt_tls_read_plain(handle as usize, bytes, capacity);
 
   if (count > 0) {
-    stage1_ascii_unpack(output, offset, bytes, count);
+    compiler_ascii_unpack(output, offset, bytes, count);
   }
   raz_rt_dealloc_aligned(bytes, 8);
   return count;
 }
 
-fn raz_rt_stage1_tls_shutdown(i64 handle) -> i64 {
+fn raz_compiler_rt_tls_shutdown(i64 handle) -> i64 {
   return raz_rt_tls_shutdown(handle as usize);
 }
 
-fn raz_rt_stage1_tls_destroy(i64 handle) {
+fn raz_compiler_rt_tls_destroy(i64 handle) {
   raz_rt_tls_destroy(handle as usize);
 }
 
@@ -742,8 +744,8 @@ public struct Parser {
   i64 current_function;
 }
 
-fn init_token(Token&mut out, TokenKind kind, i64 offset, i64 length) {
-  out.kind = kind;
+fn init_token(Token&mut out, TokenKind token_kind, i64 offset, i64 length) {
+  out.kind = token_kind;
   out.offset = offset;
   out.length = length;
 }
@@ -802,7 +804,7 @@ fn diagnostic_code_value(DiagnosticCode code) -> i64 {
 }
 
 fn source_byte(Source& value, i64 index) -> i64 {
-  return raz_rt_stage1_arena_get(value.bytes, index);
+  return raz_compiler_rt_arena_get(value.bytes, index);
 }
 
 fn is_space(i64 value) -> bool {
@@ -1335,7 +1337,7 @@ fn token_count(Source input) -> i64 {
 }
 
 fn qualify_extended_lexer() -> bool {
-  i64 data = raz_rt_stage1_arena_create(27);
+  i64 data = raz_compiler_rt_arena_create(27);
 
   if (data == 0) {
     return false;
@@ -1345,7 +1347,7 @@ fn qualify_extended_lexer() -> bool {
   i64 index = 0;
 
   while (index < 27) {
-    raz_rt_stage1_arena_set(data, index, seed[index]);
+    raz_compiler_rt_arena_set(data, index, seed[index]);
     index += 1;
   }
 
@@ -1356,7 +1358,7 @@ fn qualify_extended_lexer() -> bool {
 
   bool passed = token_count(input) == 11;
 
-  raz_rt_stage1_arena_destroy(data);
+  raz_compiler_rt_arena_destroy(data);
   return passed;
 }
 
@@ -2303,5 +2305,5 @@ fn token_same(Source& source, i64 left_offset, i64 left_length, i64 right_offset
   if (left_length != right_length) {
     return false;
   }
-  return raz_rt_stage1_arena_range_equal(source.bytes, left_offset, right_offset, left_length) != 0;
+  return raz_compiler_rt_arena_range_equal(source.bytes, left_offset, right_offset, left_length) != 0;
 }

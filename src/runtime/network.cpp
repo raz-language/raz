@@ -493,34 +493,90 @@ std::int64_t raz_rt_tcp_accept(std::int64_t listener) {
   return static_cast<std::int64_t>(accepted);
 }
 
+struct RazPollRecord {
+  std::int64_t socket;
+  std::int64_t interests;
+  std::int64_t events;
+};
+static_assert(sizeof(RazPollRecord) == 24);
+
+std::int64_t raz_rt_socket_poll_many(RazPollRecord* records, std::int64_t count,
+                                      std::int64_t timeout_millis) {
+  constexpr std::int64_t max_records = 1048576;
+  if (records == nullptr || count <= 0 || count > max_records || timeout_millis < -1) {
+    raz_set_last_error(EINVAL);
+    return -1;
+  }
+
+  const int timeout = timeout_millis < 0 ? -1 : static_cast<int>(std::min<std::int64_t>(timeout_millis, INT_MAX));
+#if defined(_WIN32)
+  if (!winsock().ok) { raz_set_socket_error(); return -1; }
+  std::array<WSAPOLLFD, 256> stack_fds{};
+  thread_local std::vector<WSAPOLLFD> dynamic_fds;
+  WSAPOLLFD* poll_fds = stack_fds.data();
+  if (count > static_cast<std::int64_t>(stack_fds.size())) {
+    dynamic_fds.resize(static_cast<std::size_t>(count));
+    poll_fds = dynamic_fds.data();
+  }
+  for (std::int64_t index = 0; index < count; ++index) {
+    if (records[index].socket < 0 || (records[index].interests & 3) == 0) {
+      raz_set_last_error(EINVAL);
+      return -1;
+    }
+    auto& descriptor = poll_fds[static_cast<std::size_t>(index)];
+    descriptor = WSAPOLLFD{};
+    descriptor.fd = static_cast<Socket>(records[index].socket);
+    if ((records[index].interests & 1) != 0) descriptor.events |= POLLRDNORM;
+    if ((records[index].interests & 2) != 0) descriptor.events |= POLLWRNORM;
+    records[index].events = 0;
+  }
+  const int ready = ::WSAPoll(poll_fds, static_cast<ULONG>(count), timeout);
+#else
+  std::array<pollfd, 256> stack_fds{};
+  thread_local std::vector<pollfd> dynamic_fds;
+  pollfd* poll_fds = stack_fds.data();
+  if (count > static_cast<std::int64_t>(stack_fds.size())) {
+    dynamic_fds.resize(static_cast<std::size_t>(count));
+    poll_fds = dynamic_fds.data();
+  }
+  for (std::int64_t index = 0; index < count; ++index) {
+    if (records[index].socket < 0 || (records[index].interests & 3) == 0) {
+      raz_set_last_error(EINVAL);
+      return -1;
+    }
+    auto& descriptor = poll_fds[static_cast<std::size_t>(index)];
+    descriptor = pollfd{};
+    descriptor.fd = static_cast<int>(records[index].socket);
+    if ((records[index].interests & 1) != 0) descriptor.events |= POLLIN;
+    if ((records[index].interests & 2) != 0) descriptor.events |= POLLOUT;
+    records[index].events = 0;
+  }
+  const int ready = ::poll(poll_fds, static_cast<nfds_t>(count), timeout);
+#endif
+  if (ready < 0) { raz_set_socket_error(); return -1; }
+
+  for (std::int64_t index = 0; index < count; ++index) {
+    const short returned = poll_fds[static_cast<std::size_t>(index)].revents;
+    std::int64_t events = 0;
+#if defined(_WIN32)
+    if ((returned & (POLLRDNORM | POLLRDBAND | POLLHUP)) != 0) events |= 1;
+    if ((returned & (POLLWRNORM | POLLWRBAND)) != 0) events |= 2;
+#else
+    if ((returned & (POLLIN | POLLPRI | POLLHUP)) != 0) events |= 1;
+    if ((returned & POLLOUT) != 0) events |= 2;
+#endif
+    if ((returned & (POLLERR | POLLNVAL)) != 0) events |= 4;
+    records[index].events = events;
+  }
+  raz_clear_last_error();
+  return static_cast<std::int64_t>(ready);
+}
+
 std::int64_t raz_rt_socket_poll(std::int64_t socket_value, std::int64_t interests,
                                  std::int64_t timeout_millis) {
-  if (socket_value < 0 || (interests & 3) == 0) return -1;
-  const auto socket = static_cast<Socket>(socket_value);
-  fd_set read_set{};
-  fd_set write_set{};
-  FD_ZERO(&read_set);
-  FD_ZERO(&write_set);
-  if ((interests & 1) != 0) FD_SET(socket, &read_set);
-  if ((interests & 2) != 0) FD_SET(socket, &write_set);
-  timeval timeout{};
-  timeval* timeout_ptr = nullptr;
-  if (timeout_millis >= 0) {
-    timeout.tv_sec = static_cast<long>(timeout_millis / 1000);
-    timeout.tv_usec = static_cast<long>((timeout_millis % 1000) * 1000);
-    timeout_ptr = &timeout;
-  }
-#if defined(_WIN32)
-  const int selected = ::select(0, &read_set, &write_set, nullptr, timeout_ptr);
-#else
-  const int selected = ::select(static_cast<int>(socket + 1), &read_set, &write_set, nullptr, timeout_ptr);
-#endif
-  if (selected < 0) return -1;
-  if (selected == 0) return 0;
-  std::int64_t events = 0;
-  if ((interests & 1) != 0 && FD_ISSET(socket, &read_set)) events |= 1;
-  if ((interests & 2) != 0 && FD_ISSET(socket, &write_set)) events |= 2;
-  return events;
+  RazPollRecord record{socket_value, interests, 0};
+  const auto ready = raz_rt_socket_poll_many(&record, 1, timeout_millis);
+  return ready < 0 ? -1 : record.events;
 }
 
 std::int64_t raz_rt_socket_send(std::int64_t socket_value, const void* data, std::int64_t size) {

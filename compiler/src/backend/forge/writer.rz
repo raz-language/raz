@@ -227,14 +227,14 @@ public struct ForgeWriter {
 
 fn writer_init(ForgeWriter&mut out) {
   out.capacity = 8388608;
-  out.data = raz_rt_stage1_arena_create(out.capacity);
+  out.data = raz_compiler_rt_arena_create(out.capacity);
   out.length = 0;
   out.failed = out.data == 0;
 }
 
 fn writer_destroy(ForgeWriter&mut out) {
   if (out.data != 0) {
-    raz_rt_stage1_arena_destroy(out.data);
+    raz_compiler_rt_arena_destroy(out.data);
   }
   out.data = 0;
   out.capacity = 0;
@@ -253,18 +253,18 @@ fn writer_grow(ForgeWriter&mut out) -> bool {
     return false;
   }
 
-  i64 next_data = raz_rt_stage1_arena_create(next_capacity);
+  i64 next_data = raz_compiler_rt_arena_create(next_capacity);
 
   if (next_data == 0) {
     out.failed = true;
     return false;
   }
-  if (raz_rt_stage1_arena_copy(next_data, 0, out.data, 0, out.length) != out.length) {
-    raz_rt_stage1_arena_destroy(next_data);
+  if (raz_compiler_rt_arena_copy(next_data, 0, out.data, 0, out.length) != out.length) {
+    raz_compiler_rt_arena_destroy(next_data);
     out.failed = true;
     return false;
   }
-  raz_rt_stage1_arena_destroy(out.data);
+  raz_compiler_rt_arena_destroy(out.data);
   out.data = next_data;
   out.capacity = next_capacity;
   return true;
@@ -277,7 +277,7 @@ fn writer_put(ForgeWriter&mut out, i64 code) {
   if (out.length >= out.capacity && !writer_grow(out)) {
     return;
   }
-  raz_rt_stage1_arena_set(out.data, out.length, code);
+  raz_compiler_rt_arena_set(out.data, out.length, code);
   out.length += 1;
 }
 
@@ -291,7 +291,7 @@ fn writer_chars(ForgeWriter&mut out, i64[]data, i64 length) {
 }
 
 fn writer_at(ForgeWriter& out, i64 index) -> i64 {
-  return raz_rt_stage1_arena_get(out.data, index);
+  return raz_compiler_rt_arena_get(out.data, index);
 }
 
 fn writer_space(ForgeWriter&mut out) {
@@ -334,7 +334,7 @@ fn writer_decimal(ForgeWriter&mut out, i64 value) {
   i64 count = 0;
 
   while (remaining > 0) {
-    i64 quotient = stage1_div_nonnegative(remaining, 10);
+    i64 quotient = compiler_div_nonnegative(remaining, 10);
 
     digits[count] = remaining - quotient * 10;
     count += 1;
@@ -423,7 +423,7 @@ fn writer_scalar_type(ForgeWriter&mut out, i64 type_kind) {
     return;
   }
   // Payload-bearing enums are represented by integer arena handles in the
-  // self-host runtime. Keep their Forge ABI aligned with construction, field
+  // compiler runtime. Keep their Forge ABI aligned with construction, field
   // projection, and arena intrinsics instead of spelling the handle as ptr.
   if (hir_type_is_enum(type_kind)) {
     writer_i64(out);
@@ -799,23 +799,23 @@ fn writer_compare(ForgeWriter&mut out, i64 opcode, i64 type_kind) {
 }
 
 fn writer_structure_needs_identity_suffix(Source& source, HirModule& hir, i64 structure) -> bool {
-  i64 offset = raz_rt_stage1_arena_get(hir.struct_name_offsets, structure);
-  i64 length = raz_rt_stage1_arena_get(hir.struct_name_lengths, structure);
+  i64 offset = raz_compiler_rt_arena_get(hir.struct_name_offsets, structure);
+  i64 length = raz_compiler_rt_arena_get(hir.struct_name_lengths, structure);
 
   if (offset < 0 || length <= 0) {
     return false;
   }
 
-  i64 template = raz_rt_stage1_arena_get(hir.struct_generic_template_indices, structure);
+  i64 template = raz_compiler_rt_arena_get(hir.struct_generic_template_indices, structure);
   i64 index = 0;
 
   while (index < hir.struct_count) {
     if (index != structure) {
-      i64 other_offset = raz_rt_stage1_arena_get(hir.struct_name_offsets, index);
-      i64 other_length = raz_rt_stage1_arena_get(hir.struct_name_lengths, index);
+      i64 other_offset = raz_compiler_rt_arena_get(hir.struct_name_offsets, index);
+      i64 other_length = raz_compiler_rt_arena_get(hir.struct_name_lengths, index);
 
       if (other_offset >= 0 && token_same(source, offset, length, other_offset, other_length)) {
-        i64 other_template = raz_rt_stage1_arena_get(hir.struct_generic_template_indices, index);
+        i64 other_template = raz_compiler_rt_arena_get(hir.struct_generic_template_indices, index);
 
         if (template < 0 || other_template < 0 || template != other_template) {
           return true;
@@ -831,8 +831,8 @@ fn writer_structure_name(ForgeWriter&mut out, Source& source, HirModule& hir, i6
   writer_text(
   out,
   source,
-  raz_rt_stage1_arena_get(hir.struct_name_offsets, structure),
-  raz_rt_stage1_arena_get(hir.struct_name_lengths, structure),
+  raz_compiler_rt_arena_get(hir.struct_name_offsets, structure),
+  raz_compiler_rt_arena_get(hir.struct_name_lengths, structure),
   );
   if (writer_structure_needs_identity_suffix(source, hir, structure)) {
     writer_put(out, 95);
@@ -840,55 +840,116 @@ fn writer_structure_name(ForgeWriter&mut out, Source& source, HirModule& hir, i6
     writer_decimal(out, structure);
   }
 
-  i64 generic_template = raz_rt_stage1_arena_get(hir.struct_generic_template_indices, structure);
+  i64 generic_template = raz_compiler_rt_arena_get(hir.struct_generic_template_indices, structure);
 
   if (generic_template >= 0) {
     writer_put(out, 95);
     writer_put(out, 103);
-    writer_put(out, 95);
 
-    i64 child_structure = raz_rt_stage1_arena_get(hir.struct_generic_type_structs, structure);
+    i64 argument_start = raz_compiler_rt_arena_get(hir.struct_generic_argument_starts, structure);
+    i64 argument_count = raz_compiler_rt_arena_get(hir.struct_generic_argument_counts, structure);
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.generic_struct_parameter_starts, generic_template);
+    i64 argument = 0;
 
-    if (child_structure >= 0) {
-      writer_structure_name(out, source, hir, child_structure);
-    } else {
-      writer_scalar_type(out, raz_rt_stage1_arena_get(hir.struct_generic_types, structure));
+    while (argument < argument_count) {
+      i64 parameter_kind = raz_compiler_rt_arena_get(hir.generic_parameter_kinds, parameter_start + argument);
+
+      if (parameter_kind != 1) {
+        i64 argument_structure = raz_compiler_rt_arena_get(
+        hir.struct_generic_argument_type_structs,
+        argument_start + argument,
+        );
+        i64 argument_type = raz_compiler_rt_arena_get(
+        hir.struct_generic_argument_types,
+        argument_start + argument,
+        );
+
+        writer_put(out, 95);
+        if (argument_structure >= 0) {
+          writer_structure_name(out, source, hir, argument_structure);
+        } else if (argument_structure == -2) {
+          writer_put(out, 99);
+          writer_decimal(out, argument_type);
+        } else {
+          writer_scalar_type(out, argument_type);
+        }
+      }
+      argument += 1;
     }
   }
 }
 
-fn function_native_symbol_same(Source& source, HirModule& hir, i64 left, i64 right) -> bool {
-  i64 left_offset = raz_rt_stage1_arena_get(hir.function_name_offsets, left);
-  i64 left_length = raz_rt_stage1_arena_get(hir.function_name_lengths, left);
+fn writer_function_generic_identity(
+ForgeWriter&mut out,
+Source& source,
+HirModule& hir,
+i64 function_index,
+) {
+  i64 template = raz_compiler_rt_arena_get(hir.function_generic_template_indices, function_index);
+  i64 argument_start = raz_compiler_rt_arena_get(hir.function_generic_argument_starts, function_index);
+  i64 argument_count = raz_compiler_rt_arena_get(hir.function_generic_argument_counts, function_index);
+  i64 parameter_start = raz_compiler_rt_arena_get(hir.generic_function_parameter_starts, template);
+  i64 index = 0;
 
-  if (raz_rt_stage1_arena_get(hir.function_link_name_lengths, left) > 0) {
-    left_offset = raz_rt_stage1_arena_get(hir.function_link_name_offsets, left);
-    left_length = raz_rt_stage1_arena_get(hir.function_link_name_lengths, left);
+  while (index < argument_count) {
+    i64 parameter_kind = raz_compiler_rt_arena_get(hir.generic_parameter_kinds, parameter_start + index);
+
+    if (parameter_kind != 1) {
+      i64 argument_structure = raz_compiler_rt_arena_get(
+      hir.function_generic_argument_type_structs,
+      argument_start + index,
+      );
+      i64 argument_type = raz_compiler_rt_arena_get(
+      hir.function_generic_argument_types,
+      argument_start + index,
+      );
+
+      writer_put(out, 95);
+      if (argument_structure >= 0) {
+        writer_structure_name(out, source, hir, argument_structure);
+      } else if (argument_structure == -2) {
+        writer_put(out, 99);
+        writer_decimal(out, argument_type);
+      } else {
+        writer_scalar_type(out, argument_type);
+      }
+    }
+    index += 1;
+  }
+}
+
+fn function_native_symbol_same(Source& source, HirModule& hir, i64 left, i64 right) -> bool {
+  i64 left_offset = raz_compiler_rt_arena_get(hir.function_name_offsets, left);
+  i64 left_length = raz_compiler_rt_arena_get(hir.function_name_lengths, left);
+
+  if (raz_compiler_rt_arena_get(hir.function_link_name_lengths, left) > 0) {
+    left_offset = raz_compiler_rt_arena_get(hir.function_link_name_offsets, left);
+    left_length = raz_compiler_rt_arena_get(hir.function_link_name_lengths, left);
   }
 
-  i64 right_offset = raz_rt_stage1_arena_get(hir.function_name_offsets, right);
-  i64 right_length = raz_rt_stage1_arena_get(hir.function_name_lengths, right);
+  i64 right_offset = raz_compiler_rt_arena_get(hir.function_name_offsets, right);
+  i64 right_length = raz_compiler_rt_arena_get(hir.function_name_lengths, right);
 
-  if (raz_rt_stage1_arena_get(hir.function_link_name_lengths, right) > 0) {
-    right_offset = raz_rt_stage1_arena_get(hir.function_link_name_offsets, right);
-    right_length = raz_rt_stage1_arena_get(hir.function_link_name_lengths, right);
+  if (raz_compiler_rt_arena_get(hir.function_link_name_lengths, right) > 0) {
+    right_offset = raz_compiler_rt_arena_get(hir.function_link_name_offsets, right);
+    right_length = raz_compiler_rt_arena_get(hir.function_link_name_lengths, right);
   }
   return token_same(source, left_offset, left_length, right_offset, right_length);
 }
 
 fn writer_function_needs_identity_suffix(Source& source, HirModule& hir, i64 function_index) -> bool {
   if (
-  raz_rt_stage1_arena_get(hir.function_is_extern, function_index) != 0 ||
-  raz_rt_stage1_arena_get(hir.function_inherent_structs, function_index) != -1 ||
-  raz_rt_stage1_arena_get(hir.function_closure_ids, function_index) >= 0 ||
-  raz_rt_stage1_arena_get(hir.function_drop_structs, function_index) >= 0 ||
-  raz_rt_stage1_arena_get(hir.function_clone_structs, function_index) >= 0
+  raz_compiler_rt_arena_get(hir.function_is_extern, function_index) != 0 ||
+  raz_compiler_rt_arena_get(hir.function_inherent_structs, function_index) != -1 ||
+  raz_compiler_rt_arena_get(hir.function_closure_ids, function_index) >= 0 ||
+  raz_compiler_rt_arena_get(hir.function_drop_structs, function_index) >= 0 ||
+  raz_compiler_rt_arena_get(hir.function_clone_structs, function_index) >= 0
   ) {
     return false;
   }
 
-  i64 offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function_index);
-  i64 length = raz_rt_stage1_arena_get(hir.function_name_lengths, function_index);
+  i64 offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
+  i64 length = raz_compiler_rt_arena_get(hir.function_name_lengths, function_index);
 
   if (
   length == 4 &&
@@ -900,23 +961,23 @@ fn writer_function_needs_identity_suffix(Source& source, HirModule& hir, i64 fun
     return false;
   }
 
-  i64 template = raz_rt_stage1_arena_get(hir.function_generic_template_indices, function_index);
+  i64 template = raz_compiler_rt_arena_get(hir.function_generic_template_indices, function_index);
   i64 index = 0;
 
   while (index < hir.function_count) {
     if (
     index != function_index &&
-    raz_rt_stage1_arena_get(hir.function_is_extern, index) == 0 &&
-    raz_rt_stage1_arena_get(hir.function_inherent_structs, index) == -1 &&
-    raz_rt_stage1_arena_get(hir.function_closure_ids, index) < 0 &&
-    raz_rt_stage1_arena_get(hir.function_drop_structs, index) < 0 &&
-    raz_rt_stage1_arena_get(hir.function_clone_structs, index) < 0
+    raz_compiler_rt_arena_get(hir.function_is_extern, index) == 0 &&
+    raz_compiler_rt_arena_get(hir.function_inherent_structs, index) == -1 &&
+    raz_compiler_rt_arena_get(hir.function_closure_ids, index) < 0 &&
+    raz_compiler_rt_arena_get(hir.function_drop_structs, index) < 0 &&
+    raz_compiler_rt_arena_get(hir.function_clone_structs, index) < 0
     ) {
-      i64 other_offset = raz_rt_stage1_arena_get(hir.function_name_offsets, index);
-      i64 other_length = raz_rt_stage1_arena_get(hir.function_name_lengths, index);
+      i64 other_offset = raz_compiler_rt_arena_get(hir.function_name_offsets, index);
+      i64 other_length = raz_compiler_rt_arena_get(hir.function_name_lengths, index);
 
       if (token_same(source, offset, length, other_offset, other_length)) {
-        i64 other_template = raz_rt_stage1_arena_get(hir.function_generic_template_indices, index);
+        i64 other_template = raz_compiler_rt_arena_get(hir.function_generic_template_indices, index);
 
         if (template < 0 || other_template < 0 || template != other_template) {
           return true;
@@ -930,29 +991,29 @@ fn writer_function_needs_identity_suffix(Source& source, HirModule& hir, i64 fun
 
 fn writer_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 function_index) {
   writer_put(out, 64);
-  if (raz_rt_stage1_arena_get(hir.function_is_extern, function_index) != 0) {
-    if (raz_rt_stage1_arena_get(hir.function_link_name_lengths, function_index) > 0) {
+  if (raz_compiler_rt_arena_get(hir.function_is_extern, function_index) != 0) {
+    if (raz_compiler_rt_arena_get(hir.function_link_name_lengths, function_index) > 0) {
       writer_text(
       out,
       source,
-      raz_rt_stage1_arena_get(hir.function_link_name_offsets, function_index),
-      raz_rt_stage1_arena_get(hir.function_link_name_lengths, function_index),
+      raz_compiler_rt_arena_get(hir.function_link_name_offsets, function_index),
+      raz_compiler_rt_arena_get(hir.function_link_name_lengths, function_index),
       );
     } else {
       writer_text(
       out,
       source,
-      raz_rt_stage1_arena_get(hir.function_name_offsets, function_index),
-      raz_rt_stage1_arena_get(hir.function_name_lengths, function_index),
+      raz_compiler_rt_arena_get(hir.function_name_offsets, function_index),
+      raz_compiler_rt_arena_get(hir.function_name_lengths, function_index),
       );
     }
     return;
   }
 
-  i64 drop_structure = raz_rt_stage1_arena_get(hir.function_drop_structs, function_index);
-  i64 clone_structure = raz_rt_stage1_arena_get(hir.function_clone_structs, function_index);
-  i64 closure_id = raz_rt_stage1_arena_get(hir.function_closure_ids, function_index);
-  i64 generic_template = raz_rt_stage1_arena_get(hir.function_generic_template_indices, function_index);
+  i64 drop_structure = raz_compiler_rt_arena_get(hir.function_drop_structs, function_index);
+  i64 clone_structure = raz_compiler_rt_arena_get(hir.function_clone_structs, function_index);
+  i64 closure_id = raz_compiler_rt_arena_get(hir.function_closure_ids, function_index);
+  i64 generic_template = raz_compiler_rt_arena_get(hir.function_generic_template_indices, function_index);
 
   if (closure_id >= 0) {
     writer_put(out, 95);
@@ -998,8 +1059,8 @@ fn writer_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64
     writer_put(out, 95);
     writer_structure_name(out, source, hir, clone_structure);
   } else {
-    i64 function_name_offset = raz_rt_stage1_arena_get(hir.function_name_offsets, function_index);
-    i64 function_name_length = raz_rt_stage1_arena_get(hir.function_name_lengths, function_index);
+    i64 function_name_offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
+    i64 function_name_length = raz_compiler_rt_arena_get(hir.function_name_lengths, function_index);
 
     if (
     function_name_length == 4 &&
@@ -1043,14 +1104,17 @@ fn writer_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64
       }
     }
 
-    i64 inherent_structure = raz_rt_stage1_arena_get(hir.function_inherent_structs, function_index);
+    i64 inherent_structure = raz_compiler_rt_arena_get(hir.function_inherent_structs, function_index);
 
-    if (generic_template < 0 && inherent_structure != -1) {
+    if (inherent_structure != -1) {
       writer_put(out, 95);
       writer_put(out, 105);
       writer_put(out, 95);
       if (inherent_structure >= 0) {
         writer_structure_name(out, source, hir, inherent_structure);
+      } else if (hir_method_target_is_scalar(inherent_structure)) {
+        writer_put(out, 116);
+        writer_decimal(out, hir_method_target_scalar_type(inherent_structure));
       } else {
         writer_put(out, 101);
         writer_decimal(out, -2 - inherent_structure);
@@ -1059,24 +1123,7 @@ fn writer_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64
     if (generic_template >= 0) {
       writer_put(out, 95);
       writer_put(out, 103);
-      writer_put(out, 95);
-      if (inherent_structure <= -2) {
-        writer_put(out, 101);
-        writer_decimal(out, -2 - inherent_structure);
-      } else {
-        i64 generic_structure = raz_rt_stage1_arena_get(
-        hir.function_generic_type_structs,
-        function_index,
-        );
-        if (generic_structure >= 0) {
-          writer_structure_name(out, source, hir, generic_structure);
-        } else {
-          writer_scalar_type(
-          out,
-          raz_rt_stage1_arena_get(hir.function_generic_types, function_index),
-          );
-        }
-      }
+      writer_function_generic_identity(out, source, hir, function_index);
     }
   }
 }
@@ -1088,15 +1135,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1115,15 +1164,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1143,15 +1194,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1167,15 +1220,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1191,15 +1246,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 101);
@@ -1216,15 +1273,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 101);
@@ -1238,15 +1297,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 101);
@@ -1260,15 +1321,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1288,15 +1351,17 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 97);
     writer_put(out, 122);
     writer_put(out, 95);
+    writer_put(out, 99);
+    writer_put(out, 111);
+    writer_put(out, 109);
+    writer_put(out, 112);
+    writer_put(out, 105);
+    writer_put(out, 108);
+    writer_put(out, 101);
+    writer_put(out, 114);
+    writer_put(out, 95);
     writer_put(out, 114);
     writer_put(out, 116);
-    writer_put(out, 95);
-    writer_put(out, 115);
-    writer_put(out, 116);
-    writer_put(out, 97);
-    writer_put(out, 103);
-    writer_put(out, 101);
-    writer_put(out, 49);
     writer_put(out, 95);
     writer_put(out, 97);
     writer_put(out, 114);
@@ -1312,7 +1377,7 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
     writer_put(out, 54);
     writer_put(out, 52);
   } else if (kind == 10) {
-    i64 name[32] = [114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 114, 101, 102, 95, 99, 114, 101, 97, 116, 101, 95, 97, 100, 100, 114, 101, 115, 115];
+    i64 name[34] = [114, 97, 122, 95, 99, 111, 109, 112, 105, 108, 101, 114, 95, 114, 116, 95, 114, 101, 102, 95, 99, 114, 101, 97, 116, 101, 95, 97, 100, 100, 114, 101, 115, 115];
     i64 i = 0;
 
     while (i < 32) {
@@ -1322,7 +1387,7 @@ fn writer_runtime_name(ForgeWriter&mut out, i64 kind) {
   }
 }
 
-fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
+fn emit_compiler_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 32);
   writer_put(out, 32);
   writer_put(out, 101);
@@ -1342,15 +1407,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -1404,15 +1471,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -1469,15 +1538,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -1542,15 +1613,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -1629,15 +1702,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -1770,15 +1845,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 101);
@@ -1842,15 +1919,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 101);
@@ -1903,15 +1982,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 101);
@@ -1978,15 +2059,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 119);
   writer_put(out, 114);
@@ -2066,15 +2149,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 101);
@@ -2322,15 +2407,17 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 108);
   writer_put(out, 105);
@@ -2422,7 +2509,7 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 52);
   writer_put(out, 10);
 
-  i64 normalize_text[112] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 110, 111, 114, 109, 97, 108, 105, 122, 101, 95, 112, 97, 116, 104, 40, 37, 112, 97, 116, 104, 58, 32, 105, 54, 52, 44, 32, 37, 112, 97, 116, 104, 95, 108, 101, 110, 103, 116, 104, 58, 32, 105, 54, 52, 44, 32, 37, 111, 117, 116, 112, 117, 116, 58, 32, 105, 54, 52, 44, 32, 37, 99, 97, 112, 97, 99, 105, 116, 121, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
+  i64 normalize_text[114] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 99, 111, 109, 112, 105, 108, 101, 114, 95, 114, 116, 95, 110, 111, 114, 109, 97, 108, 105, 122, 101, 95, 112, 97, 116, 104, 40, 37, 112, 97, 116, 104, 58, 32, 105, 54, 52, 44, 32, 37, 112, 97, 116, 104, 95, 108, 101, 110, 103, 116, 104, 58, 32, 105, 54, 52, 44, 32, 37, 111, 117, 116, 112, 117, 116, 58, 32, 105, 54, 52, 44, 32, 37, 99, 97, 112, 97, 99, 105, 116, 121, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
   i64 normalize_index = 0;
 
   while (normalize_index < 112) {
@@ -2430,7 +2517,7 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
     normalize_index += 1;
   }
 
-  i64 direct_ref_decl[70] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 114, 101, 102, 95, 99, 114, 101, 97, 116, 101, 95, 97, 100, 100, 114, 101, 115, 115, 40, 37, 97, 100, 100, 114, 101, 115, 115, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 54, 52, 10];
+  i64 direct_ref_decl[72] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 99, 111, 109, 112, 105, 108, 101, 114, 95, 114, 116, 95, 114, 101, 102, 95, 99, 114, 101, 97, 116, 101, 95, 97, 100, 100, 114, 101, 115, 115, 40, 37, 97, 100, 100, 114, 101, 115, 115, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 54, 52, 10];
   i64 direct_ref_index = 0;
 
   while (direct_ref_index < 70) {
@@ -2439,7 +2526,7 @@ fn emit_stage1_runtime_declarations(ForgeWriter&mut out) {
   }
 }
 
-fn emit_stage1_f64_runtime_declarations(ForgeWriter&mut out) {
+fn emit_compiler_f64_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 32);
   writer_put(out, 32);
   writer_put(out, 101);
@@ -2459,15 +2546,17 @@ fn emit_stage1_f64_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -2536,15 +2625,17 @@ fn emit_stage1_f64_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 97);
   writer_put(out, 114);
@@ -2610,7 +2701,7 @@ fn emit_stage1_f64_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 10);
 }
 
-fn emit_stage1_process_runtime_declarations(ForgeWriter&mut out) {
+fn emit_compiler_process_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 32);
   writer_put(out, 32);
   writer_put(out, 101);
@@ -2630,15 +2721,17 @@ fn emit_stage1_process_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 112);
   writer_put(out, 114);
@@ -2681,15 +2774,17 @@ fn emit_stage1_process_runtime_declarations(ForgeWriter&mut out) {
   writer_put(out, 97);
   writer_put(out, 122);
   writer_put(out, 95);
+  writer_put(out, 99);
+  writer_put(out, 111);
+  writer_put(out, 109);
+  writer_put(out, 112);
+  writer_put(out, 105);
+  writer_put(out, 108);
+  writer_put(out, 101);
+  writer_put(out, 114);
+  writer_put(out, 95);
   writer_put(out, 114);
   writer_put(out, 116);
-  writer_put(out, 95);
-  writer_put(out, 115);
-  writer_put(out, 116);
-  writer_put(out, 97);
-  writer_put(out, 103);
-  writer_put(out, 101);
-  writer_put(out, 49);
   writer_put(out, 95);
   writer_put(out, 112);
   writer_put(out, 114);
@@ -2743,7 +2838,7 @@ fn emit_stage1_process_runtime_declarations(ForgeWriter&mut out) {
   // LLVM native-output orchestration is implemented in Raz and launches the
   // selected host toolchain through this permanent process ABI boundary.
 
-  i64 run_ascii_decl[74] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 112, 114, 111, 99, 101, 115, 115, 95, 114, 117, 110, 95, 97, 115, 99, 105, 105, 40, 37, 112, 48, 58, 32, 105, 54, 52, 44, 32, 37, 112, 49, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
+  i64 run_ascii_decl[76] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 99, 111, 109, 112, 105, 108, 101, 114, 95, 114, 116, 95, 112, 114, 111, 99, 101, 115, 115, 95, 114, 117, 110, 95, 97, 115, 99, 105, 105, 40, 37, 112, 48, 58, 32, 105, 54, 52, 44, 32, 37, 112, 49, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
   i64 run_ascii_index = 0;
 
   while (run_ascii_index < 74) {
@@ -2811,8 +2906,8 @@ fn emit_forge_function_signatures(ForgeWriter&mut out, HirModule& hir) {
     writer_function_signature_name(out, signature);
     writer_put(out, 40);
 
-    i64 parameter_start = raz_rt_stage1_arena_get(hir.function_type_parameter_starts, signature);
-    i64 parameter_count = raz_rt_stage1_arena_get(hir.function_type_parameter_counts, signature);
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+    i64 parameter_count = raz_compiler_rt_arena_get(hir.function_type_parameter_counts, signature);
     i64 parameter = 0;
 
     while (parameter < parameter_count) {
@@ -2830,10 +2925,10 @@ fn emit_forge_function_signatures(ForgeWriter&mut out, HirModule& hir) {
 
       writer_function_signature_type(
       out,
-      raz_rt_stage1_arena_get(hir.function_type_parameter_type_structs, parameter_index),
-      raz_rt_stage1_arena_get(hir.function_type_parameter_types, parameter_index),
-      raz_rt_stage1_arena_get(hir.function_type_parameter_references, parameter_index),
-      raz_rt_stage1_arena_get(hir.function_type_parameter_slices, parameter_index),
+      raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, parameter_index),
+      raz_compiler_rt_arena_get(hir.function_type_parameter_types, parameter_index),
+      raz_compiler_rt_arena_get(hir.function_type_parameter_references, parameter_index),
+      raz_compiler_rt_arena_get(hir.function_type_parameter_slices, parameter_index),
       );
       parameter += 1;
     }
@@ -2844,10 +2939,10 @@ fn emit_forge_function_signatures(ForgeWriter&mut out, HirModule& hir) {
     writer_space(out);
     writer_function_signature_type(
     out,
-    raz_rt_stage1_arena_get(hir.function_type_return_type_structs, signature),
-    raz_rt_stage1_arena_get(hir.function_type_return_types, signature),
-    raz_rt_stage1_arena_get(hir.function_type_return_references, signature),
-    raz_rt_stage1_arena_get(hir.function_type_return_slices, signature),
+    raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature),
+    raz_compiler_rt_arena_get(hir.function_type_return_types, signature),
+    raz_compiler_rt_arena_get(hir.function_type_return_references, signature),
+    raz_compiler_rt_arena_get(hir.function_type_return_slices, signature),
     );
     writer_newline(out);
     signature += 1;
@@ -2872,7 +2967,7 @@ fn emit_forge_extern_function(ForgeWriter&mut out, Source& source, HirModule& hi
   writer_space(out);
   // Forge uses an explicit C calling-convention prefix. `system` and Raz use
   // the platform convention, so they intentionally omit a prefix here.
-  if (raz_rt_stage1_arena_get(hir.function_abi_kinds, function_index) == 1) {
+  if (raz_compiler_rt_arena_get(hir.function_abi_kinds, function_index) == 1) {
     writer_put(out, 99);
     // c
     writer_space(out);
@@ -2882,8 +2977,8 @@ fn emit_forge_extern_function(ForgeWriter&mut out, Source& source, HirModule& hi
   writer_function_name(out, source, hir, function_index);
   writer_put(out, 40);
 
-  i64 parameter_start = raz_rt_stage1_arena_get(hir.function_parameter_starts, function_index);
-  i64 parameter_count = raz_rt_stage1_arena_get(hir.function_parameter_counts, function_index);
+  i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+  i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
   i64 parameter = 0;
 
   while (parameter < parameter_count) {
@@ -2898,16 +2993,16 @@ fn emit_forge_extern_function(ForgeWriter&mut out, Source& source, HirModule& hi
     i64 index = parameter_start + parameter;
 
     if (
-    raz_rt_stage1_arena_get(hir.parameter_references, index) != 0 ||
-    raz_rt_stage1_arena_get(hir.parameter_slices, index) != 0 ||
-    raz_rt_stage1_arena_get(hir.parameter_array_extents, index) >= 0 ||
-    raz_rt_stage1_arena_get(hir.parameter_type_structs, index) >= 0
+    raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+    raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+    raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+    raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
     ) {
       writer_i64(out);
-    } else if (raz_rt_stage1_arena_get(hir.parameter_function_types, index) >= 0) {
+    } else if (raz_compiler_rt_arena_get(hir.parameter_function_types, index) >= 0) {
       writer_ptr(out);
     } else {
-      writer_scalar_type(out, raz_rt_stage1_arena_get(hir.parameter_types, index));
+      writer_scalar_type(out, raz_compiler_rt_arena_get(hir.parameter_types, index));
     }
     parameter += 1;
   }
@@ -2916,23 +3011,23 @@ fn emit_forge_extern_function(ForgeWriter&mut out, Source& source, HirModule& hi
   writer_put(out, 45);
   writer_put(out, 62);
   writer_space(out);
-  if (raz_rt_stage1_arena_get(hir.function_returns_value, function_index) == 0) {
+  if (raz_compiler_rt_arena_get(hir.function_returns_value, function_index) == 0) {
     writer_void(out);
   } else if (
-  raz_rt_stage1_arena_get(hir.function_return_references, function_index) != 0 ||
-  raz_rt_stage1_arena_get(hir.function_return_slices, function_index) != 0 ||
-  raz_rt_stage1_arena_get(hir.function_return_type_structs, function_index) >= 0
+  raz_compiler_rt_arena_get(hir.function_return_references, function_index) != 0 ||
+  raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0 ||
+  raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index) >= 0
   ) {
     writer_i64(out);
-  } else if (raz_rt_stage1_arena_get(hir.function_return_function_types, function_index) >= 0) {
+  } else if (raz_compiler_rt_arena_get(hir.function_return_function_types, function_index) >= 0) {
     writer_ptr(out);
   } else {
-    writer_scalar_type(out, raz_rt_stage1_arena_get(hir.function_return_types, function_index));
+    writer_scalar_type(out, raz_compiler_rt_arena_get(hir.function_return_types, function_index));
   }
   writer_newline(out);
 }
 
-fn emit_selfhost_async_runtime_declarations(ForgeWriter&mut out) {
+fn emit_compiler_async_runtime_declarations(ForgeWriter&mut out) {
   i64 text[979] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 114, 101, 97, 116, 101, 40, 37, 115, 108, 111, 116, 95, 99, 111, 117, 110, 116, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 112, 116, 114, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 115, 101, 116, 95, 112, 111, 108, 108, 101, 114, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 99, 97, 108, 108, 98, 97, 99, 107, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 102, 117, 116, 117, 114, 101, 95, 105, 54, 52, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 54, 52, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 108, 111, 97, 100, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 51, 50, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 115, 116, 111, 114, 101, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 115, 116, 97, 116, 101, 58, 32, 105, 51, 50, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 108, 111, 97, 100, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 115, 108, 111, 116, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 115, 108, 111, 116, 58, 32, 105, 54, 52, 44, 32, 37, 118, 97, 108, 117, 101, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 108, 111, 97, 100, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 54, 52, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 115, 116, 111, 114, 101, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 118, 97, 108, 117, 101, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 99, 97, 110, 99, 101, 108, 95, 114, 101, 113, 117, 101, 115, 116, 101, 100, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 49, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 97, 110, 99, 101, 108, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 112, 111, 108, 108, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 102, 117, 116, 117, 114, 101, 58, 32, 105, 54, 52, 44, 32, 37, 114, 101, 115, 117, 109, 101, 95, 115, 116, 97, 116, 101, 58, 32, 105, 51, 50, 41, 32, 45, 62, 32, 105, 51, 50, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 114, 101, 115, 117, 108, 116, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 105, 54, 52, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 100, 101, 115, 116, 114, 111, 121, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10];
   i64 index = 0;
 
@@ -2942,7 +3037,7 @@ fn emit_selfhost_async_runtime_declarations(ForgeWriter&mut out) {
   }
 }
 
-fn emit_selfhost_async_owned_runtime_declarations(ForgeWriter&mut out) {
+fn emit_compiler_async_owned_runtime_declarations(ForgeWriter&mut out) {
   i64 text[281] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 95, 111, 119, 110, 101, 100, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 115, 108, 111, 116, 58, 32, 105, 54, 52, 44, 32, 37, 118, 97, 108, 117, 101, 58, 32, 105, 54, 52, 44, 32, 37, 99, 108, 101, 97, 110, 117, 112, 58, 32, 112, 116, 114, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 100, 105, 115, 97, 114, 109, 40, 37, 102, 114, 97, 109, 101, 58, 32, 112, 116, 114, 44, 32, 37, 115, 108, 111, 116, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 118, 111, 105, 100, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 102, 117, 116, 117, 114, 101, 95, 99, 114, 101, 97, 116, 101, 40, 41, 32, 45, 62, 32, 105, 54, 52, 10, 32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 102, 117, 116, 117, 114, 101, 95, 99, 97, 110, 99, 101, 108, 40, 37, 102, 117, 116, 117, 114, 101, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
   i64 index = 0;
 
@@ -2952,8 +3047,8 @@ fn emit_selfhost_async_owned_runtime_declarations(ForgeWriter&mut out) {
   }
 }
 
-fn emit_selfhost_async_future_result_declaration(ForgeWriter&mut out) {
-  i64 text[82] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 102, 117, 116, 117, 114, 101, 95, 114, 101, 115, 117, 108, 116, 95, 105, 54, 52, 40, 37, 102, 117, 116, 117, 114, 101, 58, 32, 105, 54, 52, 44, 32, 37, 111, 117, 116, 112, 117, 116, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
+fn emit_compiler_async_future_result_declaration(ForgeWriter&mut out) {
+  i64 text[84] = [32, 32, 101, 120, 116, 101, 114, 110, 32, 102, 117, 110, 99, 32, 64, 114, 97, 122, 95, 99, 111, 109, 112, 105, 108, 101, 114, 95, 114, 116, 95, 102, 117, 116, 117, 114, 101, 95, 114, 101, 115, 117, 108, 116, 95, 105, 54, 52, 40, 37, 102, 117, 116, 117, 114, 101, 58, 32, 105, 54, 52, 44, 32, 37, 111, 117, 116, 112, 117, 116, 58, 32, 105, 54, 52, 41, 32, 45, 62, 32, 105, 54, 52, 10];
   i64 index = 0;
 
   while (index < 82) {
@@ -3342,7 +3437,7 @@ fn mir_block_expects_argument(MirModule& mir, i64 target) -> bool {
     return false;
   }
   return (
-  raz_rt_stage1_arena_get(mir.opcodes, target) == 24 &&
-  raz_rt_stage1_arena_get(mir.op_a, target) != 0
+  raz_compiler_rt_arena_get(mir.opcodes, target) == 24 &&
+  raz_compiler_rt_arena_get(mir.op_a, target) != 0
   );
 }

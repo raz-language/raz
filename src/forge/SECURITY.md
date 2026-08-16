@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes are applied to the latest released major/minor line. Older development archives are not maintained.
+Security fixes are applied to the latest released major/minor line. Older unreleased snapshots are not maintained.
 
 ## Reporting a vulnerability
 

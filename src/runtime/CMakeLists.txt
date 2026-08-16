@@ -20,7 +20,7 @@ if(OpenSSL_FOUND)
   target_compile_definitions(raz_runtime PRIVATE RAZ_HAVE_OPENSSL=1)
   target_link_libraries(raz_runtime PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
-  # The recursive self-host stages are linked outside CMake by the portable
+  # The recursive compiler stages are linked outside CMake by the portable
   # bootstrap driver. Export the exact imported OpenSSL library files selected
   # by CMake so that driver never has to guess package-specific cache keys.
   file(GENERATE

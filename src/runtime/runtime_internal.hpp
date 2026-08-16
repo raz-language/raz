@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cerrno>
@@ -78,6 +79,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <poll.h>
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -631,7 +633,64 @@ inline void release_erased_trait(RazErasedTraitObject* object) {
 #if defined(RAZ_HAVE_OPENSSL)
 struct RazTlsSession {
   SSL* ssl{};
+  std::string hostname;
 };
+
+struct RazTlsCacheEntry {
+  std::string hostname;
+  SSL_SESSION* session{};
+};
+
+struct RazTlsSessionCache {
+  std::mutex mutex;
+  std::array<RazTlsCacheEntry, 8> entries{};
+  std::size_t next{};
+
+  ~RazTlsSessionCache() {
+    for (auto& entry : entries) {
+      if (entry.session != nullptr) SSL_SESSION_free(entry.session);
+    }
+  }
+};
+
+inline RazTlsSessionCache& raz_tls_session_cache() {
+  static RazTlsSessionCache cache;
+  return cache;
+}
+
+inline SSL_SESSION* raz_tls_cached_session(const std::string& hostname) {
+  auto& cache = raz_tls_session_cache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  for (auto& entry : cache.entries) {
+    if (entry.session != nullptr && entry.hostname == hostname) {
+      if (SSL_SESSION_up_ref(entry.session) == 1) return entry.session;
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+inline void raz_tls_cache_session(const std::string& hostname, SSL* ssl) {
+  if (hostname.empty() || ssl == nullptr || SSL_is_init_finished(ssl) != 1) return;
+  SSL_SESSION* captured = SSL_get1_session(ssl);
+  if (captured == nullptr) return;
+
+  auto& cache = raz_tls_session_cache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  for (auto& entry : cache.entries) {
+    if (entry.session != nullptr && entry.hostname == hostname) {
+      SSL_SESSION_free(entry.session);
+      entry.session = captured;
+      return;
+    }
+  }
+
+  auto& entry = cache.entries[cache.next & (cache.entries.size() - 1)];
+  cache.next += 1;
+  if (entry.session != nullptr) SSL_SESSION_free(entry.session);
+  entry.hostname = hostname;
+  entry.session = captured;
+}
 
 inline SSL_CTX* raz_tls_client_context() {
   static std::once_flag once;
@@ -641,6 +700,10 @@ inline SSL_CTX* raz_tls_client_context() {
     if (context == nullptr) return;
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER, nullptr);
     SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
+    // Client sessions are retained explicitly in a tiny bounded host cache.
+    // OpenSSL keeps ticket/session internals opaque; Raz owns reuse policy at
+    // the connection layer without serializing cryptographic state.
+    SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
     if (SSL_CTX_set_default_verify_paths(context) != 1) {
       SSL_CTX_free(context);
       context = nullptr;

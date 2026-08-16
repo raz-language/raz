@@ -13,18 +13,18 @@ execute_process(
   OUTPUT_VARIABLE build_output
   ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
-  message(FATAL_ERROR "Self-host compiler build failed:\n${build_error}\n${build_output}")
+  message(FATAL_ERROR "Compiler compiler build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(stage1 "${WORK_ROOT}/compiler/target/host/debug/raz-compiler.exe")
+  set(seed "${WORK_ROOT}/compiler/target/host/debug/raz-compiler.exe")
 else()
-  set(stage1 "${WORK_ROOT}/compiler/target/host/debug/raz-compiler")
+  set(seed "${WORK_ROOT}/compiler/target/host/debug/raz-compiler")
 endif()
-if(NOT EXISTS "${stage1}")
-  message(FATAL_ERROR "Self-host compiler missing: ${stage1}")
+if(NOT EXISTS "${seed}")
+  message(FATAL_ERROR "Compiler compiler missing: ${seed}")
 endif()
 execute_process(
-  COMMAND "${stage1}" --profile-queries --check "${SOURCE_ROOT}/tests/layout/query_cache_stress.rz"
+  COMMAND "${seed}" --profile-queries --check "${SOURCE_ROOT}/tests/layout/query_cache_stress.rz"
   WORKING_DIRECTORY "${WORK_ROOT}"
   RESULT_VARIABLE profile_result
   OUTPUT_VARIABLE profile_output
@@ -49,7 +49,7 @@ endif()
 # epoch-aware negative cache should turn those repeated verified misses into
 # resolution-cache hits without hiding methods materialized later in analysis.
 execute_process(
-  COMMAND "${stage1}" --profile-queries --check "${SOURCE_ROOT}/tests/resolution/negative_method_cache_stress.rz"
+  COMMAND "${seed}" --profile-queries --check "${SOURCE_ROOT}/tests/resolution/negative_method_cache_stress.rz"
   WORKING_DIRECTORY "${WORK_ROOT}"
   RESULT_VARIABLE negative_profile_result
   OUTPUT_VARIABLE negative_profile_output
@@ -67,9 +67,9 @@ endif()
 
 # Pass AC: ordinary top-level function resolution is epoch-aware and cached.
 # Repeated calls to the same visible symbol must generate cache hits while
-# preserving Stage 0 / self-host acceptance parity.
+# preserving host compiler / compiler acceptance parity.
 execute_process(
-  COMMAND "${stage1}" --profile-queries --check "${SOURCE_ROOT}/tests/resolution/top_level_symbol_cache_stress.rz"
+  COMMAND "${seed}" --profile-queries --check "${SOURCE_ROOT}/tests/resolution/top_level_symbol_cache_stress.rz"
   WORKING_DIRECTORY "${WORK_ROOT}"
   RESULT_VARIABLE symbol_profile_result
   OUTPUT_VARIABLE symbol_profile_output

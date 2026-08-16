@@ -1,6 +1,98 @@
 # Package management
 
-Raz uses `raz.toml` for package metadata and `raz.lock` for deterministic dependency resolution. Path and registry dependencies feed the same project graph.
+Raz uses `raz.toml` for package metadata and `raz.lock` for deterministic dependency resolution. Local paths, the official registry, and commit-pinned Git sources feed the same package graph.
+
+## Dependency sections
+
+A manifest can declare runtime, test-only, build-tool, optional, and operating-system-specific dependencies:
+
+```toml
+[dependencies]
+core-utils = "../core-utils"
+
+[dev-dependencies]
+test-kit = "../test-kit"
+
+[build-dependencies]
+codegen = "../codegen"
+
+[optional-dependencies]
+tls = "../tls"
+
+[target.windows.dependencies]
+win32 = "../win32"
+
+[target.linux.dependencies]
+epoll = "../epoll"
+
+[target.macos.dependencies]
+darwin = "../darwin"
+
+[features]
+default = ["dep:tls"]
+full = ["default", "dep:extra"]
+```
+
+Normal dependencies are part of every build. Dev dependencies are added to the project graph for `raz test`. OS sections are selected from the host platform. Build dependencies are resolved and locked for tooling use but are not linked into the target program. Optional dependencies enter the graph only when enabled by a feature.
+
+Feature names can reference `dep:<alias>` or another feature. The root feature set is selected with:
+
+```text
+raz build --features=tls,extra raz.toml
+raz build --all-features raz.toml
+raz build --no-default-features raz.toml
+```
+
+Features are unified by name across the assembled package graph. `default` is enabled unless `--no-default-features` is supplied.
+
+## Workspaces
+
+A repository containing several Raz packages can use a root `raz.toml` with a workspace manifest:
+
+```toml
+[workspace]
+members = [
+    "crates/core",
+    "crates/net",
+    "apps/server",
+]
+```
+
+Workspace member paths are relative to the workspace root, use `/` separators, and must remain inside the workspace. Duplicate members, absolute paths, and `.` or `..` path segments are rejected. Inline and multiline member arrays are supported, including comments and trailing commas.
+
+From the workspace root, the following commands operate across every member in declaration order:
+
+```text
+raz build --workspace
+raz check --workspace
+raz test --workspace
+raz update --workspace
+raz fetch --workspace
+raz lock --workspace
+raz metadata --workspace
+raz graph --workspace
+raz tree --workspace
+```
+
+Backend and feature options are forwarded to member build/check/test commands. `library` members are type-checked during `raz build --workspace`; executable members emit normally. This matches Raz's source-package model, where library sources are assembled into consumers rather than requiring a standalone native library artifact.
+
+A workspace owns one root `raz.lock`. `raz lock --workspace` walks every member and its dependency graph, canonicalizes package identities, and writes each package once even when several members share it. `raz update --workspace` and `raz fetch --workspace` run dependency maintenance in each member directory, remove member-local lockfiles created by those operations, and regenerate the root lock. Registry/Git cache and tracking files remain member-local so a member can still be used independently.
+
+Workspace metadata, graph, and tree output are grouped under `workspace: <member>` headings. A package can depend on another workspace member using the same relative path dependency syntax used outside a workspace.
+
+## Adding dependencies
+
+Add a dependency directly to a specific section:
+
+```text
+raz add algorithms
+raz add test-kit ../test-kit --dev
+raz add codegen ../codegen --build
+raz add tls registry:tls@^1.4.0 --optional
+raz add epoll ../epoll --target=linux
+```
+
+The supported section selectors are `--dev`, `--build`, `--optional`, `--target=windows`, `--target=linux`, and `--target=macos`. `raz remove <alias>` searches every dependency section. Registry tracking records the original section, so `raz update` preserves dependency scope.
 
 ## Path dependencies
 
@@ -10,7 +102,19 @@ Add a local package with:
 raz add math ../math
 ```
 
-Raz validates the dependency manifest, updates `[dependencies]`, and regenerates `raz.lock`.
+Raz validates the dependency manifest, updates the selected dependency section, and regenerates `raz.lock`.
+
+## Git dependencies
+
+Git dependencies are deliberately commit-pinned. A source uses this form:
+
+```text
+raz add codec git:https://github.com/example/raz-codec#0123456789abcdef0123456789abcdef01234567
+```
+
+The revision must be a complete 40-character hexadecimal commit SHA. Raz invokes Git without a shell, materializes the checkout under `.raz/git/<content-key>/`, verifies that it contains `raz.toml`, records the immutable source in `.raz.git`, and writes the concrete cache path into the selected manifest section.
+
+`raz fetch` and `raz update` recreate missing Git materializations from `.raz.git`. They do not move a Git dependency to another revision; changing a Git revision is an explicit manifest/package-manager change. `.raz/` is cache state, while `.raz.git` is reproducibility metadata and should be committed with the project. Because the manifest points at the project-local Git materialization, Git dependencies are suitable for applications and workspaces but are not accepted in published package archives; publishable libraries should depend on registry packages or vendor the dependency source inside the package.
 
 ## Registry dependencies
 
@@ -19,19 +123,19 @@ The official Raz registry is the public [`raz-language/packages`](https://github
 Add the latest compatible stable package with:
 
 ```text
-raz add json
+raz add algorithms
 ```
 
 Or supply a semantic-version constraint directly:
 
 ```text
-raz add json@^1.2.0
+raz add semver@^1.0.0
 ```
 
 The explicit registry form remains available when an alias differs from the package name:
 
 ```text
-raz add my-json registry:json@^1.2.0
+raz add versioning registry:semver@^1.0.0
 ```
 
 Raz fetches `index.txt` from the official raw GitHub registry and resolves package archive paths relative to that repository. Supported constraints are:
@@ -41,7 +145,7 @@ Raz fetches `index.txt` from the official raw GitHub registry and resolves packa
 - tilde: `~1.2.0`
 - minimum: `>=1.2.0`
 
-The highest compatible version is selected deterministically.
+The highest compatible stable version is selected deterministically. Prerelease versions are considered only when the constraint explicitly names a prerelease.
 
 For tests, air-gapped environments, or local snapshots, set:
 
@@ -75,7 +179,7 @@ The registry checksum is verified against the complete selected package tree bef
 
 ## Shared package store
 
-Registry packages are materialized into a content-addressed store before they are written into the project manifest.
+Registry packages are materialized into a content-addressed store. Manifests record a portable virtual reference such as `registry:4f83c2...` rather than a machine-specific absolute cache path; the project loader maps that reference to the configured local store.
 
 Store selection is:
 
@@ -90,7 +194,7 @@ Entries are stored as:
 <store>/<content-hash>/
 ```
 
-Projects therefore reference immutable verified package content rather than mutable registry locations. Multiple projects using the same package content reuse the same store entry.
+Projects therefore reference immutable verified package content rather than mutable registry locations or machine-specific paths. Multiple projects using the same package content reuse the same store entry.
 
 ## Offline mode
 
@@ -106,19 +210,27 @@ A missing or corrupt store entry is an error in offline mode. Raz never silently
 
 ## Locking and updates
 
-`raz lock` rebuilds the deterministic lockfile from the current package graph. `raz update` re-evaluates tracked registry constraints and selects the highest compatible version currently available. Repeating either operation without input changes produces byte-stable output.
+`raz lock` rebuilds the deterministic lockfile from all declared dependency sections. Registry lock entries record the portable `registry:<content-hash>` path together with `source = "registry"` and the verified checksum, never the local store directory.
 
-Registry constraints are tracked separately from the concrete stored path so updates retain the original version intent. Removing a dependency removes its registry tracking as well.
+`raz update` re-evaluates tracked registry constraints, preserves each dependency's original section, restores missing pinned Git materializations, and selects the highest compatible registry version currently available. `raz fetch` instead treats `raz.lock` as authoritative: it materializes the exact locked registry versions/checksums and does not upgrade them. If no lockfile exists, `fetch` performs the initial resolution needed to create one. Repeating either operation without input changes produces byte-stable output.
 
-## Inspection
+Registry constraints and Git identities are tracked separately from concrete cache paths so dependency intent survives cache cleanup. Removing a dependency removes its registry or Git tracking as well. Lock generation rejects graphs where the same package name resolves to different versions or different package roots; Raz reports the conflict instead of silently choosing whichever dependency happened to be traversed first.
+
+## Discovery and inspection
 
 ```text
+raz search <query>
+raz info <package>
+raz outdated
 raz metadata
 raz graph
+raz tree
 raz registry <name> <constraint>
 ```
 
-`metadata` prints recursive package information. `graph` prints dependency relationships. `registry` shows the version and store path selected for a registry constraint.
+`search` performs a case-insensitive package-name search over the static registry index and prints each matching package with its latest version. `info` lists the latest and all published versions of one package. Neither command downloads package archives.
+
+`outdated` compares each tracked registry dependency's concrete installed version with the latest published version and also reports the latest version compatible with its recorded constraint when an in-range upgrade exists. `metadata` prints recursive package information. `graph` and its conventional alias `tree` print dependency relationships, while `registry` shows the version and store path selected for a registry constraint.
 
 ## Creating package archives
 
@@ -134,7 +246,7 @@ The default output is `<name>-<version>.dpk`. You can choose another output path
 raz pack dist/widget-1.2.3.dpk
 ```
 
-`pack` excludes generated project state (`.git/`, `.raz/`, `.raz-publish/`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). The archive uses the same full-tree content hash used by the package store and registry verifier.
+`pack` excludes generated project state (`.git/`, `.raz/`, `.raz.cache`, `.raz.registry`, `.raz.registry-index`, `.raz.git`, `.raz-publish/`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). It rejects dependency paths that would escape the archive or point into machine-local cache state; published packages must use registry dependencies or vendored paths contained inside the package. The archive uses the same full-tree content hash used by the package store and registry verifier.
 
 ## Publishing
 

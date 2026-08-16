@@ -14,6 +14,12 @@ import std::net::http::headers;
 import std::net::tls;
 import std::net::url;
 
+fn load_byte_fast(usize address) -> i64 {
+    unsafe {
+        return (*((address)as u8*const))as i64;
+    }
+}
+
 public enum ClientError {
     None,
     InvalidUrl,
@@ -488,7 +494,7 @@ fn response_http11(BytesView version) -> bool {
     i64 i = 0;
 
     while (i<8) {
-        if (core::bytes::load_u8(version.data + i) != expected[i]) {
+        if (load_byte_fast(version.data + i) != expected[i]) {
             return false;
         }
         i += 1;
@@ -575,8 +581,8 @@ fn header_name_equal(BytesView left, usize right, i64 right_length) -> bool {
     i64 i = 0;
 
     while (i < right_length) {
-        i64 a = core::bytes::load_u8(left.data + i);
-        i64 b = core::bytes::load_u8(right + i);
+        i64 a = load_byte_fast(left.data + i);
+        i64 b = load_byte_fast(right + i);
 
         if (a >= 65 && a <= 90) {
             a += 32;
@@ -848,10 +854,10 @@ fn method_is_head(usize method, i64 length) -> bool {
     return (
         length == 4 &&
         method != 0 &&
-        core::bytes::load_u8(method) == 72 &&
-        core::bytes::load_u8(method + 1) == 69 &&
-        core::bytes::load_u8(method + 2) == 65 &&
-        core::bytes::load_u8(method + 3) == 68
+        load_byte_fast(method) == 72 &&
+        load_byte_fast(method + 1) == 69 &&
+        load_byte_fast(method + 2) == 65 &&
+        load_byte_fast(method + 3) == 68
     );
 }
 
@@ -1399,4 +1405,115 @@ impl Drop for HttpClient {
     fn drop(HttpClient&mut self) {
         close_connection(self);
     }
+}
+
+/// Four-origin HTTP/1.1 connection pool. Each slot is a full reusable client,
+/// so hot services retain independent TCP/TLS connections and buffers without
+/// allocating pool metadata or performing a hash-table lookup per request.
+public struct HttpClientPool {
+    HttpClient slot0;
+    HttpClient slot1;
+    HttpClient slot2;
+    HttpClient slot3;
+    i64 next_slot;
+    i64 pool_hits;
+    i64 pool_misses;
+}
+
+public fn pool_new(
+    i64 buffer_capacity,
+    i64 max_header_bytes,
+    i64 max_body_bytes,
+    i64 timeout_millis,
+) -> HttpClientPool {
+    return HttpClientPool {
+        slot0: new(buffer_capacity, max_header_bytes, max_body_bytes, timeout_millis),
+        slot1: new(buffer_capacity, max_header_bytes, max_body_bytes, timeout_millis),
+        slot2: new(buffer_capacity, max_header_bytes, max_body_bytes, timeout_millis),
+        slot3: new(buffer_capacity, max_header_bytes, max_body_bytes, timeout_millis),
+        next_slot: 0,
+        pool_hits: 0,
+        pool_misses: 0,
+    };
+}
+
+fn pool_matches(HttpClient& client, UrlView& view) -> bool {
+    return host_equal(client, view.host, view.port, std::net::url::is_https(view));
+}
+
+/// Executes a GET using the connection already associated with the URL origin
+/// when possible. A miss replaces slots round-robin, keeping selection O(1)
+/// and bounded while supporting the common small multi-origin working set.
+public fn pool_get(
+    HttpClientPool&mut pool,
+    usize url_data,
+    i64 url_length,
+    HeaderBlock& headers,
+    HttpResponse&mut output,
+) -> ClientError {
+    Result<UrlView, UrlError> parsed = std::net::url::parse(url_data, url_length);
+    UrlView view = UrlView {
+        source: BytesView { data: 0, length: 0 },
+        scheme: BytesView { data: 0, length: 0 },
+        host: BytesView { data: 0, length: 0 },
+        port: 0,
+        explicit_port: false,
+        path: BytesView { data: 0, length: 0 },
+        query: BytesView { data: 0, length: 0 },
+        fragment: BytesView { data: 0, length: 0 },
+    };
+    match parsed {
+        Result<UrlView, UrlError>::Error(_) => {
+            return ClientError::InvalidUrl;
+        }
+        Result<UrlView, UrlError>::Ok(value) => {
+            view = value;
+        }
+    }
+
+    if (pool_matches(&pool.slot0, &view)) {
+        pool.pool_hits += 1;
+        return get(&mut pool.slot0, url_data, url_length, headers, output);
+    }
+    if (pool_matches(&pool.slot1, &view)) {
+        pool.pool_hits += 1;
+        return get(&mut pool.slot1, url_data, url_length, headers, output);
+    }
+    if (pool_matches(&pool.slot2, &view)) {
+        pool.pool_hits += 1;
+        return get(&mut pool.slot2, url_data, url_length, headers, output);
+    }
+    if (pool_matches(&pool.slot3, &view)) {
+        pool.pool_hits += 1;
+        return get(&mut pool.slot3, url_data, url_length, headers, output);
+    }
+
+    pool.pool_misses += 1;
+    ClientError result = ClientError::None;
+    if (pool.next_slot == 0) {
+        result = get(&mut pool.slot0, url_data, url_length, headers, output);
+    } else if (pool.next_slot == 1) {
+        result = get(&mut pool.slot1, url_data, url_length, headers, output);
+    } else if (pool.next_slot == 2) {
+        result = get(&mut pool.slot2, url_data, url_length, headers, output);
+    } else {
+        result = get(&mut pool.slot3, url_data, url_length, headers, output);
+    }
+    pool.next_slot = (pool.next_slot + 1) & 3;
+    return result;
+}
+
+public fn pool_hits(HttpClientPool& pool) -> i64 {
+    return pool.pool_hits;
+}
+
+public fn pool_misses(HttpClientPool& pool) -> i64 {
+    return pool.pool_misses;
+}
+
+public fn pool_close(HttpClientPool&mut pool) {
+    close(&mut pool.slot0);
+    close(&mut pool.slot1);
+    close(&mut pool.slot2);
+    close(&mut pool.slot3);
 }

@@ -5,9 +5,15 @@ namespace std::path;
 // Pure-Raz lexical path manipulation over UTF-8 byte buffers. This module
 // deliberately performs no filesystem I/O; it is safe to use for paths that do
 // not exist yet and for sandboxed path construction.
-extern fn raz_rt_load_u8(usize address) -> i64;
-extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
+
+fn load_byte(usize address) -> i64 {
+    unsafe { return (*(address as u8*const))as i64; }
+}
+
+fn store_byte(usize address, i64 value) {
+    unsafe { *(address as u8*mut) = (value & 255)as u8; }
+}
 
 public struct PathView {
     usize data;
@@ -26,7 +32,7 @@ public fn byte_at(PathView path, i64 index) -> i64 {
     if (index < 0 || index >= path.length || path.data == 0) {
         return -1;
     }
-    return raz_rt_load_u8(path.data + index);
+    return load_byte(path.data + index);
 }
 
 public fn is_absolute(PathView path) -> bool {
@@ -34,14 +40,14 @@ public fn is_absolute(PathView path) -> bool {
         return false;
     }
 
-    i64 first = raz_rt_load_u8(path.data);
+    i64 first = load_byte(path.data);
 
     if (is_separator(first)) {
         return true;
     }
     if (path.length >= 3) {
-        i64 second = raz_rt_load_u8(path.data + 1);
-        i64 third = raz_rt_load_u8(path.data + 2);
+        i64 second = load_byte(path.data + 1);
+        i64 third = load_byte(path.data + 2);
         bool drive_letter = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
 
         return drive_letter && second == 58 && is_separator(third);
@@ -57,7 +63,7 @@ public fn filename_start(PathView path) -> i64 {
     i64 index = path.length;
 
     while (index > 0) {
-        i64 byte = raz_rt_load_u8(path.data + index - 1);
+        i64 byte = load_byte(path.data + index - 1);
 
         if (is_separator(byte)) {
             return index;
@@ -78,15 +84,15 @@ public fn parent_length(PathView path) -> i64 {
 
     i64 end = path.length;
 
-    while (end > 1 && is_separator(raz_rt_load_u8(path.data + end - 1))) {
+    while (end > 1 && is_separator(load_byte(path.data + end - 1))) {
         end -= 1;
     }
 
     i64 index = end;
 
     while (index > 0) {
-        if (is_separator(raz_rt_load_u8(path.data + index - 1))) {
-            while (index > 1 && is_separator(raz_rt_load_u8(path.data + index - 1))) {
+        if (is_separator(load_byte(path.data + index - 1))) {
+            while (index > 1 && is_separator(load_byte(path.data + index - 1))) {
                 index -= 1;
             }
             return index;
@@ -103,7 +109,7 @@ public fn extension_start(PathView path) -> i64 {
     while (index > start) {
         index -= 1;
 
-        i64 byte = raz_rt_load_u8(path.data + index);
+        i64 byte = load_byte(path.data + index);
 
         if (byte == 46) {
             if (index == start) {
@@ -134,13 +140,13 @@ public fn join_required(PathView left, PathView right) -> i64 {
 
     i64 left_end = left.length;
 
-    while (left_end > 1 && is_separator(raz_rt_load_u8(left.data + left_end - 1))) {
+    while (left_end > 1 && is_separator(load_byte(left.data + left_end - 1))) {
         left_end -= 1;
     }
 
     i64 right_start = 0;
 
-    while (right_start < right.length && is_separator(raz_rt_load_u8(right.data + right_start))) {
+    while (right_start < right.length && is_separator(load_byte(right.data + right_start))) {
         right_start += 1;
     }
     return left_end + 1 + right.length - right_start;
@@ -165,19 +171,19 @@ public fn join_into(PathView left, PathView right, usize output, i64 capacity) -
 
     i64 left_end = left.length;
 
-    while (left_end > 1 && is_separator(raz_rt_load_u8(left.data + left_end - 1))) {
+    while (left_end > 1 && is_separator(load_byte(left.data + left_end - 1))) {
         left_end -= 1;
     }
 
     i64 right_start = 0;
 
-    while (right_start < right.length && is_separator(raz_rt_load_u8(right.data + right_start))) {
+    while (right_start < right.length && is_separator(load_byte(right.data + right_start))) {
         right_start += 1;
     }
     if (left_end > 0) {
         raz_rt_copy(output, left.data, left_end);
     }
-    raz_rt_store_u8(output + left_end, 47);
+    store_byte(output + left_end, 47);
 
     i64 tail = right.length - right_start;
 
@@ -197,14 +203,14 @@ public fn normalize_separators_into(PathView path, usize output, i64 capacity) -
     bool previous_separator = false;
 
     while (read < path.length) {
-        i64 byte = raz_rt_load_u8(path.data + read);
+        i64 byte = load_byte(path.data + read);
         bool separator = is_separator(byte);
 
         if (!separator || !previous_separator || (written < 2 && path.length >= 2)) {
             if (separator) {
                 byte = 47;
             }
-            raz_rt_store_u8(output + written, byte);
+            store_byte(output + written, byte);
             written += 1;
         }
         previous_separator = separator;
@@ -256,13 +262,13 @@ fn output_ends_dot_dot(usize output, i64 root, i64 written) -> bool {
 
     i64 start = written;
 
-    while (start > root && raz_rt_load_u8(output + start - 1) != 47) {
+    while (start > root && load_byte(output + start - 1) != 47) {
         start -= 1;
     }
     return (
         written - start == 2 &&
-        raz_rt_load_u8(output + start) == 46 &&
-        raz_rt_load_u8(output + start + 1) == 46
+        load_byte(output + start) == 46 &&
+        load_byte(output + start + 1) == 46
     );
 }
 
@@ -273,13 +279,13 @@ fn pop_output_component(usize output, i64 root, i64 written) -> i64 {
 
     i64 end = written;
 
-    while (end > root && raz_rt_load_u8(output + end - 1) == 47) {
+    while (end > root && load_byte(output + end - 1) == 47) {
         end -= 1;
     }
-    while (end > root && raz_rt_load_u8(output + end - 1) != 47) {
+    while (end > root && load_byte(output + end - 1) != 47) {
         end -= 1;
     }
-    if (end > root && raz_rt_load_u8(output + end - 1) == 47) {
+    if (end > root && load_byte(output + end - 1) == 47) {
         end -= 1;
     }
     if (end < root) {
@@ -297,7 +303,7 @@ fn append_component(
     i64 start,
     i64 length,
 ) -> i64 {
-    bool needs_separator = written > 0 && raz_rt_load_u8(output + written - 1) != 47;
+    bool needs_separator = written > 0 && load_byte(output + written - 1) != 47;
     i64 required = written + length;
 
     if (needs_separator) {
@@ -307,7 +313,7 @@ fn append_component(
         return -1;
     }
     if (needs_separator) {
-        raz_rt_store_u8(output + written, 47);
+        store_byte(output + written, 47);
         written += 1;
     }
     if (length > 0) {
@@ -334,24 +340,24 @@ public fn normalize_lexical_into(PathView path, usize output, i64 capacity) -> i
         if (capacity < 1) {
             return -1;
         }
-        raz_rt_store_u8(output, 47);
+        store_byte(output, 47);
         written = 1;
         read = 1;
     } else if (root == 2) {
         if (capacity < 2) {
             return -1;
         }
-        raz_rt_store_u8(output, 47);
-        raz_rt_store_u8(output + 1, 47);
+        store_byte(output, 47);
+        store_byte(output + 1, 47);
         written = 2;
         read = 2;
     } else if (root == 3) {
         if (capacity < 3) {
             return -1;
         }
-        raz_rt_store_u8(output, byte_at(path, 0));
-        raz_rt_store_u8(output + 1, 58);
-        raz_rt_store_u8(output + 2, 47);
+        store_byte(output, byte_at(path, 0));
+        store_byte(output + 1, 58);
+        store_byte(output + 2, 47);
         written = 3;
         read = 3;
     }
@@ -392,7 +398,7 @@ public fn normalize_lexical_into(PathView path, usize output, i64 capacity) -> i
         if (capacity < 1) {
             return -1;
         }
-        raz_rt_store_u8(output, 46);
+        store_byte(output, 46);
         return 1;
     }
     return written;

@@ -11,6 +11,7 @@ extern fn raz_rt_dealloc(usize pointer);
 extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
 
 public struct HashMap<K, V> {
     usize keys;
@@ -70,12 +71,16 @@ fn set_state(usize states, i64 slot, i64 value) {
 }
 
 fn zero_states(usize states, i64 capacity) {
-    i64 index = 0;
-
-    while (index < capacity) {
-        set_state(states, index, 0);
-        index += 1;
+    if (states != 0 && capacity > 0) {
+        raz_rt_fill(states, 0, capacity);
     }
+}
+
+fn hash_control(i64 hash) -> i64 {
+    // 0 is empty and 1 is a tombstone. Occupied buckets keep a seven-bit hash
+    // fingerprint in the control byte, eliminating almost all expensive Eq
+    // calls on probe collisions without adding another metadata allocation.
+    return 2 + ((hash >> 7) & 127);
 }
 
 fn growth_threshold(i64 capacity) -> i64 {
@@ -111,7 +116,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     fn is_empty(HashMap<K, V>& self) -> bool {
         return self.length == 0;
     }
-    fn find_slot(HashMap<K, V>& self, K& key, bool insertion) -> i64 {
+    fn find_slot_hashed(HashMap<K, V>& self, K& key, bool insertion, i64 hash) -> i64 {
         if (self.capacity <= 0) {
             return -1;
         }
@@ -119,7 +124,8 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         // hottest lookup loop and preserves all low hash bits.
 
         i64 mask = self.capacity - 1;
-        i64 slot = key.hash() & mask;
+        i64 slot = hash & mask;
+        i64 control = hash_control(hash);
         i64 first_tombstone = -1;
         i64 scanned = 0;
 
@@ -130,13 +136,16 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
                 if (insertion && first_tombstone >= 0) {
                     return first_tombstone;
                 }
-                return slot;
+                if (insertion) {
+                    return slot;
+                }
+                return -1;
             }
-            if (state == 2) {
+            if (state == 1) {
                 if (insertion && first_tombstone < 0) {
                     first_tombstone = slot;
                 }
-            } else {
+            } else if (state == control) {
                 unsafe {
                     K& stored = & *((self.keys + slot * (size_of<K>()as i64))as K*const);
 
@@ -148,7 +157,13 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             slot = (slot + 1) & mask;
             scanned += 1;
         }
-        return first_tombstone;
+        if (insertion) {
+            return first_tombstone;
+        }
+        return -1;
+    }
+    fn find_slot(HashMap<K, V>& self, K& key, bool insertion) -> i64 {
+        return self.find_slot_hashed(key, insertion, key.hash());
     }
     fn rehash(HashMap<K, V>&mut self, i64 requested) -> bool {
         i64 next = requested;
@@ -208,14 +223,15 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         i64 index = 0;
 
         while (index < old_capacity) {
-            if (state_at(old_states, index) == 1) {
+            if (state_at(old_states, index) >= 2) {
                 unsafe {
                     K& key = & *((old_keys + index * key_size)as K*const);
-                    i64 slot = self.find_slot(key, true);
+                    i64 hash = key.hash();
+                    i64 slot = self.find_slot_hashed(key, true, hash);
 
                     raz_rt_copy(self.keys + slot * key_size, old_keys + index * key_size, key_size);
                     raz_rt_copy(self.values + slot * value_size, old_values + index * value_size, value_size);
-                    set_state(self.states, slot, 1);
+                    set_state(self.states, slot, hash_control(hash));
                     self.length += 1;
                 }
             }
@@ -290,7 +306,8 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             return false;
         }
 
-        i64 slot = self.find_slot(&key, true);
+        i64 hash = key.hash();
+        i64 slot = self.find_slot_hashed(&key, true, hash);
 
         if (slot < 0) {
             return false;
@@ -298,20 +315,20 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
 
         i64 state = state_at(self.states, slot);
 
-        if (state == 1) {
+        if (state >= 2) {
             unsafe {
                 V replaced = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
 
                 replaced;
             }
         } else {
-            if (state == 2) {
+            if (state == 1) {
                 self.tombstones -= 1;
             }
             unsafe {
                 *((self.keys + slot * (size_of<K>()as i64))as K*mut) = move key;
             }
-            set_state(self.states, slot, 1);
+            set_state(self.states, slot, hash_control(hash));
             self.length += 1;
         }
         // Keep the owning value move at one syntactic site. Besides being
@@ -325,12 +342,12 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     fn contains_key(HashMap<K, V>& self, K& key) -> bool {
         i64 slot = self.find_slot(key, false);
 
-        return slot >= 0 && state_at(self.states, slot) == 1;
+        return slot >= 0;
     }
     fn get_ptr(HashMap<K, V>& self, K& key) -> V*const {
         i64 slot = self.find_slot(key, false);
 
-        if (slot < 0 || state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             unsafe {
                 return 0 as V*const;
             }
@@ -342,7 +359,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     fn get_mut_ptr(HashMap<K, V>&mut self, K& key) -> V*mut {
         i64 slot = self.find_slot(key, false);
 
-        if (slot < 0 || state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             unsafe {
                 return 0 as V*mut;
             }
@@ -354,7 +371,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     fn remove(HashMap<K, V>&mut self, K& key) -> Option<V> {
         i64 slot = self.find_slot(key, false);
 
-        if (slot < 0 || state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             return Option<V>::None;
         }
         unsafe {
@@ -362,7 +379,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             K removed_key = move*((self.keys + slot * (size_of<K>()as i64))as K*mut);
 
             removed_key;
-            set_state(self.states, slot, 2);
+            set_state(self.states, slot, 1);
             self.length -= 1;
             self.tombstones += 1;
             return Option<V>::Some(move removed_value);
@@ -371,7 +388,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     fn try_remove(HashMap<K, V>&mut self, K& key, V&mut output) -> bool {
         i64 slot = self.find_slot(key, false);
 
-        if (slot < 0 || state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             return false;
         }
         unsafe {
@@ -381,7 +398,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
 
             removed_key;
         }
-        set_state(self.states, slot, 2);
+        set_state(self.states, slot, 1);
         self.length -= 1;
         self.tombstones += 1;
         return true;
@@ -390,7 +407,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         i64 slot = 0;
 
         while (slot < self.capacity) {
-            if (state_at(self.states, slot) == 1) {
+            if (state_at(self.states, slot) >= 2) {
                 unsafe {
                     K removed_key = move*((self.keys + slot * (size_of<K>()as i64))as K*mut);
                     V removed_value = move*((self.values + slot * (size_of<V>()as i64))as V*mut);
@@ -399,9 +416,9 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
                     removed_value;
                 }
             }
-            set_state(self.states, slot, 0);
             slot += 1;
         }
+        zero_states(self.states, self.capacity);
         self.length = 0;
         self.tombstones = 0;
     }
@@ -460,7 +477,7 @@ impl<K> Iterator for HashMapKeyIter<K> {
             i64 slot = self.index;
 
             self.index += 1;
-            if (state_at(self.states, slot) == 1) {
+            if (state_at(self.states, slot) >= 2) {
                 self.current_slot = slot;
                 return true;
             }
@@ -482,7 +499,7 @@ impl<V> Iterator for HashMapValueIter<V> {
             i64 slot = self.index;
 
             self.index += 1;
-            if (state_at(self.states, slot) == 1) {
+            if (state_at(self.states, slot) >= 2) {
                 self.current_slot = slot;
                 return true;
             }
@@ -504,7 +521,7 @@ impl<K, V> Iterator for HashMapEntryIter<K, V> {
             i64 slot = self.index;
 
             self.index += 1;
-            if (state_at(self.states, slot) == 1) {
+            if (state_at(self.states, slot) >= 2) {
                 self.current_slot = slot;
                 return true;
             }

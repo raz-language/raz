@@ -7,11 +7,10 @@ namespace std::io::buffered;
 extern fn raz_rt_alloc(i64 size) -> usize;
 extern fn raz_rt_dealloc(usize pointer);
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
-extern fn raz_rt_load_u8(usize address) -> i64;
 extern fn raz_rt_file_read(usize handle, usize output, i64 capacity) -> i64;
 extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
 extern fn raz_rt_file_flush(usize handle) -> i64;
-public const i64 default_buffer_capacity = 8192;
+public const i64 default_buffer_capacity = 65536;
 
 public struct BufReader {
     usize handle;
@@ -168,7 +167,11 @@ public fn reader_read_byte(BufReader&mut value) -> i64 {
         }
     }
 
-    i64 byte = raz_rt_load_u8(value.buffer + value.start);
+    i64 byte = 0;
+
+    unsafe {
+        byte = (*((value.buffer + value.start)as u8*const))as i64;
+    }
 
     value.start += 1;
     return byte;
@@ -224,7 +227,7 @@ public fn writer_valid(BufWriter& value) -> bool {
     return value.handle != 0 && value.buffer != 0 && value.capacity > 0;
 }
 
-public fn writer_flush(BufWriter&mut value) -> bool {
+fn writer_drain(BufWriter&mut value) -> bool {
     if (!writer_valid(value)) {
         return false;
     }
@@ -244,6 +247,13 @@ public fn writer_flush(BufWriter&mut value) -> bool {
         written += count;
     }
     value.length = 0;
+    return true;
+}
+
+public fn writer_flush(BufWriter&mut value) -> bool {
+    if (!writer_drain(value)) {
+        return false;
+    }
     return raz_rt_file_flush(value.handle) == 1;
 }
 
@@ -255,7 +265,7 @@ public fn writer_write(BufWriter&mut value, usize data, i64 size) -> bool {
         return true;
     }
     if (size >= value.capacity) {
-        if (value.length > 0 && !writer_flush(value)) {
+        if (value.length > 0 && !writer_drain(value)) {
             return false;
         }
 
@@ -271,7 +281,7 @@ public fn writer_write(BufWriter&mut value, usize data, i64 size) -> bool {
         }
         return true;
     }
-    if (value.length + size > value.capacity && !writer_flush(value)) {
+    if (value.length + size > value.capacity && !writer_drain(value)) {
         return false;
     }
     raz_rt_copy(value.buffer + value.length, data, size);

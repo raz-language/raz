@@ -1,53 +1,50 @@
 # Contributing to Raz
 
-Thank you for helping improve Raz. The compiler is self-hosting, so changes must preserve both ordinary compiler correctness and recursive bootstrap correctness.
+Thank you for helping improve Raz. The production compiler is implemented in Raz, so changes must preserve compiler correctness, host-compiler compatibility, and reproducible compiler construction.
 
 ## Design rules
 
 1. **Forge remains the sole production backend.** Do not add a C emitter, LLVM fallback, or alternate production code generator.
 2. **Language behavior belongs in Raz.** Do not move compiler semantics or standard-library functionality into native shims simply because the Raz implementation is harder.
-3. **Keep Stage 0 frozen and native boundaries narrow.** C++ is appropriate for the frozen bootstrap seed, runtime, OS, filesystem, process, networking, and ABI boundaries that cannot reasonably live in Raz. Do not implement new language semantics in Stage 0 for feature parity; production compiler work belongs under `compiler/src/`.
+3. **Keep the host compiler compatibility-stable and native boundaries narrow.** C++ is appropriate for the host compiler and permanent runtime/OS/ABI boundaries that cannot reasonably live in Raz. New language semantics belong under `compiler/src/`.
 4. **Preserve determinism.** Source discovery, dependency ordering, generated identifiers, and compiler output must remain reproducible.
-5. **Keep one canonical compiler source set.** The self-hosted compiler lives under `compiler/src/` as semantic modules with explicit imports; `src/main.rz` is the entry module. `compiler/bootstrap-source-order.txt` is seed/recovery metadata only. Do not reintroduce `compiler/source-order.txt` or commit generated stage mirrors.
+5. **Keep one canonical compiler source set.** The production compiler lives under `compiler/src/` as semantic modules with explicit imports; `src/main.rz` is the entry module. `compiler/host-source-order.txt` is host-compiler ordering metadata only. Do not reintroduce `compiler/source-order.txt` or commit generated compiler mirrors.
 
 ## Before opening a change
 
 For normal native/compiler work:
 
 ```bash
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 ```
 
-For Windows release/self-hosting changes:
+For Windows release/compiler reproducibility changes:
 
 ```bat
 bootstrap.bat -Clean -RunTests
 ```
 
-For full release qualification:
-
-```bat
-release.bat -Clean
-```
+The compiler repository does not build installers. Binary packaging and publishing
+are maintained in the separate `raz-language/installer` repository.
 
 Also run the focused checks that match your change. Useful repository scripts include:
 
 ```text
-scripts/check-layout.py
-scripts/check-native-boundary.py
-scripts/check-forge-package.py
-scripts/format-raz.py
+tests/python/check-layout.py
+tests/python/check-native-boundary.py
+tests/python/check-forge-package.py
+tools/format-raz.py
 ```
 
 ## Style and comments
 
-Run the Raz formatter before committing:
+Run the Raz formatter on the files or directories you changed before committing:
 
 ```text
-python scripts/format-raz.py .
-python scripts/format-raz.py . --check
+python tools/format-raz.py compiler/src/driver/my_change.rz
+python tools/format-raz.py compiler/src/driver/my_change.rz --check
 ```
 
 Raz source uses four-space indentation; Raz-owned C++ follows the repository `.clang-format`/`.editorconfig`. Vendored Forge source keeps its upstream style. Comments should explain intent, invariants, or a non-obvious tradeoff rather than narrating syntax a reader can already see. See [Source formatting](docs/FORMATTING.md) for the full repository convention.
@@ -68,7 +65,7 @@ Keep generated build output out of commits. The repository `.gitignore` excludes
 Raz is Apache-2.0 licensed. Unless explicitly stated otherwise, work intentionally submitted for inclusion in Raz is contributed under Apache-2.0. New maintained source, build, and script files must include the repository copyright/SPDX header. Run:
 
 ```text
-python scripts/check-license-headers.py
+python tests/python/check-license-headers.py
 ```
 
 before submitting changes. Preserve third-party copyright, license, and NOTICE material when importing external code. See [docs/LICENSING.md](docs/LICENSING.md).

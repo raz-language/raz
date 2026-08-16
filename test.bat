@@ -4,9 +4,7 @@ REM SPDX-License-Identifier: Apache-2.0
 
 setlocal
 set "ROOT=%~dp0"
-python "%ROOT%scripts\check-layout.py"
-if errorlevel 1 exit /b %ERRORLEVEL%
-python "%ROOT%scripts\check-native-boundary.py"
+python "%ROOT%tests\check-source.py"
 if errorlevel 1 exit /b %ERRORLEVEL%
 if exist "%ROOT%build\release\CTestTestfile.cmake" (
   ctest --test-dir "%ROOT%build\release" --output-on-failure %*

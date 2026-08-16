@@ -12,7 +12,7 @@ if %ERRORLEVEL% EQU 0 (
     set "POWERSHELL=powershell.exe"
 )
 
-"%POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\verify.ps1" %*
+"%POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\verify.ps1" %*
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" echo Verification failed with exit code %RC%.
 if not "%RAZ_NO_PAUSE%"=="1" pause

@@ -7,10 +7,6 @@ extern fn raz_rt_alloc(i64 size) -> usize;
 extern fn raz_rt_dealloc(usize pointer);
 extern fn raz_rt_fill(usize destination, i64 value, i64 size);
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
-extern fn raz_rt_load_u8(usize address) -> i64;
-extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
-extern fn raz_rt_volatile_load_i64(usize address) -> i64;
-extern fn raz_rt_volatile_store_i64(usize address, i64 value);
 
 public struct RawHashMap {
     usize keys;
@@ -32,6 +28,48 @@ fn hash_map_hash(i64 key) -> i64 {
     return mixed;
 }
 
+fn hash_map_control(i64 hash) -> i64 {
+    // 0 is empty, 1 is a tombstone, occupied slots carry a seven-bit
+    // fingerprint so probes usually avoid touching the key array.
+    return 2 + ((hash >> 7) & 127);
+}
+
+fn hash_map_normalize_capacity(i64 requested) -> i64 {
+    i64 capacity = 8;
+
+    while (capacity < requested) {
+        if (capacity > 576460752303423487) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    return capacity;
+}
+
+fn hash_map_state(usize states, i64 slot) -> i64 {
+    unsafe {
+        return (*((states + slot)as u8*const))as i64;
+    }
+}
+
+fn hash_map_set_state(usize states, i64 slot, i64 value) {
+    unsafe {
+        *((states + slot)as u8*mut) = value as u8;
+    }
+}
+
+fn hash_map_key(usize keys, i64 slot) -> i64 {
+    unsafe {
+        return *((keys + slot * 8)as i64*const);
+    }
+}
+
+fn hash_map_set_key(usize keys, i64 slot, i64 value) {
+    unsafe {
+        *((keys + slot * 8)as i64*mut) = value;
+    }
+}
+
 fn hash_map_growth_threshold(i64 capacity) -> i64 {
     // ceil(capacity * 0.7) without overflowing a signed 64-bit multiply.
     return (capacity / 10) * 7 + ((capacity % 10) * 7 + 9) / 10;
@@ -51,6 +89,18 @@ fn hash_map_allocate(i64 value_size, i64 capacity) -> RawHashMap {
     }
     if (capacity < 8) {
         capacity = 8;
+    }
+    capacity = hash_map_normalize_capacity(capacity);
+    if (capacity == 0) {
+        return RawHashMap {
+            keys: 0,
+            values: 0,
+            states: 0,
+            length: 0,
+            capacity: 0,
+            value_size: value_size,
+            tombstones: 0
+        };
     }
     if (capacity > 1152921504606846975 || value_size > 9223372036854775807 / capacity) {
         return RawHashMap {
@@ -115,12 +165,14 @@ fn hash_map_find_slot(RawHashMap& map, i64 key, bool insertion) -> i64 {
         return -1;
     }
 
-    i64 slot = hash_map_hash(key) % map.capacity;
+    i64 hash = hash_map_hash(key);
+    i64 slot = hash & (map.capacity - 1);
+    i64 control = hash_map_control(hash);
     i64 tomb = -1;
     i64 scanned = 0;
 
     while (scanned<map.capacity) {
-        i64 state = raz_rt_load_u8(map.states + slot);
+        i64 state = hash_map_state(map.states, slot);
 
         if (state == 0) {
             if (insertion && tomb >= 0) {
@@ -131,14 +183,14 @@ fn hash_map_find_slot(RawHashMap& map, i64 key, bool insertion) -> i64 {
             }
             return -1;
         }
-        if (state == 2) {
+        if (state == 1) {
             if (insertion && tomb<0) {
                 tomb = slot;
             }
-        } else if (raz_rt_volatile_load_i64(map.keys + slot*8) == key) {
+        } else if (state == control && hash_map_key(map.keys, slot) == key) {
             return slot;
         }
-        slot = (slot + 1) % map.capacity;
+        slot = (slot + 1) & (map.capacity - 1);
         scanned += 1;
     }
     return tomb;
@@ -155,18 +207,18 @@ fn hash_map_insert_no_grow(RawHashMap&mut map, i64 key, usize source) -> bool {
         return false;
     }
 
-    i64 state = raz_rt_load_u8(map.states + slot);
+    i64 state = hash_map_state(map.states, slot);
 
-    if (state == 1) {
+    if (state >= 2) {
         raz_rt_copy(map.values + slot*map.value_size, source, map.value_size);
         return true;
     }
-    if (state == 2) {
+    if (state == 1) {
         map.tombstones -= 1;
     }
-    raz_rt_volatile_store_i64(map.keys + slot*8, key);
+    hash_map_set_key(map.keys, slot, key);
     raz_rt_copy(map.values + slot*map.value_size, source, map.value_size);
-    raz_rt_store_u8(map.states + slot, 1);
+    hash_map_set_state(map.states, slot, hash_map_control(hash_map_hash(key)));
     map.length += 1;
     return true;
 }
@@ -200,10 +252,10 @@ public fn raw_hash_map_reserve(RawHashMap&mut map, i64 required) -> bool {
     i64 slot = 0;
 
     while (slot<map.capacity) {
-        if (raz_rt_load_u8(map.states + slot) == 1) {
+        if (hash_map_state(map.states, slot) >= 2) {
             hash_map_insert_no_grow(
                 &mut replacement,
-                raz_rt_volatile_load_i64(map.keys + slot*8),
+                hash_map_key(map.keys, slot),
                 map.values + slot*map.value_size,
             );
         }
@@ -277,7 +329,7 @@ public fn raw_hash_map_remove(RawHashMap&mut map, i64 key, usize output) -> bool
     if (output != 0) {
         raz_rt_copy(output, map.values + slot*map.value_size, map.value_size);
     }
-    raz_rt_store_u8(map.states + slot, 2);
+    hash_map_set_state(map.states, slot, 1);
     map.length -= 1;
     map.tombstones += 1;
     return true;

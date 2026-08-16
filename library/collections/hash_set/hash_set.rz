@@ -11,6 +11,7 @@ extern fn raz_rt_dealloc(usize pointer);
 extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
 
 public struct HashSet<T> {
     usize keys;
@@ -44,12 +45,13 @@ fn set_state_value(usize states, i64 slot, i64 value) {
 }
 
 fn set_zero_states(usize states, i64 capacity) {
-    i64 index = 0;
-
-    while (index < capacity) {
-        set_state_value(states, index, 0);
-        index += 1;
+    if (states != 0 && capacity > 0) {
+        raz_rt_fill(states, 0, capacity);
     }
+}
+
+fn set_hash_control(i64 hash) -> i64 {
+    return 2 + ((hash >> 7) & 127);
 }
 
 fn set_growth_threshold(i64 capacity) -> i64 {
@@ -83,13 +85,14 @@ impl<T: Hash + Eq> HashSet<T> {
     fn is_empty(HashSet<T>& self) -> bool {
         return self.length == 0;
     }
-    fn find_slot(HashSet<T>& self, T& value, bool insertion) -> i64 {
+    fn find_slot_hashed(HashSet<T>& self, T& value, bool insertion, i64 hash) -> i64 {
         if (self.capacity <= 0) {
             return -1;
         }
 
         i64 mask = self.capacity - 1;
-        i64 slot = value.hash() & mask;
+        i64 slot = hash & mask;
+        i64 control = set_hash_control(hash);
         i64 first_tombstone = -1;
         i64 scanned = 0;
 
@@ -100,13 +103,16 @@ impl<T: Hash + Eq> HashSet<T> {
                 if (insertion && first_tombstone >= 0) {
                     return first_tombstone;
                 }
-                return slot;
+                if (insertion) {
+                    return slot;
+                }
+                return -1;
             }
-            if (state == 2) {
+            if (state == 1) {
                 if (insertion && first_tombstone < 0) {
                     first_tombstone = slot;
                 }
-            } else {
+            } else if (state == control) {
                 unsafe {
                     T& stored = & *((self.keys + slot * (size_of<T>()as i64))as T*const);
 
@@ -118,7 +124,13 @@ impl<T: Hash + Eq> HashSet<T> {
             slot = (slot + 1) & mask;
             scanned += 1;
         }
-        return first_tombstone;
+        if (insertion) {
+            return first_tombstone;
+        }
+        return -1;
+    }
+    fn find_slot(HashSet<T>& self, T& value, bool insertion) -> i64 {
+        return self.find_slot_hashed(value, insertion, value.hash());
     }
     fn rehash(HashSet<T>&mut self, i64 requested) -> bool {
         i64 next = requested;
@@ -164,13 +176,14 @@ impl<T: Hash + Eq> HashSet<T> {
         i64 index = 0;
 
         while (index < old_capacity) {
-            if (set_state_at(old_states, index) == 1) {
+            if (set_state_at(old_states, index) >= 2) {
                 unsafe {
                     T& value = & *((old_keys + index * key_size)as T*const);
-                    i64 slot = self.find_slot(value, true);
+                    i64 hash = value.hash();
+                    i64 slot = self.find_slot_hashed(value, true, hash);
 
                     raz_rt_copy(self.keys + slot * key_size, old_keys + index * key_size, key_size);
-                    set_state_value(self.states, slot, 1);
+                    set_state_value(self.states, slot, set_hash_control(hash));
                     self.length += 1;
                 }
             }
@@ -241,7 +254,8 @@ impl<T: Hash + Eq> HashSet<T> {
             return false;
         }
 
-        i64 slot = self.find_slot(&value, true);
+        i64 hash = value.hash();
+        i64 slot = self.find_slot_hashed(&value, true, hash);
 
         if (slot < 0) {
             return false;
@@ -249,34 +263,34 @@ impl<T: Hash + Eq> HashSet<T> {
 
         i64 state = set_state_at(self.states, slot);
 
-        if (state == 1) {
+        if (state >= 2) {
             return false;
         }
-        if (state == 2) {
+        if (state == 1) {
             self.tombstones -= 1;
         }
         unsafe {
             *((self.keys + slot * (size_of<T>()as i64))as T*mut) = move value;
         }
-        set_state_value(self.states, slot, 1);
+        set_state_value(self.states, slot, set_hash_control(hash));
         self.length += 1;
         return true;
     }
     fn contains(HashSet<T>& self, T& value) -> bool {
         i64 slot = self.find_slot(value, false);
 
-        return slot >= 0 && set_state_at(self.states, slot) == 1;
+        return slot >= 0;
     }
     fn take(HashSet<T>&mut self, T& value) -> Option<T> {
         i64 slot = self.find_slot(value, false);
 
-        if (slot < 0 || set_state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             return Option<T>::None;
         }
         unsafe {
             T removed = move*((self.keys + slot * (size_of<T>()as i64))as T*mut);
 
-            set_state_value(self.states, slot, 2);
+            set_state_value(self.states, slot, 1);
             self.length -= 1;
             self.tombstones += 1;
             return Option<T>::Some(move removed);
@@ -285,7 +299,7 @@ impl<T: Hash + Eq> HashSet<T> {
     fn remove(HashSet<T>&mut self, T& value) -> bool {
         i64 slot = self.find_slot(value, false);
 
-        if (slot < 0 || set_state_at(self.states, slot) != 1) {
+        if (slot < 0) {
             return false;
         }
         unsafe {
@@ -293,7 +307,7 @@ impl<T: Hash + Eq> HashSet<T> {
 
             removed;
         }
-        set_state_value(self.states, slot, 2);
+        set_state_value(self.states, slot, 1);
         self.length -= 1;
         self.tombstones += 1;
         return true;
@@ -302,16 +316,16 @@ impl<T: Hash + Eq> HashSet<T> {
         i64 slot = 0;
 
         while (slot < self.capacity) {
-            if (set_state_at(self.states, slot) == 1) {
+            if (set_state_at(self.states, slot) >= 2) {
                 unsafe {
                     T removed = move*((self.keys + slot * (size_of<T>()as i64))as T*mut);
 
                     removed;
                 }
             }
-            set_state_value(self.states, slot, 0);
             slot += 1;
         }
+        set_zero_states(self.states, self.capacity);
         self.length = 0;
         self.tombstones = 0;
     }
@@ -335,7 +349,7 @@ impl<T> Iterator for HashSetIter<T> {
             i64 slot = self.index;
 
             self.index += 1;
-            if (set_state_at(self.states, slot) == 1) {
+            if (set_state_at(self.states, slot) >= 2) {
                 self.current_slot = slot;
                 return true;
             }

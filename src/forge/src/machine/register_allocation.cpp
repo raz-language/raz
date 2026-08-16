@@ -124,7 +124,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
     // This is an optional code-quality transform, not a correctness requirement.
     // It recomputes full CFG liveness after every individual split, which is
     // intentionally precise for ordinary functions but becomes pathological for
-    // generated/self-host compiler functions with thousands of SSA values and
+    // generated/production compiler functions with thousands of SSA values and
     // hundreds of calls. The allocator already handles call-crossing values via
     // callee-saved registers and spills, so use that bounded fallback for large
     // functions instead of turning object emission into a multi-minute fixed
@@ -809,7 +809,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
     // Compute interference and peak pressure from liveness-segment events.
     // The previous implementation compared every pair of virtual registers and
     // then rescanned every interval at every instruction position.  Those two
-    // diagnostic/statistics passes were quadratic and dominated self-host object
+    // diagnostic/statistics passes were quadratic and dominated compiler object
     // emission once the compiler grew to thousands of SSA values per function.
     struct LivenessEvent {
         std::uint32_t position{};

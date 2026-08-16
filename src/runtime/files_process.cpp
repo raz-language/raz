@@ -444,6 +444,94 @@ std::int64_t raz_rt_process_run_argv(const char* program, std::int64_t program_l
 #endif
 }
 
+std::int64_t raz_rt_process_run_argv_cwd(const char* program, std::int64_t program_length,
+                                          const char* blob, std::int64_t blob_length,
+                                          std::int64_t argument_count,
+                                          const char* working_directory,
+                                          std::int64_t working_directory_length) {
+  if (program == nullptr || program_length <= 0 || blob_length < 0 || argument_count < 0 ||
+      working_directory == nullptr || working_directory_length <= 0 ||
+      (blob_length > 0 && blob == nullptr)) {
+    raz_set_last_error(EINVAL);
+    return -1;
+  }
+  const auto executable = view_text(program, program_length);
+  const auto cwd = view_text(working_directory, working_directory_length);
+  std::vector<std::string> arguments;
+  arguments.reserve(static_cast<std::size_t>(argument_count) + 1);
+  arguments.push_back(executable);
+  std::int64_t cursor = 0;
+  for (std::int64_t index = 0; index < argument_count; ++index) {
+    if (cursor > blob_length) { raz_set_last_error(EINVAL); return -1; }
+    const auto start = cursor;
+    while (cursor < blob_length && blob[cursor] != '\0') ++cursor;
+    if (cursor >= blob_length) { raz_set_last_error(EINVAL); return -1; }
+    arguments.emplace_back(blob + start, static_cast<std::size_t>(cursor - start));
+    ++cursor;
+  }
+#if defined(_WIN32)
+  auto quote_windows_argument = [](const std::string& value) {
+    if (value.empty()) return std::string("\"\"");
+    const bool needs_quotes = value.find_first_of(" \t\"") != std::string::npos;
+    if (!needs_quotes) return value;
+    std::string out; out.push_back('"');
+    std::size_t slashes = 0;
+    for (const char ch : value) {
+      if (ch == '\\') { ++slashes; continue; }
+      if (ch == '"') {
+        out.append(slashes * 2 + 1, '\\'); out.push_back('"'); slashes = 0; continue;
+      }
+      out.append(slashes, '\\'); slashes = 0; out.push_back(ch);
+    }
+    out.append(slashes * 2, '\\'); out.push_back('"');
+    return out;
+  };
+  std::string command_line;
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
+    if (i != 0) command_line.push_back(' ');
+    command_line += quote_windows_argument(arguments[i]);
+  }
+
+  std::vector<char> mutable_command(command_line.begin(), command_line.end());
+  mutable_command.push_back('\0');
+  STARTUPINFOA startup{}; startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessA(executable.c_str(), mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                      cwd.c_str(), &startup, &process)) {
+    raz_set_last_error(static_cast<std::int64_t>(GetLastError())); return -1;
+  }
+
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  if (!GetExitCodeProcess(process.hProcess, &exit_code)) exit_code = 1;
+  CloseHandle(process.hThread); CloseHandle(process.hProcess);
+  raz_clear_last_error();
+  return static_cast<std::int64_t>(exit_code);
+#else
+  const pid_t child = ::fork();
+  if (child < 0) { raz_set_errno_error(); return -1; }
+  if (child == 0) {
+    if (::chdir(cwd.c_str()) != 0) _exit(126);
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    argv.push_back(nullptr);
+    ::execvp(executable.c_str(), argv.data());
+    _exit(127);
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0) {
+    if (errno == EINTR) continue;
+    raz_set_errno_error(); return -1;
+  }
+
+  raz_clear_last_error();
+  if (WIFEXITED(status)) return static_cast<std::int64_t>(WEXITSTATUS(status));
+  if (WIFSIGNALED(status)) return 128 + static_cast<std::int64_t>(WTERMSIG(status));
+  return -1;
+#endif
+}
+
 std::int64_t raz_rt_process_argc() {
   return static_cast<std::int64_t>(process_arguments().size());
 }

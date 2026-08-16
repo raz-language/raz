@@ -15,6 +15,15 @@ extern fn raz_rt_process_run_argv(
     i64 blob_length,
     i64 argument_count,
 ) -> i64;
+extern fn raz_rt_process_run_argv_cwd(
+    usize program,
+    i64 program_length,
+    usize blob,
+    i64 blob_length,
+    i64 argument_count,
+    usize working_directory,
+    i64 working_directory_length,
+) -> i64;
 
 public struct ExitStatus {
     i64 code;
@@ -23,6 +32,7 @@ public struct ExitStatus {
 public struct Command {
     String program;
     String arguments;
+    String working_directory;
     i64 argument_count;
 }
 
@@ -33,6 +43,7 @@ public fn new(usize program, i64 length) -> Command {
     return Command {
         program: move executable,
         arguments: move arguments,
+        working_directory: alloc::string::with_capacity(0),
         argument_count: 0
     };
 }
@@ -60,6 +71,20 @@ public fn clear_args(Command&mut command) {
     command.argument_count = 0;
 }
 
+/// Sets a working directory without invoking a shell. Storage is retained and
+/// reused when the same Command is executed repeatedly.
+public fn cwd_bytes(Command&mut command, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) {
+        return false;
+    }
+    alloc::string::clear(&mut command.working_directory);
+    return alloc::string::append_bytes(&mut command.working_directory, data, length);
+}
+
+public fn clear_cwd(Command&mut command) {
+    alloc::string::clear(&mut command.working_directory);
+}
+
 public fn status(Command& command) -> Result<ExitStatus, IoError> {
     if (!valid(command)) {
         return Result<ExitStatus, IoError>::Error(IoError {
@@ -68,13 +93,27 @@ public fn status(Command& command) -> Result<ExitStatus, IoError> {
         }
         );
     }
-    i64 code = raz_rt_process_run_argv(
-        command.program.data,
-        command.program.length,
-        command.arguments.data,
-        command.arguments.length,
-        command.argument_count,
-    );
+    i64 code = 0;
+
+    if (command.working_directory.length > 0) {
+        code = raz_rt_process_run_argv_cwd(
+            command.program.data,
+            command.program.length,
+            command.arguments.data,
+            command.arguments.length,
+            command.argument_count,
+            command.working_directory.data,
+            command.working_directory.length,
+        );
+    } else {
+        code = raz_rt_process_run_argv(
+            command.program.data,
+            command.program.length,
+            command.arguments.data,
+            command.arguments.length,
+            command.argument_count,
+        );
+    }
     if (code < 0) {
         return Result<ExitStatus, IoError>::Error(std::io::error::last_error(IoOperation::Open));
     }
@@ -98,4 +137,8 @@ public fn new_string(String& program) -> Command {
 
 public fn arg_string(Command&mut command, String& value) -> bool {
     return arg_bytes(command, alloc::string::data_ptr(value), alloc::string::len(value));
+}
+
+public fn cwd_string(Command&mut command, String& value) -> bool {
+    return cwd_bytes(command, alloc::string::data_ptr(value), alloc::string::len(value));
 }

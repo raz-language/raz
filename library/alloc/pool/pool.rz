@@ -1,0 +1,181 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace alloc::pool;
+
+// Fixed-size freelist pool. One host allocation creates the backing region;
+// allocate/release are O(1) pointer/index operations with no allocator calls.
+extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+extern fn raz_rt_fill(usize destination, i64 value, i64 size);
+
+public struct FixedPool {
+    usize data;
+    i64 item_size;
+    i64 stride;
+    i64 capacity;
+    i64 available;
+    i64 free_head;
+    i64 alignment;
+}
+
+fn valid_alignment(i64 alignment) -> bool {
+    return alignment > 0 && alignment <= 4096 && (alignment & (alignment - 1)) == 0;
+}
+
+fn align_up(i64 value, i64 alignment) -> i64 {
+    if (value < 0 || !valid_alignment(alignment) || value > 9223372036854775807 - (alignment - 1)) {
+        return -1;
+    }
+    return (value + alignment - 1) & (0 - alignment);
+}
+
+fn set_next(usize slot, i64 next) {
+    unsafe {
+        *(slot as i64*mut) = next;
+    }
+}
+
+fn get_next(usize slot) -> i64 {
+    unsafe {
+        return *(slot as i64*const);
+    }
+}
+
+/// Creates a fixed pool for `capacity` objects. The backing allocation is the
+/// only general-purpose allocation used by the pool until destruction.
+public fn create_aligned(i64 item_size, i64 capacity, i64 alignment) -> FixedPool {
+    if (item_size <= 0 || capacity <= 0 || !valid_alignment(alignment)) {
+        return FixedPool { data: 0, item_size: item_size, stride: 0, capacity: 0, available: 0, free_head: -1, alignment: alignment };
+    }
+    i64 minimum = item_size;
+    if (minimum < 8) {
+        minimum = 8;
+    }
+    i64 stride = align_up(minimum, alignment);
+    if (stride <= 0 || capacity > 9223372036854775807 / stride) {
+        return FixedPool { data: 0, item_size: item_size, stride: 0, capacity: 0, available: 0, free_head: -1, alignment: alignment };
+    }
+    usize data = raz_rt_alloc_aligned(stride * capacity, alignment);
+    if (data == 0) {
+        return FixedPool { data: 0, item_size: item_size, stride: 0, capacity: 0, available: 0, free_head: -1, alignment: alignment };
+    }
+    i64 index = 0;
+    while (index < capacity) {
+        i64 next = index + 1;
+        if (next >= capacity) {
+            next = -1;
+        }
+        set_next(data + index * stride, next);
+        index += 1;
+    }
+    return FixedPool {
+        data: data,
+        item_size: item_size,
+        stride: stride,
+        capacity: capacity,
+        available: capacity,
+        free_head: 0,
+        alignment: alignment,
+    };
+}
+
+public fn create(i64 item_size, i64 capacity) -> FixedPool {
+    return create_aligned(item_size, capacity, 16);
+}
+
+public fn valid(FixedPool& pool) -> bool {
+    return pool.data != 0 && pool.stride >= pool.item_size && pool.capacity > 0;
+}
+
+public fn capacity(FixedPool& pool) -> i64 {
+    return pool.capacity;
+}
+
+public fn available(FixedPool& pool) -> i64 {
+    return pool.available;
+}
+
+public fn allocated(FixedPool& pool) -> i64 {
+    if (!valid(pool)) {
+        return 0;
+    }
+    return pool.capacity - pool.available;
+}
+
+/// Pops one slot from the intrusive freelist in O(1).
+public fn allocate(FixedPool&mut pool) -> usize {
+    if (!valid(pool) || pool.free_head < 0) {
+        return 0;
+    }
+    i64 index = pool.free_head;
+    usize slot = pool.data + index * pool.stride;
+    pool.free_head = get_next(slot);
+    pool.available -= 1;
+    return slot;
+}
+
+public fn allocate_zeroed(FixedPool&mut pool) -> usize {
+    usize slot = allocate(pool);
+    if (slot != 0) {
+        raz_rt_fill(slot, 0, pool.item_size);
+    }
+    return slot;
+}
+
+public fn owns(FixedPool& pool, usize pointer) -> bool {
+    if (!valid(pool) || pointer < pool.data || pointer >= pool.data + pool.stride * pool.capacity) {
+        return false;
+    }
+    return ((pointer - pool.data) % (pool.stride as usize)) == 0;
+}
+
+/// Returns a slot to the freelist in O(1). Callers must release each checked-
+/// out slot exactly once; like a native object pool, duplicate release is a
+/// programming error rather than a synchronized ownership operation.
+public fn release(FixedPool&mut pool, usize pointer) -> bool {
+    if (!owns(pool, pointer) || pool.available >= pool.capacity) {
+        return false;
+    }
+    i64 index = ((pointer - pool.data) / (pool.stride as usize)) as i64;
+    set_next(pointer, pool.free_head);
+    pool.free_head = index;
+    pool.available += 1;
+    return true;
+}
+
+/// Rebuilds the freelist in O(capacity) without touching the host allocator.
+public fn reset(FixedPool&mut pool) {
+    if (!valid(pool)) {
+        return;
+    }
+    i64 index = 0;
+    while (index < pool.capacity) {
+        i64 next = index + 1;
+        if (next >= pool.capacity) {
+            next = -1;
+        }
+        set_next(pool.data + index * pool.stride, next);
+        index += 1;
+    }
+    pool.free_head = 0;
+    pool.available = pool.capacity;
+}
+
+public fn destroy(FixedPool&mut pool) {
+    if (pool.data != 0) {
+        raz_rt_dealloc_aligned(pool.data, pool.alignment);
+    }
+    pool.data = 0;
+    pool.item_size = 0;
+    pool.stride = 0;
+    pool.capacity = 0;
+    pool.available = 0;
+    pool.free_head = -1;
+}
+
+impl Drop for FixedPool {
+    fn drop(FixedPool&mut self) {
+        destroy(self);
+    }
+}

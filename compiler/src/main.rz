@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_main;
-public import raz_compiler_driver_registry;
+public import raz_compiler_driver_razup;
 // Keep the compiler entrypoint boring: load input, run each phase in order, emit
 // backend artifacts, and leave the actual language rules in the subsystem modules above.
 fn main() -> i64 {
-  write_stage1_diagnostic(80, 0, 0);
+  write_compiler_diagnostic(80, 0, 0);
   if (bootstrap_qualifications_requested()) {
     if (!qualify_extended_lexer()) {
       return 39;
@@ -36,93 +36,62 @@ fn main() -> i64 {
       return 53;
     }
   }
-  write_stage1_diagnostic(81, 0, 0);
+  write_compiler_diagnostic(81, 0, 0);
 
-  i64 process_argc = raz_rt_stage1_process_argc();
+  i64 process_argc = raz_compiler_rt_process_argc();
+
+  if (razup_invoked()) {
+    return razup_command(process_argc);
+  }
 
   if (process_argc > 32) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
 
   i64 cli_command = cli_detect_command(process_argc);
 
+  if (
+  cli_command == 0 &&
+  !cli_argument_starts_with_dash_at(process_argc, 1) &&
+  !cli_argument_looks_like_path(process_argc, 1)
+  ) {
+    cli_print_unknown_command_at(process_argc, 1);
+    return 2;
+  }
   if (cli_command == 1) {
+    if (process_argc > 3) {
+      cli_print_invalid_arguments();
+      return 2;
+    }
     i64 topic = cli_help_topic(process_argc);
 
     if (topic > 0) {
       cli_print_command_help(topic);
+    } else if (process_argc > 2) {
+      cli_print_unknown_command_at(process_argc, 2);
+      return 2;
     } else {
       cli_print_general_help();
     }
     return 0;
   }
   if (cli_command == 2) {
+    if (process_argc != 2) {
+      cli_print_invalid_arguments();
+      return 2;
+    }
     cli_print_version();
     return 0;
-  }
-  if (cli_command == 7) {
-    cli_print_backends();
-    return 0;
-  }
-  if (cli_command == 8) {
-    cli_print_targets();
-    return 0;
-  }
-  if (cli_command == 9) {
-    cli_print_doctor();
-    return 0;
-  }
-  if (cli_command == 13) {
-    return cli_clean_project();
-  }
-  if (cli_command == 14) {
-    return cli_init_project();
-  }
-  if (cli_command == 15) {
-    return cli_new_project(process_argc);
-  }
-  if (cli_command == 18 && !cli_command_help_requested(process_argc, cli_command)) {
-    return tooling_fmt_command(process_argc);
-  }
-  if (cli_command == 19 && !cli_command_help_requested(process_argc, cli_command)) {
-    return tooling_doc_command(process_argc);
-  }
-  if (cli_command == 20 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_add_command(process_argc);
-  }
-  if (cli_command == 21 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_remove_command(process_argc);
-  }
-  if (cli_command == 22 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_registry_update_command();
-  }
-  if (cli_command == 23 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_lock_command();
-  }
-  if (cli_command == 24 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_metadata_command(false);
-  }
-  if (cli_command == 25 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_metadata_command(true);
-  }
-  if (cli_command == 26 && !cli_command_help_requested(process_argc, cli_command)) {
-    return registry_command(process_argc);
-  }
-  if (cli_command == 27 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_pack_command(process_argc);
-  }
-  if (cli_command == 28 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_publish_command();
-  }
-  if (cli_command == 29 && !cli_command_help_requested(process_argc, cli_command)) {
-    return signing_keygen_command(process_argc);
-  }
-  if (cli_command == 30 && !cli_command_help_requested(process_argc, cli_command)) {
-    return package_registry_update_command();
   }
   if (cli_command_help_requested(process_argc, cli_command)) {
     cli_print_command_help(cli_command);
     return 0;
+  }
+  bool auxiliary_handled = false;
+  i64 auxiliary_status = driver_command_dispatch(process_argc, cli_command, &mut auxiliary_handled);
+  if (auxiliary_handled) {
+    return auxiliary_status;
   }
 
   i64 backend = backend_default();
@@ -140,6 +109,15 @@ fn main() -> i64 {
   bool run_after_build = cli_command == 12;
   bool test_after_build = cli_command == 16;
   bool check_only = cli_command == 4 || cli_command == 11 || cli_command == 17;
+  i64 requested_features = raz_compiler_rt_arena_create(4096);
+  i64 requested_features_length = 0;
+  bool all_features = false;
+  bool default_features = true;
+
+  if (requested_features == 0) {
+    return 40;
+  }
+
   LlvmTargetOptions llvm_options;
 
   llvm_target_options_init(&mut llvm_options);
@@ -162,13 +140,13 @@ fn main() -> i64 {
   bool scanning_options = true;
 
   while (scanning_options && argument_base < process_argc) {
-    i64 option_argument = raz_rt_stage1_arena_create(4096);
+    i64 option_argument = raz_compiler_rt_arena_create(4096);
 
     if (option_argument == 0) {
       return 55;
     }
 
-    i64 option_length = raz_rt_stage1_process_arg(argument_base, option_argument, 4096);
+    i64 option_length = raz_compiler_rt_process_arg(argument_base, option_argument, 4096);
 
     if (option_length <= 0) {
       return 55;
@@ -176,7 +154,10 @@ fn main() -> i64 {
 
     i64 backend_shortcut = cli_backend_shortcut(option_argument, option_length);
 
-    if (backend_shortcut >= 0) {
+    if (path_is_check_option(option_argument, option_length)) {
+      check_only = true;
+      argument_base += 1;
+    } else if (backend_shortcut >= 0) {
       backend = backend_shortcut;
       argument_base += 1;
     } else if (profile_queries_option(option_argument, option_length)) {
@@ -192,43 +173,72 @@ fn main() -> i64 {
     } else if (backend_option_present(option_argument, option_length)) {
       backend = backend_option_kind(option_argument, option_length);
       if (backend < 0) {
-        return 55;
+        cli_print_unknown_option(option_argument, option_length);
+        return 2;
       }
       argument_base += 1;
+    } else if (cli_all_features_option(option_argument, option_length)) {
+      all_features = true;
+      argument_base += 1;
+    } else if (cli_no_default_features_option(option_argument, option_length)) {
+      default_features = false;
+      argument_base += 1;
     } else {
+      i64 feature_option_length = cli_features_option(option_argument, option_length, requested_features, 4096);
+
+      if (feature_option_length < 0) {
+        cli_print_unknown_option(option_argument, option_length);
+        return 2;
+      }
+      if (feature_option_length > 0) {
+        requested_features_length = feature_option_length;
+        argument_base += 1;
+        raz_compiler_rt_arena_destroy(option_argument);
+        continue;
+      }
+
       i64 parsed_option = llvm_parse_target_option(&mut llvm_options, option_argument, option_length);
 
       if (parsed_option < 0) {
-        return 55;
+        cli_print_unknown_option(option_argument, option_length);
+        return 2;
       }
       if (parsed_option > 0) {
         argument_base += 1;
+      } else if (cli_arg_starts_with_dash(option_argument, option_length)) {
+        cli_print_unknown_option(option_argument, option_length);
+        return 2;
       } else {
         scanning_options = false;
-        raz_rt_stage1_arena_destroy(option_argument);
+        raz_compiler_rt_arena_destroy(option_argument);
       }
     }
   }
   if (backend != 1 && llvm_target_options_require_llvm(&llvm_options)) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
   if (backend != 0 && (forge_native || forge_structured_only)) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
 
   i64 remaining_argc = process_argc - argument_base;
 
   if (remaining_argc > 2) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
   if (
   (cli_command == 4 || cli_command == 11 || cli_command == 16 || cli_command == 17) &&
   remaining_argc > 1
   ) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
   if (cli_command == 10 && remaining_argc != 2) {
-    return 55;
+    cli_print_invalid_arguments();
+    return 2;
   }
 
   i64 cli_manifest_path = 0;
@@ -237,11 +247,11 @@ fn main() -> i64 {
   i64 cli_output_length = 0;
 
   if (process_argc > argument_base) {
-    cli_manifest_path = raz_rt_stage1_arena_create(4096);
+    cli_manifest_path = raz_compiler_rt_arena_create(4096);
     if (cli_manifest_path == 0) {
       return 55;
     }
-    cli_manifest_length = raz_rt_stage1_process_arg(argument_base, cli_manifest_path, 4096);
+    cli_manifest_length = raz_compiler_rt_process_arg(argument_base, cli_manifest_path, 4096);
     if (cli_manifest_length <= 0) {
       return 55;
     }
@@ -251,31 +261,63 @@ fn main() -> i64 {
       return 55;
     }
     check_only = true;
-    cli_manifest_length = raz_rt_stage1_process_arg(argument_base + 1, cli_manifest_path, 4096);
+    cli_manifest_length = raz_compiler_rt_process_arg(argument_base + 1, cli_manifest_path, 4096);
     if (cli_manifest_length <= 0) {
       return 55;
     }
   } else if (process_argc >= argument_base + 2) {
-    cli_output_path = raz_rt_stage1_arena_create(4096);
+    cli_output_path = raz_compiler_rt_arena_create(4096);
     if (cli_output_path == 0) {
       return 55;
     }
-    cli_output_length = raz_rt_stage1_process_arg(argument_base + 1, cli_output_path, 4096);
+    cli_output_length = raz_compiler_rt_process_arg(argument_base + 1, cli_output_path, 4096);
     if (cli_output_length <= 0) {
       return 55;
     }
   }
+  if (cli_manifest_path == 0) {
+    i64 default_manifest = raz_compiler_rt_arena_create(8);
+    if (default_manifest == 0) {
+      return 40;
+    }
+    i64 default_manifest_bytes[8] = [114, 97, 122, 46, 116, 111, 109, 108];
+    i64 default_manifest_index = 0;
+
+    while (default_manifest_index < 8) {
+      raz_compiler_rt_arena_set(
+        default_manifest,
+        default_manifest_index,
+        default_manifest_bytes[default_manifest_index],
+      );
+      default_manifest_index += 1;
+    }
+    if (raz_compiler_rt_path_exists_ascii(default_manifest, 8) != 0) {
+      cli_manifest_path = default_manifest;
+      cli_manifest_length = 8;
+    } else {
+      raz_compiler_rt_arena_destroy(default_manifest);
+    }
+  }
+  if (cli_manifest_path == 0 || cli_manifest_length <= 0) {
+    cli_print_missing_input();
+    return 2;
+  }
+  if (raz_compiler_rt_path_exists_ascii(cli_manifest_path, cli_manifest_length) == 0) {
+    cli_print_missing_path(cli_manifest_path, cli_manifest_length);
+    return 2;
+  }
+
   if (run_after_build && cli_output_path == 0) {
-    cli_output_path = raz_rt_stage1_arena_create(32);
+    cli_output_path = raz_compiler_rt_arena_create(32);
     if (cli_output_path == 0) {
       return 40;
     }
-    if (raz_rt_stage1_host_platform() == 1) {
+    if (raz_compiler_rt_host_platform() == 1) {
       i64 run_name[11] = [114, 97, 122, 45, 114, 117, 110, 46, 101, 120, 101];
       i64 rn = 0;
 
       while (rn<11) {
-        raz_rt_stage1_arena_set(cli_output_path, rn, run_name[rn]);
+        raz_compiler_rt_arena_set(cli_output_path, rn, run_name[rn]);
         rn += 1;
       }
       cli_output_length = 11;
@@ -284,7 +326,7 @@ fn main() -> i64 {
       i64 rn = 0;
 
       while (rn<7) {
-        raz_rt_stage1_arena_set(cli_output_path, rn, run_name[rn]);
+        raz_compiler_rt_arena_set(cli_output_path, rn, run_name[rn]);
         rn += 1;
       }
       cli_output_length = 7;
@@ -301,7 +343,7 @@ fn main() -> i64 {
   i64 source_capacity = 4194304;
   i64 module_capacity = 4194304;
   i64 manifest_path[18] = [115, 116, 97, 103, 101, 49, 45, 112, 97, 99, 107, 97, 103, 101, 46, 116, 120, 116];
-  i64 manifest = raz_rt_stage1_arena_create(manifest_capacity);
+  i64 manifest = raz_compiler_rt_arena_create(manifest_capacity);
 
   if (manifest == 0) {
     return 40;
@@ -311,7 +353,7 @@ fn main() -> i64 {
 
   if (!direct_source && !project_manifest) {
     if (cli_manifest_path != 0) {
-      manifest_length = raz_rt_stage1_read_ascii(
+      manifest_length = raz_compiler_rt_read_ascii(
       cli_manifest_path,
       cli_manifest_length,
       manifest,
@@ -325,10 +367,10 @@ fn main() -> i64 {
     }
   }
 
-  i64 bytes = raz_rt_stage1_arena_create(source_capacity);
+  i64 bytes = raz_compiler_rt_arena_create(source_capacity);
 
   if (bytes == 0) {
-    raz_rt_stage1_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(manifest);
     return 40;
   }
 
@@ -337,49 +379,67 @@ fn main() -> i64 {
   i64 module_count = 0;
 
   if (project_manifest) {
-    write_stage1_diagnostic(82, 0, 0);
+    write_compiler_diagnostic(82, 0, 0);
 
-    i64 visited = raz_rt_stage1_arena_create(262144);
-    i64 active = raz_rt_stage1_arena_create(262144);
-    i64 project_state = raz_rt_stage1_arena_create(9);
+    i64 visited = raz_compiler_rt_arena_create(262144);
+    i64 active = raz_compiler_rt_arena_create(262144);
+    i64 project_state = raz_compiler_rt_arena_create(15);
 
     if (visited == 0 || active == 0 || project_state == 0) {
       return 40;
     }
-    raz_rt_stage1_arena_set(project_state, 0, bytes);
-    raz_rt_stage1_arena_set(project_state, 1, 0);
-    raz_rt_stage1_arena_set(project_state, 2, source_capacity);
-    raz_rt_stage1_arena_set(project_state, 3, module_capacity);
-    raz_rt_stage1_arena_set(project_state, 4, 0);
-    raz_rt_stage1_arena_set(project_state, 5, visited);
-    raz_rt_stage1_arena_set(project_state, 6, 0);
-    raz_rt_stage1_arena_set(project_state, 7, active);
-    raz_rt_stage1_arena_set(project_state, 8, 0);
-    write_stage1_diagnostic(83, 0, 0);
+    raz_compiler_rt_arena_set(project_state, 0, bytes);
+    raz_compiler_rt_arena_set(project_state, 1, 0);
+    raz_compiler_rt_arena_set(project_state, 2, source_capacity);
+    raz_compiler_rt_arena_set(project_state, 3, module_capacity);
+    raz_compiler_rt_arena_set(project_state, 4, 0);
+    raz_compiler_rt_arena_set(project_state, 5, visited);
+    raz_compiler_rt_arena_set(project_state, 6, 0);
+    raz_compiler_rt_arena_set(project_state, 7, active);
+    raz_compiler_rt_arena_set(project_state, 8, 0);
+    i64 include_dev_dependencies = 0;
+    i64 include_all_features = 0;
+    i64 include_default_features = 0;
+    if (test_after_build) {
+      include_dev_dependencies = 1;
+    }
+    if (all_features) {
+      include_all_features = 1;
+    }
+    if (default_features) {
+      include_default_features = 1;
+    }
+    raz_compiler_rt_arena_set(project_state, 9, include_dev_dependencies);
+    raz_compiler_rt_arena_set(project_state, 10, raz_compiler_rt_host_platform());
+    raz_compiler_rt_arena_set(project_state, 11, include_all_features);
+    raz_compiler_rt_arena_set(project_state, 12, requested_features);
+    raz_compiler_rt_arena_set(project_state, 13, requested_features_length);
+    raz_compiler_rt_arena_set(project_state, 14, include_default_features);
+    write_compiler_diagnostic(83, 0, 0);
     if (
     cli_manifest_path == 0 ||
     !append_project_manifest(cli_manifest_path, cli_manifest_length, project_state, 0)
     ) {
       return 40;
     }
-    write_stage1_diagnostic(
+    write_compiler_diagnostic(
     84,
-    raz_rt_stage1_arena_get(project_state, 4),
-    raz_rt_stage1_arena_get(project_state, 1),
+    raz_compiler_rt_arena_get(project_state, 4),
+    raz_compiler_rt_arena_get(project_state, 1),
     );
-    length = raz_rt_stage1_arena_get(project_state, 1);
-    module_count = raz_rt_stage1_arena_get(project_state, 4);
-    raz_rt_stage1_arena_destroy(project_state);
-    raz_rt_stage1_arena_destroy(visited);
-    raz_rt_stage1_arena_destroy(active);
+    length = raz_compiler_rt_arena_get(project_state, 1);
+    module_count = raz_compiler_rt_arena_get(project_state, 4);
+    raz_compiler_rt_arena_destroy(project_state);
+    raz_compiler_rt_arena_destroy(visited);
+    raz_compiler_rt_arena_destroy(active);
   }
   if (direct_source) {
-    i64 module_bytes = raz_rt_stage1_arena_create(module_capacity);
+    i64 module_bytes = raz_compiler_rt_arena_create(module_capacity);
 
     if (module_bytes == 0) {
       return 40;
     }
-    i64 module_length = raz_rt_stage1_read_ascii(
+    i64 module_length = raz_compiler_rt_read_ascii(
     cli_manifest_path,
     cli_manifest_length,
     module_bytes,
@@ -388,24 +448,24 @@ fn main() -> i64 {
     if (module_length <= 0 || module_length >= module_capacity || module_length + 1 >= source_capacity) {
       return 40;
     }
-    if (raz_rt_stage1_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length) {
-      raz_rt_stage1_arena_destroy(module_bytes);
+    if (raz_compiler_rt_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length) {
+      raz_compiler_rt_arena_destroy(module_bytes);
       return 40;
     }
     length += module_length;
-    raz_rt_stage1_arena_set(bytes, length, 10);
+    raz_compiler_rt_arena_set(bytes, length, 10);
     length += 1;
     module_count = 1;
-    raz_rt_stage1_arena_destroy(module_bytes);
+    raz_compiler_rt_arena_destroy(module_bytes);
   }
   while (!direct_source && !project_manifest && cursor < manifest_length) {
     while (
     cursor < manifest_length &&
     (
-    raz_rt_stage1_arena_get(manifest, cursor) == 10 ||
-    raz_rt_stage1_arena_get(manifest, cursor) == 13 ||
-    raz_rt_stage1_arena_get(manifest, cursor) == 32 ||
-    raz_rt_stage1_arena_get(manifest, cursor) == 9
+    raz_compiler_rt_arena_get(manifest, cursor) == 10 ||
+    raz_compiler_rt_arena_get(manifest, cursor) == 13 ||
+    raz_compiler_rt_arena_get(manifest, cursor) == 32 ||
+    raz_compiler_rt_arena_get(manifest, cursor) == 9
     )
     ) {
       cursor += 1;
@@ -418,13 +478,13 @@ fn main() -> i64 {
 
       while (
       cursor < manifest_length &&
-      raz_rt_stage1_arena_get(manifest, cursor) != 10 &&
-      raz_rt_stage1_arena_get(manifest, cursor) != 13
+      raz_compiler_rt_arena_get(manifest, cursor) != 10 &&
+      raz_compiler_rt_arena_get(manifest, cursor) != 13
       ) {
         if (path_length >= 255) {
           return 40;
         }
-        path[path_length] = raz_rt_stage1_arena_get(manifest, cursor);
+        path[path_length] = raz_compiler_rt_arena_get(manifest, cursor);
         path_length += 1;
         cursor += 1;
       }
@@ -432,7 +492,7 @@ fn main() -> i64 {
         path_length -= 1;
       }
       if (path_length> 0) {
-        i64 module_bytes = raz_rt_stage1_arena_create(module_capacity);
+        i64 module_bytes = raz_compiler_rt_arena_create(module_capacity);
 
         if (module_bytes == 0) {
           return 40;
@@ -451,23 +511,23 @@ fn main() -> i64 {
           return 40;
         }
         if (
-        raz_rt_stage1_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length
+        raz_compiler_rt_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length
         ) {
-          raz_rt_stage1_arena_destroy(module_bytes);
+          raz_compiler_rt_arena_destroy(module_bytes);
           return 40;
         }
         length += module_length;
-        raz_rt_stage1_arena_set(bytes, length, 10);
+        raz_compiler_rt_arena_set(bytes, length, 10);
         length += 1;
         module_count += 1;
-        raz_rt_stage1_arena_destroy(module_bytes);
+        raz_compiler_rt_arena_destroy(module_bytes);
       }
     }
   }
   if (module_count <= 0) {
     return 40;
   }
-  write_stage1_diagnostic(90, module_count, length);
+  write_compiler_diagnostic(90, module_count, length);
 
   Source input;
 
@@ -490,32 +550,36 @@ fn main() -> i64 {
   cli_output_length,
   )
   ) {
-    write_stage1_diagnostic(96, 1, length);
-    raz_rt_stage1_arena_destroy(bytes);
-    raz_rt_stage1_arena_destroy(manifest);
+    write_compiler_diagnostic(96, 1, length);
+    cli_print_status(3, cli_manifest_path, cli_manifest_length);
+    cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+    raz_compiler_rt_arena_destroy(bytes);
+    raz_compiler_rt_arena_destroy(manifest);
     if (cli_manifest_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_manifest_path);
+      raz_compiler_rt_arena_destroy(cli_manifest_path);
     }
     if (cli_output_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_output_path);
+      raz_compiler_rt_arena_destroy(cli_output_path);
     }
     return 0;
   }
+  cli_print_compile_status(cli_command, cli_manifest_path, cli_manifest_length);
+
   // Parsing already performs the complete lexical walk and reports invalid
-  // bytes. Avoid a second full-file lexer pass here: on the self-host compiler
+  // bytes. Avoid a second full-file lexer pass here: on the production compiler
   // this source is large and arena-backed, so the redundant preflight scan was
   // a measurable bootstrap cost with no additional correctness coverage.
-  write_stage1_diagnostic(91, 0, length);
+  write_compiler_diagnostic(91, 0, length);
   // HIR is the sole normative Raz grammar/semantic parser. parser.rz remains
   // available as a bootstrap/preflight utility, but production compilation no
   // longer parses the source twice or lets a compact syntax subset reject a
   // construct before the authoritative frontend sees it.
-  write_stage1_diagnostic(92, 0, 0);
+  write_compiler_diagnostic(92, 0, 0);
 
   HirModule hir;
 
   if (!build_hir(input, &mut hir)) {
-    write_stage1_diagnostic(2, diagnostic_code_value(hir.diagnostic_code), hir.diagnostic_offset);
+    write_compiler_diagnostic(2, diagnostic_code_value(hir.diagnostic_code), hir.diagnostic_offset);
     cli_render_frontend_diagnostic(&input, hir.diagnostic_code, hir.diagnostic_offset);
     return 43;
   }
@@ -526,62 +590,69 @@ fn main() -> i64 {
     write_query_profile(&hir);
   }
   if (check_only) {
+    cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
     destroy_hir(&mut hir);
-    raz_rt_stage1_arena_destroy(bytes);
-    raz_rt_stage1_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(bytes);
+    raz_compiler_rt_arena_destroy(manifest);
     if (cli_manifest_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_manifest_path);
+      raz_compiler_rt_arena_destroy(cli_manifest_path);
     }
     return 0;
   }
-  write_stage1_diagnostic(
+  write_compiler_diagnostic(
   93,
-  raz_rt_stage1_arena_get(hir.function_statement_counts, 0),
-  raz_rt_stage1_arena_get(
+  raz_compiler_rt_arena_get(hir.function_statement_counts, 0),
+  raz_compiler_rt_arena_get(
   hir.statement_kinds,
-  raz_rt_stage1_arena_get(hir.function_statement_starts, 0),
+  raz_compiler_rt_arena_get(hir.function_statement_starts, 0),
   ),
   );
 
   MirModule mir;
 
   if (!lower_hir(&hir, &mut mir)) {
-    write_stage1_diagnostic(3, 0, 0);
+    write_compiler_diagnostic(3, 0, 0);
     destroy_hir(&mut hir);
     return 44;
   }
   if (!run_mir_pipeline(&mut mir, llvm_options.optimization_kind)) {
-    write_stage1_diagnostic(3, mir.function_count, mir.instruction_count);
+    write_compiler_diagnostic(3, mir.function_count, mir.instruction_count);
     destroy_mir(&mut mir);
     destroy_hir(&mut hir);
     return 45;
   }
   incremental_persist_module_mir_state(cli_manifest_path, cli_manifest_length, &hir, &mut mir);
-  write_stage1_diagnostic(94, mir.function_count, mir.instruction_count);
+  write_compiler_diagnostic(94, mir.function_count, mir.instruction_count);
   if (test_after_build) {
+    cli_print_status(5, cli_manifest_path, cli_manifest_length);
     i64 test_status = execute_mir_tests(&input, &hir, &mut mir);
+    if (test_status == 0) {
+      cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+    }
 
     destroy_mir(&mut mir);
     destroy_hir(&mut hir);
-    raz_rt_stage1_arena_destroy(bytes);
-    raz_rt_stage1_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(bytes);
+    raz_compiler_rt_arena_destroy(manifest);
     if (cli_manifest_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_manifest_path);
+      raz_compiler_rt_arena_destroy(cli_manifest_path);
     }
     return test_status;
   }
   if (run_after_build) {
+    cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+    cli_print_status(4, cli_manifest_path, cli_manifest_length);
     i64 run_status = execute_mir_main(&hir, &mut mir);
 
     destroy_mir(&mut mir);
     destroy_hir(&mut hir);
-    raz_rt_stage1_arena_destroy(bytes);
-    raz_rt_stage1_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(bytes);
+    raz_compiler_rt_arena_destroy(manifest);
     if (cli_manifest_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_manifest_path);
+      raz_compiler_rt_arena_destroy(cli_manifest_path);
     }
     if (cli_output_path != 0) {
-      raz_rt_stage1_arena_destroy(cli_output_path);
+      raz_compiler_rt_arena_destroy(cli_output_path);
     }
     return run_status;
   }
@@ -640,19 +711,20 @@ fn main() -> i64 {
   cli_output_path,
   cli_output_length,
   );
-  write_stage1_diagnostic(95, 0, 0);
+  write_compiler_diagnostic(95, 0, 0);
+  cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
   destroy_mir(&mut mir);
   destroy_hir(&mut hir);
-  raz_rt_stage1_arena_destroy(bytes);
-  raz_rt_stage1_arena_destroy(manifest);
+  raz_compiler_rt_arena_destroy(bytes);
+  raz_compiler_rt_arena_destroy(manifest);
   if (cli_manifest_path != 0) {
-    raz_rt_stage1_arena_destroy(cli_manifest_path);
+    raz_compiler_rt_arena_destroy(cli_manifest_path);
   }
   if (llvm_sidecar_path != 0) {
-    raz_rt_stage1_arena_destroy(llvm_sidecar_path);
+    raz_compiler_rt_arena_destroy(llvm_sidecar_path);
   }
   if (cli_output_path != 0) {
-    raz_rt_stage1_arena_destroy(cli_output_path);
+    raz_compiler_rt_arena_destroy(cli_output_path);
   }
   return 0;
 }

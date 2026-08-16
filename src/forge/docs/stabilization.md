@@ -14,4 +14,4 @@ The strict production matrix executes all tests, including JIT and installed con
 
 ## Supported production scope
 
-Forge 2.0 provides the frontend development kit, verified IR, interpreter, x86-64 JIT and object generation, System V and Windows aggregate ABI lowering, deterministic ELF/COFF objects and archives, native static/shared library workflows, incremental artifacts, optimization pipelines, and CFG-aware register allocation.
+Forge 2.0 provides the frontend integration API, verified IR, interpreter, x86-64 JIT and object generation, System V and Windows aggregate ABI lowering, deterministic ELF/COFF objects and archives, native static/shared library workflows, incremental artifacts, optimization pipelines, and CFG-aware register allocation.

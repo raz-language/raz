@@ -160,6 +160,6 @@ Every emitted `.rxe` is independently decoded and canonically re-encoded. Backen
 
 `reference.rz` implements a Raz-native execution oracle for RXE semantics. It supports deterministic memory, references, direct and indirect calls, closures, integer semantics, globals, aggregate operations, control flow, and safety limits. It is used for differential validation against MIR and is separate from any chain-specific VM.
 
-`examples/backends/rxe/` contains conformance fixtures for control flow, arrays, slices, indirect calls, closure behavior, structure copies, and executable identity.
+`tests/examples/backends/rxe/` contains conformance fixtures for control flow, arrays, slices, indirect calls, closure behavior, structure copies, and executable identity.
 
-The generated binary-format reference is [RXE-v1-FORMAT.md](RXE-v1-FORMAT.md), and the frozen ISA contract is [RXE-ISA-v1-FREEZE.md](RXE-ISA-v1-FREEZE.md).
+The generated binary-format reference is [RXE-v1-FORMAT.md](RXE-v1-FORMAT.md), and the stable ISA contract is [RXE-ISA-v1.md](RXE-ISA-v1.md).

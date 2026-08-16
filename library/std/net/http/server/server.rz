@@ -9,6 +9,7 @@ import std::io::buffer;
 import std::net;
 import std::net::http;
 import std::net::http::headers;
+import std::net::vectored;
 
 public enum ServerError {
     None,
@@ -32,11 +33,15 @@ public struct ServerConnection {
     TcpStream stream;
     ByteBuffer input;
     String output;
+    String decode_buffer;
+    IoVector send_vector;
     i64 buffer_capacity;
     i64 max_header_bytes;
     i64 max_body_bytes;
     i64 timeout_millis;
     bool open;
+    bool request_pending;
+    i64 request_consumed;
 }
 
 public struct HttpRequest {
@@ -112,11 +117,15 @@ public fn connection_empty() -> ServerConnection {
         },
         input: byte_buffer_new(),
         output: alloc::string::with_capacity(1024),
+        decode_buffer: alloc::string::with_capacity(4096),
+        send_vector: std::net::vectored::create(2),
         buffer_capacity: 16384,
         max_header_bytes: 65536,
         max_body_bytes: 16777216,
         timeout_millis: -1,
         open: false,
+        request_pending: false,
+        request_consumed: 0,
     };
 }
 
@@ -130,13 +139,25 @@ public fn accept(HttpServer& server, ServerConnection&mut output) -> bool {
         tcp_stream_close(&mut output.stream);
     }
     output.stream = move stream;
-    output.input = byte_buffer_with_capacity(server.buffer_capacity);
+    // Preserve the receive allocation across accepted connections. A server
+    // worker normally reuses one ServerConnection for its lifetime; replacing
+    // the ByteBuffer here turned every accept into allocator traffic.
+    byte_buffer_clear(&mut output.input);
+    if (byte_buffer_capacity(&output.input) < server.buffer_capacity) {
+        if (!byte_buffer_reserve(&mut output.input, server.buffer_capacity)) {
+            tcp_stream_close(&mut output.stream);
+            return false;
+        }
+    }
     alloc::string::clear(&mut output.output);
+    alloc::string::clear(&mut output.decode_buffer);
     output.buffer_capacity = server.buffer_capacity;
     output.max_header_bytes = server.max_header_bytes;
     output.max_body_bytes = server.max_body_bytes;
     output.timeout_millis = server.timeout_millis;
     output.open = true;
+    output.request_pending = false;
+    output.request_consumed = 0;
     if (output.timeout_millis >= 0) {
         set_timeout_millis(output.stream.socket, output.timeout_millis, output.timeout_millis);
     }
@@ -148,7 +169,13 @@ public fn close_connection(ServerConnection&mut connection) {
         tcp_stream_close(&mut connection.stream);
     }
     connection.open = false;
+    connection.request_pending = false;
+    connection.request_consumed = 0;
     byte_buffer_clear(&mut connection.input);
+}
+
+fn load_byte_fast(usize address) -> i64 {
+    unsafe { return (*(address as u8*const))as i64; }
 }
 
 fn http11(BytesView version) -> bool {
@@ -160,7 +187,7 @@ fn http11(BytesView version) -> bool {
     i64 i = 0;
 
     while (i < 8) {
-        if (core::bytes::load_u8(version.data + i) != expected[i]) {
+        if (load_byte_fast(version.data + i) != expected[i]) {
             return false;
         }
         i += 1;
@@ -253,15 +280,21 @@ fn copy_request(HttpRequestView& view, String& decoded_chunks, HttpRequest&mut o
     return true;
 }
 
-/// Reads exactly one request while preserving already-buffered bytes belonging
-/// to a following keep-alive request. Chunked framing is removed before the
-/// body is exposed to application code.
-public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) -> ServerError {
+/// Returns a borrowed request view over the connection's retained input buffer.
+/// No method/target/header/body Strings are allocated or copied for normal
+/// content-length requests. The view remains valid until release_request() or
+/// close_connection() is called. Chunked bodies are decoded into the
+/// connection-owned reusable decode_buffer and the returned body view points
+/// there. A worker must release a request before asking for the next one.
+public fn read_request_view(ServerConnection&mut connection, HttpRequestView&mut output) -> ServerError {
     if (!connection.open) {
         return ServerError::Closed;
     }
+    if (connection.request_pending) {
+        return ServerError::Protocol;
+    }
 
-    String decoded = alloc::string::with_capacity(4096);
+    alloc::string::clear(&mut connection.decode_buffer);
 
     while (true) {
         i64 readable = byte_buffer_readable(&connection.input);
@@ -273,30 +306,12 @@ public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) 
             usize base = byte_buffer_data(&connection.input);
 
             HttpRequestView view = HttpRequestView {
-                source: BytesView {
-                    data: 0,
-                    length: 0
-                },
-                method: BytesView {
-                    data: 0,
-                    length: 0
-                },
-                target: BytesView {
-                    data: 0,
-                    length: 0
-                },
-                version: BytesView {
-                    data: 0,
-                    length: 0
-                },
-                header_block: BytesView {
-                    data: 0,
-                    length: 0
-                },
-                body: BytesView {
-                    data: 0,
-                    length: 0
-                },
+                source: BytesView { data: 0, length: 0 },
+                method: BytesView { data: 0, length: 0 },
+                target: BytesView { data: 0, length: 0 },
+                version: BytesView { data: 0, length: 0 },
+                header_block: BytesView { data: 0, length: 0 },
+                body: BytesView { data: 0, length: 0 },
                 content_length: -1,
                 chunked: false,
                 connection_close: false,
@@ -326,15 +341,19 @@ public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) 
                 }
                 if (view.chunked) {
                     i64 chunk_bytes = 0;
-
                     HttpError chunk_error = decode_chunks(
                         &view,
                         connection.max_body_bytes,
-                        &mut decoded,
+                        &mut connection.decode_buffer,
                         &mut chunk_bytes,
                     );
                     if (chunk_error == HttpError::None) {
                         consumed = body_start + chunk_bytes;
+                        view.body = BytesView {
+                            data: alloc::string::data_ptr(&connection.decode_buffer),
+                            length: alloc::string::len(&connection.decode_buffer),
+                        };
+                        view.content_length = view.body.length;
                     } else if (chunk_error != HttpError::Incomplete) {
                         if (chunk_error == HttpError::BodyIncomplete) {
                             return ServerError::BodyTooLarge;
@@ -346,15 +365,10 @@ public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) 
                 } else if (view.content_length >= 0) {
                     consumed = body_start + view.content_length;
                 }
-                // Requests without explicit framing have no body. This also
-                // prevents pipelined bytes from being mistaken for a body.
                 if (error == HttpError::None) {
-                    if (!copy_request(&view, &mut decoded, output)) {
-                        return ServerError::OutOfMemory;
-                    }
-                    if (!byte_buffer_consume(&mut connection.input, consumed)) {
-                        return ServerError::Protocol;
-                    }
+                    *output = view;
+                    connection.request_pending = true;
+                    connection.request_consumed = consumed;
                     return ServerError::None;
                 }
             }
@@ -368,6 +382,103 @@ public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) 
         }
     }
     return ServerError::Protocol;
+}
+
+/// Releases the borrowed request returned by read_request_view(). This is O(1)
+/// and preserves any already-buffered pipelined request bytes for the next
+/// parse. Borrowed fields must not be used after this call.
+public fn release_request(ServerConnection&mut connection) -> bool {
+    if (!connection.request_pending) {
+        return false;
+    }
+    i64 consumed = connection.request_consumed;
+    connection.request_pending = false;
+    connection.request_consumed = 0;
+    return byte_buffer_consume(&mut connection.input, consumed);
+}
+
+/// Returns true when the connection currently has a borrowed request that has
+/// not yet been released.
+public fn request_pending(ServerConnection& connection) -> bool {
+    return connection.request_pending;
+}
+
+/// Returns true when a complete request is already present in the retained
+/// input buffer. It never reads from the socket. Readiness-driven workers can
+/// use this after release_request() to drain HTTP pipelining before returning
+/// to poll/epoll/kqueue/WSAPoll.
+public fn buffered_request_ready(ServerConnection& connection) -> bool {
+    if (!connection.open || connection.request_pending) {
+        return false;
+    }
+    i64 readable = byte_buffer_readable(&connection.input);
+    if (readable <= 0) {
+        return false;
+    }
+    usize base = byte_buffer_data(&connection.input);
+    HttpRequestView view = HttpRequestView {
+        source: BytesView { data: 0, length: 0 },
+        method: BytesView { data: 0, length: 0 },
+        target: BytesView { data: 0, length: 0 },
+        version: BytesView { data: 0, length: 0 },
+        header_block: BytesView { data: 0, length: 0 },
+        body: BytesView { data: 0, length: 0 },
+        content_length: -1,
+        chunked: false,
+        connection_close: false,
+    };
+    HttpError error = std::net::http::parse_request(base, readable, connection.max_header_bytes, &mut view);
+    if (error != HttpError::None) {
+        return false;
+    }
+    if (!view.chunked) {
+        return true;
+    }
+    ChunkCursor cursor = std::net::http::chunks(view.body);
+    ChunkView chunk = ChunkView {
+        data: BytesView { data: 0, length: 0 },
+        trailers: BytesView { data: 0, length: 0 },
+        final_chunk: false,
+    };
+    while (true) {
+        HttpError chunk_error = std::net::http::next_chunk(&mut cursor, &mut chunk);
+        if (chunk_error != HttpError::None) {
+            return false;
+        }
+        if (chunk.final_chunk) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Owning convenience API. High-throughput workers should prefer
+/// read_request_view() + release_request() to avoid four request-field copies.
+public fn read_request(ServerConnection&mut connection, HttpRequest&mut output) -> ServerError {
+    HttpRequestView view = HttpRequestView {
+        source: BytesView { data: 0, length: 0 },
+        method: BytesView { data: 0, length: 0 },
+        target: BytesView { data: 0, length: 0 },
+        version: BytesView { data: 0, length: 0 },
+        header_block: BytesView { data: 0, length: 0 },
+        body: BytesView { data: 0, length: 0 },
+        content_length: -1,
+        chunked: false,
+        connection_close: false,
+    };
+    ServerError error = read_request_view(connection, &mut view);
+    if (error != ServerError::None) {
+        return error;
+    }
+    bool copied = copy_request(&view, &mut connection.decode_buffer, output);
+    bool released = release_request(connection);
+    if (!copied) {
+        return ServerError::OutOfMemory;
+    }
+    if (!released) {
+        return ServerError::Protocol;
+    }
+    return ServerError::None;
 }
 
 fn append_crlf(String&mut output) -> bool {
@@ -444,6 +555,44 @@ fn append_connection(String&mut output, bool keep_alive) -> bool {
     return append_crlf(output);
 }
 
+fn send_header_body(
+    ServerConnection&mut connection,
+    usize header,
+    i64 header_length,
+    usize body,
+    i64 body_length,
+) -> bool {
+    if (body_length <= 0) {
+        return tcp_stream_send_all(&connection.stream, header, header_length);
+    }
+    if (!std::net::vectored::valid(&connection.send_vector)) {
+        return (
+            tcp_stream_send_all(&connection.stream, header, header_length) &&
+            tcp_stream_send_all(&connection.stream, body, body_length)
+        );
+    }
+    std::net::vectored::clear(&mut connection.send_vector);
+    if (
+        !std::net::vectored::push(&mut connection.send_vector, header, header_length) ||
+        !std::net::vectored::push(&mut connection.send_vector, body, body_length)
+    ) {
+        return false;
+    }
+    i64 sent = std::net::vectored::send_tcp(&connection.stream, &connection.send_vector);
+    if (sent < 0) { return false; }
+    if (sent < header_length) {
+        return (
+            tcp_stream_send_all(&connection.stream, header + sent, header_length - sent) &&
+            tcp_stream_send_all(&connection.stream, body, body_length)
+        );
+    }
+    i64 body_sent = sent - header_length;
+    if (body_sent < body_length) {
+        return tcp_stream_send_all(&connection.stream, body + body_sent, body_length - body_sent);
+    }
+    return true;
+}
+
 public fn send_response(
     ServerConnection&mut connection,
     i64 status,
@@ -480,14 +629,17 @@ public fn send_response(
     ) {
         return ServerError::OutOfMemory;
     }
-    if (body_length > 0 && !alloc::string::append_bytes(&mut connection.output, body, body_length)) {
-        return ServerError::OutOfMemory;
-    }
+    // Keep the reusable output String as a header buffer. The application body
+    // remains caller-owned and is sent as a second scatter/gather slice, so
+    // large responses avoid an O(body) memcpy and output-buffer growth while
+    // still completing in one socket syscall on the normal fast path.
     if (
-        !tcp_stream_send_all(
-            &connection.stream,
+        !send_header_body(
+            connection,
             alloc::string::data_ptr(&connection.output),
             alloc::string::len(&connection.output),
+            body,
+            body_length,
         )
     ) {
         close_connection(connection);

@@ -11,6 +11,7 @@
 #include <charconv>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <cstdint>
 #include <limits>
@@ -448,6 +449,37 @@ LowerResult lower_module(const ir::Module& source) {
         }
         if (failed) continue;
 
+        // IR blocks are not required to be stored in dominance order.  Build a
+        // reverse-postorder traversal for lowering so values defined in a
+        // dominating block are materialized before uses in dominated blocks.
+        // Preserve the original block vector for emission; only the lowering
+        // visitation order changes.
+        std::unordered_map<std::string, std::size_t> block_indices;
+        for (std::size_t index = 0; index < function.blocks.size(); ++index)
+            block_indices.emplace(function.blocks[index].name, index);
+        std::vector<std::uint8_t> lowering_visited(function.blocks.size(), 0U);
+        std::vector<std::size_t> lowering_order;
+        const auto append_rpo_component = [&](std::size_t root) {
+            std::vector<std::size_t> postorder;
+            std::function<void(std::size_t)> visit = [&](std::size_t index) {
+                if (index >= function.blocks.size() || lowering_visited[index]) return;
+                lowering_visited[index] = 1U;
+                for (const auto& operation : function.blocks[index].operations) {
+                    for (const auto& successor : operation.successors) {
+                        const auto found = block_indices.find(successor);
+                        if (found != block_indices.end()) visit(found->second);
+                    }
+                }
+                postorder.push_back(index);
+            };
+            visit(root);
+            for (auto index = postorder.rbegin(); index != postorder.rend(); ++index)
+                lowering_order.push_back(*index);
+        };
+        if (!function.blocks.empty()) append_rpo_component(0);
+        for (std::size_t index = 0; index < function.blocks.size(); ++index)
+            if (!lowering_visited[index]) append_rpo_component(index);
+
         auto& entry = lowered.blocks.front();
         if (owned_result_register)
             entry.instructions.push_back({Opcode::load_argument_i64, *owned_result_register, {}, 0, 0, {}, {}});
@@ -528,7 +560,8 @@ LowerResult lower_module(const ir::Module& source) {
         }
         if (failed) continue;
 
-        for (std::size_t block_index = 0; block_index < function.blocks.size() && !failed; ++block_index) {
+        for (std::size_t lowering_index = 0; lowering_index < lowering_order.size() && !failed; ++lowering_index) {
+            const auto block_index = lowering_order[lowering_index];
             const auto& block = function.blocks[block_index];
             auto& machine_block = lowered.blocks[block_index];
             const auto append_control_successors = [&](const ir::Operation& operation, Instruction& target_instruction) -> bool {
@@ -614,7 +647,23 @@ LowerResult lower_module(const ir::Module& source) {
                         instruction.opcode = function.return_type == ir::Type(ir::TypeKind::f32) ? Opcode::return_f32 :
                                              function.return_type == ir::Type(ir::TypeKind::f64) ? Opcode::return_f64 :
                                              (function.return_type == ir::Type(ir::TypeKind::i64) || function.return_type == ir::Type(ir::TypeKind::ptr)) ? Opcode::return_i64 : Opcode::return_i32;
-                        failed = !append_inputs(operation, registers, instruction, result.diagnostics, function.name) || instruction.inputs.size() != 1;
+                        if (operation.operands.size() != 1) {
+                            failed = true;
+                        } else if (const auto found = registers.find(operation.operands[0]); found != registers.end()) {
+                            instruction.inputs = {found->second};
+                        } else if (
+                            function.return_type == ir::Type(ir::TypeKind::ptr) &&
+                            addresses.find(operation.operands[0]) != addresses.end()
+                        ) {
+                            const auto& address = addresses.at(operation.operands[0]);
+                            const auto return_address = allocate_register(ir::Type(ir::TypeKind::ptr));
+                            machine_block.instructions.push_back({Opcode::load_stack_address, return_address, {},
+                                -static_cast<std::int64_t>(address.object_base + address.object_size - address.offset), 0, {}, {}});
+                            instruction.inputs = {return_address};
+                        } else {
+                            error(result.diagnostics, "undefined lowering operand '" + operation.operands[0] + "' in @" + function.name);
+                            failed = true;
+                        }
                     }
                 } else if (operation.opcode == "unreachable") {
                     if (function.return_type == ir::Type(ir::TypeKind::void_)) {

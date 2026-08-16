@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace core::bytes;
-// Allocation-free byte views and search/comparison helpers. Individual byte
-// access crosses only the permanent raw-memory ABI boundary; bulk equality and
-// ordering use the platform's optimized memory primitives.
+// Allocation-free byte views and search/comparison helpers. Checked scalar
+// access stays in Raz so parser/codec loops do not pay an ABI call per byte;
+// bulk equality, ordering and scanning use optimized host memory primitives.
 extern fn raz_rt_load_u8(usize address) -> i64;
 extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
 extern fn raz_rt_bytes_equal(usize left, usize right, i64 size) -> i64;
 extern fn raz_rt_bytes_compare(usize left, usize right, i64 size) -> i64;
 extern fn raz_rt_bytes_find(usize data, i64 size, i64 value) -> i64;
 extern fn raz_rt_bytes_rfind(usize data, i64 size, i64 value) -> i64;
+extern fn raz_rt_hash_bytes(usize data, i64 size) -> i64;
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
 extern fn raz_rt_move(usize destination, usize source, i64 size);
 extern fn raz_rt_fill(usize destination, i64 value, i64 size);
@@ -32,28 +33,47 @@ public fn byte_at(BytesView bytes, i64 index) -> i64 {
     if (index < 0 || index >= bytes.length || bytes.data == 0) {
         return -1;
     }
-    return raz_rt_load_u8(bytes.data + index);
+    unsafe {
+        return (*((bytes.data + index)as u8*const))as i64;
+    }
 }
 
 public fn set_byte(usize data, i64 length, i64 index, i64 value) -> bool {
     if (index < 0 || index >= length || data == 0) {
         return false;
     }
-    return raz_rt_store_u8(data + index, value) == 1;
+    unsafe {
+        *((data + index)as u8*mut) = (value & 255)as u8;
+    }
+    return true;
 }
 
 public fn load_u8(usize address) -> i64 {
     if (address == 0) {
         return -1;
     }
-    return raz_rt_load_u8(address);
+    unsafe {
+        return (*(address as u8*const))as i64;
+    }
 }
 
 public fn store_u8(usize address, i64 value) -> bool {
     if (address == 0) {
         return false;
     }
-    return raz_rt_store_u8(address, value) == 1;
+    unsafe {
+        *(address as u8*mut) = (value & 255)as u8;
+    }
+    return true;
+}
+
+/// Fast non-cryptographic hash for borrowed bytes. The value is process/library
+/// version specific and is intended for hash tables, not persistent formats.
+public fn hash(BytesView bytes) -> i64 {
+    if (!valid(bytes)) {
+        return 0;
+    }
+    return raz_rt_hash_bytes(bytes.data, bytes.length);
 }
 
 public fn equal(BytesView left, BytesView right) -> bool {

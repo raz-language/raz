@@ -5,6 +5,23 @@
 
 using namespace raz::runtime_detail;
 
+namespace {
+constexpr std::array<std::uint32_t, 256> raz_make_crc32_ieee_table() {
+  std::array<std::uint32_t, 256> table{};
+  for (std::uint32_t index = 0; index < 256; ++index) {
+    std::uint32_t value = index;
+    for (int bit = 0; bit < 8; ++bit) {
+      const std::uint32_t mask = 0U - (value & 1U);
+      value = (value >> 1U) ^ (UINT32_C(0xedb88320) & mask);
+    }
+    table[index] = value;
+  }
+  return table;
+}
+
+constexpr auto raz_crc32_ieee_table = raz_make_crc32_ieee_table();
+}
+
 extern "C" {
 std::int64_t raz_rt_abi_pointer_size() { return static_cast<std::int64_t>(sizeof(void*)); }
 std::int64_t raz_rt_abi_pointer_alignment() { return static_cast<std::int64_t>(alignof(void*)); }
@@ -120,6 +137,13 @@ void* raz_rt_alloc_aligned(std::int64_t size, std::int64_t alignment) {
   if (size <= 0 || alignment <= 0 || alignment > 4096 ||
       (alignment & (alignment - 1)) != 0) return nullptr;
   const auto normalized = static_cast<std::size_t>(std::max<std::int64_t>(alignment, alignof(std::max_align_t)));
+  // malloc already satisfies max_align_t. Keeping ordinary alignments on the
+  // malloc/realloc path lets Raz vectors grow in place when the host allocator
+  // can extend the allocation, which avoids an allocate/copy/free cycle on one
+  // of the hottest standard-library paths.
+  if (normalized <= alignof(std::max_align_t)) {
+    return std::malloc(static_cast<std::size_t>(size));
+  }
   return ::operator new(static_cast<std::size_t>(size), std::align_val_t(normalized), std::nothrow);
 }
 
@@ -127,7 +151,46 @@ void raz_rt_dealloc_aligned(void* pointer, std::int64_t alignment) {
   if (pointer == nullptr) return;
   if (alignment <= 0 || alignment > 4096 || (alignment & (alignment - 1)) != 0) return;
   const auto normalized = static_cast<std::size_t>(std::max<std::int64_t>(alignment, alignof(std::max_align_t)));
+  if (normalized <= alignof(std::max_align_t)) {
+    std::free(pointer);
+    return;
+  }
   ::operator delete(pointer, std::align_val_t(normalized));
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void* raz_realloc_overaligned(void* pointer, std::int64_t old_size, std::int64_t new_size,
+                                     std::size_t alignment) {
+  void* replacement = ::operator new(static_cast<std::size_t>(new_size), std::align_val_t(alignment), std::nothrow);
+  if (replacement == nullptr) return nullptr;
+  if (old_size > 0) {
+    const auto copy_size = static_cast<std::size_t>(std::min(old_size, new_size));
+    std::memcpy(replacement, pointer, copy_size);
+  }
+  ::operator delete(pointer, std::align_val_t(alignment));
+  return replacement;
+}
+
+void* raz_rt_realloc_aligned(void* pointer, std::int64_t old_size, std::int64_t new_size,
+                             std::int64_t alignment) {
+  if (old_size < 0 || alignment <= 0 || alignment > 4096 ||
+      (alignment & (alignment - 1)) != 0) return nullptr;
+  if (new_size <= 0) {
+    raz_rt_dealloc_aligned(pointer, alignment);
+    return nullptr;
+  }
+
+  const auto normalized = static_cast<std::size_t>(std::max<std::int64_t>(alignment, alignof(std::max_align_t)));
+  if (pointer == nullptr) return raz_rt_alloc_aligned(new_size, alignment);
+  if (normalized <= alignof(std::max_align_t)) {
+    return std::realloc(pointer, static_cast<std::size_t>(new_size));
+  }
+
+  return raz_realloc_overaligned(pointer, old_size, new_size, normalized);
 }
 
 void* raz_rt_realloc(void* pointer, std::int64_t size) {
@@ -217,8 +280,46 @@ std::int64_t raz_rt_atomic_add_i64_ordered(std::int64_t* value, std::int64_t del
   return value == nullptr ? 0 : std::atomic_ref<std::int64_t>(*value).fetch_add(delta, raz_memory_order(order));
 }
 
+std::int64_t raz_rt_atomic_exchange_i64_ordered(std::int64_t* value, std::int64_t desired, std::int64_t order) {
+  return value == nullptr ? 0 : std::atomic_ref<std::int64_t>(*value).exchange(desired, raz_memory_order(order));
+}
+
+std::int64_t raz_rt_atomic_compare_exchange_i64_ordered(std::int64_t* value, std::int64_t expected,
+                                                         std::int64_t desired, std::int64_t success_order,
+                                                         std::int64_t failure_order) {
+  if (value == nullptr) return 0;
+  auto success = raz_memory_order(success_order);
+  auto failure = raz_memory_order(failure_order);
+  // C++ does not permit release/acq_rel on the failure edge, and the failure
+  // order may not be stronger than the success edge. Clamp invalid requests
+  // instead of forcing all lock-free Raz code back to seq_cst.
+  if (success == std::memory_order_relaxed || success == std::memory_order_release) {
+    failure = std::memory_order_relaxed;
+  } else if (success == std::memory_order_acquire || success == std::memory_order_acq_rel) {
+    if (failure != std::memory_order_relaxed && failure != std::memory_order_acquire) {
+      failure = std::memory_order_acquire;
+    }
+  } else {
+    if (failure == std::memory_order_release) failure = std::memory_order_relaxed;
+    if (failure == std::memory_order_acq_rel) failure = std::memory_order_acquire;
+  }
+  return std::atomic_ref<std::int64_t>(*value).compare_exchange_strong(expected, desired, success, failure) ? 1 : 0;
+}
+
 void raz_rt_memory_fence_ordered(std::int64_t order) {
   std::atomic_thread_fence(raz_memory_order(order));
+}
+
+void raz_rt_cpu_relax() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  YieldProcessor();
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
 }
 
 std::int64_t raz_rt_load_u8(std::uintptr_t address) {
@@ -266,6 +367,65 @@ std::int64_t raz_rt_bytes_rfind(std::uintptr_t data, std::int64_t size, std::int
     if (base[index - 1] == needle) return index - 1;
   }
   return -1;
+}
+
+std::uint32_t raz_rt_crc32_ieee_update(std::uint32_t state, std::uintptr_t data, std::int64_t size) {
+  if (size <= 0 || data == 0) return state;
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(data);
+  std::int64_t index = 0;
+
+  // One native crossing updates the complete buffer. The eight-way unroll
+  // gives the compiler enough independent address work to overlap table loads
+  // while preserving the exact incremental IEEE CRC-32 state contract.
+  while (index + 8 <= size) {
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 0]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 1]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 2]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 3]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 4]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 5]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 6]) & 0xffU];
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index + 7]) & 0xffU];
+    index += 8;
+  }
+  while (index < size) {
+    state = (state >> 8U) ^ raz_crc32_ieee_table[(state ^ bytes[index]) & 0xffU];
+    ++index;
+  }
+  return state;
+}
+
+std::int64_t raz_rt_hash_bytes(std::uintptr_t data, std::int64_t size) {
+  if (size < 0 || (size > 0 && data == 0)) return 0;
+
+  const auto avalanche = [](std::uint64_t value) noexcept {
+    value ^= value >> 30U;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27U;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31U;
+    return value;
+  };
+
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(data);
+  std::uint64_t hash = avalanche(UINT64_C(0xa0761d6478bd642f) ^ static_cast<std::uint64_t>(size));
+  std::int64_t offset = 0;
+
+  while (offset + 8 <= size) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, bytes + offset, sizeof(word));
+    hash ^= avalanche(word + UINT64_C(0xe7037ed1a0b428db) + static_cast<std::uint64_t>(offset));
+    hash = std::rotl(hash, 27) * UINT64_C(0x9e3779b185ebca87) + UINT64_C(0x165667b19e3779f9);
+    offset += 8;
+  }
+
+  if (offset < size) {
+    std::uint64_t tail = 0;
+    std::memcpy(&tail, bytes + offset, static_cast<std::size_t>(size - offset));
+    hash ^= avalanche(tail ^ (static_cast<std::uint64_t>(size - offset) << 56U));
+  }
+  hash = avalanche(hash ^ static_cast<std::uint64_t>(size));
+  return static_cast<std::int64_t>(hash & UINT64_C(0x7fffffffffffffff));
 }
 
 void* raz_rt_mutex_create() { return new (std::nothrow) std::mutex(); }

@@ -36,17 +36,43 @@ int diagnostic_catalog(const Options& options) {
   return 0;
 }
 
-int create_project(const Options& options) {
-  const auto root = std::filesystem::absolute(options.project);
-  if (std::filesystem::exists(root) && !std::filesystem::is_empty(root)) {
-    cli_errorf("destination is not empty: ", root); return 1;
+std::string default_manifest(std::string_view name) {
+  std::ostringstream manifest;
+  manifest << "[package]\nname = \"" << name << "\"\nversion = \"0.1.0\"\nkind = \"executable\"\nentry = \"src/main.rz\"\n"
+           << "\n[dependencies]\n"
+           << "\n[profile.debug]\noptimization = 0\ndebug = true\nincremental = true\n"
+           << "\n[profile.release]\noptimization = 3\ndebug = false\nincremental = true\n";
+  return manifest.str();
+}
+
+int create_project(const Options& options, bool initialize_existing = false) {
+  const auto root = std::filesystem::absolute(options.project).lexically_normal();
+  std::error_code error;
+  if (!initialize_existing && std::filesystem::exists(root, error) && !std::filesystem::is_empty(root, error)) {
+    cli_errorf("destination is not empty: ", root);
+    cli_hint("use 'raz init <path>' to initialize an existing directory");
+    return 1;
+  }
+  if (initialize_existing && std::filesystem::exists(root / "raz.toml")) {
+    cli_errorf("a Raz package already exists at ", root);
+    return 1;
   }
 
-  std::filesystem::create_directories(root / "src");
+  std::filesystem::create_directories(root / "src", error);
+  if (error) { cli_errorf("could not create package directory: ", error.message()); return 1; }
   const auto name = root.filename().string();
-  std::ofstream(root / "raz.toml") << "[package]\nname = \"" << name << "\"\nversion = \"0.1.0\"\nkind = \"executable\"\nentry = \"src/main.rz\"\n\n[dependencies]\n\n[profile.debug]\noptimization = 0\ndebug = true\nincremental = true\n\n[profile.release]\noptimization = 3\ndebug = false\nincremental = true\n";
-  std::ofstream(root / "src/main.rz") << "fn main() -> i64 {\n  return 0;\n}\n";
-  cli_status("Created", std::string("package ") + name + " at " + root.string(), raz::terminal::green);
+  if (name.empty()) { cli_error("could not derive a package name from the destination path"); return 1; }
+  if (!write_text_file(root / "raz.toml", default_manifest(name))) {
+    cli_errorf("could not write ", root / "raz.toml");
+    return 1;
+  }
+  const auto entry = root / "src" / "main.rz";
+  if (!std::filesystem::exists(entry) && !write_text_file(entry, "fn main() -> i64 {\n  return 0;\n}\n")) {
+    cli_errorf("could not write ", entry);
+    return 1;
+  }
+  cli_status(initialize_existing ? "Initialized" : "Created",
+             std::string("package ") + name + " at " + root.string(), raz::terminal::green);
   return 0;
 }
 

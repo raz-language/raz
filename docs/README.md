@@ -1,28 +1,35 @@
 # Raz documentation
 
-The documentation describes the current Raz 1.0 language and toolchain.
+This documentation describes the Raz 1.0 language, compiler, standard library, package system, and supported toolchain.
 
 ## Learn Raz
 
-- [Raz Made Easy](Raz_Made_Easy_1.0.0.md) — practical introduction and examples.
+- [Getting Started](GETTING-STARTED.md) — practical language introduction.
 - [Language specification](LANGUAGE-SPECIFICATION.md) — syntax and semantic rules.
-- [Stable language scope](STABLE-LANGUAGE-SCOPE.md) — compatibility guarantees.
-- [Formatting](FORMATTING.md) — source formatting conventions.
+- [Language stability](LANGUAGE-STABILITY.md) — Raz 1.x compatibility guarantees.
+- [Formatting](FORMATTING.md) — canonical source formatting.
 
-## Build and use projects
+## Build applications
 
-- [CLI reference](CLI.md) — compiler and project commands.
-- [Toolchain specification](TOOLCHAIN-SPECIFICATION.md) — project, backend, artifact, and reproducibility contracts.
-- [Package management](PACKAGE-MANAGEMENT.md) — the GitHub-backed official registry, dependencies, private registries, mirrors, lockfiles, the shared package store, and offline operation.
-- [Backends](backends.md) — Forge and LLVM backend behavior.
+- [CLI reference](CLI.md) — project and compiler commands.
+- [Package management](PACKAGE-MANAGEMENT.md) — dependencies, lockfiles, registries, caching, and publishing.
+- [Standard-library performance](STANDARD-LIBRARY-PERFORMANCE.md) — performance-oriented library design.
+- [Installation](INSTALLATION.md) — MSI and portable installation.
 
-## Understand the implementation
+## Toolchain reference
 
+- [Toolchain specification](TOOLCHAIN-SPECIFICATION.md)
 - [Compiler architecture](ARCHITECTURE.md)
-- [Self-hosting](SELF-HOSTING.md)
-- [Bootstrap performance](BOOTSTRAP-PERFORMANCE.md)
-- [Performance model](PERFORMANCE.md)
-- [Standard-library performance](STANDARD-LIBRARY-PERFORMANCE.md)
-- [Windows bootstrap](WINDOWS-ALL-STAGES-BUILD.md)
-
-- [Licensing and source-header policy](LICENSING.md)
+- [Compiler bootstrap](COMPILER-BOOTSTRAP.md)
+- [Compiler reproducibility](COMPILER-REPRODUCIBILITY.md)
+- [MIR](MIR.md)
+- [Backends](BACKENDS.md)
+- [RXE](RXE.md)
+- [RXE v1 format](RXE-v1-FORMAT.md)
+- [RXE v1 ISA](RXE-ISA-v1.md)
+- [WebAssembly ABI](WASM-ABI-v1.md)
+- [Language server](LANGUAGE-SERVER.md)
+- [Semantic queries](SEMANTIC-QUERIES.md)
+- [Performance](PERFORMANCE.md)
+- [Windows build](WINDOWS-BUILD.md)
+- [Licensing](LICENSING.md)

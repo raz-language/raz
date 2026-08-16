@@ -2,7 +2,7 @@
 
 This directory contains the production Raz compiler, written in Raz.
 
-The compiler source is organized by responsibility under `compiler/src/` and is compiled as ordinary semantic Raz modules. Each compiler module owns an explicit `raz_compiler_*` namespace and an import edge; production builds do not use physical source concatenation. `bootstrap-source-order.txt` is retained only as frozen seed/recovery metadata for constructing Stage 1 with Stage 0. `src/main.rz` remains the small final entrypoint.
+The compiler source is organized by responsibility under `compiler/src/` and is compiled as ordinary semantic Raz modules. Each compiler module owns an explicit `raz_compiler_*` namespace and an import edge; production builds do not use physical source concatenation. `host-source-order.txt` is retained only as deterministic host-compiler ordering metadata. `src/main.rz` remains the small final entrypoint.
 
 ## Source layout
 
@@ -104,4 +104,4 @@ The compiler is split at stable responsibility boundaries so semantic analysis, 
 
 ## Source ordering
 
-Raz packages use deterministic semantic module discovery and explicit imports. The generic project loader still recognizes `source-order.txt` for legacy packages, but the canonical compiler intentionally does not provide one. `compiler/bootstrap-source-order.txt` lists every compiler source exactly once with `src/main.rz` last solely for frozen Stage 0 recovery and recursive fixed-point seed construction. Repository checks ensure that file cannot accidentally become the production compilation policy again.
+Raz packages use deterministic semantic module discovery and explicit imports. The generic project loader still recognizes `source-order.txt` for legacy packages, but the canonical compiler intentionally does not provide one. `compiler/host-source-order.txt` lists every compiler source exactly once with `src/main.rz` last solely for host-compiler construction and reproducibility qualification. Repository checks ensure that file cannot accidentally become the production compilation policy again.

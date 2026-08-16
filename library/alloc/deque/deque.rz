@@ -4,6 +4,7 @@
 namespace alloc::deque;
 
 extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+extern fn raz_rt_realloc_aligned(usize pointer, i64 old_size, i64 new_size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
 extern fn raz_rt_copy(usize destination, usize source, i64 size);
 
@@ -130,11 +131,50 @@ public fn raw_deque_is_empty(RawDeque& deque) -> bool {
     return deque.length == 0;
 }
 
-fn raw_deque_physical_index(RawDeque& deque, i64 logical) -> i64 {
-    if (deque.capacity <= 0) {
+fn raw_deque_wrap_index(i64 index, i64 capacity) -> i64 {
+    if (capacity <= 0) {
         return -1;
     }
-    return (deque.head + logical) % deque.capacity;
+    // The overwhelmingly common growth path is power-of-two, making this a
+    // cheap predictable branch followed by a mask. Exact user capacities and
+    // shrink_to_fit retain their API semantics through the modulo fallback.
+    if ((capacity & (capacity - 1)) == 0) {
+        return index & (capacity - 1);
+    }
+    return index % capacity;
+}
+
+fn raw_deque_physical_index(RawDeque& deque, i64 logical) -> i64 {
+    return raw_deque_wrap_index(deque.head + logical, deque.capacity);
+}
+
+fn raw_deque_copy_linear(usize destination, RawDeque& deque) {
+    if (deque.length <= 0 || deque.capacity <= 0) {
+        return;
+    }
+
+    i64 first = deque.capacity - deque.head;
+
+    if (first > deque.length) {
+        first = deque.length;
+    }
+    if (first > 0) {
+        raz_rt_copy(
+            destination,
+            deque.data + deque.head * deque.element_size,
+            first * deque.element_size,
+        );
+    }
+
+    i64 second = deque.length - first;
+
+    if (second > 0) {
+        raz_rt_copy(
+            destination + first * deque.element_size,
+            deque.data,
+            second * deque.element_size,
+        );
+    }
 }
 
 public fn raw_deque_element_address(RawDeque& deque, i64 index) -> usize {
@@ -155,22 +195,37 @@ public fn raw_deque_reserve_exact(RawDeque&mut deque, i64 capacity) -> bool {
         return false;
     }
 
+    i64 old_bytes = deque_allocation_size(deque.element_size, deque.capacity);
+
+    if (old_bytes < 0) {
+        return false;
+    }
+
+    // A linearized ring can use the allocator's in-place growth path. Wrapped
+    // rings need one new allocation, but are copied as at most two bulk spans
+    // instead of one ABI call per element.
+    if (deque.head == 0) {
+        usize replacement = raz_rt_realloc_aligned(
+            deque.data,
+            old_bytes,
+            bytes,
+            deque.element_alignment,
+        );
+
+        if (replacement == 0) {
+            return false;
+        }
+        deque.data = replacement;
+        deque.capacity = capacity;
+        return true;
+    }
+
     usize replacement = raz_rt_alloc_aligned(bytes, deque.element_alignment);
 
     if (replacement == 0) {
         return false;
     }
-
-    i64 index = 0;
-
-    while (index < deque.length) {
-        raz_rt_copy(
-            replacement + index * deque.element_size,
-            raw_deque_element_address(deque, index),
-            deque.element_size,
-        );
-        index += 1;
-    }
+    raw_deque_copy_linear(replacement, deque);
     raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
     deque.data = replacement;
     deque.capacity = capacity;
@@ -194,10 +249,38 @@ public fn raw_deque_shrink_to_fit(RawDeque&mut deque) -> bool {
         return true;
     }
 
-    i64 bytes = deque_allocation_size(deque.element_size, deque.length);
+    i64 target = deque.length;
+
+    if (target == deque.capacity && deque.head == 0) {
+        return true;
+    }
+
+    i64 bytes = deque_allocation_size(deque.element_size, target);
 
     if (bytes < 0 || !deque_valid_alignment(deque.element_alignment)) {
         return false;
+    }
+
+    i64 old_bytes = deque_allocation_size(deque.element_size, deque.capacity);
+
+    if (old_bytes < 0) {
+        return false;
+    }
+
+    if (deque.head == 0) {
+        usize replacement = raz_rt_realloc_aligned(
+            deque.data,
+            old_bytes,
+            bytes,
+            deque.element_alignment,
+        );
+
+        if (replacement == 0) {
+            return false;
+        }
+        deque.data = replacement;
+        deque.capacity = target;
+        return true;
     }
 
     usize replacement = raz_rt_alloc_aligned(bytes, deque.element_alignment);
@@ -205,20 +288,10 @@ public fn raw_deque_shrink_to_fit(RawDeque&mut deque) -> bool {
     if (replacement == 0) {
         return false;
     }
-
-    i64 index = 0;
-
-    while (index < deque.length) {
-        raz_rt_copy(
-            replacement + index * deque.element_size,
-            raw_deque_element_address(deque, index),
-            deque.element_size,
-        );
-        index += 1;
-    }
+    raw_deque_copy_linear(replacement, deque);
     raz_rt_dealloc_aligned(deque.data, deque.element_alignment);
     deque.data = replacement;
-    deque.capacity = deque.length;
+    deque.capacity = target;
     deque.head = 0;
     return true;
 }
@@ -259,7 +332,7 @@ public fn raw_deque_pop_front_raw(RawDeque&mut deque, usize output) -> bool {
         return false;
     }
     raz_rt_copy(output, deque.data + deque.head * deque.element_size, deque.element_size);
-    deque.head = (deque.head + 1) % deque.capacity;
+    deque.head = raw_deque_wrap_index(deque.head + 1, deque.capacity);
     deque.length -= 1;
     if (deque.length == 0) {
         deque.head = 0;

@@ -2,7 +2,7 @@
 
 ## Raz
 
-**Mario Vinciguerra** - language design and development.
+**Mario Vinciguerra** - language design and implementation.
 
 Raz 1.0 grew from the goal of building a modern native systems language with explicit ownership, deterministic resource management, strong compile-time semantics, and a backend interface small enough to understand end-to-end.
 
@@ -14,4 +14,4 @@ The C++ Forge backend is bundled under `src/forge/` and retains its nested Apach
 
 ## Contributors
 
-Contributions are recorded in the repository history. See `CONTRIBUTING.md` for development and review guidelines.
+Contributions are recorded in the repository history. See `CONTRIBUTING.md` for contribution and review guidelines.

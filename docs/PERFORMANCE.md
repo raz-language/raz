@@ -23,7 +23,7 @@ The stable language is designed so common abstractions do not require hidden man
 
 ## Memory and allocation
 
-Raz 1.0's `alloc` foundations use geometric capacity growth for `RawVec` and owned strings. Repeated small growth therefore avoids one reallocation per append. Bulk copy, move, and fill operations cross the native memory boundary directly instead of executing byte-at-a-time loops in Raz.
+Raz 1.0's `alloc` foundations use geometric capacity growth for vectors, deques, and owned strings. Ordinary-alignment growth uses an in-place-capable aligned `realloc` path, while over-aligned values preserve their stricter allocation contract. Wrapped deque movement is performed in at most two bulk spans. Bulk copy, move, fill, equality, and search operations use host memory primitives, while scalar byte access stays in Raz so parsers and codecs do not pay an ABI call per byte.
 
 Compiler-internal arenas also keep hot scalar bounds metadata adjacent to the allocation. This avoids the global lock/hash lookup that once made recursive compiler generations dramatically slower.
 
@@ -33,11 +33,11 @@ The stable library exposes:
 
 - ordered atomics and fences;
 - mutexes, reader/writer locks, conditions, semaphores, barriers, latches, and one-time initialization;
-- bounded MPMC channels and cancellation tokens;
+- bounded MPMC channels, plus a cacheline-separated lock-free SPSC ring with batched transfer operations;
 - worker-pool execution and futures;
 - monotonic timing and hardware-thread discovery;
 - synchronous TCP/UDP/DNS plus socket tuning;
-- nonblocking socket mode and a wake-driven readiness reactor; and
+- nonblocking socket mode, reusable batch `poll`/`WSAPoll` readiness sets, and a wake-driven readiness reactor; and
 - async filesystem/socket foundations.
 
 These APIs intentionally stay close to host capabilities so high-level libraries can build batching and application-specific scheduling without paying for a mandatory heavyweight runtime.

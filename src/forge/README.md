@@ -330,7 +330,7 @@ scripts/             Reproducible release and sanitizer gates
 | [Building a language](docs/building-a-language.md) | C++ SDK and C API integration |
 | [Release readiness](docs/release-readiness.md) | Supported production contract and release gates |
 | [Roadmap](docs/roadmap.md) | Planned compiler work |
-| [Contributing](CONTRIBUTING.md) | Development workflow and contribution standards |
+| [Contributing](CONTRIBUTING.md) | Contribution workflow and contribution standards |
 | [Security](SECURITY.md) | Vulnerability reporting policy |
 | [Code of Conduct](CODE_OF_CONDUCT.md) | Community participation expectations |
 
@@ -342,7 +342,7 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 
 Forge is licensed under the [Apache License 2.0](LICENSE). Maintained source, header, test, example, and build-script files carry SPDX headers identifying Copyright 2026 Mario Vinciguerra.
 
-## Frontend Development Kit
+## Frontend Integration API
 
 Forge 1.3 includes reusable source management, structured diagnostics, nested symbol scopes, semantic declarations, and safe control-flow builders under `<forge/frontend/frontend.hpp>`.
 
@@ -352,7 +352,7 @@ Create a standalone frontend project with:
 forge new-language Aurora aurora
 ```
 
-See [Frontend Development Kit](docs/frontend-development-kit.md) and the complete [MiniLang example](examples/frontend/minilang/README.md).
+See [Frontend Integration API](docs/frontend-integration.md) and the complete [MiniLang example](examples/frontend/minilang/README.md).
 
 
 ## Production inspection

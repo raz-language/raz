@@ -60,7 +60,13 @@ public fn next(ReadDir&mut iterator, String&mut name, Metadata&mut metadata) -> 
         exists: 0
     };
 
-    i64 required = raz_rt_dir_next(iterator.handle, 0, 0, &mut raw, 6);
+    // Fast path: once the reusable String has a useful capacity, ask the OS
+    // iterator to fill it directly. raz_rt_dir_next does not consume the entry
+    // when capacity is insufficient, so only unusually long names require a
+    // sizing retry. Large directory walks therefore cross the native boundary
+    // once per entry in steady state instead of twice.
+    i64 available = alloc::string::capacity(name);
+    i64 required = raz_rt_dir_next(iterator.handle, name.data, available + 1, &mut raw, 6);
 
     if (required == -1) {
         iterator.finished = true;
@@ -69,14 +75,29 @@ public fn next(ReadDir&mut iterator, String&mut name, Metadata&mut metadata) -> 
     if (required < 0) {
         return -1;
     }
-    if (!alloc::string::reserve_exact(name, required)) {
-        return -1;
-    }
 
-    i64 fetched = raz_rt_dir_next(iterator.handle, name.data, required + 1, &mut raw, 6);
+    i64 fetched = required;
 
-    if (fetched < 0) {
-        return -1;
+    if (required > available) {
+        i64 next_capacity = available;
+
+        if (next_capacity < 64) {
+            next_capacity = 64;
+        }
+        while (next_capacity < required) {
+            if (next_capacity > 4611686018427387903) {
+                next_capacity = required;
+                break;
+            }
+            next_capacity *= 2;
+        }
+        if (!alloc::string::reserve_exact(name, next_capacity)) {
+            return -1;
+        }
+        fetched = raz_rt_dir_next(iterator.handle, name.data, name.capacity + 1, &mut raw, 6);
+        if (fetched < 0 || fetched > name.capacity) {
+            return -1;
+        }
     }
     name.length = fetched;
     *metadata = Metadata {

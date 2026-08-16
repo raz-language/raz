@@ -104,14 +104,21 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
     return false;
   }
 
-  i64 field_start = raz_rt_stage1_arena_get(builder.module.struct_field_starts, structure);
-  i64 field_count = raz_rt_stage1_arena_get(builder.module.struct_field_counts, structure);
-  i64 argument_start = builder.module.argument_count;
+  i64 field_start = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+  i64 field_count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+  i64 pending_arguments = raz_compiler_rt_arena_create(field_count + 1);
+
+  if (pending_arguments == 0) {
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+
   i64 index = 0;
 
   hir_advance(builder);
   while (index < field_count) {
     if (builder.current.kind != TokenKind::Identifier) {
+      raz_compiler_rt_arena_destroy(pending_arguments);
       hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
       return false;
     }
@@ -121,12 +128,13 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
     if (
     !token_same(
     &builder.scan.input,
-    raz_rt_stage1_arena_get(builder.module.struct_field_name_offsets, field),
-    raz_rt_stage1_arena_get(builder.module.struct_field_name_lengths, field),
+    raz_compiler_rt_arena_get(builder.module.struct_field_name_offsets, field),
+    raz_compiler_rt_arena_get(builder.module.struct_field_name_lengths, field),
     builder.current.offset,
     builder.current.length,
     )
     ) {
+      raz_compiler_rt_arena_destroy(pending_arguments);
       hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
       return false;
     }
@@ -141,6 +149,7 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
     if (builder.current.kind == TokenKind::Colon) {
       hir_advance(builder);
       if (!hir_parse_expression(builder, &mut value)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
         return false;
       }
     } else {
@@ -148,23 +157,21 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
       i64 slot = -1;
 
       if (!hir_find_name(builder, name_offset, name_length, &mut kind, &mut slot)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
         hir_fail(builder, DiagnosticCode::UnknownName);
         return false;
       }
       if (!hir_add_node(builder, kind, slot, 0, 0, 0, &mut value)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
         return false;
       }
       hir_apply_name_type(builder, kind, slot, value);
     }
-    if (builder.module.argument_count >= 262144) {
-      hir_fail(builder, DiagnosticCode::TooManyItems);
-      return false;
-    }
-    raz_rt_stage1_arena_set(builder.module.arguments, builder.module.argument_count, value);
-    builder.module.argument_count += 1;
+    raz_compiler_rt_arena_set(pending_arguments, index, value);
     index += 1;
     if (index < field_count) {
       if (!hir_expect(builder, TokenKind::Comma)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
         return false;
       }
     } else if (builder.current.kind == TokenKind::Comma) {
@@ -172,15 +179,39 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
     }
   }
   if (!hir_expect(builder, TokenKind::RightBrace)) {
+    raz_compiler_rt_arena_destroy(pending_arguments);
     return false;
   }
+  if (builder.module.argument_count + field_count >= 262144) {
+    raz_compiler_rt_arena_destroy(pending_arguments);
+    hir_fail(builder, DiagnosticCode::TooManyItems);
+    return false;
+  }
+
+  // Nested struct literals may append their own arguments while this literal
+  // is being parsed. Stage the parent arguments privately and commit them only
+  // after the complete literal has been parsed so its argument range remains
+  // contiguous and stable.
+  i64 argument_start = builder.module.argument_count;
+
+  index = 0;
+  while (index < field_count) {
+    raz_compiler_rt_arena_set(
+    builder.module.arguments,
+    builder.module.argument_count,
+    raz_compiler_rt_arena_get(pending_arguments, index),
+    );
+    builder.module.argument_count += 1;
+    index += 1;
+  }
+  raz_compiler_rt_arena_destroy(pending_arguments);
 
   i64 constructed = -1;
 
   if (!hir_add_node(builder, 34, structure, argument_start, field_count, 0, &mut constructed)) {
     return false;
   }
-  raz_rt_stage1_arena_set(builder.module.node_type_structs, constructed, structure);
+  raz_compiler_rt_arena_set(builder.module.node_type_structs, constructed, structure);
   *out = constructed;
   return true;
 }
@@ -192,7 +223,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
   ) {
     if (
     builder.current_function < 0 ||
-    raz_rt_stage1_arena_get(builder.module.function_is_async, builder.current_function) == 0
+    raz_compiler_rt_arena_get(builder.module.function_is_async, builder.current_function) == 0
     ) {
       hir_fail(builder, DiagnosticCode::ExpectedToken);
       return false;
@@ -229,7 +260,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     // HIR parser so the compact preflight parser cannot accidentally weaken it.
     if (
     builder.current_function < 0 ||
-    raz_rt_stage1_arena_get(builder.module.function_is_async, builder.current_function) == 0
+    raz_compiler_rt_arena_get(builder.module.function_is_async, builder.current_function) == 0
     ) {
       hir_fail(builder, DiagnosticCode::ExpectedToken);
       return false;
@@ -341,9 +372,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
 
     bool raw_storage_move = false;
 
-    if (raz_rt_stage1_arena_get(builder.module.node_kinds, operand) == 21) {
-      i64 raw_pointer = raz_rt_stage1_arena_get(builder.module.node_a, operand);
-      i64 raw_pointer_kind = raz_rt_stage1_arena_get(builder.module.node_references, raw_pointer);
+    if (raz_compiler_rt_arena_get(builder.module.node_kinds, operand) == 21) {
+      i64 raw_pointer = raz_compiler_rt_arena_get(builder.module.node_a, operand);
+      i64 raw_pointer_kind = raz_compiler_rt_arena_get(builder.module.node_references, raw_pointer);
 
       raw_storage_move = builder.unsafe_depth > 0 && (raw_pointer_kind == 2 || raw_pointer_kind == 3);
     }
@@ -371,29 +402,29 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       i64 root_structure = -1;
 
       if (root_kind == 3) {
-        root_structure = raz_rt_stage1_arena_get(builder.module.local_type_structs, root_index);
+        root_structure = raz_compiler_rt_arena_get(builder.module.local_type_structs, root_index);
       } else if (root_kind == 2) {
-        root_structure = raz_rt_stage1_arena_get(builder.module.parameter_type_structs, root_index);
+        root_structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, root_index);
       }
       if (
       root_structure >= 0 &&
-      raz_rt_stage1_arena_get(builder.module.struct_drop_functions, root_structure) >= 0
+      raz_compiler_rt_arena_get(builder.module.struct_drop_functions, root_structure) >= 0
       ) {
         hir_fail(builder, DiagnosticCode::InvalidMove);
         return false;
       }
     }
     // Moving a Copy aggregate has copy semantics: the source remains
-    // initialized.  Stage 0 diagnoses this as a warning rather than
+    // initialized.  host compiler diagnoses this as a warning rather than
     // consuming the binding, so do not poison ownership state here.
 
-    i64 moved_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, operand);
+    i64 moved_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, operand);
     bool consumes_source = true;
 
     if (
     path == 0 &&
     moved_structure >= 0 &&
-    raz_rt_stage1_arena_get(builder.module.struct_copy_flags, moved_structure) != 0
+    raz_compiler_rt_arena_get(builder.module.struct_copy_flags, moved_structure) != 0
     ) {
       consumes_source = false;
     }
@@ -437,8 +468,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
 
-      i64 current_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, element);
-      i64 current_type = raz_rt_stage1_arena_get(builder.module.node_types, element);
+      i64 current_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, element);
+      i64 current_type = raz_compiler_rt_arena_get(builder.module.node_types, element);
 
       if (count == 0) {
         element_structure = current_structure;
@@ -454,7 +485,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       ) {
         return false;
       }
-      raz_rt_stage1_arena_set(builder.module.arguments, builder.module.argument_count, element);
+      raz_compiler_rt_arena_set(builder.module.arguments, builder.module.argument_count, element);
       builder.module.argument_count += 1;
       count += 1;
       if (builder.current.kind == TokenKind::Comma) {
@@ -474,9 +505,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     if (!hir_add_node(builder, 53, argument_start, count, 0, 0, &mut array)) {
       return false;
     }
-    raz_rt_stage1_arena_set(builder.module.node_type_structs, array, element_structure);
+    raz_compiler_rt_arena_set(builder.module.node_type_structs, array, element_structure);
     hir_set_node_type(builder, array, element_type);
-    raz_rt_stage1_arena_set(builder.module.node_array_extents, array, count);
+    raz_compiler_rt_arena_set(builder.module.node_array_extents, array, count);
 
     i64 base = array;
 
@@ -488,8 +519,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       if (!hir_parse_expression(builder, &mut index) || !hir_expect(builder, TokenKind::RightBracket)) {
         return false;
       }
-      if (raz_rt_stage1_arena_get(builder.module.node_kinds, index) == 1) {
-        i64 constant_index = raz_rt_stage1_arena_get(builder.module.node_values, index);
+      if (raz_compiler_rt_arena_get(builder.module.node_kinds, index) == 1) {
+        i64 constant_index = raz_compiler_rt_arena_get(builder.module.node_values, index);
 
         if (constant_index < 0 || constant_index >= count) {
           hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -503,7 +534,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
       hir_copy_node_type(builder, indexed, base);
-      raz_rt_stage1_arena_set(builder.module.node_array_extents, indexed, -1);
+      raz_compiler_rt_arena_set(builder.module.node_array_extents, indexed, -1);
       base = indexed;
     }
     *out = base;
@@ -526,7 +557,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       // parenthesized aggregate behaves exactly like the ungrouped value.
       if (
       builder.current.kind == TokenKind::Dot &&
-      hir_type_is_enum(raz_rt_stage1_arena_get(builder.module.node_types, first_value))
+      hir_type_is_enum(raz_compiler_rt_arena_get(builder.module.node_types, first_value))
       ) {
         hir_advance(builder);
         if (builder.current.kind != TokenKind::Integer) {
@@ -534,22 +565,22 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           return false;
         }
 
-        i64 enumeration = hir_type_enum_index(raz_rt_stage1_arena_get(builder.module.node_types, first_value));
+        i64 enumeration = hir_type_enum_index(raz_compiler_rt_arena_get(builder.module.node_types, first_value));
         i64 payload_index = parse_integer_value(&builder.scan.input, &builder.current);
         i64 selected_payload = -1;
-        i64 member = raz_rt_stage1_arena_get(builder.module.enum_member_starts, enumeration);
+        i64 member = raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration);
 
         i64 member_end =
         member +
-        raz_rt_stage1_arena_get(builder.module.enum_member_counts, enumeration);
+        raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration);
         while (member < member_end && selected_payload < 0) {
-          i64 payload_count = raz_rt_stage1_arena_get(
+          i64 payload_count = raz_compiler_rt_arena_get(
           builder.module.enum_member_payload_counts,
           member,
           );
           if (payload_index >= 0 && payload_index < payload_count) {
             selected_payload =
-            raz_rt_stage1_arena_get(builder.module.enum_member_payload_starts, member) +
+            raz_compiler_rt_arena_get(builder.module.enum_member_payload_starts, member) +
             payload_index;
           }
           member += 1;
@@ -564,20 +595,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         if (!hir_add_node(builder, 16, first_value, payload_index + 1, 0, 0, &mut projected)) {
           return false;
         }
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_type_structs,
         projected,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_type_structs, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_type_structs, selected_payload),
         );
         hir_set_node_type(
         builder,
         projected,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_types, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_types, selected_payload),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_array_extents,
         projected,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_array_extents, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_array_extents, selected_payload),
         );
         hir_advance(builder);
         first_value = projected;
@@ -586,13 +617,13 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       return true;
     }
 
-    i64 values = raz_rt_stage1_arena_create(64);
-    i64 structures = raz_rt_stage1_arena_create(64);
-    i64 types = raz_rt_stage1_arena_create(64);
-    i64 references = raz_rt_stage1_arena_create(64);
-    i64 slices = raz_rt_stage1_arena_create(64);
-    i64 slice_mutables = raz_rt_stage1_arena_create(64);
-    i64 array_extents = raz_rt_stage1_arena_create(64);
+    i64 values = raz_compiler_rt_arena_create(64);
+    i64 structures = raz_compiler_rt_arena_create(64);
+    i64 types = raz_compiler_rt_arena_create(64);
+    i64 references = raz_compiler_rt_arena_create(64);
+    i64 slices = raz_compiler_rt_arena_create(64);
+    i64 slice_mutables = raz_compiler_rt_arena_create(64);
+    i64 array_extents = raz_compiler_rt_arena_create(64);
 
     if (
     values == 0 ||
@@ -603,41 +634,41 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     slice_mutables == 0 ||
     array_extents == 0
     ) {
-      raz_rt_stage1_arena_destroy(values);
-      raz_rt_stage1_arena_destroy(structures);
-      raz_rt_stage1_arena_destroy(types);
-      raz_rt_stage1_arena_destroy(references);
-      raz_rt_stage1_arena_destroy(slices);
-      raz_rt_stage1_arena_destroy(slice_mutables);
-      raz_rt_stage1_arena_destroy(array_extents);
+      raz_compiler_rt_arena_destroy(values);
+      raz_compiler_rt_arena_destroy(structures);
+      raz_compiler_rt_arena_destroy(types);
+      raz_compiler_rt_arena_destroy(references);
+      raz_compiler_rt_arena_destroy(slices);
+      raz_compiler_rt_arena_destroy(slice_mutables);
+      raz_compiler_rt_arena_destroy(array_extents);
       hir_fail(builder, DiagnosticCode::TooManyItems);
       return false;
     }
 
     i64 count = 1;
 
-    raz_rt_stage1_arena_set(values, 0, first_value);
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(values, 0, first_value);
+    raz_compiler_rt_arena_set(
     structures,
     0,
-    raz_rt_stage1_arena_get(builder.module.node_type_structs, first_value),
+    raz_compiler_rt_arena_get(builder.module.node_type_structs, first_value),
     );
-    raz_rt_stage1_arena_set(types, 0, raz_rt_stage1_arena_get(builder.module.node_types, first_value));
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(types, 0, raz_compiler_rt_arena_get(builder.module.node_types, first_value));
+    raz_compiler_rt_arena_set(
     references,
     0,
-    raz_rt_stage1_arena_get(builder.module.node_references, first_value),
+    raz_compiler_rt_arena_get(builder.module.node_references, first_value),
     );
-    raz_rt_stage1_arena_set(slices, 0, raz_rt_stage1_arena_get(builder.module.node_slices, first_value));
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(slices, 0, raz_compiler_rt_arena_get(builder.module.node_slices, first_value));
+    raz_compiler_rt_arena_set(
     slice_mutables,
     0,
-    raz_rt_stage1_arena_get(builder.module.node_slice_mutable, first_value),
+    raz_compiler_rt_arena_get(builder.module.node_slice_mutable, first_value),
     );
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(
     array_extents,
     0,
-    raz_rt_stage1_arena_get(builder.module.node_array_extents, first_value),
+    raz_compiler_rt_arena_get(builder.module.node_array_extents, first_value),
     );
     while (builder.current.kind == TokenKind::Comma) {
       hir_advance(builder);
@@ -645,13 +676,13 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         break;
       }
       if (count >= 64) {
-        raz_rt_stage1_arena_destroy(values);
-        raz_rt_stage1_arena_destroy(structures);
-        raz_rt_stage1_arena_destroy(types);
-        raz_rt_stage1_arena_destroy(references);
-        raz_rt_stage1_arena_destroy(slices);
-        raz_rt_stage1_arena_destroy(slice_mutables);
-        raz_rt_stage1_arena_destroy(array_extents);
+        raz_compiler_rt_arena_destroy(values);
+        raz_compiler_rt_arena_destroy(structures);
+        raz_compiler_rt_arena_destroy(types);
+        raz_compiler_rt_arena_destroy(references);
+        raz_compiler_rt_arena_destroy(slices);
+        raz_compiler_rt_arena_destroy(slice_mutables);
+        raz_compiler_rt_arena_destroy(array_extents);
         hir_fail(builder, DiagnosticCode::TooManyItems);
         return false;
       }
@@ -659,52 +690,52 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       i64 value = -1;
 
       if (!hir_parse_expression(builder, &mut value)) {
-        raz_rt_stage1_arena_destroy(values);
-        raz_rt_stage1_arena_destroy(structures);
-        raz_rt_stage1_arena_destroy(types);
-        raz_rt_stage1_arena_destroy(references);
-        raz_rt_stage1_arena_destroy(slices);
-        raz_rt_stage1_arena_destroy(slice_mutables);
-        raz_rt_stage1_arena_destroy(array_extents);
+        raz_compiler_rt_arena_destroy(values);
+        raz_compiler_rt_arena_destroy(structures);
+        raz_compiler_rt_arena_destroy(types);
+        raz_compiler_rt_arena_destroy(references);
+        raz_compiler_rt_arena_destroy(slices);
+        raz_compiler_rt_arena_destroy(slice_mutables);
+        raz_compiler_rt_arena_destroy(array_extents);
         return false;
       }
-      raz_rt_stage1_arena_set(values, count, value);
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(values, count, value);
+      raz_compiler_rt_arena_set(
       structures,
       count,
-      raz_rt_stage1_arena_get(builder.module.node_type_structs, value),
+      raz_compiler_rt_arena_get(builder.module.node_type_structs, value),
       );
-      raz_rt_stage1_arena_set(types, count, raz_rt_stage1_arena_get(builder.module.node_types, value));
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(types, count, raz_compiler_rt_arena_get(builder.module.node_types, value));
+      raz_compiler_rt_arena_set(
       references,
       count,
-      raz_rt_stage1_arena_get(builder.module.node_references, value),
+      raz_compiler_rt_arena_get(builder.module.node_references, value),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       slices,
       count,
-      raz_rt_stage1_arena_get(builder.module.node_slices, value),
+      raz_compiler_rt_arena_get(builder.module.node_slices, value),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       slice_mutables,
       count,
-      raz_rt_stage1_arena_get(builder.module.node_slice_mutable, value),
+      raz_compiler_rt_arena_get(builder.module.node_slice_mutable, value),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       array_extents,
       count,
-      raz_rt_stage1_arena_get(builder.module.node_array_extents, value),
+      raz_compiler_rt_arena_get(builder.module.node_array_extents, value),
       );
       count += 1;
     }
     if (!hir_expect(builder, TokenKind::RightParen)) {
-      raz_rt_stage1_arena_destroy(values);
-      raz_rt_stage1_arena_destroy(structures);
-      raz_rt_stage1_arena_destroy(types);
-      raz_rt_stage1_arena_destroy(references);
-      raz_rt_stage1_arena_destroy(slices);
-      raz_rt_stage1_arena_destroy(slice_mutables);
-      raz_rt_stage1_arena_destroy(array_extents);
+      raz_compiler_rt_arena_destroy(values);
+      raz_compiler_rt_arena_destroy(structures);
+      raz_compiler_rt_arena_destroy(types);
+      raz_compiler_rt_arena_destroy(references);
+      raz_compiler_rt_arena_destroy(slices);
+      raz_compiler_rt_arena_destroy(slice_mutables);
+      raz_compiler_rt_arena_destroy(array_extents);
       return false;
     }
     i64 tuple_structure = hir_intern_tuple_type(
@@ -717,14 +748,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     array_extents,
     count,
     );
-    raz_rt_stage1_arena_destroy(structures);
-    raz_rt_stage1_arena_destroy(types);
-    raz_rt_stage1_arena_destroy(references);
-    raz_rt_stage1_arena_destroy(slices);
-    raz_rt_stage1_arena_destroy(slice_mutables);
-    raz_rt_stage1_arena_destroy(array_extents);
+    raz_compiler_rt_arena_destroy(structures);
+    raz_compiler_rt_arena_destroy(types);
+    raz_compiler_rt_arena_destroy(references);
+    raz_compiler_rt_arena_destroy(slices);
+    raz_compiler_rt_arena_destroy(slice_mutables);
+    raz_compiler_rt_arena_destroy(array_extents);
     if (tuple_structure < 0 || builder.module.argument_count + count >= 262144) {
-      raz_rt_stage1_arena_destroy(values);
+      raz_compiler_rt_arena_destroy(values);
       if (tuple_structure >= 0) {
         hir_fail(builder, DiagnosticCode::TooManyItems);
       }
@@ -735,22 +766,22 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     i64 element = 0;
 
     while (element < count) {
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.arguments,
       builder.module.argument_count,
-      raz_rt_stage1_arena_get(values, element),
+      raz_compiler_rt_arena_get(values, element),
       );
       builder.module.argument_count += 1;
       element += 1;
     }
-    raz_rt_stage1_arena_destroy(values);
+    raz_compiler_rt_arena_destroy(values);
 
     i64 tuple = -1;
 
     if (!hir_add_node(builder, 34, tuple_structure, argument_start, count, 0, &mut tuple)) {
       return false;
     }
-    raz_rt_stage1_arena_set(builder.module.node_type_structs, tuple, tuple_structure);
+    raz_compiler_rt_arena_set(builder.module.node_type_structs, tuple, tuple_structure);
     *out = tuple;
     return true;
   }
@@ -780,7 +811,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       return false;
     }
     if (unary == TokenKind::Star) {
-      i64 pointer_kind = raz_rt_stage1_arena_get(builder.module.node_references, operand);
+      i64 pointer_kind = raz_compiler_rt_arena_get(builder.module.node_references, operand);
 
       if ((pointer_kind == 2 || pointer_kind == 3) && builder.unsafe_depth == 0) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -789,7 +820,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     }
     if (unary == TokenKind::Minus) {
       i64 zero = -1;
-      i64 operand_type = raz_rt_stage1_arena_get(builder.module.node_types, operand);
+      i64 operand_type = raz_compiler_rt_arena_get(builder.module.node_types, operand);
 
       if (operand_type == 1) {
         if (!hir_add_node(builder, 30, 0, 0, 0, 0, &mut zero)) {
@@ -815,9 +846,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     if (unary == TokenKind::Ampersand) {
       bool raw_storage_borrow = false;
 
-      if (raz_rt_stage1_arena_get(builder.module.node_kinds, operand) == 21) {
-        i64 raw_pointer = raz_rt_stage1_arena_get(builder.module.node_a, operand);
-        i64 raw_pointer_kind = raz_rt_stage1_arena_get(builder.module.node_references, raw_pointer);
+      if (raz_compiler_rt_arena_get(builder.module.node_kinds, operand) == 21) {
+        i64 raw_pointer = raz_compiler_rt_arena_get(builder.module.node_a, operand);
+        i64 raw_pointer_kind = raz_compiler_rt_arena_get(builder.module.node_references, raw_pointer);
 
         if (builder.unsafe_depth > 0 && (raw_pointer_kind == 2 || raw_pointer_kind == 3)) {
           if (unary_value != 0 && raw_pointer_kind != 3) {
@@ -834,7 +865,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     } else if (unary == TokenKind::Star) {
       kind = 21;
     } else if (unary == TokenKind::Tilde) {
-      if (raz_rt_stage1_arena_get(builder.module.node_types, operand) == 1) {
+      if (raz_compiler_rt_arena_get(builder.module.node_types, operand) == 1) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
         return false;
       }
@@ -850,11 +881,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       hir_copy_node_type(builder, result, operand);
     }
     if (unary == TokenKind::Ampersand) {
-      raz_rt_stage1_arena_set(builder.module.node_references, result, 1);
-      raz_rt_stage1_arena_set(builder.module.node_reference_mutable, result, unary_value);
+      raz_compiler_rt_arena_set(builder.module.node_references, result, 1);
+      raz_compiler_rt_arena_set(builder.module.node_reference_mutable, result, unary_value);
     } else if (unary == TokenKind::Star) {
-      raz_rt_stage1_arena_set(builder.module.node_references, result, 0);
-      raz_rt_stage1_arena_set(builder.module.node_reference_mutable, result, 0);
+      raz_compiler_rt_arena_set(builder.module.node_references, result, 0);
+      raz_compiler_rt_arena_set(builder.module.node_reference_mutable, result, 0);
     }
     *out = result;
     return true;
@@ -1065,19 +1096,19 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       return false;
     }
 
-    i64 source_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, source_value);
+    i64 source_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, source_value);
 
     if (source_structure < 0) {
-      i64 source_type = raz_rt_stage1_arena_get(builder.module.node_types, source_value);
+      i64 source_type = raz_compiler_rt_arena_get(builder.module.node_types, source_value);
 
       if (hir_type_is_enum(source_type)) {
         i64 enumeration = hir_type_enum_index(source_type);
 
-        if (raz_rt_stage1_arena_get(builder.module.enum_copy_flags, enumeration) != 0) {
+        if (raz_compiler_rt_arena_get(builder.module.enum_copy_flags, enumeration) != 0) {
           *out = source_value;
           return true;
         }
-        if (raz_rt_stage1_arena_get(builder.module.enum_derived_clone_flags, enumeration) != 0) {
+        if (raz_compiler_rt_arena_get(builder.module.enum_derived_clone_flags, enumeration) != 0) {
           i64 structural_enum = -1;
 
           if (!hir_add_node(builder, 55, source_value, enumeration, 0, 0, &mut structural_enum)) {
@@ -1093,14 +1124,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       // `FnOnce` closures are consumable callables, not Clone values.
       // Their callable ownership lives on the local rather than a struct
       // type, so reject cloning the local before the scalar fallback.
-      if (raz_rt_stage1_arena_get(builder.module.node_kinds, source_value) == 3) {
+      if (raz_compiler_rt_arena_get(builder.module.node_kinds, source_value) == 3) {
         i64 source_local = hir_local_index_from_slot(
         builder,
-        raz_rt_stage1_arena_get(builder.module.node_a, source_value),
+        raz_compiler_rt_arena_get(builder.module.node_a, source_value),
         );
         if (
         source_local >= 0 &&
-        raz_rt_stage1_arena_get(builder.module.local_callable_kinds, source_local) == 4
+        raz_compiler_rt_arena_get(builder.module.local_callable_kinds, source_local) == 4
         ) {
           hir_fail(builder, DiagnosticCode::ExpectedToken);
           return false;
@@ -1110,9 +1141,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       return true;
     }
 
-    i64 target = raz_rt_stage1_arena_get(builder.module.struct_clone_functions, source_structure);
+    i64 target = raz_compiler_rt_arena_get(builder.module.struct_clone_functions, source_structure);
 
-    if (target < 0 && raz_rt_stage1_arena_get(builder.module.struct_copy_flags, source_structure) != 0) {
+    if (target < 0 && raz_compiler_rt_arena_get(builder.module.struct_copy_flags, source_structure) != 0) {
       // Copy is a valid structural Clone derivation: cloning does not need
       // a helper call because the value may be duplicated directly.
       *out = source_value;
@@ -1120,20 +1151,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     }
     if (
     target < 0 &&
-    raz_rt_stage1_arena_get(builder.module.struct_derived_clone_flags, source_structure) != 0
+    raz_compiler_rt_arena_get(builder.module.struct_derived_clone_flags, source_structure) != 0
     ) {
       i64 structural = -1;
 
       if (!hir_add_node(builder, 52, source_value, source_structure, 0, 0, &mut structural)) {
         return false;
       }
-      raz_rt_stage1_arena_set(builder.module.node_type_structs, structural, source_structure);
+      raz_compiler_rt_arena_set(builder.module.node_type_structs, structural, source_structure);
       *out = structural;
       return true;
     }
     if (
     target < 0 &&
-    raz_rt_stage1_arena_get(builder.module.struct_generic_template_indices, source_structure) < 0
+    raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, source_structure) < 0
     ) {
       hir_fail(builder, DiagnosticCode::ExpectedToken);
       return false;
@@ -1144,7 +1175,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     if (!hir_add_node(builder, 41, source_value, source_structure, 0, 0, &mut call)) {
       return false;
     }
-    raz_rt_stage1_arena_set(builder.module.node_type_structs, call, source_structure);
+    raz_compiler_rt_arena_set(builder.module.node_type_structs, call, source_structure);
     *out = call;
     return true;
   }
@@ -1190,16 +1221,16 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
   ) {
     hir_advance(builder);
 
-    i64 generic_argument_structures = raz_rt_stage1_arena_create(32);
-    i64 generic_argument_types = raz_rt_stage1_arena_create(32);
+    i64 generic_argument_structures = raz_compiler_rt_arena_create(32);
+    i64 generic_argument_types = raz_compiler_rt_arena_create(32);
     i64 generic_argument_count = 0;
     bool parsing_generic_arguments = true;
 
     while (parsing_generic_arguments) {
       if (generic_argument_count >= 32) {
         hir_fail(builder, DiagnosticCode::TooManyItems);
-        raz_rt_stage1_arena_destroy(generic_argument_structures);
-        raz_rt_stage1_arena_destroy(generic_argument_types);
+        raz_compiler_rt_arena_destroy(generic_argument_structures);
+        raz_compiler_rt_arena_destroy(generic_argument_types);
         return false;
       }
 
@@ -1211,37 +1242,37 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       i64 parameter_start = 0;
 
       if (generic >= 0) {
-        parameter_start = raz_rt_stage1_arena_get(
+        parameter_start = raz_compiler_rt_arena_get(
         builder.module.generic_function_parameter_starts,
         generic,
         );
       } else if (generic_structure_template >= 0) {
-        parameter_start = raz_rt_stage1_arena_get(
+        parameter_start = raz_compiler_rt_arena_get(
         builder.module.generic_struct_parameter_starts,
         generic_structure_template,
         );
       } else {
-        parameter_start = raz_rt_stage1_arena_get(
+        parameter_start = raz_compiler_rt_arena_get(
         builder.module.generic_enum_parameter_starts,
         generic_enum_template,
         );
       }
 
       i64 parameter = parameter_start + generic_argument_count;
-      i64 parameter_kind = raz_rt_stage1_arena_get(builder.module.generic_parameter_kinds, parameter);
+      i64 parameter_kind = raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, parameter);
 
       if (parameter_kind == 2) {
         concrete_structure = -2;
         if (!hir_parse_const_generic_expression(builder, &mut concrete_type)) {
-          raz_rt_stage1_arena_destroy(generic_argument_structures);
-          raz_rt_stage1_arena_destroy(generic_argument_types);
+          raz_compiler_rt_arena_destroy(generic_argument_structures);
+          raz_compiler_rt_arena_destroy(generic_argument_types);
           return false;
         }
       } else if (parameter_kind == 1) {
         if (builder.current.kind != TokenKind::Lifetime) {
           hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
-          raz_rt_stage1_arena_destroy(generic_argument_structures);
-          raz_rt_stage1_arena_destroy(generic_argument_types);
+          raz_compiler_rt_arena_destroy(generic_argument_structures);
+          raz_compiler_rt_arena_destroy(generic_argument_types);
           return false;
         }
         concrete_structure = -3;
@@ -1265,22 +1296,22 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         &mut concrete_slice_mutable,
         )
         ) {
-          raz_rt_stage1_arena_destroy(generic_argument_structures);
-          raz_rt_stage1_arena_destroy(generic_argument_types);
+          raz_compiler_rt_arena_destroy(generic_argument_structures);
+          raz_compiler_rt_arena_destroy(generic_argument_types);
           return false;
         }
         if (concrete_reference != 0 || concrete_slice != 0) {
           hir_fail(builder, DiagnosticCode::ExpectedToken);
-          raz_rt_stage1_arena_destroy(generic_argument_structures);
-          raz_rt_stage1_arena_destroy(generic_argument_types);
+          raz_compiler_rt_arena_destroy(generic_argument_structures);
+          raz_compiler_rt_arena_destroy(generic_argument_types);
           return false;
         }
         if (semantic_bool && concrete_structure < 0 && concrete_type == 0) {
           concrete_type = 16;
         }
       }
-      raz_rt_stage1_arena_set(generic_argument_structures, generic_argument_count, concrete_structure);
-      raz_rt_stage1_arena_set(generic_argument_types, generic_argument_count, concrete_type);
+      raz_compiler_rt_arena_set(generic_argument_structures, generic_argument_count, concrete_structure);
+      raz_compiler_rt_arena_set(generic_argument_types, generic_argument_count, concrete_type);
       generic_argument_count += 1;
       if (builder.current.kind == TokenKind::Comma) {
         hir_advance(builder);
@@ -1289,8 +1320,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       }
     }
     if (!hir_expect(builder, TokenKind::Greater)) {
-      raz_rt_stage1_arena_destroy(generic_argument_structures);
-      raz_rt_stage1_arena_destroy(generic_argument_types);
+      raz_compiler_rt_arena_destroy(generic_argument_structures);
+      raz_compiler_rt_arena_destroy(generic_argument_types);
       return false;
     }
     if (generic >= 0) {
@@ -1302,8 +1333,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       generic_argument_types,
       );
       if (resolved_generic_target < 0) {
-        raz_rt_stage1_arena_destroy(generic_argument_structures);
-        raz_rt_stage1_arena_destroy(generic_argument_types);
+        raz_compiler_rt_arena_destroy(generic_argument_structures);
+        raz_compiler_rt_arena_destroy(generic_argument_types);
         return false;
       }
     } else if (generic_structure_template >= 0) {
@@ -1315,8 +1346,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       generic_argument_types,
       );
       if (resolved_generic_structure < 0) {
-        raz_rt_stage1_arena_destroy(generic_argument_structures);
-        raz_rt_stage1_arena_destroy(generic_argument_types);
+        raz_compiler_rt_arena_destroy(generic_argument_structures);
+        raz_compiler_rt_arena_destroy(generic_argument_types);
         return false;
       }
     } else {
@@ -1328,13 +1359,13 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       generic_argument_types,
       );
       if (resolved_generic_enum < 0) {
-        raz_rt_stage1_arena_destroy(generic_argument_structures);
-        raz_rt_stage1_arena_destroy(generic_argument_types);
+        raz_compiler_rt_arena_destroy(generic_argument_structures);
+        raz_compiler_rt_arena_destroy(generic_argument_types);
         return false;
       }
     }
-    raz_rt_stage1_arena_destroy(generic_argument_structures);
-    raz_rt_stage1_arena_destroy(generic_argument_types);
+    raz_compiler_rt_arena_destroy(generic_argument_structures);
+    raz_compiler_rt_arena_destroy(generic_argument_types);
   }
 
   i64 named_structure = resolved_generic_structure;
@@ -1388,12 +1419,12 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       );
       if (
       resolved_callable &&
-      raz_rt_stage1_arena_get(builder.module.local_callable_kinds, callable_local) != 5
+      raz_compiler_rt_arena_get(builder.module.local_callable_kinds, callable_local) != 5
       ) {
-        target = raz_rt_stage1_arena_get(builder.module.local_callable_functions, callable_local);
+        target = raz_compiler_rt_arena_get(builder.module.local_callable_functions, callable_local);
         if (
-        raz_rt_stage1_arena_get(builder.module.local_callable_kinds, callable_local) == 4 &&
-        raz_rt_stage1_arena_get(builder.module.local_callable_consumed, callable_local) != 0
+        raz_compiler_rt_arena_get(builder.module.local_callable_kinds, callable_local) == 4 &&
+        raz_compiler_rt_arena_get(builder.module.local_callable_consumed, callable_local) != 0
         ) {
           hir_fail(builder, DiagnosticCode::UseAfterMove);
           return false;
@@ -1410,12 +1441,12 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           return false;
         }
         hir_apply_name_type(builder, name_kind, name_slot, indirect_callee);
-        indirect_signature = raz_rt_stage1_arena_get(
+        indirect_signature = raz_compiler_rt_arena_get(
         builder.module.node_function_types,
         indirect_callee,
         );
 
-        i64 indirect_type = raz_rt_stage1_arena_get(builder.module.node_types, indirect_callee);
+        i64 indirect_type = raz_compiler_rt_arena_get(builder.module.node_types, indirect_callee);
 
         if (
         (indirect_type != 14 && (indirect_type < 16 || indirect_type > 18)) ||
@@ -1430,7 +1461,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     }
     hir_advance(builder);
 
-    i64 pending_arguments = raz_rt_stage1_arena_create(256);
+    i64 pending_arguments = raz_compiler_rt_arena_create(256);
 
     if (pending_arguments == 0) {
       hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -1446,15 +1477,15 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         i64 argument = -1;
 
         if (!hir_parse_expression(builder, &mut argument)) {
-          raz_rt_stage1_arena_destroy(pending_arguments);
+          raz_compiler_rt_arena_destroy(pending_arguments);
           return false;
         }
         if (argument_count >= 256) {
-          raz_rt_stage1_arena_destroy(pending_arguments);
+          raz_compiler_rt_arena_destroy(pending_arguments);
           hir_fail(builder, DiagnosticCode::TooManyItems);
           return false;
         }
-        raz_rt_stage1_arena_set(pending_arguments, argument_count, argument);
+        raz_compiler_rt_arena_set(pending_arguments, argument_count, argument);
         argument_count += 1;
         if (builder.current.kind == TokenKind::Comma) {
           hir_advance(builder);
@@ -1467,41 +1498,41 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       }
     }
     if (!hir_expect(builder, TokenKind::RightParen)) {
-      raz_rt_stage1_arena_destroy(pending_arguments);
+      raz_compiler_rt_arena_destroy(pending_arguments);
       return false;
     }
 
     i64 expected_argument_count = 0;
 
     if (indirect_call) {
-      expected_argument_count = raz_rt_stage1_arena_get(
+      expected_argument_count = raz_compiler_rt_arena_get(
       builder.module.function_type_parameter_counts,
       indirect_signature,
       );
     } else if (target >= 0) {
-      expected_argument_count = raz_rt_stage1_arena_get(
+      expected_argument_count = raz_compiler_rt_arena_get(
       builder.module.function_parameter_counts,
       target,
       );
       if (
       callable_local >= 0 &&
-      raz_rt_stage1_arena_get(builder.module.function_closure_ids, target) >= 0
+      raz_compiler_rt_arena_get(builder.module.function_closure_ids, target) >= 0
       ) {
-        expected_argument_count = raz_rt_stage1_arena_get(
+        expected_argument_count = raz_compiler_rt_arena_get(
         builder.module.function_closure_explicit_parameter_counts,
         target,
         );
       }
     } else {
-      expected_argument_count = raz_rt_stage1_arena_get(builder.module.struct_field_counts, structure);
+      expected_argument_count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
     }
     if (argument_count != expected_argument_count) {
-      raz_rt_stage1_arena_destroy(pending_arguments);
+      raz_compiler_rt_arena_destroy(pending_arguments);
       hir_fail(builder, DiagnosticCode::WrongArgumentCount);
       return false;
     }
     if (builder.module.argument_count + argument_count >= 262144) {
-      raz_rt_stage1_arena_destroy(pending_arguments);
+      raz_compiler_rt_arena_destroy(pending_arguments);
       hir_fail(builder, DiagnosticCode::TooManyItems);
       return false;
     }
@@ -1510,21 +1541,21 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     i64 field_start = 0;
 
     if (indirect_call) {
-      parameter_start = raz_rt_stage1_arena_get(
+      parameter_start = raz_compiler_rt_arena_get(
       builder.module.function_type_parameter_starts,
       indirect_signature,
       );
     } else if (target >= 0) {
-      parameter_start = raz_rt_stage1_arena_get(builder.module.function_parameter_starts, target);
+      parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, target);
     } else {
-      field_start = raz_rt_stage1_arena_get(builder.module.struct_field_starts, structure);
+      field_start = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
     }
 
     i64 argument_index = 0;
 
     while (argument_index < argument_count) {
-      i64 argument_node = raz_rt_stage1_arena_get(pending_arguments, argument_index);
-      i64 argument_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, argument_node);
+      i64 argument_node = raz_compiler_rt_arena_get(pending_arguments, argument_index);
+      i64 argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument_node);
 
       if (target >= 0 || indirect_call) {
         i64 parameter_index = parameter_start + argument_index;
@@ -1536,49 +1567,49 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         i64 parameter_function_type = -1;
 
         if (indirect_call) {
-          parameter_structure = raz_rt_stage1_arena_get(
+          parameter_structure = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_type_structs,
           parameter_index,
           );
-          parameter_type = raz_rt_stage1_arena_get(
+          parameter_type = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_types,
           parameter_index,
           );
-          parameter_reference = raz_rt_stage1_arena_get(
+          parameter_reference = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_references,
           parameter_index,
           );
-          parameter_slice = raz_rt_stage1_arena_get(
+          parameter_slice = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_slices,
           parameter_index,
           );
-          parameter_slice_mutable = raz_rt_stage1_arena_get(
+          parameter_slice_mutable = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_slice_mutable,
           parameter_index,
           );
-          parameter_function_type = raz_rt_stage1_arena_get(
+          parameter_function_type = raz_compiler_rt_arena_get(
           builder.module.function_type_parameter_function_types,
           parameter_index,
           );
         } else {
-          parameter_structure = raz_rt_stage1_arena_get(
+          parameter_structure = raz_compiler_rt_arena_get(
           builder.module.parameter_type_structs,
           parameter_index,
           );
-          parameter_type = raz_rt_stage1_arena_get(builder.module.parameter_types, parameter_index);
-          parameter_reference = raz_rt_stage1_arena_get(
+          parameter_type = raz_compiler_rt_arena_get(builder.module.parameter_types, parameter_index);
+          parameter_reference = raz_compiler_rt_arena_get(
           builder.module.parameter_references,
           parameter_index,
           );
-          parameter_slice = raz_rt_stage1_arena_get(
+          parameter_slice = raz_compiler_rt_arena_get(
           builder.module.parameter_slices,
           parameter_index,
           );
-          parameter_slice_mutable = raz_rt_stage1_arena_get(
+          parameter_slice_mutable = raz_compiler_rt_arena_get(
           builder.module.parameter_slice_mutable,
           parameter_index,
           );
-          parameter_function_type = raz_rt_stage1_arena_get(
+          parameter_function_type = raz_compiler_rt_arena_get(
           builder.module.parameter_function_types,
           parameter_index,
           );
@@ -1588,9 +1619,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         parameter_reference == 0 &&
         parameter_structure < 0 &&
         parameter_type == 0 &&
-        raz_rt_stage1_arena_get(builder.module.node_kinds, argument_node) == 1
+        raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 1
         ) {
-          bool argument_is_bool = raz_rt_stage1_arena_get(
+          bool argument_is_bool = raz_compiler_rt_arena_get(
           builder.module.node_c,
           argument_node,
           ) == 1;
@@ -1598,7 +1629,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           bool parameter_is_bool = hir_parameter_spells_bool(builder, parameter_index);
 
           if (argument_is_bool != parameter_is_bool) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             hir_fail(builder, DiagnosticCode::ExpectedToken);
             return false;
           }
@@ -1607,19 +1638,19 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         i64 parameter_array_extent = -1;
 
         if (!indirect_call) {
-          parameter_array_extent = raz_rt_stage1_arena_get(
+          parameter_array_extent = raz_compiler_rt_arena_get(
           builder.module.parameter_array_extents,
           parameter_index,
           );
         }
         if (parameter_array_extent >= 0) {
           if (
-          raz_rt_stage1_arena_get(
+          raz_compiler_rt_arena_get(
           builder.module.node_array_extents,
           argument_node,
           ) != parameter_array_extent
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             hir_fail(builder, DiagnosticCode::ExpectedToken);
             return false;
           }
@@ -1635,22 +1666,22 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           &mut sliced_argument,
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
           argument_node = sliced_argument;
-          argument_structure = raz_rt_stage1_arena_get(
+          argument_structure = raz_compiler_rt_arena_get(
           builder.module.node_type_structs,
           argument_node,
           );
           if (parameter_structure >= 0) {
             if (argument_structure != parameter_structure) {
-              raz_rt_stage1_arena_destroy(pending_arguments);
+              raz_compiler_rt_arena_destroy(pending_arguments);
               hir_fail(builder, DiagnosticCode::ExpectedToken);
               return false;
             }
           } else if (!hir_require_value_type(builder, &mut argument_node, parameter_type)) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
         } else if (parameter_reference != 0) {
@@ -1663,7 +1694,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           parameter_type,
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
         } else if (parameter_type == 15 && parameter_function_type <= -2) {
@@ -1671,7 +1702,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           i64 coerced_object = -1;
 
           if (!hir_coerce_trait_object(builder, argument_node, trait_object, &mut coerced_object)) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
           argument_node = coerced_object;
@@ -1681,9 +1712,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           // already-typed callable values. Preserve the closure node so
           // capture ownership remains available to later lowering.
 
-          i64 argument_kind = raz_rt_stage1_arena_get(builder.module.node_kinds, argument_node);
+          i64 argument_kind = raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node);
 
-          i64 argument_signature = raz_rt_stage1_arena_get(
+          i64 argument_signature = raz_compiler_rt_arena_get(
           builder.module.node_function_types,
           argument_node,
           );
@@ -1691,11 +1722,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           i64 closure_kind = 0;
 
           if (argument_kind == 42) {
-            i64 closure_function = raz_rt_stage1_arena_get(builder.module.node_a, argument_node);
+            i64 closure_function = raz_compiler_rt_arena_get(builder.module.node_a, argument_node);
 
-            closure_kind = raz_rt_stage1_arena_get(builder.module.node_b, argument_node);
+            closure_kind = raz_compiler_rt_arena_get(builder.module.node_b, argument_node);
             argument_signature = hir_function_pointer_signature(builder, closure_function);
-            raz_rt_stage1_arena_set(
+            raz_compiler_rt_arena_set(
             builder.module.node_function_types,
             argument_node,
             argument_signature,
@@ -1713,7 +1744,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
               kind_compatible = closure_kind >= 1 && closure_kind <= 4;
             }
           } else {
-            i64 argument_type = raz_rt_stage1_arena_get(builder.module.node_types, argument_node);
+            i64 argument_type = raz_compiler_rt_arena_get(builder.module.node_types, argument_node);
 
             kind_compatible = argument_type >= 16 && argument_type <= 18;
           }
@@ -1727,7 +1758,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           argument_signature,
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             hir_fail(builder, DiagnosticCode::ExpectedToken);
             return false;
           }
@@ -1736,40 +1767,40 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         argument_structure < 0 &&
         !(
         parameter_type == 14 &&
-        raz_rt_stage1_arena_get(builder.module.node_kinds, argument_node) == 42
+        raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 42
         ) &&
         !hir_require_value_type(builder, &mut argument_node, parameter_type)
         ) {
-          raz_rt_stage1_arena_destroy(pending_arguments);
+          raz_compiler_rt_arena_destroy(pending_arguments);
           return false;
         }
         if (parameter_type == 14) {
-          if (raz_rt_stage1_arena_get(builder.module.node_kinds, argument_node) == 42) {
-            i64 closure_function = raz_rt_stage1_arena_get(builder.module.node_a, argument_node);
+          if (raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 42) {
+            i64 closure_function = raz_compiler_rt_arena_get(builder.module.node_a, argument_node);
 
             if (
-            raz_rt_stage1_arena_get(
+            raz_compiler_rt_arena_get(
             builder.module.function_closure_capture_counts,
             closure_function,
             ) != 0
             ) {
-              raz_rt_stage1_arena_destroy(pending_arguments);
+              raz_compiler_rt_arena_destroy(pending_arguments);
               hir_fail(builder, DiagnosticCode::ExpectedToken);
               return false;
             }
 
             i64 closure_signature = hir_function_pointer_signature(builder, closure_function);
 
-            raz_rt_stage1_arena_set(builder.module.node_kinds, argument_node, 47);
-            raz_rt_stage1_arena_set(builder.module.node_a, argument_node, closure_function);
+            raz_compiler_rt_arena_set(builder.module.node_kinds, argument_node, 47);
+            raz_compiler_rt_arena_set(builder.module.node_a, argument_node, closure_function);
             hir_set_node_type(builder, argument_node, 14);
-            raz_rt_stage1_arena_set(
+            raz_compiler_rt_arena_set(
             builder.module.node_function_types,
             argument_node,
             closure_signature,
             );
           }
-          i64 argument_signature = raz_rt_stage1_arena_get(
+          i64 argument_signature = raz_compiler_rt_arena_get(
           builder.module.node_function_types,
           argument_node,
           );
@@ -1781,7 +1812,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           argument_signature,
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             hir_fail(builder, DiagnosticCode::ExpectedToken);
             return false;
           }
@@ -1789,29 +1820,29 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       } else {
         i64 field_index = field_start + argument_index;
 
-        i64 field_structure = raz_rt_stage1_arena_get(
+        i64 field_structure = raz_compiler_rt_arena_get(
         builder.module.struct_field_type_structs,
         field_index,
         );
-        i64 field_reference = raz_rt_stage1_arena_get(
+        i64 field_reference = raz_compiler_rt_arena_get(
         builder.module.struct_field_references,
         field_index,
         );
 
-        i64 field_slice = raz_rt_stage1_arena_get(builder.module.struct_field_slices, field_index);
+        i64 field_slice = raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_index);
 
-        i64 field_array_extent = raz_rt_stage1_arena_get(
+        i64 field_array_extent = raz_compiler_rt_arena_get(
         builder.module.struct_field_array_extents,
         field_index,
         );
         if (
         field_array_extent >= 0 &&
-        raz_rt_stage1_arena_get(
+        raz_compiler_rt_arena_get(
         builder.module.node_array_extents,
         argument_node,
         ) != field_array_extent
         ) {
-          raz_rt_stage1_arena_destroy(pending_arguments);
+          raz_compiler_rt_arena_destroy(pending_arguments);
           hir_fail(builder, DiagnosticCode::ExpectedToken);
           return false;
         }
@@ -1822,15 +1853,15 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           !hir_coerce_slice(
           builder,
           argument_node,
-          raz_rt_stage1_arena_get(builder.module.struct_field_slice_mutable, field_index),
+          raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_index),
           &mut sliced_argument,
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
           argument_node = sliced_argument;
-          argument_structure = raz_rt_stage1_arena_get(
+          argument_structure = raz_compiler_rt_arena_get(
           builder.module.node_type_structs,
           argument_node,
           );
@@ -1842,15 +1873,15 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           &mut argument_node,
           field_reference,
           field_structure,
-          raz_rt_stage1_arena_get(builder.module.struct_field_types, field_index),
+          raz_compiler_rt_arena_get(builder.module.struct_field_types, field_index),
           )
           ) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             return false;
           }
         } else if (field_structure >= 0) {
           if (argument_structure != field_structure) {
-            raz_rt_stage1_arena_destroy(pending_arguments);
+            raz_compiler_rt_arena_destroy(pending_arguments);
             hir_fail(builder, DiagnosticCode::ExpectedToken);
             return false;
           }
@@ -1859,14 +1890,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         !hir_require_value_type(
         builder,
         &mut argument_node,
-        raz_rt_stage1_arena_get(builder.module.struct_field_types, field_index),
+        raz_compiler_rt_arena_get(builder.module.struct_field_types, field_index),
         )
         ) {
-          raz_rt_stage1_arena_destroy(pending_arguments);
+          raz_compiler_rt_arena_destroy(pending_arguments);
           return false;
         }
       }
-      raz_rt_stage1_arena_set(pending_arguments, argument_index, argument_node);
+      raz_compiler_rt_arena_set(pending_arguments, argument_index, argument_node);
       argument_index += 1;
     }
 
@@ -1874,32 +1905,32 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
 
     argument_index = 0;
     while (argument_index < argument_count) {
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.arguments,
       builder.module.argument_count,
-      raz_rt_stage1_arena_get(pending_arguments, argument_index),
+      raz_compiler_rt_arena_get(pending_arguments, argument_index),
       );
       builder.module.argument_count += 1;
       argument_index += 1;
     }
-    raz_rt_stage1_arena_destroy(pending_arguments);
+    raz_compiler_rt_arena_destroy(pending_arguments);
     if (
     callable_local >= 0 &&
-    raz_rt_stage1_arena_get(builder.module.function_closure_ids, target) >= 0
+    raz_compiler_rt_arena_get(builder.module.function_closure_ids, target) >= 0
     ) {
-      i64 callable_kind_value = raz_rt_stage1_arena_get(
+      i64 callable_kind_value = raz_compiler_rt_arena_get(
       builder.module.local_callable_kinds,
       callable_local,
       );
       if (!hir_append_callable_local_captures(builder, callable_local, target, callable_kind_value)) {
         return false;
       }
-      argument_count += raz_rt_stage1_arena_get(
+      argument_count += raz_compiler_rt_arena_get(
       builder.module.local_callable_capture_counts,
       callable_local,
       );
       if (callable_kind_value == 4) {
-        raz_rt_stage1_arena_set(builder.module.local_callable_consumed, callable_local, 1);
+        raz_compiler_rt_arena_set(builder.module.local_callable_consumed, callable_local, 1);
       }
     }
 
@@ -1922,32 +1953,32 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       hir_set_node_type(
       builder,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_type_return_types, indirect_signature),
+      raz_compiler_rt_arena_get(builder.module.function_type_return_types, indirect_signature),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_references,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_type_return_references, indirect_signature),
+      raz_compiler_rt_arena_get(builder.module.function_type_return_references, indirect_signature),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_type_structs,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_type_return_type_structs, indirect_signature),
+      raz_compiler_rt_arena_get(builder.module.function_type_return_type_structs, indirect_signature),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_slices,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_type_return_slices, indirect_signature),
+      raz_compiler_rt_arena_get(builder.module.function_type_return_slices, indirect_signature),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_slice_mutable,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_type_return_slice_mutable, indirect_signature),
+      raz_compiler_rt_arena_get(builder.module.function_type_return_slice_mutable, indirect_signature),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_function_types,
       call,
-      raz_rt_stage1_arena_get(
+      raz_compiler_rt_arena_get(
       builder.module.function_type_return_function_types,
       indirect_signature,
       ),
@@ -1956,12 +1987,12 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       // Effect contracts are transitive: a constrained caller may only
       // invoke callees that explicitly guarantee every effect it requires.
       if (builder.current_function >= 0) {
-        i64 required_effects = raz_rt_stage1_arena_get(
+        i64 required_effects = raz_compiler_rt_arena_get(
         builder.module.function_effect_flags,
         builder.current_function,
         );
 
-        i64 provided_effects = raz_rt_stage1_arena_get(builder.module.function_effect_flags, target);
+        i64 provided_effects = raz_compiler_rt_arena_get(builder.module.function_effect_flags, target);
 
         if ((required_effects & provided_effects) != required_effects) {
           hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -1969,7 +2000,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         }
       }
       if (
-      raz_rt_stage1_arena_get(builder.module.function_is_unsafe, target) != 0 &&
+      raz_compiler_rt_arena_get(builder.module.function_is_unsafe, target) != 0 &&
       builder.unsafe_depth == 0
       ) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -1981,55 +2012,55 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       hir_set_node_type(
       builder,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_types, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_types, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_references,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_references, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_references, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_reference_mutable,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_reference_mutable, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_reference_mutable, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_lifetimes,
       call,
       hir_resolve_call_return_lifetime(builder, target, argument_start, argument_count),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_type_structs,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_type_structs, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_type_structs, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_slices,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_slices, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_slices, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_slice_mutable,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_slice_mutable, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_slice_mutable, target),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_function_types,
       call,
-      raz_rt_stage1_arena_get(builder.module.function_return_function_types, target),
+      raz_compiler_rt_arena_get(builder.module.function_return_function_types, target),
       );
     } else {
       if (!hir_add_node(builder, 34, structure, argument_start, argument_count, 0, &mut call)) {
         return false;
       }
-      raz_rt_stage1_arena_set(builder.module.node_type_structs, call, structure);
+      raz_compiler_rt_arena_set(builder.module.node_type_structs, call, structure);
     }
     // Function/constructor calls are primary expressions too, so postfix
     // propagation must be handled before returning from the direct-call
     // fast path.  Without this, `produce()?` leaves `?` unconsumed even
     // though member/index postfixes on ordinary names use the common loop.
     if (builder.current.kind == TokenKind::Question) {
-      i64 operand_type = raz_rt_stage1_arena_get(builder.module.node_types, call);
+      i64 operand_type = raz_compiler_rt_arena_get(builder.module.node_types, call);
 
       if (!hir_type_is_enum(operand_type) || builder.current_function < 0) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -2039,11 +2070,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       i64 enumeration = hir_type_enum_index(operand_type);
       i64 success_member = hir_enum_propagation_success_member(builder, enumeration);
 
-      i64 return_type = raz_rt_stage1_arena_get(
+      i64 return_type = raz_compiler_rt_arena_get(
       builder.module.function_return_types,
       builder.current_function,
       );
-      i64 return_structure = raz_rt_stage1_arena_get(
+      i64 return_structure = raz_compiler_rt_arena_get(
       builder.module.function_return_type_structs,
       builder.current_function,
       );
@@ -2057,7 +2088,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       }
 
       i64 return_enumeration = hir_type_enum_index(return_type);
-      i64 payload = raz_rt_stage1_arena_get(builder.module.enum_member_payload_starts, success_member);
+      i64 payload = raz_compiler_rt_arena_get(builder.module.enum_member_payload_starts, success_member);
       i64 propagated = -1;
 
       if (
@@ -2073,20 +2104,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       ) {
         return false;
       }
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_type_structs,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_type_structs, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_type_structs, payload),
       );
       hir_set_node_type(
       builder,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_types, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_types, payload),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_array_extents,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_array_extents, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_array_extents, payload),
       );
       hir_advance(builder);
       call = propagated;
@@ -2124,7 +2155,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
   }
   // Only search package/module declarations after lexical resolution fails.
   // The old order scanned every global and every function for each local
-  // identifier in a block, which made self-host HIR construction quadratic.
+  // identifier in a block, which made compiler HIR construction quadratic.
 
   i64 global_value = -1;
   i64 function_value = -1;
@@ -2140,7 +2171,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     builder.namespace_lookup_target_package_hash = -1;
   }
   if (constant >= 0) {
-    base = raz_rt_stage1_arena_get(builder.module.constant_nodes, constant);
+    base = raz_compiler_rt_arena_get(builder.module.constant_nodes, constant);
   } else if (associated_const) {
     if (!hir_add_node(builder, 1, associated_const_value, 0, 0, 0, &mut base)) {
       return false;
@@ -2158,18 +2189,18 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     // behave like the captured place inside the closure body, so insert the
     // implicit dereference only for synthesized capture parameters.  Normal
     // source-level reference parameters continue to use their existing ABI.
-    i64 active_closure_kind = raz_rt_stage1_arena_get(
+    i64 active_closure_kind = raz_compiler_rt_arena_get(
     builder.module.function_closure_kinds,
     builder.current_function,
     );
     if (
     kind == 2 &&
-    raz_rt_stage1_arena_get(builder.module.function_closure_ids, builder.current_function) >= 0 &&
-    slot >= raz_rt_stage1_arena_get(
+    raz_compiler_rt_arena_get(builder.module.function_closure_ids, builder.current_function) >= 0 &&
+    slot >= raz_compiler_rt_arena_get(
     builder.module.function_closure_explicit_parameter_counts,
     builder.current_function,
     ) &&
-    raz_rt_stage1_arena_get(builder.module.node_references, base) != 0 &&
+    raz_compiler_rt_arena_get(builder.module.node_references, base) != 0 &&
     active_closure_kind != 2 &&
     active_closure_kind != 3
     ) {
@@ -2179,35 +2210,35 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
       hir_copy_node_type(builder, capture_value, base);
-      raz_rt_stage1_arena_set(builder.module.node_references, capture_value, 0);
+      raz_compiler_rt_arena_set(builder.module.node_references, capture_value, 0);
       base = capture_value;
     }
   } else if (global_value >= 0) {
     if (!hir_add_node(builder, 54, global_value, 0, 0, 0, &mut base)) {
       return false;
     }
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(
     builder.module.node_type_structs,
     base,
-    raz_rt_stage1_arena_get(builder.module.global_type_structs, global_value),
+    raz_compiler_rt_arena_get(builder.module.global_type_structs, global_value),
     );
-    hir_set_node_type(builder, base, raz_rt_stage1_arena_get(builder.module.global_types, global_value));
-    raz_rt_stage1_arena_set(
+    hir_set_node_type(builder, base, raz_compiler_rt_arena_get(builder.module.global_types, global_value));
+    raz_compiler_rt_arena_set(
     builder.module.node_array_extents,
     base,
-    raz_rt_stage1_arena_get(builder.module.global_array_extents, global_value),
+    raz_compiler_rt_arena_get(builder.module.global_array_extents, global_value),
     );
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(
     builder.module.node_function_types,
     base,
-    raz_rt_stage1_arena_get(builder.module.global_function_types, global_value),
+    raz_compiler_rt_arena_get(builder.module.global_function_types, global_value),
     );
   } else if (function_value >= 0) {
     if (!hir_add_node(builder, 47, function_value, 0, 0, 0, &mut base)) {
       return false;
     }
     hir_set_node_type(builder, base, 14);
-    raz_rt_stage1_arena_set(
+    raz_compiler_rt_arena_set(
     builder.module.node_function_types,
     base,
     hir_function_pointer_signature(builder, function_value),
@@ -2247,20 +2278,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     if (builder.current.kind == TokenKind::Dot || builder.current.kind == TokenKind::ColonColon) {
       hir_advance(builder);
 
-      i64 projected_enum_type = raz_rt_stage1_arena_get(builder.module.node_types, base);
+      i64 projected_enum_type = raz_compiler_rt_arena_get(builder.module.node_types, base);
 
       if (
-      raz_rt_stage1_arena_get(builder.module.node_kinds, base) == 33 &&
+      raz_compiler_rt_arena_get(builder.module.node_kinds, base) == 33 &&
       hir_type_is_enum(projected_enum_type)
       ) {
         i64 projected_enum = hir_type_enum_index(projected_enum_type);
-        i64 projected_member = raz_rt_stage1_arena_get(builder.module.node_b, base);
+        i64 projected_member = raz_compiler_rt_arena_get(builder.module.node_b, base);
 
-        i64 projected_payload_start = raz_rt_stage1_arena_get(
+        i64 projected_payload_start = raz_compiler_rt_arena_get(
         builder.module.enum_member_payload_starts,
         projected_member,
         );
-        i64 projected_payload_count = raz_rt_stage1_arena_get(
+        i64 projected_payload_count = raz_compiler_rt_arena_get(
         builder.module.enum_member_payload_counts,
         projected_member,
         );
@@ -2278,20 +2309,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           if (!hir_add_node(builder, 16, base, payload_index + 1, 0, 0, &mut member)) {
             return false;
           }
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_type_structs,
           member,
-          raz_rt_stage1_arena_get(builder.module.enum_payload_type_structs, payload),
+          raz_compiler_rt_arena_get(builder.module.enum_payload_type_structs, payload),
           );
           hir_set_node_type(
           builder,
           member,
-          raz_rt_stage1_arena_get(builder.module.enum_payload_types, payload),
+          raz_compiler_rt_arena_get(builder.module.enum_payload_types, payload),
           );
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_array_extents,
           member,
-          raz_rt_stage1_arena_get(builder.module.enum_payload_array_extents, payload),
+          raz_compiler_rt_arena_get(builder.module.enum_payload_array_extents, payload),
           );
           base = member;
           hir_advance(builder);
@@ -2327,11 +2358,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             if (
             !hir_reflection_add_name_string(
             builder,
-            raz_rt_stage1_arena_get(
+            raz_compiler_rt_arena_get(
             builder.module.enum_member_name_offsets,
             projected_member,
             ),
-            raz_rt_stage1_arena_get(
+            raz_compiler_rt_arena_get(
             builder.module.enum_member_name_lengths,
             projected_member,
             ),
@@ -2355,7 +2386,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             0,
             0,
             0,
-            raz_rt_stage1_arena_get(builder.module.enum_member_values, projected_member),
+            raz_compiler_rt_arena_get(builder.module.enum_member_values, projected_member),
             &mut discriminant,
             )
             ) {
@@ -2372,19 +2403,19 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         i64 projected_enum = hir_type_enum_index(projected_enum_type);
         i64 payload_index = parse_integer_value(&builder.scan.input, &builder.current);
         i64 selected_payload = -1;
-        i64 enum_member = raz_rt_stage1_arena_get(builder.module.enum_member_starts, projected_enum);
+        i64 enum_member = raz_compiler_rt_arena_get(builder.module.enum_member_starts, projected_enum);
 
         i64 enum_member_end =
         enum_member +
-        raz_rt_stage1_arena_get(builder.module.enum_member_counts, projected_enum);
+        raz_compiler_rt_arena_get(builder.module.enum_member_counts, projected_enum);
         while (enum_member < enum_member_end && selected_payload < 0) {
-          i64 member_payload_count = raz_rt_stage1_arena_get(
+          i64 member_payload_count = raz_compiler_rt_arena_get(
           builder.module.enum_member_payload_counts,
           enum_member,
           );
           if (payload_index >= 0 && payload_index < member_payload_count) {
             selected_payload =
-            raz_rt_stage1_arena_get(builder.module.enum_member_payload_starts, enum_member) +
+            raz_compiler_rt_arena_get(builder.module.enum_member_payload_starts, enum_member) +
             payload_index;
           }
           enum_member += 1;
@@ -2399,39 +2430,39 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         if (!hir_add_node(builder, 16, base, payload_index + 1, 0, 0, &mut member)) {
           return false;
         }
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_type_structs,
         member,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_type_structs, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_type_structs, selected_payload),
         );
         hir_set_node_type(
         builder,
         member,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_types, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_types, selected_payload),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_array_extents,
         member,
-        raz_rt_stage1_arena_get(builder.module.enum_payload_array_extents, selected_payload),
+        raz_compiler_rt_arena_get(builder.module.enum_payload_array_extents, selected_payload),
         );
         base = member;
         hir_advance(builder);
         continue;
       }
 
-      i64 tuple_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, base);
+      i64 tuple_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, base);
 
       if (
       tuple_structure >= 0 &&
       (
-      raz_rt_stage1_arena_get(builder.module.struct_name_offsets, tuple_structure) < 0 ||
-      raz_rt_stage1_arena_get(builder.module.struct_tuple_flags, tuple_structure) != 0
+      raz_compiler_rt_arena_get(builder.module.struct_name_offsets, tuple_structure) < 0 ||
+      raz_compiler_rt_arena_get(builder.module.struct_tuple_flags, tuple_structure) != 0
       ) &&
       builder.current.kind == TokenKind::Integer
       ) {
         i64 tuple_field = parse_integer_value(&builder.scan.input, &builder.current);
 
-        i64 tuple_field_count = raz_rt_stage1_arena_get(
+        i64 tuple_field_count = raz_compiler_rt_arena_get(
         builder.module.struct_field_counts,
         tuple_structure,
         );
@@ -2446,37 +2477,37 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           return false;
         }
         i64 field_metadata =
-        raz_rt_stage1_arena_get(builder.module.struct_field_starts, tuple_structure) +
+        raz_compiler_rt_arena_get(builder.module.struct_field_starts, tuple_structure) +
         tuple_field;
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_type_structs,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_type_structs, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field_metadata),
         );
         hir_set_node_type(
         builder,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_types, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_types, field_metadata),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_references,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_references, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_references, field_metadata),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_slices,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_slices, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_metadata),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_slice_mutable,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
         );
-        raz_rt_stage1_arena_set(
+        raz_compiler_rt_arena_set(
         builder.module.node_array_extents,
         member,
-        raz_rt_stage1_arena_get(builder.module.struct_field_array_extents, field_metadata),
+        raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field_metadata),
         );
         base = member;
         hir_advance(builder);
@@ -2486,7 +2517,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           return false;
         }
         if (
-        raz_rt_stage1_arena_get(builder.module.node_slices, base) != 0 &&
+        raz_compiler_rt_arena_get(builder.module.node_slices, base) != 0 &&
         token_is_length(&builder.scan.input, &builder.current)
         ) {
           i64 length_node = -1;
@@ -2500,10 +2531,10 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           continue;
         }
 
-        i64 base_kind = raz_rt_stage1_arena_get(builder.module.node_kinds, base);
+        i64 base_kind = raz_compiler_rt_arena_get(builder.module.node_kinds, base);
 
         if (base_kind == 15) {
-          i64 namespace_structure = raz_rt_stage1_arena_get(builder.module.node_c, base);
+          i64 namespace_structure = raz_compiler_rt_arena_get(builder.module.node_c, base);
 
           if (namespace_structure >= 0 || namespace_structure <= -2) {
             i64 method = hir_find_inherent_method(
@@ -2514,12 +2545,12 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             );
             if (method >= 0) {
               if (
-              raz_rt_stage1_arena_get(builder.module.inherent_method_receivers, method) != 0
+              raz_compiler_rt_arena_get(builder.module.inherent_method_receivers, method) != 0
               ) {
                 hir_fail(builder, DiagnosticCode::UnknownName);
                 return false;
               }
-              i64 target = raz_rt_stage1_arena_get(
+              i64 target = raz_compiler_rt_arena_get(
               builder.module.inherent_method_functions,
               method,
               );
@@ -2546,8 +2577,8 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           } else {
             enumeration = hir_find_enum(
             builder,
-            raz_rt_stage1_arena_get(builder.module.node_a, base),
-            raz_rt_stage1_arena_get(builder.module.node_b, base),
+            raz_compiler_rt_arena_get(builder.module.node_a, base),
+            raz_compiler_rt_arena_get(builder.module.node_b, base),
             );
           }
           i64 member_index = hir_find_enum_member_index(
@@ -2561,13 +2592,13 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             return false;
           }
 
-          i64 enum_value = raz_rt_stage1_arena_get(builder.module.enum_member_values, member_index);
+          i64 enum_value = raz_compiler_rt_arena_get(builder.module.enum_member_values, member_index);
 
-          i64 payload_start = raz_rt_stage1_arena_get(
+          i64 payload_start = raz_compiler_rt_arena_get(
           builder.module.enum_member_payload_starts,
           member_index,
           );
-          i64 payload_count = raz_rt_stage1_arena_get(
+          i64 payload_count = raz_compiler_rt_arena_get(
           builder.module.enum_member_payload_counts,
           member_index,
           );
@@ -2589,21 +2620,21 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
 
               i64 payload = payload_start + argument_count;
 
-              i64 payload_structure = raz_rt_stage1_arena_get(
+              i64 payload_structure = raz_compiler_rt_arena_get(
               builder.module.enum_payload_type_structs,
               payload,
               );
-              i64 argument_structure = raz_rt_stage1_arena_get(
+              i64 argument_structure = raz_compiler_rt_arena_get(
               builder.module.node_type_structs,
               argument,
               );
-              i64 payload_array_extent = raz_rt_stage1_arena_get(
+              i64 payload_array_extent = raz_compiler_rt_arena_get(
               builder.module.enum_payload_array_extents,
               payload,
               );
               if (
               payload_array_extent >= 0 &&
-              raz_rt_stage1_arena_get(
+              raz_compiler_rt_arena_get(
               builder.module.node_array_extents,
               argument,
               ) != payload_array_extent
@@ -2620,7 +2651,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
               !hir_require_value_type(
               builder,
               &mut argument,
-              raz_rt_stage1_arena_get(builder.module.enum_payload_types, payload),
+              raz_compiler_rt_arena_get(builder.module.enum_payload_types, payload),
               )
               ) {
                 return false;
@@ -2629,7 +2660,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
                 hir_fail(builder, DiagnosticCode::TooManyItems);
                 return false;
               }
-              raz_rt_stage1_arena_set(
+              raz_compiler_rt_arena_set(
               builder.module.arguments,
               builder.module.argument_count,
               argument,
@@ -2649,7 +2680,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             hir_fail(builder, DiagnosticCode::WrongArgumentCount);
             return false;
           }
-          if (raz_rt_stage1_arena_get(builder.module.enum_has_payload, enumeration) != 0) {
+          if (raz_compiler_rt_arena_get(builder.module.enum_has_payload, enumeration) != 0) {
             i64 constructed = -1;
 
             if (
@@ -2681,10 +2712,10 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             base = literal;
           }
         } else {
-          i64 semantic_type = raz_rt_stage1_arena_get(builder.module.node_function_types, base);
+          i64 semantic_type = raz_compiler_rt_arena_get(builder.module.node_function_types, base);
 
           i64 dyn_trait = hir_dyn_trait_from_semantic_type(
-          raz_rt_stage1_arena_get(builder.module.node_types, base),
+          raz_compiler_rt_arena_get(builder.module.node_types, base),
           semantic_type,
           );
           if (dyn_trait >= 0) {
@@ -2706,24 +2737,45 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             continue;
           }
 
-          i64 structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, base);
+          i64 structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, base);
           i64 method_target = structure;
-          i64 base_type = raz_rt_stage1_arena_get(builder.module.node_types, base);
+          i64 base_type = raz_compiler_rt_arena_get(builder.module.node_types, base);
 
           if (structure < 0 && hir_type_is_enum(base_type)) {
             method_target = -2 - hir_type_enum_index(base_type);
+          } else if (structure < 0) {
+            method_target = hir_scalar_method_target(base_type);
           }
-          i64 method = hir_find_inherent_method(
-          builder,
-          method_target,
-          builder.current.offset,
-          builder.current.length,
-          );
+          i64 field = -1;
+
+          if (structure >= 0) {
+            field = hir_find_struct_field(
+            builder,
+            structure,
+            builder.current.offset,
+            builder.current.length,
+            );
+          }
+
+          Lexer member_scan = builder.scan;
+          Token member_next;
+          next_token(&mut member_scan, &mut member_next);
+          bool method_call = member_next.kind == TokenKind::LeftParen;
+          i64 method = -1;
+
+          if (method_call) {
+            method = hir_find_inherent_method(
+            builder,
+            method_target,
+            builder.current.offset,
+            builder.current.length,
+            );
+          }
           if (
           method >= 0 &&
-          raz_rt_stage1_arena_get(builder.module.inherent_method_receivers, method) != 0
+          raz_compiler_rt_arena_get(builder.module.inherent_method_receivers, method) != 0
           ) {
-            i64 target = raz_rt_stage1_arena_get(
+            i64 target = raz_compiler_rt_arena_get(
             builder.module.inherent_method_functions,
             method,
             );
@@ -2737,12 +2789,6 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             base = called;
             continue;
           }
-          i64 field = hir_find_struct_field(
-          builder,
-          structure,
-          builder.current.offset,
-          builder.current.length,
-          );
           if (field < 0) {
             hir_fail(builder, DiagnosticCode::UnknownName);
             return false;
@@ -2753,38 +2799,38 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
           if (!hir_add_node(builder, 16, base, field, 0, 0, &mut member)) {
             return false;
           }
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_type_structs,
           member,
           hir_struct_field_type(builder, structure, field),
           );
           i64 field_metadata =
-          raz_rt_stage1_arena_get(builder.module.struct_field_starts, structure) +
+          raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure) +
           field;
           hir_set_node_type(
           builder,
           member,
-          raz_rt_stage1_arena_get(builder.module.struct_field_types, field_metadata),
+          raz_compiler_rt_arena_get(builder.module.struct_field_types, field_metadata),
           );
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_references,
           member,
-          raz_rt_stage1_arena_get(builder.module.struct_field_references, field_metadata),
+          raz_compiler_rt_arena_get(builder.module.struct_field_references, field_metadata),
           );
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_slices,
           member,
-          raz_rt_stage1_arena_get(builder.module.struct_field_slices, field_metadata),
+          raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_metadata),
           );
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_slice_mutable,
           member,
-          raz_rt_stage1_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
+          raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
           );
-          raz_rt_stage1_arena_set(
+          raz_compiler_rt_arena_set(
           builder.module.node_array_extents,
           member,
-          raz_rt_stage1_arena_get(builder.module.struct_field_array_extents, field_metadata),
+          raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field_metadata),
           );
           base = member;
           hir_advance(builder);
@@ -2794,7 +2840,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       // Postfix propagation keeps the failure channel compatible while
       // allowing the enclosing Result/Option to use a different success type.
 
-      i64 operand_type = raz_rt_stage1_arena_get(builder.module.node_types, base);
+      i64 operand_type = raz_compiler_rt_arena_get(builder.module.node_types, base);
 
       if (!hir_type_is_enum(operand_type) || builder.current_function < 0) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -2804,11 +2850,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       i64 enumeration = hir_type_enum_index(operand_type);
       i64 success_member = hir_enum_propagation_success_member(builder, enumeration);
 
-      i64 return_type = raz_rt_stage1_arena_get(
+      i64 return_type = raz_compiler_rt_arena_get(
       builder.module.function_return_types,
       builder.current_function,
       );
-      i64 return_structure = raz_rt_stage1_arena_get(
+      i64 return_structure = raz_compiler_rt_arena_get(
       builder.module.function_return_type_structs,
       builder.current_function,
       );
@@ -2822,7 +2868,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       }
 
       i64 return_enumeration = hir_type_enum_index(return_type);
-      i64 payload = raz_rt_stage1_arena_get(builder.module.enum_member_payload_starts, success_member);
+      i64 payload = raz_compiler_rt_arena_get(builder.module.enum_member_payload_starts, success_member);
       i64 propagated = -1;
 
       if (
@@ -2838,20 +2884,20 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       ) {
         return false;
       }
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_type_structs,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_type_structs, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_type_structs, payload),
       );
       hir_set_node_type(
       builder,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_types, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_types, payload),
       );
-      raz_rt_stage1_arena_set(
+      raz_compiler_rt_arena_set(
       builder.module.node_array_extents,
       propagated,
-      raz_rt_stage1_arena_get(builder.module.enum_payload_array_extents, payload),
+      raz_compiler_rt_arena_get(builder.module.enum_payload_array_extents, payload),
       );
       hir_advance(builder);
       base = propagated;
@@ -2867,11 +2913,11 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
 
-      i64 base_extent = raz_rt_stage1_arena_get(builder.module.node_array_extents, base);
+      i64 base_extent = raz_compiler_rt_arena_get(builder.module.node_array_extents, base);
       bool statically_safe_index = false;
 
-      if (base_extent >= 0 && raz_rt_stage1_arena_get(builder.module.node_kinds, index) == 1) {
-        i64 constant_index = raz_rt_stage1_arena_get(builder.module.node_values, index);
+      if (base_extent >= 0 && raz_compiler_rt_arena_get(builder.module.node_kinds, index) == 1) {
+        i64 constant_index = raz_compiler_rt_arena_get(builder.module.node_values, index);
 
         if (constant_index < 0 || constant_index >= base_extent) {
           hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -2881,7 +2927,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
       }
       if (
       builder.current_function >= 0 &&
-      (raz_rt_stage1_arena_get(builder.module.function_effect_flags, builder.current_function) & 2) != 0 &&
+      (raz_compiler_rt_arena_get(builder.module.function_effect_flags, builder.current_function) & 2) != 0 &&
       !statically_safe_index
       ) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -2894,9 +2940,9 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
       hir_copy_node_type(builder, indexed, base);
-      raz_rt_stage1_arena_set(builder.module.node_slices, indexed, 0);
-      raz_rt_stage1_arena_set(builder.module.node_slice_mutable, indexed, 0);
-      raz_rt_stage1_arena_set(builder.module.node_array_extents, indexed, -1);
+      raz_compiler_rt_arena_set(builder.module.node_slices, indexed, 0);
+      raz_compiler_rt_arena_set(builder.module.node_slice_mutable, indexed, 0);
+      raz_compiler_rt_arena_set(builder.module.node_array_extents, indexed, -1);
       base = indexed;
     }
   }
@@ -2910,7 +2956,7 @@ fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
   if (!hir_parse_primary(builder, &mut value)) {
     return false;
   }
-  if (builder.allow_moved_name == 0 && raz_rt_stage1_arena_get(builder.module.node_kinds, value) != 39) {
+  if (builder.allow_moved_name == 0 && raz_compiler_rt_arena_get(builder.module.node_kinds, value) != 39) {
     i64 root_kind = 0;
     i64 root_index = -1;
     i64 path = 0;
@@ -2955,9 +3001,9 @@ fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
       return false;
     }
 
-    i64 source_type = raz_rt_stage1_arena_get(builder.module.node_types, value);
-    i64 source_structure = raz_rt_stage1_arena_get(builder.module.node_type_structs, value);
-    i64 source_reference = raz_rt_stage1_arena_get(builder.module.node_references, value);
+    i64 source_type = raz_compiler_rt_arena_get(builder.module.node_types, value);
+    i64 source_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, value);
+    i64 source_reference = raz_compiler_rt_arena_get(builder.module.node_references, value);
     bool source_raw = source_reference == 2 || source_reference == 3;
     bool target_raw = target_reference == 2 || target_reference == 3;
 
@@ -3013,15 +3059,15 @@ fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
         return false;
       }
       hir_set_node_type(builder, converted, target_type);
-      raz_rt_stage1_arena_set(builder.module.node_type_structs, converted, target_structure);
-      raz_rt_stage1_arena_set(builder.module.node_references, converted, target_reference);
+      raz_compiler_rt_arena_set(builder.module.node_type_structs, converted, target_structure);
+      raz_compiler_rt_arena_set(builder.module.node_references, converted, target_reference);
 
       i64 target_mutable = 0;
 
       if (target_reference == 3) {
         target_mutable = 1;
       }
-      raz_rt_stage1_arena_set(builder.module.node_reference_mutable, converted, target_mutable);
+      raz_compiler_rt_arena_set(builder.module.node_reference_mutable, converted, target_mutable);
       value = converted;
     }
   }

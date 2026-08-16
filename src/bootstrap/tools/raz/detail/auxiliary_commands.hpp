@@ -211,7 +211,7 @@ int emit_language_spec(const ProjectGraph& graph) {
   const auto source_root = std::filesystem::path(RAZ_SOURCE_ROOT);
   const std::array<std::pair<std::string_view, std::filesystem::path>, 4> documents{{
       {"language", source_root / "docs" / "LANGUAGE-SPECIFICATION.md"},
-      {"stableScope", source_root / "docs" / "STABLE-LANGUAGE-SCOPE.md"},
+      {"stableScope", source_root / "docs" / "LANGUAGE-STABILITY.md"},
       {"architecture", source_root / "docs" / "ARCHITECTURE.md"},
       {"toolchain", source_root / "docs" / "TOOLCHAIN-SPECIFICATION.md"},
   }};
@@ -349,30 +349,157 @@ int dependency_graph(const ProjectGraph& graph) {
   return json && dot ? 0 : 1;
 }
 
-int doctor_project(const ProjectGraph& graph) {
-  const auto output_root = graph.manifest.root / "target" / "doctor";
-  std::filesystem::create_directories(output_root);
-  const auto report_path = output_root / "doctor.json";
-  const auto forge_abi = graph.manifest.root / "third_party" / "forge" / "src" / "target" / "abi.cpp";
-  const auto forge_layout = graph.manifest.root / "third_party" / "forge" / "src" / "target" / "data_layout.cpp";
-  const auto lock = graph.manifest.root / "raz.lock";
-  const std::string linker = environment_value("RAZ_LINKER");
-  std::ofstream report(report_path, std::ios::trunc);
-  report << "{\n  \"schema\": \"raz-doctor-v1\",\n"
-         << "  \"package\": \"" << json_escape(graph.manifest.name) << "\",\n"
-         << "  \"modules\": " << project_modules(graph).size() << ",\n"
-         << "  \"lockfile\": " << (std::filesystem::exists(lock) ? "true" : "false") << ",\n"
-         << "  \"forgeTargetSources\": " << (std::filesystem::exists(forge_abi) && std::filesystem::exists(forge_layout) ? "true" : "false") << ",\n"
-         << "  \"linker\": \"" << json_escape(linker.empty() ? "default" : linker) << "\",\n"
+std::optional<std::filesystem::path> find_tool_on_path(std::string_view tool) {
+  if (tool.empty()) return std::nullopt;
+  const std::filesystem::path requested(tool);
+  if (requested.has_parent_path()) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(requested, error)) return std::filesystem::absolute(requested, error);
+    return std::nullopt;
+  }
+
+  const auto path_value = environment_value("PATH");
+  if (path_value.empty()) return std::nullopt;
 #if defined(_WIN32)
-         << "  \"host\": \"windows-x86_64\"\n";
+  constexpr char separator = ';';
+  std::vector<std::string> suffixes{""};
+  if (!requested.has_extension()) {
+    const auto pathext = environment_value("PATHEXT");
+    if (!pathext.empty()) {
+      std::size_t begin = 0;
+      while (begin <= pathext.size()) {
+        const auto next = pathext.find(';', begin);
+        auto suffix = pathext.substr(begin, next == std::string::npos ? std::string::npos : next - begin);
+        std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!suffix.empty()) suffixes.push_back(std::move(suffix));
+        if (next == std::string::npos) break;
+        begin = next + 1;
+      }
+    } else {
+      suffixes.insert(suffixes.end(), {".exe", ".cmd", ".bat"});
+    }
+  }
 #else
-         << "  \"host\": \"posix-x86_64\"\n";
+  constexpr char separator = ':';
 #endif
-  report << "}\n";
-  const bool healthy = !graph.modules.empty();
-  std::cout << "Doctor " << (healthy ? "passed" : "failed") << " for " << graph.manifest.name << "; report: " << report_path << '\n';
-  return healthy && report ? 0 : 1;
+
+  std::size_t begin = 0;
+  while (begin <= path_value.size()) {
+    const auto next = path_value.find(separator, begin);
+    auto directory = path_value.substr(begin, next == std::string::npos ? std::string::npos : next - begin);
+    if (directory.empty()) directory = ".";
+#if defined(_WIN32)
+    for (const auto& suffix : suffixes) {
+      std::filesystem::path candidate = std::filesystem::path(directory) / (std::string(tool) + suffix);
+      std::error_code error;
+      if (std::filesystem::is_regular_file(candidate, error)) return std::filesystem::absolute(candidate, error);
+    }
+#else
+    std::filesystem::path candidate = std::filesystem::path(directory) / std::string(tool);
+    std::error_code error;
+    const auto status = std::filesystem::status(candidate, error);
+    if (!error && std::filesystem::is_regular_file(status)) {
+      const auto permissions = status.permissions();
+      using P = std::filesystem::perms;
+      if ((permissions & (P::owner_exec | P::group_exec | P::others_exec)) != P::none)
+        return std::filesystem::absolute(candidate, error);
+    }
+#endif
+    if (next == std::string::npos) break;
+    begin = next + 1;
+  }
+  return std::nullopt;
+}
+
+int doctor_toolchain(const Options& options) {
+  bool healthy = true;
+  cli_status("Checking", "Raz toolchain and host environment", raz::terminal::cyan);
+  cli_status("OK", "Raz 1.0.0", raz::terminal::green);
+
+#if defined(_WIN32)
+  constexpr std::string_view host_os = "windows";
+#else
+  constexpr std::string_view host_os = "posix";
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  constexpr std::string_view host_arch = "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  constexpr std::string_view host_arch = "aarch64";
+#else
+  constexpr std::string_view host_arch = "unknown";
+#endif
+  cli_status("Host", std::string(host_os) + "-" + std::string(host_arch) + ", " +
+      std::to_string(sizeof(void*) * 8U) + "-bit, " +
+      std::to_string(std::max(1U, std::thread::hardware_concurrency())) + " hardware thread(s)",
+      raz::terminal::cyan);
+  if (host_arch == "unknown" || sizeof(void*) != 8) {
+    cli_error("the bundled Forge backend requires a supported 64-bit host architecture");
+    healthy = false;
+  }
+
+  const auto linker_name = native_linker();
+  const auto linker_path = find_tool_on_path(linker_name);
+  if (linker_path) {
+    cli_status("Linker", linker_name + " -> " + linker_path->string(), raz::terminal::green);
+  } else {
+    cli_errorf("native linker driver not found: ", linker_name);
+    cli_hint("install a compatible C++ linker driver or set RAZ_LINKER to its executable path");
+    healthy = false;
+  }
+
+  if (!g_self_executable.empty()) {
+    std::error_code executable_error;
+    auto executable = std::filesystem::absolute(g_self_executable, executable_error);
+    cli_status("Driver", executable_error ? g_self_executable.string() : executable.string(), raz::terminal::cyan);
+  }
+
+  ProjectGraph graph;
+  ProjectError project_error;
+  const bool has_project = raz::compiler::discover_project(options.project, graph, project_error);
+  std::filesystem::path report_path;
+  if (has_project) {
+    const auto project_entry = graph.manifest.entry.is_absolute()
+        ? graph.manifest.entry : graph.manifest.root / graph.manifest.entry;
+    const bool entry_exists = std::filesystem::is_regular_file(project_entry);
+    const bool has_modules = !graph.modules.empty();
+    cli_status("Project", graph.manifest.name + " v" + graph.manifest.version + " (" +
+        std::to_string(project_modules(graph).size()) + " module(s))",
+        entry_exists && has_modules ? raz::terminal::green : raz::terminal::red);
+    if (!entry_exists) { cli_errorf("project entry does not exist: ", project_entry); healthy = false; }
+    if (!has_modules) { cli_error("project contains no compilable modules"); healthy = false; }
+
+    const auto output_root = graph.manifest.root / "target" / "doctor";
+    std::error_code directory_error;
+    std::filesystem::create_directories(output_root, directory_error);
+    if (!directory_error) report_path = output_root / "doctor.json";
+  } else if (options.project_explicit) {
+    cli_errorf("could not discover a Raz project from ", options.project, ": ", project_error.message);
+    healthy = false;
+  } else {
+    cli_status("Project", "no package detected; toolchain-only checks completed", raz::terminal::yellow);
+  }
+
+  if (!report_path.empty()) {
+    std::ofstream report(report_path, std::ios::trunc);
+    report << "{\n  \"schema\": \"raz-doctor-v2\",\n"
+           << "  \"healthy\": " << (healthy ? "true" : "false") << ",\n"
+           << "  \"version\": \"1.0.0\",\n"
+           << "  \"host\": \"" << host_os << '-' << host_arch << "\",\n"
+           << "  \"pointerBits\": " << sizeof(void*) * 8U << ",\n"
+           << "  \"hardwareThreads\": " << std::max(1U, std::thread::hardware_concurrency()) << ",\n"
+           << "  \"linker\": \"" << json_escape(linker_name) << "\",\n"
+           << "  \"linkerFound\": " << (linker_path ? "true" : "false") << ",\n"
+           << "  \"package\": \"" << json_escape(graph.manifest.name) << "\",\n"
+           << "  \"modules\": " << project_modules(graph).size() << "\n}\n";
+    if (!report) { cli_errorf("could not write doctor report: ", report_path); healthy = false; }
+    else cli_status("Report", report_path.string(), raz::terminal::cyan);
+  }
+
+  cli_status(healthy ? "Finished" : "Failed",
+             healthy ? "toolchain is ready" : "toolchain has problems that require attention",
+             healthy ? raz::terminal::green : raz::terminal::red);
+  return healthy ? 0 : 1;
 }
 
 int cache_project(const ProjectGraph& graph, const Options& options) {
