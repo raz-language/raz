@@ -31,7 +31,7 @@ All notable user-visible changes to Raz are documented here.
 ### Standard library
 
 - Added production filesystem, process, environment, networking, HTTP, TLS, DNS, time, random, collections, serialization, logging, concurrency, compression, and testing facilities.
-- Added allocation-conscious containers, bump arenas, fixed pools, reusable buffered I/O, vectored sockets, scalable polling, bounded DNS/HTTP reuse, TLS session reuse, lock-free SPSC/MPMC queues, and zero-copy HTTP request views.
+- Added allocation-conscious containers, bump arenas, fixed pools, reusable buffered I/O, vectored sockets, scalable polling, reactor-integrated monotonic timers and backpressure controls, bounded DNS/HTTP reuse, TLS session reuse, lock-free SPSC/MPMC queues, and zero-copy HTTP request views.
 - Added a pure-Raz LZ4 block codec and optimized CRC-32 processing.
 
 ### Platforms and distribution

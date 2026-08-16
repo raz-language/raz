@@ -107,7 +107,10 @@ public fn reserve(PollSet&mut set, i64 requested) -> bool {
 }
 
 public fn push(PollSet&mut set, i64 socket, i64 interests) -> bool {
-    if (!valid(set) || set.length >= set.capacity || socket < 0 || (interests & 3) == 0) {
+    if (!valid(set) || socket < 0 || (interests & 3) == 0) {
+        return false;
+    }
+    if (set.length >= set.capacity && !reserve(set, set.length + 1)) {
         return false;
     }
     usize record = set.data + set.length * record_bytes;
@@ -138,6 +141,38 @@ public fn events(PollSet& set, i64 index) -> i64 {
         return 0;
     }
     return load_i64(set.data + index * record_bytes + record_events);
+}
+
+/// Updates the readiness interests of an existing record in place. This is the
+/// low-churn path for backpressure: a connection can move between readable,
+/// writable, or both without removing and rebuilding the poll set.
+public fn set_interests(PollSet&mut set, i64 index, i64 value) -> bool {
+    if (!valid(set) || index < 0 || index >= set.length || (value & 3) == 0) {
+        return false;
+    }
+    usize record = set.data + index * record_bytes;
+    store_i64(record + record_interests, value & 3);
+    store_i64(record + record_events, 0);
+    return true;
+}
+
+/// Removes a record in O(1) by moving the final record into its slot. When a
+/// non-final record is removed, socket(set, index) identifies the socket that
+/// moved into the vacated index.
+public fn remove_swap(PollSet&mut set, i64 index) -> bool {
+    if (!valid(set) || index < 0 || index >= set.length) {
+        return false;
+    }
+    i64 last = set.length - 1;
+    if (index != last) {
+        usize destination = set.data + index * record_bytes;
+        usize source = set.data + last * record_bytes;
+        store_i64(destination + record_socket, load_i64(source + record_socket));
+        store_i64(destination + record_interests, load_i64(source + record_interests));
+        store_i64(destination + record_events, load_i64(source + record_events));
+    }
+    set.length = last;
+    return true;
 }
 
 public fn wait(PollSet&mut set, i64 timeout_millis) -> i64 {

@@ -74,6 +74,23 @@ require("library/std/io/buffered.rz", [
     "fn writer_drain",
     "return raz_rt_file_flush(value.handle) == 1",
 ])
+require("library/std/fs/tree.rz", [
+    "String scratch = alloc::string::with_capacity(length + 128)",
+    "i64 parent_length = path.length",
+    "alloc::string::truncate(path, parent_length)",
+])
+require("library/std/net/reactor.rz", [
+    "public struct BatchReactor",
+    "RawVec timers",
+    "timer_sift_up",
+    "timer_sift_down",
+    "public fn batch_watch_readable",
+    "public fn batch_set_interests",
+    "public fn batch_remove_swap",
+    "public fn batch_schedule_after",
+    "public fn batch_pop_expired",
+    "std::net::poll_set::wait(&mut reactor.set, effective)",
+])
 require("library/std/fs/read_dir.rz", [
     "i64 available = alloc::string::capacity(name)",
     "raz_rt_dir_next(iterator.handle, name.data, available + 1",
@@ -111,6 +128,9 @@ require("library/std/log/log.rz", [
     "public struct LogBuffer",
     "public fn field_i64",
     "public fn field_bytes",
+    "public fn field_bool",
+    "public fn field_u64",
+    "public fn write_stream",
 ])
 
 require("src/runtime/runtime_internal.hpp", [
@@ -138,6 +158,9 @@ require("library/std/net/poll_set/poll_set.rz", [
     "raz_rt_socket_poll_many",
     "max_records = 1048576",
     "public fn reserve",
+    "public fn set_interests",
+    "public fn remove_swap",
+    "set.length >= set.capacity && !reserve(set, set.length + 1)",
 ])
 require("src/runtime/network.cpp", [
     "raz_rt_socket_poll_many",
@@ -194,6 +217,6 @@ print("stdlib performance audit: PASS")
 print("  allocation: in-place-capable vector/deque growth")
 print("  collections: power-of-two probing + control-byte fingerprints")
 print("  bytes/strings/codecs: scalar hot loops stay in Raz, bulk work stays batched")
-print("  I/O/network: 64 KiB buffering + reusable polling + DNS/HTTP/TLS reuse")
+print("  I/O/network: retained tree paths + 64 KiB buffering + timer-integrated batch reactor + DNS/HTTP/TLS reuse")
 print("  compression: allocation-reusing caller-buffer LZ4 block codec")
 print("  concurrency: cacheline-separated lock-free SPSC + sequence-based MPMC queues")

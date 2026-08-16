@@ -6,6 +6,7 @@ import alloc::string;
 import core::bytes;
 import std::fmt;
 import std::time;
+import std::io::stdio;
 
 /// Allocation-reusing structured log record builder. Callers own the backing
 /// String and can retain it for the lifetime of a worker/thread.
@@ -83,4 +84,46 @@ public fn bytes(LogBuffer& buffer) -> BytesView {
 
 public fn len(LogBuffer& buffer) -> i64 {
     return alloc::string::len(&buffer.line);
+}
+
+public fn field_bool(LogBuffer&mut buffer, usize key, i64 key_length, bool value) -> bool {
+    if (!alloc::string::push_byte(&mut buffer.line, 32) ||
+        !append_literal(&mut buffer.line, key, key_length) ||
+        !alloc::string::push_byte(&mut buffer.line, 61)) {
+        return false;
+    }
+    if (value) {
+        return alloc::string::push_byte(&mut buffer.line, 116) &&
+            alloc::string::push_byte(&mut buffer.line, 114) &&
+            alloc::string::push_byte(&mut buffer.line, 117) &&
+            alloc::string::push_byte(&mut buffer.line, 101);
+    }
+    return alloc::string::push_byte(&mut buffer.line, 102) &&
+        alloc::string::push_byte(&mut buffer.line, 97) &&
+        alloc::string::push_byte(&mut buffer.line, 108) &&
+        alloc::string::push_byte(&mut buffer.line, 115) &&
+        alloc::string::push_byte(&mut buffer.line, 101);
+}
+
+public fn field_u64(LogBuffer&mut buffer, usize key, i64 key_length, u64 value) -> bool {
+    return (
+        alloc::string::push_byte(&mut buffer.line, 32) &&
+        append_literal(&mut buffer.line, key, key_length) &&
+        alloc::string::push_byte(&mut buffer.line, 61) &&
+        std::fmt::append_u64(&mut buffer.line, value)
+    );
+}
+
+/// Writes the completed record directly to a standard stream without creating
+/// another String. LogBuffer retains its allocation for the next record.
+public fn write_stream(LogBuffer& buffer, i64 stream) -> bool {
+    return std::io::stdio::write_all(stream, buffer.line.data, buffer.line.length);
+}
+
+public fn write_stdout(LogBuffer& buffer) -> bool {
+    return write_stream(buffer, std::io::stdio::stdout_stream);
+}
+
+public fn write_stderr(LogBuffer& buffer) -> bool {
+    return write_stream(buffer, std::io::stdio::stderr_stream);
 }

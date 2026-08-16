@@ -10,7 +10,7 @@ The library provides ownership-aware slices, strings, vectors, deques, hash sets
 
 Hosted APIs include:
 
-- paths and filesystem operations;
+- paths and filesystem operations, including allocation-reusing tree traversal/removal;
 - files and text I/O;
 - environment and shell-free process helpers, including reusable argv/cwd command execution;
 - time, durations, monotonic clocks, deadlines, OS entropy, and bulk deterministic randomness;
@@ -21,7 +21,7 @@ Resource-owning values use deterministic `Drop` behavior.
 
 ## Networking
 
-The network stack includes IPv4/IPv6 addressing, DNS resolution with a bounded hot-host cache, TCP/UDP sockets, vectored I/O, buffering, framing, and higher-level protocol support. Socket/protocol policy lives in Raz while the runtime exposes the underlying OS operations.
+The network stack includes IPv4/IPv6 addressing, DNS resolution with a bounded hot-host cache, TCP/UDP sockets, vectored I/O, buffering, framing, an auto-growing batched readiness reactor, and higher-level protocol support. Socket/protocol policy lives in Raz while the runtime exposes the underlying OS operations.
 
 ## Serialization and application protocols
 

@@ -7,7 +7,6 @@ import core::result;
 import std::fs::metadata;
 import std::fs::read_dir;
 import std::io::error;
-import std::path;
 
 extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;
 extern fn raz_rt_remove_one(usize path, i64 length) -> i64;
@@ -75,8 +74,26 @@ public fn create_dir_all(usize path, i64 length) -> Result<bool, IoError> {
     return Result<bool, IoError>::Ok(created_any);
 }
 
-fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
-    Result<Metadata, IoError> metadata_result = std::fs::metadata::query(path, length);
+fn append_child_path(String&mut path, usize name, i64 name_length) -> bool {
+    if (name_length < 0 || (name_length > 0 && name == 0)) {
+        return false;
+    }
+    i64 length = alloc::string::len(path);
+    if (length > 0 && !separator(alloc::string::byte_at(path, length - 1))) {
+        if (!alloc::string::push_byte(path, 47)) {
+            return false;
+        }
+    }
+    return alloc::string::append_bytes(path, name, name_length);
+}
+
+// Recursive deletion keeps one mutable full-path buffer for the entire walk.
+// Each recursion level records the current length, appends the child name,
+// descends, then truncates back to the saved length. This avoids allocating a
+// joined String for every directory entry while keeping directory handles and
+// reusable entry-name buffers local to each active level.
+fn remove_tree_inner(String&mut path) -> Result<i64, IoError> {
+    Result<Metadata, IoError> metadata_result = std::fs::metadata::query(path.data, path.length);
 
     Metadata metadata = Metadata {
         kind: 0,
@@ -96,7 +113,7 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
     }
     // Symlinks are removed as links and never followed.
     if (!std::fs::metadata::is_dir(&metadata) || metadata.symlink) {
-        i64 removed = raz_rt_remove_one(path, length);
+        i64 removed = raz_rt_remove_one(path.data, path.length);
 
         if (removed < 0) {
             return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Remove));
@@ -104,7 +121,7 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
         return Result<i64, IoError>::Ok(removed);
     }
 
-    Result<ReadDir, IoError> opened = std::fs::read_dir::open(path, length);
+    Result<ReadDir, IoError> opened = std::fs::read_dir::open(path.data, path.length);
 
     ReadDir iterator = ReadDir {
         handle: 0,
@@ -120,7 +137,6 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
     }
 
     String name = alloc::string::with_capacity(64);
-
     Metadata child_metadata = Metadata {
         kind: 0,
         size: 0,
@@ -129,7 +145,6 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
         symlink: false,
         exists: false
     };
-
     i64 removed_total = 0;
 
     while (true) {
@@ -141,38 +156,17 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
         if (next_status < 0) {
             return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Read));
         }
-        PathView base = PathView {
-            data: path,
-            length: length
-        };
-        PathView child = PathView {
-            data: name.data,
-            length: name.length
-        };
 
-        i64 required = std::path::join_required(base, child);
-        String joined = alloc::string::with_capacity(required);
-
-        if (required > 0 && joined.data == 0) {
+        i64 parent_length = path.length;
+        if (!append_child_path(path, name.data, name.length)) {
             return Result<i64, IoError>::Error(IoError {
                 operation: IoOperation::Remove,
                 code: 12
-            }
-            );
+            });
         }
 
-        i64 written = std::path::join_into(base, child, joined.data, required);
-
-        if (written < 0) {
-            return Result<i64, IoError>::Error(IoError {
-                operation: IoOperation::Remove,
-                code: 22
-            }
-            );
-        }
-        joined.length = written;
-
-        Result<i64, IoError> child_result = remove_tree_inner(joined.data, joined.length);
+        Result<i64, IoError> child_result = remove_tree_inner(path);
+        alloc::string::truncate(path, parent_length);
 
         match child_result {
             Result<i64, IoError>::Error(error) => {
@@ -185,7 +179,7 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
     }
     std::fs::read_dir::close(&mut iterator);
 
-    i64 removed_dir = raz_rt_remove_one(path, length);
+    i64 removed_dir = raz_rt_remove_one(path.data, path.length);
 
     if (removed_dir < 0) {
         return Result<i64, IoError>::Error(std::io::error::last_error(IoOperation::Remove));
@@ -194,5 +188,18 @@ fn remove_tree_inner(usize path, i64 length) -> Result<i64, IoError> {
 }
 
 public fn remove_dir_all(usize path, i64 length) -> Result<i64, IoError> {
-    return remove_tree_inner(path, length);
+    if (length <= 0 || path == 0) {
+        return Result<i64, IoError>::Error(IoError {
+            operation: IoOperation::Remove,
+            code: 22
+        });
+    }
+    String scratch = alloc::string::with_capacity(length + 128);
+    if (!alloc::string::append_bytes(&mut scratch, path, length)) {
+        return Result<i64, IoError>::Error(IoError {
+            operation: IoOperation::Remove,
+            code: 12
+        });
+    }
+    return remove_tree_inner(&mut scratch);
 }

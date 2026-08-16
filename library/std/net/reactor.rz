@@ -107,3 +107,340 @@ public fn destroy(IoReactorI64&mut reactor) {
     reactor.accepting = false;
     std::thread::executor::executor_destroy(&mut reactor.executor);
 }
+
+// High-throughput readiness reactor. Unlike IoReactorI64, which adapts one
+// blocking watch into the worker executor, BatchReactor keeps all watched
+// sockets in one reusable PollSet and crosses the OS boundary once per wait.
+// A retained min-heap of monotonic timers shares the same wait, allowing event
+// loops to handle keep-alive deadlines, retries and idle timeouts without a
+// sleeping task per timer.
+import std::net::poll_set;
+import std::time;
+import alloc::vec;
+
+const i64 timer_record_bytes = 16;
+const i64 timer_deadline_offset = 0;
+const i64 timer_token_offset = 8;
+const i64 timer_max_records = 1048576;
+
+public struct BatchReactor {
+    PollSet set;
+    RawVec timers;
+}
+
+fn timer_load(i64 offset, BatchReactor& reactor, i64 index) -> i64 {
+    unsafe {
+        return *((alloc::vec::data_ptr(&reactor.timers) + index * timer_record_bytes + offset)as i64*const);
+    }
+}
+
+fn timer_store(i64 offset, BatchReactor&mut reactor, i64 index, i64 value) {
+    unsafe {
+        *((alloc::vec::data_ptr(&reactor.timers) + index * timer_record_bytes + offset)as i64*mut) = value;
+    }
+}
+
+fn timer_deadline(BatchReactor& reactor, i64 index) -> i64 {
+    return timer_load(timer_deadline_offset, reactor, index);
+}
+
+fn timer_token(BatchReactor& reactor, i64 index) -> i64 {
+    return timer_load(timer_token_offset, reactor, index);
+}
+
+fn timer_set(BatchReactor&mut reactor, i64 index, i64 deadline, i64 token) {
+    timer_store(timer_deadline_offset, reactor, index, deadline);
+    timer_store(timer_token_offset, reactor, index, token);
+}
+
+fn timer_swap(BatchReactor&mut reactor, i64 left, i64 right) {
+    if (left == right) {
+        return;
+    }
+    i64 left_deadline = timer_deadline(reactor, left);
+    i64 left_token = timer_token(reactor, left);
+    i64 right_deadline = timer_deadline(reactor, right);
+    i64 right_token = timer_token(reactor, right);
+    timer_set(reactor, left, right_deadline, right_token);
+    timer_set(reactor, right, left_deadline, left_token);
+}
+
+fn timer_init(BatchReactor&mut reactor, i64 capacity) -> bool {
+    i64 requested = capacity;
+    if (requested < 16) {
+        requested = 16;
+    }
+    if (requested > timer_max_records) {
+        return false;
+    }
+    RawVec timers = alloc::vec::create_aligned(timer_record_bytes, 8, requested);
+    if (alloc::vec::capacity(&timers) != requested) {
+        alloc::vec::destroy(&mut timers);
+        return false;
+    }
+    reactor.timers = move timers;
+    return true;
+}
+
+fn timer_valid(BatchReactor& reactor) -> bool {
+    return alloc::vec::capacity(&reactor.timers) > 0 && alloc::vec::data_ptr(&reactor.timers) != 0;
+}
+
+fn timer_reserve(BatchReactor&mut reactor, i64 requested) -> bool {
+    if (!timer_valid(reactor) || requested <= 0 || requested > timer_max_records) {
+        return false;
+    }
+    return alloc::vec::reserve(&mut reactor.timers, requested);
+}
+
+fn timer_sift_up(BatchReactor&mut reactor, i64 index) {
+    i64 child = index;
+    while (child > 0) {
+        i64 parent = (child - 1) / 2;
+        if (timer_deadline(reactor, parent) <= timer_deadline(reactor, child)) {
+            return;
+        }
+        timer_swap(reactor, parent, child);
+        child = parent;
+    }
+}
+
+fn timer_sift_down(BatchReactor&mut reactor, i64 index) {
+    i64 parent = index;
+    while (true) {
+        i64 left = parent * 2 + 1;
+        if (left >= reactor.timers.length) {
+            return;
+        }
+        i64 right = left + 1;
+        i64 smallest = left;
+        if (right < reactor.timers.length && timer_deadline(reactor, right) < timer_deadline(reactor, left)) {
+            smallest = right;
+        }
+        if (timer_deadline(reactor, parent) <= timer_deadline(reactor, smallest)) {
+            return;
+        }
+        timer_swap(reactor, parent, smallest);
+        parent = smallest;
+    }
+}
+
+fn timer_push(BatchReactor&mut reactor, i64 deadline, i64 token) -> bool {
+    if (!timer_valid(reactor) || deadline < 0 || token < 0) {
+        return false;
+    }
+    if (reactor.timers.length >= reactor.timers.capacity && !timer_reserve(reactor, reactor.timers.length + 1)) {
+        return false;
+    }
+    i64 index = reactor.timers.length;
+    reactor.timers.length += 1;
+    timer_set(reactor, index, deadline, token);
+    timer_sift_up(reactor, index);
+    return true;
+}
+
+fn timer_remove_at(BatchReactor&mut reactor, i64 index) -> bool {
+    if (!timer_valid(reactor) || index < 0 || index >= reactor.timers.length) {
+        return false;
+    }
+    i64 last = reactor.timers.length - 1;
+    if (index != last) {
+        timer_set(reactor, index, timer_deadline(reactor, last), timer_token(reactor, last));
+    }
+    reactor.timers.length = last;
+    if (index < reactor.timers.length) {
+        if (index > 0 && timer_deadline(reactor, index) < timer_deadline(reactor, (index - 1) / 2)) {
+            timer_sift_up(reactor, index);
+        } else {
+            timer_sift_down(reactor, index);
+        }
+    }
+    return true;
+}
+
+fn timer_cancel(BatchReactor&mut reactor, i64 token) -> bool {
+    i64 index = 0;
+    while (index < reactor.timers.length) {
+        if (timer_token(reactor, index) == token) {
+            return timer_remove_at(reactor, index);
+        }
+        index += 1;
+    }
+    return false;
+}
+
+fn timer_destroy(BatchReactor&mut reactor) {
+    alloc::vec::destroy(&mut reactor.timers);
+}
+
+public fn batch_create(i64 capacity) -> BatchReactor {
+    i64 requested = capacity;
+    if (requested < 64) {
+        requested = 64;
+    }
+    PollSet set = std::net::poll_set::create(requested);
+    RawVec timers = alloc::vec::create_aligned(timer_record_bytes, 8, 0);
+    BatchReactor reactor = BatchReactor {
+        set: move set,
+        timers: move timers,
+    };
+    timer_init(&mut reactor, 64);
+    return reactor;
+}
+
+public fn batch_valid(BatchReactor& reactor) -> bool {
+    return std::net::poll_set::valid(&reactor.set) && timer_valid(reactor);
+}
+
+public fn batch_clear(BatchReactor&mut reactor) {
+    std::net::poll_set::clear(&mut reactor.set);
+}
+
+public fn batch_watch(BatchReactor&mut reactor, i64 socket, i64 interests) -> bool {
+    return std::net::poll_set::push(&mut reactor.set, socket, interests);
+}
+
+public fn batch_watch_readable(BatchReactor&mut reactor, i64 socket) -> bool {
+    return batch_watch(reactor, socket, std::net::poll_set::readable);
+}
+
+public fn batch_watch_writable(BatchReactor&mut reactor, i64 socket) -> bool {
+    return batch_watch(reactor, socket, std::net::poll_set::writable);
+}
+
+/// Changes an existing watch without allocating or rebuilding the set. This is
+/// the normal backpressure primitive for readiness-driven connection workers.
+public fn batch_set_interests(BatchReactor&mut reactor, i64 index, i64 interests) -> bool {
+    return std::net::poll_set::set_interests(&mut reactor.set, index, interests);
+}
+
+/// Removes a watch in O(1). The final record is moved into the removed slot;
+/// batch_socket(index) returns the moved socket when index remains in range.
+public fn batch_remove_swap(BatchReactor&mut reactor, i64 index) -> bool {
+    return std::net::poll_set::remove_swap(&mut reactor.set, index);
+}
+
+/// Schedules a monotonic timer identified by a caller-owned non-negative token.
+/// Timers live in a retained min-heap and do not allocate in steady state.
+public fn batch_schedule_at(BatchReactor&mut reactor, i64 token, i64 deadline_nanos) -> bool {
+    return timer_push(reactor, deadline_nanos, token);
+}
+
+public fn batch_schedule_after(BatchReactor&mut reactor, i64 token, i64 delay_millis) -> bool {
+    if (delay_millis < 0) {
+        return false;
+    }
+    i64 now = std::time::monotonic_nanos();
+    i64 deadline = now;
+    if (delay_millis > 9223372036854) {
+        deadline = 9223372036854775807;
+    } else {
+        i64 delta = delay_millis * 1000000;
+        if (now > 9223372036854775807 - delta) {
+            deadline = 9223372036854775807;
+        } else {
+            deadline = now + delta;
+        }
+    }
+    return timer_push(reactor, deadline, token);
+}
+
+/// Cancels one timer matching token. Cancellation is O(n); scheduling and expiry
+/// remain O(log n), keeping the hot event-loop path heap based.
+public fn batch_cancel_timer(BatchReactor&mut reactor, i64 token) -> bool {
+    return timer_cancel(reactor, token);
+}
+
+public fn batch_timer_len(BatchReactor& reactor) -> i64 {
+    return reactor.timers.length;
+}
+
+public fn batch_next_deadline(BatchReactor& reactor) -> i64 {
+    if (reactor.timers.length <= 0) {
+        return -1;
+    }
+    return timer_deadline(reactor, 0);
+}
+
+/// Pops one expired timer into token. Multiple timers can be drained by calling
+/// this repeatedly after a wait returns.
+public fn batch_pop_expired(BatchReactor&mut reactor, i64&mut token) -> bool {
+    if (reactor.timers.length <= 0) {
+        return false;
+    }
+    i64 now = std::time::monotonic_nanos();
+    if (timer_deadline(reactor, 0) > now) {
+        return false;
+    }
+    *token = timer_token(reactor, 0);
+    return timer_remove_at(reactor, 0);
+}
+
+fn batch_timeout(BatchReactor& reactor, i64 requested_millis) -> i64 {
+    if (reactor.timers.length <= 0) {
+        return requested_millis;
+    }
+    i64 now = std::time::monotonic_nanos();
+    i64 deadline = timer_deadline(reactor, 0);
+    i64 timer_millis = 0;
+    if (deadline > now) {
+        i64 remaining = deadline - now;
+        timer_millis = remaining / 1000000;
+        if (remaining % 1000000 != 0) {
+            timer_millis += 1;
+        }
+    }
+    if (requested_millis < 0 || timer_millis < requested_millis) {
+        return timer_millis;
+    }
+    return requested_millis;
+}
+
+/// Waits once for the entire socket set and the nearest scheduled timer. The OS
+/// poll timeout is clamped to the heap root, so timers and I/O share one event
+/// loop without a sleeping worker per deadline.
+public fn batch_wait(BatchReactor&mut reactor, i64 timeout_millis) -> i64 {
+    if (!batch_valid(reactor) || timeout_millis < -1) {
+        return -1;
+    }
+    i64 effective = batch_timeout(reactor, timeout_millis);
+    if (std::net::poll_set::len(&reactor.set) <= 0) {
+        if (effective < 0) {
+            return -1;
+        }
+        if (effective > 0) {
+            std::time::sleep_millis(effective);
+        }
+        return 0;
+    }
+    return std::net::poll_set::wait(&mut reactor.set, effective);
+}
+
+public fn batch_len(BatchReactor& reactor) -> i64 {
+    return std::net::poll_set::len(&reactor.set);
+}
+
+public fn batch_socket(BatchReactor& reactor, i64 index) -> i64 {
+    return std::net::poll_set::socket(&reactor.set, index);
+}
+
+public fn batch_events(BatchReactor& reactor, i64 index) -> i64 {
+    return std::net::poll_set::events(&reactor.set, index);
+}
+
+public fn batch_readable(BatchReactor& reactor, i64 index) -> bool {
+    return (batch_events(reactor, index) & std::net::poll_set::readable) != 0;
+}
+
+public fn batch_writable(BatchReactor& reactor, i64 index) -> bool {
+    return (batch_events(reactor, index) & std::net::poll_set::writable) != 0;
+}
+
+public fn batch_error(BatchReactor& reactor, i64 index) -> bool {
+    return (batch_events(reactor, index) & std::net::poll_set::error) != 0;
+}
+
+public fn batch_destroy(BatchReactor&mut reactor) {
+    std::net::poll_set::destroy(&mut reactor.set);
+    timer_destroy(reactor);
+}

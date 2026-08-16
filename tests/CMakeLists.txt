@@ -1396,6 +1396,15 @@ add_test(NAME raz-stdlib-ergonomics-audit
 add_test(NAME raz-stdlib-performance-audit
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-stdlib-performance.py)
 
+add_test(NAME raz-stdlib-systems-runtime
+  COMMAND ${CMAKE_COMMAND}
+    -DRAZ_EXE=$<TARGET_FILE:raz_host>
+    -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+    -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+    -DWORK_ROOT=${CMAKE_CURRENT_BINARY_DIR}/stdlib-systems-runtime-work
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stdlib_systems_runtime.cmake)
+set_tests_properties(raz-stdlib-systems-runtime PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+
 # Production networking, serialization, and higher-level I/O.
 add_test(NAME raz-network-codec-runtime
   COMMAND ${CMAKE_COMMAND}

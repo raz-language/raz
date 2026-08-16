@@ -114,3 +114,19 @@ TLS clients share the process-wide OpenSSL client context and now retain a bound
 
 HTTP `ServerConnection` now retains chunk-decoding scratch in addition to its receive and response buffers. Keep-alive workers therefore avoid the previous hidden 4 KiB allocation on every `read_request` call, including chunked requests. Each connection also retains a two-slice `IoVector`; normal responses send the completed header block and caller-owned body with scatter/gather I/O, avoiding an O(body-size) copy into the response `String` and its associated capacity growth. Partial vectored sends fall back to exact `send_all` completion.
 
+
+## Filesystem tree operations
+
+Recursive tree removal retains one mutable full-path buffer for the complete traversal. Each directory level records the current path length, appends the child component, descends, and truncates back to the saved length. This removes the previous per-entry joined-path allocation while preserving symlink safety and deterministic handle cleanup.
+
+## Batched readiness reactor
+
+`std::net::reactor::BatchReactor` is the preferred event-loop primitive for many nonblocking sockets. Watches are stored in one reusable `PollSet`, which grows geometrically when required, and one `batch_wait` crosses the operating-system boundary for the entire set.
+
+The reactor also owns a retained min-heap of monotonic timers. Scheduling and expiry are O(log n), the timer allocation grows geometrically, and `batch_wait` automatically clamps its OS poll timeout to the nearest deadline. Keep-alive expiry, retries, idle connection timeouts, and similar timers can therefore share the socket event loop rather than occupying sleeping worker tasks. Expired timer tokens are drained with `batch_pop_expired`.
+
+Readiness interests are mutable in place with `batch_set_interests`, which lets a connection switch between readable and writable states when applying backpressure without rebuilding the watch set. `batch_remove_swap` removes a closed connection in O(1) by moving the final poll record into the vacated slot. The older executor-backed one-watch API remains useful when a blocking watch must be adapted into a task, but high-throughput servers should use the batched reactor.
+
+## Structured log emission
+
+`std::log::LogBuffer` retains its record storage and now supports integer, unsigned-integer, boolean, and byte fields plus direct standard-stream emission. Finishing and writing a record does not construct a second formatting string, so worker-local log buffers can remain allocation-stable after reaching their high-water capacity.
