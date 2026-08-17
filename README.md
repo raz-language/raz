@@ -1,149 +1,81 @@
+<div align="center">
+
 # Raz
 
-**Raz is a statically typed systems programming language for building high-performance native software with explicit control, memory safety, and a complete project toolchain.**
+### A systems programming language for native software that has to be fast, safe, and predictable.
 
-Raz is designed for software where predictable performance matters: command-line tools, network services, runtimes, databases, compilers, infrastructure, and other native applications. The language combines ownership and borrowing with low-level memory access, generics, traits, pattern matching, deterministic destruction, structured concurrency, and multiple production code-generation targets.
+[![CI](https://img.shields.io/github/actions/workflow/status/raz-language/raz/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/raz-language/raz/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/language-1.0-111827?style=flat-square)](docs/LANGUAGE-STABILITY.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-111827?style=flat-square)](LICENSE)
+[![Packages](https://img.shields.io/badge/packages-registry-111827?style=flat-square)](https://github.com/raz-language/packages)
 
-The production compiler is written in Raz. Forge is the default native backend, with LLVM, WebAssembly, and RXE available from the same compiler pipeline.
+[Getting started](docs/GETTING-STARTED.md) ·
+[Installation](docs/INSTALLATION.md) ·
+[Language specification](docs/LANGUAGE-SPECIFICATION.md) ·
+[CLI reference](docs/CLI.md) ·
+[Documentation](docs/README.md)
 
-## Highlights
+</div>
 
-- **Native performance** — direct compilation to platform objects and executables through Forge or LLVM.
-- **Memory safety with explicit control** — ownership, moves, borrowing, mutable references, non-lexical loan analysis, deterministic destruction, and `unsafe` for deliberate low-level operations.
-- **Systems-oriented type system** — structs, payload enums, tuples, arrays, slices, references, raw pointers, function pointers, generics, traits, associated items, and const generics.
-- **Predictable resource management** — no tracing garbage collector and no hidden runtime ownership model.
-- **High-performance standard library** — allocation-conscious collections, arenas and pools, buffered and vectored I/O, filesystem and process APIs, sockets, DNS, HTTP, TLS, compression, serialization, atomics, lock-free queues, and readiness-driven networking.
-- **First-class project tooling** — builds, tests, formatting, documentation, diagnostics, package management, workspaces, lockfiles, incremental compilation, and language-server support.
-- **Multiple backends** — Forge native code, LLVM IR/native code, WebAssembly, and RXE bytecode.
-- **Reproducible packages** — semantic-version resolution, content-addressed storage, integrity verification, offline builds, Git dependencies, workspaces, deterministic package archives, and registry publishing.
+---
 
-## Quick start
+Raz is a statically typed language for command-line tools, network services, runtimes, databases, compilers, storage engines, and infrastructure — software where the cost model has to be visible in the source. It pairs ownership and borrowing with low-level memory access, generics, traits, pattern matching, deterministic destruction, and structured concurrency, and it ships as a complete platform rather than a compiler alone.
 
-Create and run a project:
+**Raz 1.0 is stable.** The documented language contract does not break within the 1.x line.
 
-```text
-raz new hello
-cd hello
-raz run
-```
+## Why Raz
 
-A minimal Raz program:
+**A cost model you can see.** No tracing garbage collector, no hidden runtime ownership model. Ownership, moves, borrows, and deterministic drop decide lifetime at compile time; generics monomorphize, dynamic dispatch happens where it is asked for, and `unsafe` marks the boundary where low-level work becomes deliberate.
 
-```raz
-fn main() -> i64 {
-    i64 answer = 40 + 2;
-    return answer;
-}
-```
+**Safety without surrendering control.** Non-lexical loan analysis, bounds- and lifetime-aware slices, and explicit `extern` and raw-pointer boundaries let systems code stay systems code while the compiler proves the parts that should be provable.
 
-Common project commands:
+**One frontend, four targets.** Every backend consumes the same verified MIR, so semantics are settled before code generation begins. Native output through Forge or LLVM, plus WebAssembly and RXE bytecode.
 
-```text
-raz check
-raz build
-raz run
-raz test
-raz fmt --check
-raz doc src/main.rz
-raz doctor
-```
+**A toolchain designed with the language.** Builds, tests, formatting, documentation, linting, package management, workspaces, lockfiles, incremental compilation, and a language server — all from one command, all sharing the compiler's semantic engine rather than reimplementing it.
 
-Build an optimized native binary:
+**Engineering you can verify.** The production compiler is written in Raz and reproduces itself deterministically from its own source tree. The language specification is the normative reference; the conformance suite is the executable one. Package archives are deterministic and content-addressed.
 
-```text
-raz build --profile release --opt=3
-```
+## The language
 
-## Language overview
+| Area | Raz 1.0 |
+|---|---|
+| Execution | Native machine code through Forge or LLVM/Clang |
+| Memory model | Ownership, moves, borrows, non-lexical loan analysis, deterministic drop |
+| Managed runtime | No tracing garbage collector, no hidden runtime ownership model |
+| Type system | Structs, payload enums, tuples, arrays, slices, references, raw pointers, function pointers |
+| Abstraction | Generics, traits, associated items, const generics, closures, iterators |
+| Control flow | Pattern matching, structured error handling, `defer`, deterministic destruction |
+| Compile time | Constants, const functions and generics, `comptime`, reflection facilities |
+| Concurrency | Threads, atomics, synchronization primitives, channels, tasks, futures |
+| Async | `async fn`, `spawn`, `await`, readiness reactor, async I/O foundations |
+| Native boundary | Explicit `extern`, raw pointers, and `unsafe` for deliberate low-level work |
+| Project model | Manifests, path and registry dependencies, lockfiles, workspaces, tests, docs |
 
-Raz uses type-first declarations and semicolon-terminated statements.
+Raz uses type-first declarations and semicolon-terminated statements. The [language specification](docs/LANGUAGE-SPECIFICATION.md) is the normative reference; [Getting Started](docs/GETTING-STARTED.md) is the practical introduction.
 
-### Functions and values
+## Install and start
 
-```raz
-public fn add(i64 left, i64 right) -> i64 {
-    return left + right;
-}
+Releases provide an MSI installer and a portable archive for Windows, with `razup` for toolchain management. Confirm the environment with `raz --version` and `raz doctor`, then create a project with `raz new` and run it with `raz run`.
 
-fn main() -> i64 {
-    i64 result = add(20, 22);
-    return result;
-}
-```
-
-### Ownership and borrowing
-
-```raz
-struct Resource {
-    i64 handle;
-}
-
-fn increment(i64&mut value) {
-    *value += 1;
-}
-
-fn main() -> i64 {
-    Resource first = Resource { handle: 7 };
-    Resource second = move first;
-
-    i64 value = 41;
-    increment(&mut value);
-    return second.handle + value;
-}
-```
-
-Aggregate values have value semantics: assigning a struct value to another local creates independent aggregate storage unless ownership is explicitly moved.
-
-### Traits and generics
-
-```raz
-trait Measurable {
-    fn measure(Self& self) -> i64;
-}
-
-struct Metric {
-    i64 value;
-}
-
-impl Measurable for Metric {
-    fn measure(Metric& self) -> i64 {
-        return self.value;
-    }
-}
-
-fn read<T: Measurable>(T& value) -> i64 {
-    return value.measure();
-}
-```
-
-### Arrays and iteration
-
-```raz
-fn sum() -> i64 {
-    i64 values[4] = [1, 2, 3, 4];
-    i64 total = 0;
-
-    for value in values {
-        total += value;
-    }
-
-    return total;
-}
-```
+See [Installation](docs/INSTALLATION.md) for installer, portable, silent-install, and toolchain-management details, and [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough.
 
 ## Toolchain
 
 `raz` is the project driver and primary command-line interface. `razc` is the direct compiler interface.
 
-```text
-raz --help
-raz --version
-raz doctor
-raz backends
-raz targets
-```
+| Command | Purpose |
+|---|---|
+| `raz new` · `raz init` | Create or initialize a package |
+| `raz check` | Parse, resolve, type-check, and validate |
+| `raz build` · `raz run` | Build a native artifact, or build and execute |
+| `raz test` · `raz lint` | Run `test_` functions; run semantic validation |
+| `raz fmt` · `raz doc` | Canonical formatting; API documentation |
+| `raz add` · `raz remove` · `raz update` | Manage dependencies and re-resolve constraints |
+| `raz search` · `raz info` · `raz outdated` | Inspect the official registry and tracked versions |
+| `raz pack` · `raz publish` | Produce and submit deterministic package archives |
+| `raz doctor` · `raz backends` · `raz targets` | Inspect the toolchain, backends, and targets |
 
-Normal build output is concise and package-oriented:
+Build output is concise and package-oriented:
 
 ```text
    Compiling core v0.4.2
@@ -151,7 +83,7 @@ Normal build output is concise and package-oriented:
     Finished app [release, host] (3 compiled, 8 fresh) in 412 ms
 ```
 
-Command parsing fails before build work begins, and common mistakes receive actionable diagnostics:
+Command parsing fails before any build work begins, and common mistakes get actionable diagnostics:
 
 ```text
 error: no such command: 'biuld'
@@ -159,86 +91,33 @@ error: no such command: 'biuld'
   help: view all commands with 'raz --help'
 ```
 
-See [CLI reference](docs/CLI.md) for the complete command and diagnostic interface.
+Diagnostics are stable and machine-readable, and the same semantic engine drives the language server: completion, navigation, references, rename, symbols, formatting, and code actions. See the [CLI reference](docs/CLI.md) and [Language server](docs/LANGUAGE-SERVER.md).
 
 ## Standard library
 
-The standard library is implemented primarily in Raz and is organized into three layers:
+Implemented primarily in Raz, in three layers:
 
-```text
-library/core/    language and runtime-independent foundations
-library/alloc/   allocation-backed collections and memory utilities
-library/std/     operating-system, networking, concurrency, and application APIs
-```
+| Layer | Scope |
+|---|---|
+| `library/core/` | Language and runtime-independent foundations |
+| `library/alloc/` | Allocation-backed collections and memory utilities |
+| `library/std/` | Operating-system, networking, concurrency, and application APIs |
 
-The library includes:
+| Domain | Coverage |
+|---|---|
+| Collections | Vectors, deques, hash maps and sets, strings, slices, arenas, fixed object pools |
+| System | Files, directories, paths, environment, processes, clocks, timers, random generation |
+| I/O | Buffered, vectored, and byte-oriented I/O |
+| Networking | TCP, UDP, DNS, TLS, HTTP, URL handling, framed transports, readiness polling |
+| Encoding | JSON, Base64, hexadecimal, binary encoding, CRC-32, LZ4 block compression |
+| Concurrency | Threads, atomics, channels, worker executors, lock-free SPSC/MPMC queues |
+| Application | Structured logging, allocation-conscious CLI parsing |
 
-- vectors, deques, hash maps, hash sets, strings, slices, arenas, and fixed object pools;
-- files, directories, paths, environment variables, processes, clocks, timers, and random generation;
-- buffered, vectored, and byte-oriented I/O;
-- TCP, UDP, address parsing, DNS, TLS, HTTP, URL handling, framed transports, and readiness polling;
-- JSON, Base64, hexadecimal, binary encoding, CRC-32, and LZ4 block compression;
-- threads, atomics, channels, worker executors, and lock-free SPSC/MPMC queues;
-- structured logging and allocation-conscious CLI parsing.
-
-Performance-sensitive APIs are designed around retained buffers, caller-owned storage, batching, bounded caches, and reuse. Higher-level policy stays in Raz; native code is restricted to permanent operating-system, ABI, cryptographic-engine, and backend boundaries.
-
-### Readiness-driven networking
-
-For high-connection-count services, `std::net::reactor::BatchReactor` keeps socket watches and monotonic timers in reusable storage. One wait handles the complete socket set and automatically clamps the OS timeout to the nearest scheduled timer.
-
-```raz
-BatchReactor reactor = std::net::reactor::batch_create(1024);
-std::net::reactor::batch_watch_readable(&mut reactor, listener);
-std::net::reactor::batch_schedule_after(&mut reactor, 1, 30000);
-
-i64 ready = std::net::reactor::batch_wait(&mut reactor, -1);
-```
-
-Connection interests can be changed in place for backpressure, and watches can be removed in O(1) without rebuilding the poll set.
-
-## Packages and workspaces
-
-The official package registry is hosted at [`raz-language/packages`](https://github.com/raz-language/packages).
-
-```text
-raz search json
-raz add json
-raz add codec@^1.2.0
-raz tree
-raz update
-raz fetch
-raz pack
-raz publish
-raz vendor
-raz install formatter
-raz install tooling
-raz install --bins tooling
-raz install --bin=razfmt tooling
-raz install --list
-raz install --update tooling
-raz uninstall formatter
-```
-
-Same-name registry dependencies stay readable in `raz.toml` as version constraints such as `websocket = "^0.2.0"`; explicit aliases can name `registry:<package>@<constraint>`. Raz records exact dependency state in `raz.lock`. Registry packages are integrity-checked and stored in a shared content-addressed cache. Normal `build`, `check`, `run`, and `test` commands automatically hydrate missing locked packages, so a clean checkout does not require a separate install step. `raz fetch` explicitly prefetches the lockfile exactly; `raz update` is the operation that re-resolves compatible versions.
-
-A multi-package repository can use a workspace manifest:
-
-```toml
-[workspace]
-members = [
-    "crates/core",
-    "crates/cli",
-]
-```
-
-Workspace builds, checks, tests, updates, fetches, metadata, and dependency graphs operate from the root manifest and share one root lockfile.
-
-See [Package management](docs/PACKAGE-MANAGEMENT.md).
+Performance-sensitive APIs are designed around retained buffers, caller-owned storage, batching, bounded caches, and reuse. Higher-level policy stays in Raz; native code is restricted to permanent operating-system, ABI, cryptographic-engine, and backend boundaries. See [Standard-library performance](docs/STANDARD-LIBRARY-PERFORMANCE.md) and the [performance model](docs/PERFORMANCE.md).
 
 ## Compiler and backends
 
-Raz source is analyzed once and lowered through a backend-neutral compiler pipeline:
+Source is analyzed once and lowered through a backend-neutral pipeline. Every target consumes the same verified MIR, so language semantics are established before any backend runs.
 
 ```text
 Raz source
@@ -250,7 +129,7 @@ Parser + semantic analysis
 Typed HIR
     │
     ▼
-Verified MIR
+Verified MIR ──────────► diagnostics · language server · tooling
     │
     ├──────── Forge ──────── native object / executable
     ├──────── LLVM ───────── LLVM IR / native object
@@ -258,62 +137,39 @@ Verified MIR
     └──────── RXE ────────── .rxe bytecode
 ```
 
-**Forge** is the default native backend. It provides SSA-based optimization, ABI lowering, machine lowering, register allocation, instruction encoding, and deterministic ELF/COFF object emission.
+| Backend | Role |
+|---|---|
+| **Forge** | Default native backend, linked in-process. SSA-based optimization, ABI lowering, machine lowering, register allocation, instruction encoding, deterministic ELF/COFF emission. |
+| **LLVM** | Production option. Emits LLVM IR from the same verified MIR and uses an external LLVM/Clang toolchain for native code generation. |
+| **WebAssembly** | Portable `.wasm` output under a documented ABI. |
+| **RXE** | Portable bytecode target with a specified format and instruction set. |
 
-**LLVM** emits LLVM IR from the same verified MIR and can use an external LLVM/Clang toolchain for native code generation.
+Backend selection never changes language semantics. Compiler construction is reproducible: a compatibility-pinned host compiler builds the production compiler, and the result is verified before the toolchain is produced.
 
-**WebAssembly** and **RXE** provide portable execution targets while preserving the same language semantics established before backend emission.
+See [Architecture](docs/ARCHITECTURE.md), [Backends](docs/BACKENDS.md), [MIR](docs/MIR.md), and [Compiler reproducibility](docs/COMPILER-REPRODUCIBILITY.md).
 
-Detailed architecture documentation is available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/BACKENDS.md](docs/BACKENDS.md).
+## Platform support
 
-## Installation
+| | Native | ABI · object format |
+|---|---|---|
+| **Windows x64** | Forge, LLVM/Clang | Windows x64 · COFF |
+| **Linux x86-64** | Forge, LLVM/Clang | System V AMD64 · ELF |
+| **WebAssembly** | — | Documented [WASM ABI v1](docs/WASM-ABI-v1.md) |
+| **RXE** | — | Portable [RXE v1](docs/RXE-v1-FORMAT.md) bytecode |
 
-### Windows
+Both ABIs and object formats are covered by repository qualification. Platform-specific standard-library facilities are documented per module and do not imply portability to unsupported targets.
 
-Raz releases provide an MSI installer and a portable archive. The MSI can add Raz to `PATH` during installation.
+## Packages and workspaces
 
-After installation:
+The official registry is hosted at [`raz-language/packages`](https://github.com/raz-language/packages) — a GitHub-backed static registry of immutable, deterministic archives. Published packages include `crypto`, `serde`, `toml`, `regex`, `uuid`, `semver`, `datetime`, `websocket`, `http-router`, `sqlite`, and `postgres`.
 
-```text
-raz --version
-raz doctor
-```
+Dependencies are declared as semantic-version constraints and pinned exactly in `raz.lock`. Archives are integrity-checked and stored in a shared content-addressed cache, so `build`, `check`, `run`, and `test` hydrate missing locked packages automatically — a clean checkout needs no separate install step. Offline builds, vendoring, Git dependencies, private registries, and mirrors are supported, and a root manifest can coordinate many member packages against one lockfile.
 
-Toolchains can also be managed with `razup`:
-
-```text
-razup install stable
-razup update
-razup default stable
-razup toolchain list
-```
-
-See [Installation](docs/INSTALLATION.md) for installer, portable, silent-install, and toolchain-management details.
+See [Package management](docs/PACKAGE-MANAGEMENT.md).
 
 ## Building from source
 
-Raz supports native source builds on Windows and Linux.
-
-Windows:
-
-```powershell
-./bootstrap.bat
-```
-
-Linux:
-
-```sh
-./bootstrap.sh
-```
-
-The bootstrap command configures the native host components, constructs the Raz compiler, and verifies compiler reproducibility before producing the toolchain.
-
-For native components only:
-
-```text
-cmake --preset release
-cmake --build --preset release
-```
+Raz builds from source on Windows and Linux. `bootstrap.bat` and `bootstrap.sh` configure the native host components, construct the Raz compiler, and verify compiler reproducibility before producing the toolchain. Native components alone can be built with the CMake `release` preset.
 
 See [Compiler bootstrap](docs/COMPILER-BOOTSTRAP.md) and [Windows build](docs/WINDOWS-BUILD.md).
 
@@ -331,20 +187,44 @@ tools/       formatting, verification, and repository utilities
 
 ## Documentation
 
-Start with [docs/README.md](docs/README.md).
+| Reference | Description |
+|---|---|
+| [Getting Started](docs/GETTING-STARTED.md) | Practical introduction to the language |
+| [Language specification](docs/LANGUAGE-SPECIFICATION.md) | Normative syntax and semantic rules |
+| [Language stability](docs/LANGUAGE-STABILITY.md) | Raz 1.x compatibility guarantees |
+| [CLI reference](docs/CLI.md) | Complete command and diagnostic interface |
+| [Package management](docs/PACKAGE-MANAGEMENT.md) | Dependencies, lockfiles, registries, publishing |
+| [Standard library](docs/STANDARD-LIBRARY.md) | Module map of every layer, module, and public item |
+| [Diagnostic index](docs/DIAGNOSTIC-INDEX.md) · [Common diagnostics](docs/DIAGNOSTICS-EXPLAINED.md) | Every error code, and extended explanations |
+| [Architecture](docs/ARCHITECTURE.md) · [Backends](docs/BACKENDS.md) · [MIR](docs/MIR.md) | Compiler internals |
+| [Performance](docs/PERFORMANCE.md) · [Standard library](docs/STANDARD-LIBRARY-PERFORMANCE.md) | Performance model and library design |
+| [Language server](docs/LANGUAGE-SERVER.md) · [Formatting](docs/FORMATTING.md) | Editor integration and source conventions |
+| [Documentation index](docs/README.md) | Everything else |
 
-Key references:
+## Contributing
 
-- [Getting Started](docs/GETTING-STARTED.md)
-- [Language specification](docs/LANGUAGE-SPECIFICATION.md)
-- [Language stability](docs/LANGUAGE-STABILITY.md)
-- [CLI reference](docs/CLI.md)
-- [Package management](docs/PACKAGE-MANAGEMENT.md)
-- [Standard-library performance](docs/STANDARD-LIBRARY-PERFORMANCE.md)
-- [Compiler architecture](docs/ARCHITECTURE.md)
-- [Backends](docs/BACKENDS.md)
-- [Language server](docs/LANGUAGE-SERVER.md)
-- [Formatting](docs/FORMATTING.md)
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the design rules changes must preserve, required checks, formatting, test expectations, and contribution licensing.
+
+For normal compiler and native work, build and test before opening a change:
+
+```bash
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
+```
+
+Format the Raz source you touched, and confirm license headers:
+
+```bash
+python tools/format-raz.py <changed-file>.rz --check
+python tests/python/check-license-headers.py
+```
+
+User-visible changes are recorded in [CHANGELOG.md](CHANGELOG.md). Contributors are credited in [AUTHORS.md](AUTHORS.md); to cite Raz in academic work, see [CITATION.cff](CITATION.cff).
+
+## Security
+
+Please do not report security vulnerabilities through public issues. See [SECURITY.md](SECURITY.md) for the reporting process and the areas considered security-relevant.
 
 ## License
 

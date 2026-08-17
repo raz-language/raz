@@ -6,10 +6,12 @@
 
 ```text
 raz --help
+raz <command> --help
 raz --version
 raz doctor
 raz backends
 raz targets
+raz diagnostics
 ```
 
 `raz doctor` can run outside a project. It checks the host architecture, native linker driver, and Raz driver location. When a project path is supplied (or a project is discovered), it also validates the package entry/modules and writes `target/doctor/doctor.json`.
@@ -25,15 +27,29 @@ raz test <input>
 raz lint <input>
 ```
 
-Common backend controls:
+### Options
 
-```text
---backend=forge
---backend=llvm
---forge
---llvm
---opt=0|1|2|3|s|z
-```
+These apply to `build`, `run`, `check`, `test`, and `lint` unless noted.
+
+| Option | Values | Effect |
+|---|---|---|
+| `--backend=<name>` | `forge` · `llvm` | Select the code-generation backend. Forge is the default. |
+| `--forge` · `--llvm` | | Shorthand for the corresponding `--backend`. |
+| `--wasm` · `--rxe` | | Select the WebAssembly or RXE target instead of native output. |
+| `--opt=<level>` | `0` `1` `2` `3` `s` `z` | Optimization level; `s` and `z` optimize for size. |
+| `--profile <name>` | `debug` · `release` | Build profile, as declared in `raz.toml`. |
+| `--entry=<path>` | | Override the package entry module. |
+| `--features=<a,b>` | | Enable the named build features. |
+| `--all-features` | | Enable every declared feature. |
+| `--no-default-features` | | Disable the default feature set. |
+| `--workspace` | | Run the command across every workspace member from the root manifest. |
+| `--quiet` | | Suppress non-error status output; diagnostics are still reported. |
+| `--verbose` | | Show per-module incremental actions instead of package-level status. |
+| `--diagnostic-format=<f>` | `human` · `short` · `json` | Diagnostic renderer. See [Diagnostics](#diagnostics). |
+| `--allow` · `--warn` · `--deny <code\|category>` | | Warning policy, applied in order. |
+| `--deny-warnings` | | Shorthand for making all warnings errors. |
+
+`raz run` passes everything after `--` to the program rather than to the compiler.
 
 ## Backend commands
 
@@ -87,7 +103,41 @@ raz graph
 raz registry <name> <constraint>
 raz pack [output.dpk]
 raz publish
+raz tree
+raz fetch
+raz keygen [prefix]
 ```
+
+### Dependency options
+
+`raz add` accepts a dependency scope and a platform filter:
+
+| Option | Effect |
+|---|---|
+| `--dev` | Add to development dependencies |
+| `--build` | Add to build dependencies |
+| `--optional` | Add as an optional dependency |
+| `--target=<os>` | Restrict to `windows`, `linux`, or `macos` |
+
+A Git source is written `git:<url>#<commit>`, where the revision must be a 40-character commit SHA. A registry source can be named explicitly as `registry:<name>@<constraint>`.
+
+### Install options
+
+| Option | Effect |
+|---|---|
+| `--list` | List managed tools rather than installing |
+| `--bins` | Install every declared `[[bin]]` target |
+| `--bin=<name>` | Install one named binary target |
+| `--update` | Update managed binaries within the recorded constraint |
+| `--force` | Rebuild binaries already owned by that package |
+
+### Other package options
+
+| Command | Option | Effect |
+|---|---|---|
+| `raz vendor` | `--check` | Verify the vendored tree against the lockfile instead of writing it |
+| `raz fetch` · `raz update` | `--workspace` | Operate across all workspace members |
+| Git dependencies | `--no-checkout` | Materialize metadata without checking out a working tree |
 
 `raz search` and `raz info` inspect the static official index without materializing package archives. `raz outdated` compares tracked registry dependencies with the newest published versions and reports the newest version still compatible with each recorded constraint. `raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `.raz-publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
 
@@ -113,6 +163,7 @@ raz fetch --workspace
 raz lock --workspace
 raz metadata --workspace
 raz graph --workspace
+raz tree --workspace
 ```
 
 The workspace uses one root `raz.lock`. Build/check/test options such as `--features=...`, `--all-features`, `--no-default-features`, backend selection, and target options are forwarded to each member.

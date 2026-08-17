@@ -6,7 +6,7 @@ Language design by **Mario Vinciguerra**.
 
 Raz is a statically typed native systems programming language built for predictable performance, deterministic resource management, ownership safety, and direct control over native software. Raz 1.0 lowers source through typed HIR and backend-neutral MIR, then dispatches to either Forge, the default bundled native backend, or the Raz-written LLVM IR backend. Forge emits native objects in-process; the LLVM backend emits textual LLVM IR in Raz and uses an external Clang/LLVM toolchain when native objects or executables are requested.
 
-This guide replaces the earlier alpha-era edition and reflects the current Raz 1.0 compiler, syntax, package model, standard library, Forge and LLVM backends, ownership system, compile-time facilities, async model, and tooling.
+This guide reflects the Raz 1.0 compiler, syntax, package model, standard library, Forge and LLVM backends, ownership system, compile-time facilities, async model, and tooling.
 
 ---
 
@@ -36,6 +36,15 @@ Raz aims to make low-level code easy to reason about without hiding the cost mod
 Raz was also built as a serious real-world frontend for **[Forge](https://github.com/Ascension-Digital-Technologies/Forge)**, a compact native compiler infrastructure project. Forge remains the default bundled backend and is linked in-process. Raz also includes a first-class LLVM IR emitter written in Raz itself, allowing the same frontend and MIR semantics to target the wider LLVM ecosystem without bundling LLVM's C++ source tree.
 
 Both paths produce native code. Performance depends on Raz's semantic lowering, the selected backend and optimization pipeline, the standard library/runtime boundary, and the target machine. Forge keeps a compact in-process integration surface; LLVM mode emits LLVM IR internally and delegates native code generation to an installed external Clang/LLVM toolchain.
+
+**Summary**
+
+Raz targets native software where the cost model must stay visible: ownership instead of a tracing collector, monomorphized generics, and explicit unsafe boundaries. Forge is the default backend and LLVM is a production option, both fed from the same verified MIR.
+
+**Exercises**
+
+1. Name three kinds of program from the chapter's list that you have written before, and note which language property mattered most in each.
+2. Read `docs/PERFORMANCE.md` and list the two zero-cost goals that most affect your own code.
 
 ---
 
@@ -103,6 +112,15 @@ Useful project commands include:
 
 `razc` is the lower-level compiler frontend used for direct compiler and conformance workflows.
 
+**Summary**
+
+A Raz package is a `raz.toml` manifest plus `.rz` sources. `raz check` validates without producing an artifact, `raz build` produces one, and `raz run` does both and executes.
+
+**Exercises**
+
+1. Create a package with `raz new hello`, then run `raz check` and `raz build` and compare how long each takes.
+2. Open `raz.toml` and change `kind` to `static-library`. Predict what `raz run` will report, then confirm it.
+
 ---
 
 ## Chapter 3 - Your First Program
@@ -145,6 +163,15 @@ Comments use familiar syntax:
 /// Documentation comments are attached to public API declarations.
 ```
 
+**Summary**
+
+Raz uses type-first declarations, semicolon-terminated statements, and braces for blocks. `main` may return `i64` as a process exit status or return nothing.
+
+**Exercises**
+
+1. Write a program that prints two lines and returns a nonzero exit status. Check the status your shell reports.
+2. Introduce a deliberate typo in a name and read the resulting diagnostic. Note the code it reports.
+
 ---
 
 ## Chapter 4 - Variables and Types
@@ -177,6 +204,15 @@ f64 precise = count as f64;
 ```
 
 Raz keeps numeric coercions in the frontend. The backend receives already-typed operations rather than guessing source-language conversion rules.
+
+**Summary**
+
+Bindings name a type, then an identifier, then an initializer. Numeric types never convert implicitly; `as` makes every conversion explicit and visible.
+
+**Exercises**
+
+1. Write an expression mixing `i32` and `i64` operands and read the `D2009` diagnostic before fixing it with `as`.
+2. Predict the value of `7 / 2` and `7.0 / 2.0`, then verify both.
 
 ---
 
@@ -212,6 +248,15 @@ i64& mut edit = &mut value;
 Slices provide a borrowed view over contiguous data. Fixed arrays and slices remain bounds-aware on safe indexing paths.
 
 Raw pointer types are explicit, for example `i8*mut` and `i8*const`. Raw pointer operations belong at the language's unsafe/native boundary rather than silently appearing in safe code.
+
+**Summary**
+
+Arrays are fixed-size and carry their length in the type. Slices are views, references borrow without owning, and raw pointers are confined to `unsafe`.
+
+**Exercises**
+
+1. Write a function taking a slice and returning its sum, then call it with a whole array and a sub-range.
+2. Try to return a reference to a local array and read the `D2064` diagnostic.
 
 ---
 
@@ -254,6 +299,15 @@ for value in 0..=4 {
 
 `break`, `continue`, and `return` have ordinary structured-control semantics.
 
+**Summary**
+
+Conditions must be `bool` — there is no truthiness. `for` iterates arrays, ranges, and iterators; `..` is exclusive and `..=` inclusive.
+
+**Exercises**
+
+1. Rewrite a `while` loop from this chapter as a `for` loop over a range.
+2. Write `if (flags & MASK == MASK)` and explain, from §2.6 of the specification, why it does not do what it looks like.
+
 ---
 
 ## Chapter 7 - Structs and Methods
@@ -289,6 +343,15 @@ impl Point {
 ```
 
 The receiver type makes ownership and mutation permission explicit rather than relying on an invisible implicit receiver mode.
+
+**Summary**
+
+Structs group named typed fields; `impl` blocks attach methods. A method receiver is an explicit `Self&`, `Self&mut`, or `Self` parameter, so mutation and ownership stay visible at the call site.
+
+**Exercises**
+
+1. Add a method that mutates a field, and observe what changes at the call site when the receiver is `Self&mut` rather than `Self&`.
+2. Write a constructor-style function returning `Self` and use it.
 
 ---
 
@@ -333,6 +396,15 @@ fn evaluate(Message message) -> i64 {
 
 A wildcard arm can cover remaining supported cases when appropriate.
 
+**Summary**
+
+Enums carry typed payloads and `match` must be exhaustive. Adding a variant turns every incomplete match into a compile error rather than a runtime surprise.
+
+**Exercises**
+
+1. Add a variant to an enum you already match on and count the diagnostics you get.
+2. Replace an explicit arm with `_` and explain what you gave up.
+
 ---
 
 ## Chapter 9 - Option, Result, and `?`
@@ -369,6 +441,15 @@ fn relay(bool fail) -> Result<i64, i64> {
 
 This keeps recoverable failure visible in the function type rather than making exceptions the primary error model.
 
+**Summary**
+
+`Option<T>` models absence and `Result<T,E>` models recoverable failure. Postfix `?` propagates the non-success path, which keeps failure visible in the signature.
+
+**Exercises**
+
+1. Write a function returning `Result<i64,i64>` and call it from another that uses `?`.
+2. Use `?` in a function whose return type cannot carry the error, and read the `D2047` diagnostic.
+
 ---
 
 ## Chapter 10 - Ownership and Moves
@@ -397,6 +478,15 @@ The important model is simple:
 - `T& mut` borrows exclusive mutable access;
 - reborrows cannot outlive the source borrow; and
 - references cannot escape a lifetime the source value cannot satisfy.
+
+**Summary**
+
+Values move by default. After a move the source binding is unusable, which is what makes single ownership checkable rather than a convention.
+
+**Exercises**
+
+1. Move a value into a function and then use the original. Read the `D2054` diagnostic and fix it three ways: borrow, clone, and reorder.
+2. Add `move` to a `Copy` value and read the `D2052` lint.
 
 ---
 
@@ -427,6 +517,15 @@ The compiler rejects, among other cases:
 - invalid reference return/escape;
 - borrowed captures that outlive their source; and
 - references that cannot safely cross an async suspension.
+
+**Summary**
+
+Borrows are either many shared or one mutable. Loans are non-lexical: a borrow stops constraining its source at its last use, not at the closing brace.
+
+**Exercises**
+
+1. Write code rejected by `D2056`, then fix it by moving the final use of the first borrow earlier rather than by adding a scope.
+2. Borrow two different fields of one struct mutably at the same time and confirm it is accepted.
 
 ---
 
@@ -469,6 +568,15 @@ fn calculate(i64 input) -> i64 {
 
 `Drop` is appropriate for type-owned cleanup. `defer` is useful for local scope cleanup and paired operations.
 
+**Summary**
+
+`Drop` runs at end of ownership and `defer` runs at scope exit in LIFO order. Both are elaborated into control flow, so cleanup happens on early exits too.
+
+**Exercises**
+
+1. Write a type with `Drop` that prints, and observe the order when two exist in one scope.
+2. Put a `return` inside a `defer` and read the `D2050` diagnostic.
+
 ---
 
 ## Chapter 13 - Generics
@@ -495,6 +603,15 @@ struct Buffer<T, const usize N> {
 ```
 
 Generic static dispatch is monomorphized into concrete code. This keeps the abstraction in the source language without requiring a universal boxed runtime representation.
+
+**Summary**
+
+Generic functions and types are monomorphized, so abstraction has no dispatch cost. Bounds state what a parameter must provide.
+
+**Exercises**
+
+1. Write a generic function with a trait bound, then call it with a type that does not satisfy the bound and read the diagnostic.
+2. Use a const generic parameter for an array length.
 
 ---
 
@@ -542,6 +659,15 @@ fn use_render(dyn Render object) -> i64 {
 }
 ```
 
+**Summary**
+
+Traits define shared behavior with default methods, associated types, and associated constants. Static dispatch is the default; `dyn` opts into dynamic dispatch.
+
+**Exercises**
+
+1. Implement a trait for two types and write one generic function that accepts both.
+2. Convert the same call to use `dyn` and describe what changed about dispatch and layout.
+
 ---
 
 ## Chapter 15 - Iterators and Ranges
@@ -579,6 +705,15 @@ impl Iterator for Counter {
 
 `IntoIterator` allows a container to define the iterator created for a `for` loop. Temporary iterable cleanup follows the same ownership/drop rules as other values.
 
+**Summary**
+
+`for` works over arrays, ranges, borrowed arrays, and any type implementing the iterator contracts. Iteration follows the same ownership rules as everything else.
+
+**Exercises**
+
+1. Iterate an array by value, by `&`, and by `&mut`, and note which forms may modify elements.
+2. Implement `Iterator` for a small type and drive it with `for`.
+
 ---
 
 ## Chapter 16 - Compile-Time Programming
@@ -598,6 +733,15 @@ comptime {
 The stable compile-time surface includes constants, const functions, const generics, compile-time assertions/loops, selected reflection and layout facilities, and supported derive operations.
 
 The compiler intentionally rejects compile-time behavior that would make builds depend on ambient nondeterministic process state.
+
+**Summary**
+
+Constants, const functions, `comptime` blocks, and reflection run at compile time under a deterministic, bounded evaluator. Compile-time results cannot depend on ambient process state.
+
+**Exercises**
+
+1. Assert a `size_of<T>()` value in a `comptime` block and then change the struct so the assertion fails.
+2. Write a const function and use its result as an array length.
 
 ---
 
@@ -635,6 +779,15 @@ auto consume = move fn() -> i64 {
 
 The callable model distinguishes shared/reusable callables, mutable callables, and once-only owned callables. Non-capturing closures can participate in compatible function-pointer workflows.
 
+**Summary**
+
+Closures capture by shared borrow, mutable borrow, or move, subject to ordinary ownership rules. A non-capturing closure coerces to a function pointer.
+
+**Exercises**
+
+1. Write closures that capture the same variable in each of the three modes and note where the borrow checker intervenes.
+2. Pass a non-capturing closure to a function taking `fn(i64)->i64`.
+
 ---
 
 ## Chapter 18 - Async, Tasks, and `await`
@@ -656,6 +809,15 @@ async fn pipeline() -> i64 {
 The compiler lowers async state into compiler-managed frames and tracks values live across suspension points. Ownership rules still apply: an owned value can move into an async frame, while an unsafe reference escape across `await` is rejected.
 
 The standard library/runtime provides futures, tasks, timers, cancellation, worker execution, readiness-reactor support, and async socket/filesystem foundations. Raz does not force one application scheduler design onto every program.
+
+**Summary**
+
+`async fn`, `spawn`, and `await` lower into compiler-generated state machines. Values live across suspension only when their storage can be stabilized in the async frame.
+
+**Exercises**
+
+1. Spawn two tasks and await both. Note the order in which they complete.
+2. Hold a local borrow across an `await` and read the diagnostic explaining why it is rejected.
 
 ---
 
@@ -684,6 +846,15 @@ Most packages use deterministic source discovery. Packages such as the compiler 
 
 Official registry packages resolve from the GitHub-backed [`raz-language/packages`](https://github.com/raz-language/packages) repository, with local snapshots, private HTTP/HTTPS registries, and mirror fallback still supported. Registry packages are materialized into a shared content-addressed store. Set `RAZ_PACKAGE_STORE` or `RAZ_HOME` to choose the store location, or `RAZ_OFFLINE=1` to require a cached registry snapshot and an already-present, integrity-valid store entry. `raz search foo` and `raz info foo` inspect the official index without downloading packages. `raz outdated` reports newer versions for tracked dependencies. `raz add foo` and `raz add foo@^1.2.0` use the official registry and keep the manifest compact (`foo = ">=0.0.0"` or the requested constraint). `raz pack` creates deterministic `.dpk` archives; ordinary `raz publish` prepares a `.raz-publish/` submission for the GitHub registry, while explicit private registries retain filesystem or HTTP/HTTPS publishing.
 
+**Summary**
+
+Namespaces are the declaration identity boundary; `import` controls visibility, and `public import` builds façade APIs. Dependencies are declared in `raz.toml` and pinned in `raz.lock`.
+
+**Exercises**
+
+1. Split a program into two modules with distinct namespaces and import one from the other.
+2. Add a registry dependency with `raz add` and inspect the change to `raz.lock`.
+
 ---
 
 ## Chapter 20 - Standard Library
@@ -710,6 +881,15 @@ library/std    hosted OS, I/O, concurrency, async, and networking APIs
 
 The design rule is important: ordinary algorithms should stay in Raz. Native code under `src/runtime` exists for real OS, ABI, atomic, SIMD, allocation, and bulk-memory boundaries rather than as a second hidden standard library.
 
+**Summary**
+
+The library is layered: `core` is runtime-independent, `alloc` adds allocation-backed collections, and `std` adds the operating system, networking, and concurrency.
+
+**Exercises**
+
+1. Find a function you need in the [standard library index](STANDARD-LIBRARY.md) and identify which layer it belongs to.
+2. Explain why a given API lives in `alloc` rather than `core`.
+
 ---
 
 ## Chapter 21 - Concurrency and Synchronization
@@ -728,6 +908,15 @@ Raz 1.0 exposes low-level primitives suitable for building higher-level concurre
 
 The standard library stays close enough to host primitives that servers and runtimes can build application-specific scheduling and batching rather than paying for one mandatory global runtime.
 
+**Summary**
+
+Threads, atomics, channels, and executors are library types with explicit ownership. Sharing across threads is a type-level decision, not a convention.
+
+**Exercises**
+
+1. Send values through a channel between two threads and observe what ownership transfer means across the boundary.
+2. Replace a mutex with an atomic where the data is a single scalar, and describe the trade.
+
 ---
 
 ## Chapter 22 - Networking and I/O
@@ -737,6 +926,15 @@ Networking foundations include TCP, UDP, DNS, nonblocking mode, endpoint inspect
 The performance rule for I/O-heavy software is to avoid unnecessary crossings and allocations. Raz 1.0 exposes low-level primitives as stable building blocks; buffering, vectored/scatter-gather I/O, buffer pools, framed byte builders, and specialized event-loop policy belong in Raz library layers rather than hidden native shims.
 
 For filesystem workloads, synchronous and asynchronous foundations are both present. Application code should pick the model that matches its workload instead of assuming async is always faster.
+
+**Summary**
+
+I/O is buffered and caller-controlled. Networking exposes both blocking sockets and a readiness reactor for high-connection-count services.
+
+**Exercises**
+
+1. Read a file with a reused buffer and note where allocations would have occurred with a naive API.
+2. Sketch which of your own workloads would justify the reactor over blocking sockets.
 
 ---
 
@@ -756,6 +954,15 @@ fn main() -> i64 {
 Raw pointers, pointer casts/dereferences, and native calls that require additional trust belong in the supported unsafe forms.
 
 A good systems-programming rule applies: make the unsafe boundary small, document the invariant, validate at the edge, and return to ordinary typed Raz code immediately.
+
+**Summary**
+
+`extern`, raw pointers, and `unsafe` mark the native boundary explicitly. Types crossing the ABI need `@repr(C)`; the default layout is not the C layout.
+
+**Exercises**
+
+1. Declare an `extern` function and call it inside `unsafe`.
+2. Take a struct crossing the ABI boundary, add `@repr(C)`, and compare `size_of` before and after.
 
 ---
 
@@ -802,6 +1009,15 @@ Forge was created to give language frontends a compact native backend surface in
 
 There is no C emitter. Forge and LLVM are explicit backends; LLVM never silently falls back to Forge, and "LLVM IR emitter: built-in" means the emitter is part of the Raz compiler - not that LLVM itself is vendored into the repository.
 
+**Summary**
+
+Source is lowered through typed HIR to verified MIR, and only then to a backend. Every backend sees the same checked semantics.
+
+**Exercises**
+
+1. Build the same program with `--forge` and `--llvm` and confirm the behavior is identical.
+2. Explain why ownership errors are reported before any backend runs.
+
 ---
 
 ## Chapter 25 - Native Performance
@@ -832,6 +1048,15 @@ Forge can improve scalar optimization, alias analysis, memory promotion, instruc
 
 When benchmarking, record the target machine, optimization level, generated IR/object size, allocation behavior, throughput/latency, and correctness result. Optimize general mechanisms rather than special-casing one benchmark shape.
 
+**Summary**
+
+Performance comes from language, library, and backend decisions together: no hidden runtime, allocation-conscious APIs, and an optimizing native pipeline.
+
+**Exercises**
+
+1. Build once with `--opt=0` and once with `--opt=3` and compare both build time and run time.
+2. Identify one allocation in your own code that a retained buffer would remove.
+
 ---
 
 ## Chapter 26 - Diagnostics, Formatting, and Testing
@@ -857,6 +1082,15 @@ fn main() -> i64 {
 ```
 
 The project toolchain also provides backend/target discovery, compiler query profiling, package metadata and graph inspection, deterministic dependency locking, registry resolution, formatting, testing, and API documentation generation.
+
+**Summary**
+
+Diagnostics carry stable codes, formatting is canonical rather than configurable, and `raz test` discovers `test_` functions by name.
+
+**Exercises**
+
+1. Run `raz fmt --check` on deliberately misformatted source and read the result.
+2. Write a failing test, read the output, then fix it.
 
 ---
 
@@ -906,6 +1140,15 @@ fn main() -> i64 {
     }
 }
 ```
+
+**Summary**
+
+The complete program combines ownership, enums, error propagation, and the standard library into something small but real.
+
+**Exercises**
+
+1. Extend the program with one new enum variant and follow the compiler until it builds again.
+2. Add a test for its main behavior and run `raz test`.
 
 ---
 
