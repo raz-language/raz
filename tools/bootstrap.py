@@ -499,7 +499,10 @@ def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str]
 def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Path, output: Path, env: dict[str, str], runtime_deps: list[str]) -> None:
     name = Path(compiler).name.lower()
     if IS_WINDOWS and name in {"cl", "cl.exe", "clang-cl", "clang-cl.exe"}:
-        args = [compiler, "/nologo", str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "ws2_32.lib", "bcrypt.lib", f"/Fe:{output}", "/link", "/STACK:8388608"]
+        # Reproducibility executables are the Raz compiler itself.  Reserve
+        # 32 MiB on Windows to match the compiler-specific host link contract;
+        # ordinary Raz programs continue to use the smaller default elsewhere.
+        args = [compiler, "/nologo", str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "ws2_32.lib", "bcrypt.lib", f"/Fe:{output}", "/link", "/STACK:33554432"]
     elif IS_WINDOWS:
         args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-lws2_32", "-lbcrypt"]
     else:

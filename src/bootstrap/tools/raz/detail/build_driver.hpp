@@ -640,7 +640,17 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
     command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
 #endif
     command << "ws2_32.lib bcrypt.lib /Fe:" << shell_quote(output);
-    if (!shared) command << " /link /STACK:8388608";
+    if (!shared) {
+      // The self-hosted compiler recursively walks large syntax/HIR trees and
+      // needs more stack than ordinary Raz applications on Windows. Keep the
+      // normal executable reserve at 8 MiB, but give raz-compiler a 32 MiB
+      // reserve so compiler-sized inputs cannot hit STATUS_STACK_OVERFLOW.
+      const auto output_name = output.filename().string();
+      if (output_name == "raz-compiler.exe" || output_name == "raz-compiler")
+        command << " /link /STACK:33554432";
+      else
+        command << " /link /STACK:8388608";
+    }
     return command.str();
   }
 #endif
