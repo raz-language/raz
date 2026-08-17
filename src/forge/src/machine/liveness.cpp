@@ -24,33 +24,34 @@ bool has_result(Opcode opcode) noexcept {
     }
 }
 
-void add_use(std::vector<bool>& live, VirtualRegister reg) {
-    if (reg < live.size()) live[reg] = true;
+void add_use(RegisterBitSet& live, VirtualRegister reg) {
+    if (reg < live.size()) live.set(reg);
 }
 
 } // namespace
 
-LivenessAnalysis analyze_liveness(const Function& function) {
+LivenessAnalysis analyze_liveness(const Function& function, bool include_instruction_liveness) {
     LivenessAnalysis analysis;
     const auto block_count = function.blocks.size();
-    analysis.uses.assign(block_count, std::vector<bool>(function.register_count));
-    analysis.defs.assign(block_count, std::vector<bool>(function.register_count));
-    analysis.live_in.assign(block_count, std::vector<bool>(function.register_count));
-    analysis.live_out.assign(block_count, std::vector<bool>(function.register_count));
+    analysis.uses.assign(block_count, RegisterBitSet(function.register_count));
+    analysis.defs.assign(block_count, RegisterBitSet(function.register_count));
+    analysis.live_in.assign(block_count, RegisterBitSet(function.register_count));
+    analysis.live_out.assign(block_count, RegisterBitSet(function.register_count));
     analysis.successors.resize(block_count);
 
     std::unordered_map<std::string, std::size_t> block_indices;
+    block_indices.reserve(block_count);
     for (std::size_t index = 0; index < block_count; ++index)
         block_indices.emplace(function.blocks[index].name, index);
 
     for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
         const auto& block = function.blocks[block_index];
         for (const auto parameter : block.parameters)
-            if (parameter < function.register_count) analysis.defs[block_index][parameter] = true;
+            if (parameter < function.register_count) analysis.defs[block_index].set(parameter);
         for (const auto& instruction : block.instructions) {
             const auto record_use = [&](VirtualRegister reg) {
-                if (reg < function.register_count && !analysis.defs[block_index][reg])
-                    analysis.uses[block_index][reg] = true;
+                if (reg < function.register_count && !analysis.defs[block_index].test(reg))
+                    analysis.uses[block_index].set(reg);
             };
             for (const auto input : instruction.inputs) record_use(input);
             for (const auto& successor : instruction.successors) {
@@ -59,51 +60,75 @@ LivenessAnalysis analyze_liveness(const Function& function) {
                 if (target != block_indices.end()) analysis.successors[block_index].push_back(target->second);
             }
             if (has_result(instruction.opcode) && instruction.result < function.register_count)
-                analysis.defs[block_index][instruction.result] = true;
+                analysis.defs[block_index].set(instruction.result);
         }
     }
 
-    bool changed = true;
-    while (changed) {
-        changed = false;
+    // Propagate only the reverse-CFG frontier after the initial sweep. Most
+    // compiler-generated CFGs converge locally; rescanning every unrelated
+    // block on every fixed-point round turns a small loop/backedge update into
+    // whole-function work.
+    std::vector<std::vector<std::size_t>> predecessors(block_count);
+    for (std::size_t source = 0; source < block_count; ++source)
+        for (const auto successor : analysis.successors[source])
+            predecessors[successor].push_back(source);
+
+    std::vector<bool> dirty(block_count, true);
+    std::vector<bool> next_dirty(block_count, false);
+    RegisterBitSet next_out(function.register_count);
+    RegisterBitSet next_in(function.register_count);
+    bool has_dirty = block_count != 0U;
+    while (has_dirty) {
+        has_dirty = false;
+        std::fill(next_dirty.begin(), next_dirty.end(), false);
         ++analysis.fixed_point_iterations;
         for (std::size_t reverse = block_count; reverse > 0; --reverse) {
             const auto block_index = reverse - 1U;
-            auto next_out = std::vector<bool>(function.register_count);
+            if (!dirty[block_index]) continue;
+
+            next_out.clear();
             for (const auto successor : analysis.successors[block_index])
-                for (VirtualRegister reg = 0; reg < function.register_count; ++reg)
-                    next_out[reg] = next_out[reg] || analysis.live_in[successor][reg];
+                next_out.union_with(analysis.live_in[successor]);
 
-            auto next_in = analysis.uses[block_index];
-            for (VirtualRegister reg = 0; reg < function.register_count; ++reg)
-                next_in[reg] = next_in[reg] || (next_out[reg] && !analysis.defs[block_index][reg]);
+            next_in.assign_union_minus(analysis.uses[block_index], next_out, analysis.defs[block_index]);
 
-            if (next_out != analysis.live_out[block_index] || next_in != analysis.live_in[block_index]) {
-                analysis.live_out[block_index] = std::move(next_out);
-                analysis.live_in[block_index] = std::move(next_in);
-                changed = true;
+            if (next_out == analysis.live_out[block_index] && next_in == analysis.live_in[block_index]) continue;
+            analysis.live_out[block_index] = next_out;
+            analysis.live_in[block_index] = next_in;
+            for (const auto predecessor : predecessors[block_index]) {
+                next_dirty[predecessor] = true;
+                has_dirty = true;
+            }
+        }
+        dirty.swap(next_dirty);
+    }
+
+    // Interval construction needs only block boundary liveness. Avoid the much
+    // larger block x instruction x register live-after matrix unless a caller
+    // is performing an instruction-local transform such as DCE or call-range
+    // splitting.
+    if (include_instruction_liveness) {
+        analysis.live_after.resize(block_count);
+        for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
+            const auto& block = function.blocks[block_index];
+            auto live = analysis.live_out[block_index];
+            analysis.live_after[block_index].resize(block.instructions.size());
+            for (std::size_t reverse = block.instructions.size(); reverse > 0; --reverse) {
+                const auto instruction_index = reverse - 1U;
+                const auto& instruction = block.instructions[instruction_index];
+                analysis.live_after[block_index][instruction_index] = live;
+                if (has_result(instruction.opcode) && instruction.result < live.size())
+                    live.reset(instruction.result);
+                for (const auto input : instruction.inputs) add_use(live, input);
+                for (const auto& successor : instruction.successors)
+                    for (const auto argument : successor.arguments) add_use(live, argument);
             }
         }
     }
 
-    analysis.live_after.resize(block_count);
     for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
-        const auto& block = function.blocks[block_index];
-        auto live = analysis.live_out[block_index];
-        analysis.live_after[block_index].resize(block.instructions.size());
-        for (std::size_t reverse = block.instructions.size(); reverse > 0; --reverse) {
-            const auto instruction_index = reverse - 1U;
-            const auto& instruction = block.instructions[instruction_index];
-            analysis.live_after[block_index][instruction_index] = live;
-            if (has_result(instruction.opcode) && instruction.result < live.size())
-                live[instruction.result] = false;
-            for (const auto input : instruction.inputs) add_use(live, input);
-            for (const auto& successor : instruction.successors)
-                for (const auto argument : successor.arguments) add_use(live, argument);
-        }
-        for (VirtualRegister reg = 0; reg < function.register_count; ++reg)
-            if (analysis.live_out[block_index][reg]) ++analysis.cross_block_live_values;
-        for (const auto& instruction : block.instructions)
+        analysis.cross_block_live_values += static_cast<std::uint32_t>(analysis.live_out[block_index].count());
+        for (const auto& instruction : function.blocks[block_index].instructions)
             for (const auto& successor : instruction.successors)
                 analysis.cross_block_live_values += static_cast<std::uint32_t>(successor.arguments.size());
     }

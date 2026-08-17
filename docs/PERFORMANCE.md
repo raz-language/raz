@@ -59,6 +59,29 @@ Performance patches should improve a general mechanism rather than recognize one
 
 Compiler and library optimization should target broadly useful mechanisms such as scalar simplification, alias-aware memory promotion, instruction selection, register allocation, code layout, vectorization, batching, allocation behavior, and target-aware lowering. Benchmark-specific source patterns are not part of the optimization contract.
 
+## Compiler iteration performance
+
+Project loading is incremental-aware before semantic analysis begins. On a cache miss,
+Raz reads each module once and reuses that retained source for namespace discovery,
+import discovery, and deterministic topological assembly. Namespace/import ownership
+is indexed so large module graphs avoid repeated global import scans. Top-level
+declaration identity is maintained in an open-addressed `(package, namespace, name)`
+index, so duplicate detection does not rescan every previously declared symbol.
+
+For unchanged semantic checks, Raz persists a versioned project-source snapshot and
+semantic key under `.raz/cache`. The snapshot is validated against every contributing
+manifest/module using file size and a normalized high-resolution modification tick;
+a valid snapshot avoids project traversal and source rereads, and an exact semantic-key
+match avoids rebuilding HIR. Same-size rewrites therefore invalidate correctly on
+filesystems whose native file-clock epoch is signed. Any uncertainty is treated as a
+miss and runs the normal compiler pipeline.
+
+For a non-interface source edit, `raz check` can reuse the previous successful semantic
+result for ordinary non-generic bodies in source-clean modules. Declarations and exported
+interfaces are still rebuilt globally, while the changed module and modules affected by an
+upstream interface change are fully checked. Build/code-generation commands remain
+conservative until persisted HIR/MIR/object restoration is available.
+
 ## Generic-heavy incremental builds
 
 Generated generic specializations use deterministic module ownership before native object emission. Structurally identical copies produced by multiple modules are kept in exactly one owner module and referenced externally from the others. This allows generic-heavy applications to retain per-module native object caching instead of collapsing to an aggregate object. Conflicting definitions still take the conservative fallback path.
@@ -74,3 +97,21 @@ archives and native runtime/Forge/OpenSSL libraries are likewise content fingerp
 with a metadata-keyed digest cache to keep hot no-op builds cheap. This is deliberately not a platform-specific partial/incremental linker: when any actual
 link-input byte or linker configuration changes, Raz invokes the system linker normally.
 That preserves byte-for-byte clean-build semantics across Linux and Windows.
+
+## Backend compilation efficiency
+
+Forge avoids rediscovering control-flow and module facts during native lowering. Machine
+lowering builds a block-name index once per function and reuses it for control-flow edge
+resolution. Runtime callback validation similarly indexes signature declarations once per
+module rather than searching the function list for every binding.
+
+Register-allocation call splitting derives per-block register-use and last-use tables once
+per allocator iteration. Same-block and continuation-use queries are then constant-time
+lookups instead of rescans of the remaining instruction stream for every live register.
+The transformation and its pressure heuristics are unchanged; only repeated analysis work
+is removed.
+
+The Raz-to-Forge bridge also classifies structured-native support once for a module and
+carries that result through fallback object emission and qualification diagnostics. A
+complex module therefore does not rescan every function, local, and MIR instruction merely
+to repeat an unchanged backend-capability decision.

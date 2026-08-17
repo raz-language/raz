@@ -31,6 +31,44 @@ std::string unquote(std::string value) {
   return value;
 }
 
+
+std::vector<std::string> parse_string_array(const std::string& value, bool& ok) {
+  std::vector<std::string> out;
+  auto text = trim(value);
+  ok = false;
+  if (text.size() < 2 || text.front() != '[' || text.back() != ']') return out;
+  text = trim(text.substr(1, text.size() - 2));
+  if (text.empty()) { ok = true; return out; }
+  std::size_t cursor = 0;
+  while (cursor < text.size()) {
+    while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor]))) ++cursor;
+    if (cursor >= text.size() || text[cursor] != '"') return {};
+    ++cursor;
+    std::string item;
+    while (cursor < text.size() && text[cursor] != '"') {
+      if (text[cursor] == '\\') {
+        ++cursor;
+        if (cursor >= text.size()) return {};
+        if (text[cursor] == '"' || text[cursor] == '\\') item.push_back(text[cursor]);
+        else return {};
+        ++cursor;
+        continue;
+      }
+      item.push_back(text[cursor++]);
+    }
+    if (cursor >= text.size() || text[cursor] != '"') return {};
+    ++cursor;
+    if (item.empty()) return {};
+    out.push_back(std::move(item));
+    while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor]))) ++cursor;
+    if (cursor == text.size()) break;
+    if (text[cursor] != ',') return {};
+    ++cursor;
+  }
+  ok = true;
+  return out;
+}
+
 bool parse_bool(const std::string& value, bool& out) {
   if (trim(value) == "true") {
     out = true;
@@ -445,6 +483,38 @@ bool load_manifest(const std::filesystem::path& path, Manifest& result, ProjectE
     } else if (section == "dependencies") {
       Dependency dependency{key, result.root / unquote(value)};
       result.dependencies.emplace(key, std::move(dependency));
+    } else if (section == "native") {
+      bool array_ok = false;
+      if (key == "libraries") {
+        auto libraries = parse_string_array(value, array_ok);
+        if (!array_ok) {
+          error.message = path.string() + ":" + std::to_string(number) + ": native libraries must be a string array";
+          return false;
+        }
+        for (auto& library : libraries) {
+          const bool valid = std::all_of(library.begin(), library.end(), [](unsigned char ch) {
+            return std::isalnum(ch) || ch == '_' || ch == '-' || ch == '+' || ch == '.';
+          });
+          if (!valid || library.front() == '.' || library.find("..") != std::string::npos) {
+            error.message = path.string() + ":" + std::to_string(number) + ": invalid native library name: " + library;
+            return false;
+          }
+          result.native_libraries.push_back(std::move(library));
+        }
+      } else if (key == "library-paths") {
+        auto paths = parse_string_array(value, array_ok);
+        if (!array_ok) {
+          error.message = path.string() + ":" + std::to_string(number) + ": native library-paths must be a string array";
+          return false;
+        }
+        for (const auto& native_path : paths) {
+          const auto resolved = (result.root / native_path).lexically_normal();
+          result.native_library_paths.push_back(resolved);
+        }
+      } else {
+        error.message = path.string() + ":" + std::to_string(number) + ": unknown [native] key: " + key;
+        return false;
+      }
     } else if (section.starts_with("profile.")) {
       const auto profile_name = section.substr(8);
       auto& profile = result.profiles[profile_name];

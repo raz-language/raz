@@ -903,38 +903,86 @@ OptimizationStats optimize_function(Function& function) {
         block.instructions = std::move(optimized);
     }
 
-    // Global machine dead-code elimination. Recompute full CFG liveness after
-    // each sweep so chains spanning block boundaries collapse to a fixed point.
-    // Potentially trapping operations and memory/call side effects are retained.
-    bool removed_dead_code = true;
-    while (removed_dead_code) {
-        removed_dead_code = false;
-        const auto liveness = analyze_liveness(function);
-        stats.liveness_iterations += liveness.fixed_point_iterations;
-        stats.cross_block_live_values = std::max(stats.cross_block_live_values,
-                                                  liveness.cross_block_live_values);
-        for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
-            auto& instructions = function.blocks[block_index].instructions;
-            std::vector<Instruction> retained_in_reverse;
-            retained_in_reverse.reserve(instructions.size());
-            for (std::size_t reverse = instructions.size(); reverse > 0; --reverse) {
-                const auto instruction_index = reverse - 1U;
-                auto& instruction = instructions[instruction_index];
-                const bool result_is_dead = has_result(instruction.opcode) &&
-                    instruction.result < function.register_count &&
-                    !liveness.live_after[block_index][instruction_index][instruction.result];
-                if (result_is_dead && is_removable_when_dead(instruction.opcode)) {
-                    ++stats.dead_instructions_eliminated;
-                    if (is_comparison(instruction.opcode)) ++stats.dead_comparisons_eliminated;
-                    removed_dead_code = true;
-                    continue;
-                }
-                retained_in_reverse.push_back(std::move(instruction));
+    // Global machine dead-code elimination. Machine IR is SSA here, so a
+    // result is globally dead exactly when it has no remaining uses. Drive
+    // deletion from a def/use worklist and decrement producer use counts as
+    // consumers disappear. This reaches the same transitive fixed point across
+    // block boundaries without rebuilding whole-function liveness after every
+    // sweep.
+    const auto no_definition = std::numeric_limits<std::size_t>::max();
+    std::vector<std::uint32_t> use_count(function.register_count, 0U);
+    std::vector<std::size_t> definition_block(function.register_count, no_definition);
+    std::vector<std::size_t> definition_instruction(function.register_count, no_definition);
+    std::vector<std::vector<bool>> removed(function.blocks.size());
+
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        const auto& instructions = function.blocks[block_index].instructions;
+        removed[block_index].assign(instructions.size(), false);
+        for (std::size_t instruction_index = 0; instruction_index < instructions.size(); ++instruction_index) {
+            const auto& instruction = instructions[instruction_index];
+            for (const auto input : instruction.inputs)
+                if (input < use_count.size()) ++use_count[input];
+            for (const auto& successor : instruction.successors)
+                for (const auto argument : successor.arguments)
+                    if (argument < use_count.size()) ++use_count[argument];
+            if (has_result(instruction.opcode) && instruction.result < function.register_count) {
+                definition_block[instruction.result] = block_index;
+                definition_instruction[instruction.result] = instruction_index;
             }
-            std::reverse(retained_in_reverse.begin(), retained_in_reverse.end());
-            instructions = std::move(retained_in_reverse);
         }
     }
+
+    std::vector<VirtualRegister> dead_worklist;
+    dead_worklist.reserve(function.register_count / 4U + 1U);
+    const auto enqueue_if_dead = [&](VirtualRegister reg) {
+        if (reg >= function.register_count || use_count[reg] != 0U) return;
+        const auto block_index = definition_block[reg];
+        const auto instruction_index = definition_instruction[reg];
+        if (block_index == no_definition || instruction_index == no_definition) return;
+        if (is_removable_when_dead(function.blocks[block_index].instructions[instruction_index].opcode))
+            dead_worklist.push_back(reg);
+    };
+    for (VirtualRegister reg = 0; reg < function.register_count; ++reg) enqueue_if_dead(reg);
+
+    while (!dead_worklist.empty()) {
+        const auto reg = dead_worklist.back();
+        dead_worklist.pop_back();
+        if (reg >= function.register_count || use_count[reg] != 0U) continue;
+        const auto block_index = definition_block[reg];
+        const auto instruction_index = definition_instruction[reg];
+        if (block_index == no_definition || instruction_index == no_definition ||
+            removed[block_index][instruction_index]) continue;
+        const auto& instruction = function.blocks[block_index].instructions[instruction_index];
+        if (!is_removable_when_dead(instruction.opcode)) continue;
+
+        removed[block_index][instruction_index] = true;
+        ++stats.dead_instructions_eliminated;
+        if (is_comparison(instruction.opcode)) ++stats.dead_comparisons_eliminated;
+        const auto release_use = [&](VirtualRegister input) {
+            if (input >= use_count.size() || use_count[input] == 0U) return;
+            if (--use_count[input] == 0U) enqueue_if_dead(input);
+        };
+        for (const auto input : instruction.inputs) release_use(input);
+        for (const auto& successor : instruction.successors)
+            for (const auto argument : successor.arguments) release_use(argument);
+    }
+
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        auto& instructions = function.blocks[block_index].instructions;
+        std::vector<Instruction> retained;
+        retained.reserve(instructions.size());
+        for (std::size_t instruction_index = 0; instruction_index < instructions.size(); ++instruction_index)
+            if (!removed[block_index][instruction_index]) retained.push_back(std::move(instructions[instruction_index]));
+        instructions = std::move(retained);
+    }
+
+    // Keep the existing liveness quality counters, but materialize boundary
+    // liveness only once after DCE. Instruction-local live-after state is not
+    // needed by the worklist algorithm.
+    const auto post_dce_liveness = analyze_liveness(function, false);
+    stats.liveness_iterations += post_dce_liveness.fixed_point_iterations;
+    stats.cross_block_live_values = std::max(stats.cross_block_live_values,
+                                              post_dce_liveness.cross_block_live_values);
 
     stats.instructions_after = 0;
     for (const auto& block : function.blocks)

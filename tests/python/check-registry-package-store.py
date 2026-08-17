@@ -46,7 +46,7 @@ def main():
     assert 'widget@2.0.0' in run([c,'registry','widget','>=1.2.0'],app,env).stdout
     assert 'widget@1.10.0-alpha.1' in run([c,'registry','widget','1.10.0-alpha.1'],app,env).stdout
     run([c,'add','widget','registry:widget@^1.2.0'],app,env)
-    assert 'widget@^1.2.0' in (app/'.raz.registry').read_text(); assert 'widget = "registry:' in (app/'raz.toml').read_text(); assert '1.7.3' in (app/'.raz.cache').read_text(); assert any((work/'home/store').glob('*/raz.toml'))
+    assert 'widget@^1.2.0' in (app/'.raz.registry').read_text(); assert 'widget = "^1.2.0"' in (app/'raz.toml').read_text(); assert '1.7.3' in (app/'.raz.cache').read_text(); assert any((work/'home/store').glob('*/raz.toml'))
     helper_entry=make_named_pkg(reg,'helper','0.3.0')
     with index.open('a') as f:f.write(helper_entry+'\n')
     run([c,'add','helper','registry:helper@^0.3.0'],app,env)
@@ -87,7 +87,7 @@ def main():
     assert 'widget widget 1.7.3 ' in cache and 'helper helper 0.3.0 ' in cache and 'devtool devtool 0.1.0 ' in cache, cache
     with index.open('a') as f:f.write(make_pkg(reg,'1.9.0')+'\n')
     with index.open('a') as f:f.write(make_named_pkg(reg,'devtool','0.1.5')+'\n')
-    run([c,'update'],app,env); manifest=(app/'raz.toml').read_text(); assert 'widget = "registry:' in manifest; assert '[dev-dependencies]' in manifest and 'devtool = ' in manifest; lock=(app/'raz.lock').read_bytes(); assert b'version = "1.9.0"' in lock and b'version = "0.1.5"' in lock; assert b'source = "registry"' in lock and b'checksum = "' in lock; assert str(work/'home/store').encode() not in lock
+    run([c,'update'],app,env); manifest=(app/'raz.toml').read_text(); assert 'widget = "^1.2.0"' in manifest; assert '[dev-dependencies]' in manifest and 'devtool = ' in manifest; lock=(app/'raz.lock').read_bytes(); assert b'version = "1.9.0"' in lock and b'version = "0.1.5"' in lock; assert b'source = "registry"' in lock and b'checksum = "' in lock; assert str(work/'home/store').encode() not in lock
     stable=hashlib.sha256(lock).hexdigest()
     with index.open('a') as f:f.write(make_pkg(reg,'1.9.5')+'\n')
     run([c,'fetch'],app,env); assert hashlib.sha256((app/'raz.lock').read_bytes()).hexdigest()==stable; assert '1.9.0' in (app/'.raz.cache').read_text()

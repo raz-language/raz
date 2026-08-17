@@ -31,7 +31,7 @@ checks = {
     'moves and reinitialization conflict with active loans':
         'kind == 1 || kind == 2' in loans and
         'mir_local_active_loan_conflicts' in loans and 'current,' in loans and 'true,' in loans,
-    'ownership firewall executes loan verifier': 'verify_mir_loan_regions(mir)' in drops,
+    'ownership firewall executes loan verifier': 'verify_mir_loan_regions_with_cfg(mir, &cfg, loan_last_uses)' in drops,
     'loan program points remain DCE-pinned':
         'mir_instruction_has_ownership_event' in dce,
 }

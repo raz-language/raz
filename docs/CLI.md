@@ -67,9 +67,19 @@ raz search <query>
 raz info <package>
 raz add <package>[@<constraint>]
 raz add <alias> <path>
+raz add <name>@<constraint>
 raz add <alias> registry:<name>@<constraint>
 raz remove <alias>
 raz outdated
+raz install <package>[@<constraint>]
+raz install --list
+raz install --bins <package>[@<constraint>]
+raz install --bin=<name> <package>[@<constraint>]
+raz install --update <package>[@<constraint>]
+raz install --force <package>[@<constraint>]
+raz uninstall <package>
+raz vendor
+raz vendor --check
 raz update
 raz lock
 raz metadata
@@ -246,3 +256,11 @@ raz diagnostics --diagnostic-format json
 ```
 
 The JSON form uses the `raz-diagnostic-catalog-v1` schema and is suitable for IDE/tooling discovery.
+
+### Installing package tools
+
+`raz install <package>[@<constraint>]` resolves and verifies the package through the official registry and shared content-addressed store, then installs its executable targets in release mode into `RAZ_HOME/bin` (or the platform user Raz home `bin` directory). If the package declares Cargo-style `[[bin]]` entries, plain `raz install` installs all declared binaries; `--bins` makes that selection explicit and `--bin=<name>` restricts installation to one target. Packages without `[[bin]]` use the normal package executable entry. Installed-tool metadata is recorded per executable, including package, selected version, requested constraint, checksum, and binary name. `raz install --list` lists managed tools, `raz install --update <package>` updates the managed binary set within the recorded constraint, and `raz install --force <package>` deliberately rebuilds binaries owned by that package. Managed binary-name collisions across packages are rejected. `raz uninstall <package>` removes every executable managed by that package and its metadata without deleting reusable registry/store content. Library-only packages fail installation at the normal executable build step.
+
+## Vendoring
+
+`raz vendor` materializes the exact registry and pinned Git dependency graph from `raz.lock` into `vendor/` and writes `.raz-vendor`. While the marker is present, normal builds resolve registry packages from `vendor/registry/<checksum>` and Git materializations from `vendor/git/` without consulting the network or the global package store. `raz vendor --check` verifies the vendored registry tree against lockfile checksums and confirms every tracked Git dependency is present. Re-run `raz vendor` after `raz update`.

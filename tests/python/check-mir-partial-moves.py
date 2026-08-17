@@ -41,7 +41,7 @@ checks = {
     'legacy whole-local checker ignores projected events':
         'mir.ownership_event_path_counts' in move,
     'ownership firewall executes partial-move verifier':
-        'verify_mir_partial_move_dataflow(mir)' in drops,
+        'verify_mir_partial_move_dataflow_with_cfg(mir, &cfg)' in drops,
     'DCE pins ownership semantic program points': all(x in dce for x in [
         'mir_instruction_has_ownership_event', 'i64 pinned', 'mir.ownership_event_instructions']),
 }

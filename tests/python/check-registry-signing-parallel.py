@@ -74,7 +74,7 @@ def main():
     (remote/'index.txt').write_text('\n'.join(lines)+'\n')
     SlowRegistry.root=remote; SlowRegistry.inflight=0; SlowRegistry.max_inflight=0
     server=ThreadingHTTPServer(('127.0.0.1',0),SlowRegistry); thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start(); base=f'http://127.0.0.1:{server.server_address[1]}'
-    par=work/'parallel-consumer'; make_consumer(par); (par/'.raz.registry').write_text('alpha = "alpha@^1.0.0"\nbeta = "beta@^1.0.0"\n')
+    par=work/'parallel-consumer'; make_consumer(par); (par/'raz.toml').write_text('[package]\nname = "consumer"\nversion = "0.1.0"\nkind = "executable"\nsource = "src"\nentry = "src/main.rz"\n\n[dependencies]\nalpha = "registry:alpha@^1.0.0"\nbeta = "registry:beta@^1.0.0"\n')
     penv=env.copy(); penv['RAZ_REGISTRY_URL']=base; penv['RAZ_HOME']=str(work/'parallel-client-home')
     run([compiler,'fetch'],par,penv)
     server.shutdown();server.server_close();thread.join(timeout=5)

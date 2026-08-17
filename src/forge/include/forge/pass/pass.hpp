@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -20,12 +21,22 @@ struct PassResult {
     std::size_t operations_removed{};
     std::size_t operations_rewritten{};
     std::size_t blocks_removed{};
+    analysis::InvalidationScope invalidation{analysis::InvalidationScope::none};
+    std::vector<std::string> touched_blocks;
+
+    void touch_block(const std::string& block) {
+        if (std::find(touched_blocks.begin(), touched_blocks.end(), block) == touched_blocks.end())
+            touched_blocks.push_back(block);
+    }
 
     PassResult& operator+=(const PassResult& other) {
         changed = changed || other.changed;
         operations_removed += other.operations_removed;
         operations_rewritten += other.operations_rewritten;
         blocks_removed += other.blocks_removed;
+        if (other.changed && static_cast<unsigned>(other.invalidation) > static_cast<unsigned>(invalidation))
+            invalidation = other.invalidation;
+        for (const auto& block : other.touched_blocks) touch_block(block);
         return *this;
     }
 };

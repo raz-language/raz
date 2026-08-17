@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "forge/diagnostics/diagnostic.hpp"
+#include "forge/machine/liveness.hpp"
 #include "forge/machine/module.hpp"
 
 namespace forge::machine {
@@ -128,6 +129,7 @@ struct StackAllocation {
 
 [[nodiscard]] LiveRangeSplitStats split_live_ranges_around_calls(Function& function);
 [[nodiscard]] std::vector<LiveInterval> compute_live_intervals(const Function& function);
+[[nodiscard]] std::vector<LiveInterval> compute_live_intervals(const Function& function, const LivenessAnalysis& liveness);
 [[nodiscard]] RegisterAllocation allocate_linear_scan(const Function& function);
 [[nodiscard]] StackAllocation allocate_stack_slots(const Function& function);
 

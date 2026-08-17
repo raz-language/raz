@@ -55,12 +55,22 @@ def main() -> int:
             fail(f"{command} command is not discoverable in CLI source")
     if "driver_command_dispatch(process_argc, cli_command" not in main_source:
         fail("production CLI does not invoke the auxiliary command dispatcher")
+    if "fn package_registry_prepare_build(" not in registry:
+        fail("ordinary project builds do not have an exact-lock dependency hydration preflight")
+    if "package_registry_prepare_build(cli_manifest_path, cli_manifest_length)" not in main_source:
+        fail("build/check/run/test do not automatically hydrate locked registry packages")
+    if "registry_fetch_lock_data(lock_data, data_length)" not in registry:
+        fail("build preflight does not hydrate exact lockfile entries")
     if "registry_official_publish_metadata" not in registry or "registry_official_publish_requested" not in registry:
         fail("official publish metadata validation is missing")
     if "old_length = raz_compiler_rt_read_ascii(fp, 12, old, 1048576)" not in registry:
         fail("registry cache is not preserving existing dependency rows")
     if "bool official = argc == 3" not in package or "package_add_official_registry_command(alias, al, section_kind)" not in package:
         fail("raz add does not accept the one-argument official package form")
+    if "fn registry_bare_constraint(" not in registry or "bool same_name = al == nl" not in registry:
+        fail("same-name official dependencies do not use compact manifest constraints")
+    if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/driver/project.rz").read_text(encoding="utf-8"):
+        fail("project loader does not resolve compact registry constraints through raz.lock")
     if "prepared_submission = true" not in registry or "i64 msg[9] = [80, 114, 101, 112, 97, 114, 101, 100, 32]" not in registry:
         fail("default raz publish is not distinguished from direct private-registry publishing")
 
@@ -70,7 +80,7 @@ def main() -> int:
     if "i64 publish[13]" not in transport or "registry_path_prefix(path, length, &publish, 13)" not in transport:
         fail(".raz-publish/ is not excluded from deterministic package trees")
 
-    print(f"official-registry: PASS ({EXPECTED}; discovery + shorthand add + validated immutable submission staging)")
+    print(f"official-registry: PASS ({EXPECTED}; discovery + compact shorthand add + validated immutable submission staging)")
     return 0
 
 

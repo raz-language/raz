@@ -210,9 +210,17 @@ raz update
 raz fetch
 raz pack
 raz publish
+raz vendor
+raz install formatter
+raz install tooling
+raz install --bins tooling
+raz install --bin=razfmt tooling
+raz install --list
+raz install --update tooling
+raz uninstall formatter
 ```
 
-Raz records exact dependency state in `raz.lock`. Registry packages are integrity-checked and stored in a shared content-addressed cache. `raz fetch` reproduces the lockfile exactly; `raz update` is the operation that re-resolves compatible versions.
+Same-name registry dependencies stay readable in `raz.toml` as version constraints such as `websocket = "^0.2.0"`; explicit aliases can name `registry:<package>@<constraint>`. Raz records exact dependency state in `raz.lock`. Registry packages are integrity-checked and stored in a shared content-addressed cache. Normal `build`, `check`, `run`, and `test` commands automatically hydrate missing locked packages, so a clean checkout does not require a separate install step. `raz fetch` explicitly prefetches the lockfile exactly; `raz update` is the operation that re-resolves compatible versions.
 
 A multi-package repository can use a workspace manifest:
 

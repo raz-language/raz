@@ -31,6 +31,8 @@ struct Manifest final {
   std::filesystem::path entry = "src/main.rz";
   PackageKind kind = PackageKind::executable;
   std::map<std::string, Dependency> dependencies;
+  std::vector<std::string> native_libraries;
+  std::vector<std::filesystem::path> native_library_paths;
   std::map<std::string, BuildProfile> profiles;
 };
 

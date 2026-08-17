@@ -59,10 +59,11 @@ HIR records two deterministic fingerprints per physical module:
   regions only.
 
 The distinction allows project-level incremental compilation to distinguish an
-implementation change from a change that can affect importing modules. The
-interface fingerprint is conservative: public declaration bodies may be part
-of the hashed declaration region, so some changes can invalidate more work than
-strictly necessary, but it does not allow a stale semantic result to survive.
+implementation change from a change that can affect importing modules. The interface fingerprint is conservative for aggregate/type surfaces, while public
+function fingerprints cover the declaration signature rather than the implementation
+body. Changing a public function body without changing its signature is therefore an
+implementation-only change; changing its parameters, return type, generic bounds, or
+other exported signature text invalidates importing modules.
 
 ## Persistent incremental state
 
@@ -97,11 +98,22 @@ source and exported-interface fingerprints classify modules as fresh,
 implementation-dirty, or interface-dirty; only interface changes invalidate
 importing modules.
 
-Artifact reuse is intentionally exact. Check, test, and run operations always
-execute the compiler pipeline rather than short-circuiting through a cached build
-artifact. Module fingerprints are stored separately from artifacts so future
-module-granular HIR and MIR serialization can reuse the same source/interface
-identity model.
+Artifact reuse is intentionally exact. Native build artifacts are reused only
+when the complete source/backend key matches. Semantic checks additionally keep a
+versioned semantic key: an unchanged `raz check` can return after restoring the
+validated project-source snapshot and confirming that exact semantic key, without
+rebuilding HIR. The project snapshot stores the already ordered combined source and
+a manifest/module input list keyed by file size plus high-resolution modification
+time; any metadata change is a conservative cache miss.
+
+Project loading reads each module source once on a cache miss and reuses that retained
+buffer for namespace discovery, import discovery, and final topological assembly.
+The cache is only an optimization: malformed metadata, unsupported project ordering,
+or any uncertain filesystem state falls back to normal source loading.
+
+Module fingerprints are stored separately from whole-project artifacts so
+module-granular HIR/MIR/object serialization can reuse the same source/interface
+identity model as that support is completed.
 
 The cache format carries an explicit schema generation. Compiler changes that
 make previously produced backend artifacts incompatible must advance that

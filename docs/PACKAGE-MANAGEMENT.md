@@ -88,7 +88,7 @@ Add a dependency directly to a specific section:
 raz add algorithms
 raz add test-kit ../test-kit --dev
 raz add codegen ../codegen --build
-raz add tls registry:tls@^1.4.0 --optional
+raz add tls@^1.4.0 --optional
 raz add epoll ../epoll --target=linux
 ```
 
@@ -179,7 +179,7 @@ The registry checksum is verified against the complete selected package tree bef
 
 ## Shared package store
 
-Registry packages are materialized into a content-addressed store. Manifests record a portable virtual reference such as `registry:4f83c2...` rather than a machine-specific absolute cache path; the project loader maps that reference to the configured local store.
+Registry packages are materialized into a content-addressed store. Same-name official dependencies use compact Cargo-style constraints, for example `websocket = "^0.2.0"`. Explicit aliases may use `wire = "registry:websocket@^0.2.0"`. `raz.lock` records the exact selected version and verified content checksum; the project loader maps that locked checksum to the configured local store. Legacy `registry:<checksum>` manifest entries remain readable for compatibility.
 
 Store selection is:
 
@@ -208,9 +208,28 @@ to prohibit network access and registry-source materialization. Raz keeps the la
 
 A missing or corrupt store entry is an error in offline mode. Raz never silently substitutes mutable source content.
 
+## Build-time dependency hydration
+
+Normal project commands automatically ensure exact locked registry dependencies are present before loading the package graph:
+
+```text
+raz build
+raz check
+raz run
+raz test
+```
+
+A freshly cloned project containing `raz.toml` and `raz.lock` therefore does **not** require a separate `raz fetch` step. Raz reads the lockfile, verifies or materializes the exact registry package checksums in the shared content-addressed store, recursively hydrates locked transitive packages, and only then loads the project graph. Existing valid store entries make this a local integrity check.
+
+`raz fetch` remains useful as an explicit prefetch command for CI image preparation, air-gapped workflows, and dependency warming. `raz update` is the only normal command that intentionally re-resolves compatible registry versions. This keeps ordinary builds lockfile-driven rather than network-version-driven.
+
+The direct compiler boundary remains network-independent; registry access belongs to project/package orchestration rather than language compilation itself.
+
 ## Locking and updates
 
-`raz lock` rebuilds the deterministic lockfile from all declared dependency sections. Registry lock entries record the portable `registry:<content-hash>` path together with `source = "registry"` and the verified checksum, never the local store directory.
+`raz lock` rebuilds the deterministic lockfile from all declared dependency sections. Registry constraints remain unchanged in `raz.toml`; registry lock entries record the exact portable `registry:<content-hash>` path together with `source = "registry"` and the verified checksum, never the local store directory. If a manifest constraint is edited so the current lockfile no longer satisfies it, normal builds fail with guidance to run `raz update`.
+
+`.raz.registry` may be created as derived internal state to accelerate registry update operations. It is regenerated from `raz.toml` before update/discovery work and is never the source of dependency intent. Projects should commit `raz.toml` and `raz.lock`, not `.raz.registry` or `.raz.cache`.
 
 `raz update` re-evaluates tracked registry constraints, preserves each dependency's original section, restores missing pinned Git materializations, and selects the highest compatible registry version currently available. `raz fetch` instead treats `raz.lock` as authoritative: it materializes the exact locked registry versions/checksums and does not upgrade them. If no lockfile exists, `fetch` performs the initial resolution needed to create one. Repeating either operation without input changes produces byte-stable output.
 
@@ -313,3 +332,64 @@ RAZ_SIGNING_KEY=/secure/registry.private.key raz publish
 Signed registry records carry a key identifier and Ed25519 signature over the package name, version, and verified package-tree hash. Consumers configure trusted public keys with `RAZ_TRUSTED_KEYS`; each line contains a key identifier followed by a 32-byte public key encoded as hexadecimal. Set `RAZ_REQUIRE_SIGNATURES=1` to reject unsigned registry records.
 
 The existing `RAZ_REGISTRY_SIGNATURE` HTTP header remains a registry-authentication hook and is independent from package identity signing.
+
+## Installing package tools
+
+Registry packages that expose an executable entry can be installed as user tools:
+
+```text
+raz install formatter
+raz install formatter@^1.4
+raz install tooling
+raz install --bins tooling
+raz install --bin=razfmt tooling
+raz install --list
+raz install --update tooling
+raz install --force tooling@^1.4
+raz uninstall formatter
+```
+
+Installation uses the same registry resolver, signature/integrity checks, archive format, and content-addressed store as project dependencies. The executable is built in release mode and written to `RAZ_HOME/bin`, or to the default per-user `.raz/bin` directory when `RAZ_HOME` is unset. Raz records the installed package version, original constraint, checksum, and selected executable name in user-level tool metadata so installed executables remain manageable independently of the shared package cache.
+
+A package may expose additional executable entries with Cargo-style `[[bin]]` records:
+
+```toml
+[package]
+name = "tooling"
+version = "1.0.0"
+entry = "src/main.rz"
+
+[[bin]]
+name = "razfmt"
+entry = "src/bin/razfmt.rz"
+
+[[bin]]
+name = "razdoc"
+entry = "src/bin/razdoc.rz"
+```
+
+Packages may declare multiple Cargo-style `[[bin]]` targets. Plain `raz install tooling` installs every declared binary, while `raz install --bins tooling` makes the same all-binary selection explicit and `raz install --bin=razfmt tooling` compiles only the selected entry without changing the package's normal project entry point. Installed-tool metadata is per binary, so one package can own several executables simultaneously. A managed binary name cannot be stolen by another package, even with `--force`.
+
+`raz install --list` prints the managed tool set. `raz install --update <package>` resolves the newest release that still satisfies the recorded constraint and updates the package's executable targets; supplying `<package>@<constraint>` replaces that constraint for the update. A normal install refuses to overwrite an existing managed executable, while `--force` deliberately rebuilds/replaces executables owned by the same package. `raz uninstall <package>` removes every executable and metadata record owned by that package but does not purge reusable registry/store content.
+
+## Vendored dependencies
+
+For hermetic, air-gapped, or source-controlled dependency trees, run `raz vendor`. Raz first hydrates the exact `raz.lock` graph, then copies content-addressed registry packages to `vendor/registry/` and pinned Git materializations to `vendor/git/`. The `.raz-vendor` marker activates local source replacement for ordinary builds; package resolution is no longer dependent on the global cache or network. `raz vendor --check` performs an integrity-only verification. Re-run vendoring after changing the lockfile with `raz update`.
+
+## Native system libraries
+
+Packages that expose a stable native ABI can declare their linker requirements without adding package-specific compiler code:
+
+```toml
+[native]
+libraries = ["sqlite3"]
+library-paths = ["vendor/lib"]
+```
+
+`libraries` contains platform linker library names rather than filenames. On Unix-like targets Raz emits the corresponding `-l<name>` options; MSVC-style Windows links use `<name>.lib`. `library-paths` are resolved relative to the package that declares them and are forwarded as native library search paths.
+
+Native requirements are **transitive**. If an application depends on a Raz package that declares `sqlite3`, the final executable link automatically receives that requirement; the application does not repeat it. Duplicate libraries and search paths are removed while preserving dependency order.
+
+Raz deliberately does not accept arbitrary shell commands or raw linker command strings from package manifests. The first native dependency contract is limited to library identities and search paths so registry packages cannot turn normal dependency resolution into arbitrary command execution.
+
+The native library itself remains an external platform/package-manager responsibility. For example, the `sqlite` package requires SQLite 3 to be installed or otherwise available in a declared `library-paths` directory.

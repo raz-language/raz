@@ -420,14 +420,27 @@ def source_order() -> list[str]:
     return order
 
 
+def _link_or_copy_stage_source(source: str, destination: str) -> str:
+    """Hard-link immutable compiler inputs when possible; copy as a fallback."""
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(source, destination)
+
+
 def prepare_reproducibility_build(build_dir: Path, order: list[str]) -> None:
     if build_dir.exists():
         shutil.rmtree(build_dir)
-    # The production compiler understands semantic namespaces/imports. Reproducibility builds compile
-    # the canonical compiler project; host-source-order.txt is used only as
-    # a deterministic module scheduling order until import-topological scheduling
-    # fully replaces the bootstrap ordering metadata.
-    shutil.copytree(ROOT / "compiler", build_dir, ignore=shutil.ignore_patterns(".raz", "target"))
+    # Reproducibility stages only read the canonical compiler sources. Hard-link
+    # those immutable inputs instead of copying the complete compiler tree for
+    # every generation. Generated .raz/target state remains stage-local.
+    shutil.copytree(
+        ROOT / "compiler",
+        build_dir,
+        ignore=shutil.ignore_patterns(".raz", "target"),
+        copy_function=_link_or_copy_stage_source,
+    )
     (build_dir / "source-order.txt").write_text("\n".join(order) + "\n", encoding="ascii")
 
 

@@ -67,102 +67,104 @@ fn hir_query_cache_key_matches(HirBuilder&mut builder, i64 slot, i64 kind, i64 a
   );
 }
 
-fn hir_query_invalidation_contains(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
-  i64 index = 0;
+fn hir_query_mark_invalidation(
+HirBuilder&mut builder,
+i64 kind,
+i64 a,
+i64 b,
+i64 c,
+) -> bool {
+  i64 slot = hir_query_slot(kind, a, b, c);
 
-  while (index < builder.query_invalidation_count) {
-    if (
-    raz_compiler_rt_arena_get(builder.query_invalidation_kinds, index) == kind &&
-    raz_compiler_rt_arena_get(builder.query_invalidation_a, index) == a &&
-    raz_compiler_rt_arena_get(builder.query_invalidation_b, index) == b &&
-    raz_compiler_rt_arena_get(builder.query_invalidation_c, index) == c
-    ) {
-      return true;
-    }
-    index += 1;
+  if (
+  raz_compiler_rt_arena_get(builder.query_cache_states, slot) != 0 &&
+  raz_compiler_rt_arena_get(builder.query_cache_states, slot) != -1 &&
+  raz_compiler_rt_arena_get(builder.query_cache_kinds, slot) == kind &&
+  raz_compiler_rt_arena_get(builder.query_cache_a, slot) == a &&
+  raz_compiler_rt_arena_get(builder.query_cache_b, slot) == b &&
+  raz_compiler_rt_arena_get(builder.query_cache_c, slot) == c
+  ) {
+    raz_compiler_rt_arena_set(builder.query_cache_states, slot, -1);
+    builder.query_invalidation_total += 1;
+    return true;
   }
   return false;
 }
 
-fn hir_query_push_invalidation(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
-  if (hir_query_invalidation_contains(builder, kind, a, b, c)) {
-    return true;
-  }
-  if (builder.query_invalidation_count >= 4096) {
-    return false;
-  }
+fn hir_query_dependency_child_marked(HirBuilder&mut builder, i64 dependency) -> bool {
+  i64 kind = raz_compiler_rt_arena_get(builder.query_dependency_child_kinds, dependency);
+  i64 a = raz_compiler_rt_arena_get(builder.query_dependency_child_a, dependency);
+  i64 b = raz_compiler_rt_arena_get(builder.query_dependency_child_b, dependency);
+  i64 c = raz_compiler_rt_arena_get(builder.query_dependency_child_c, dependency);
+  i64 slot = hir_query_slot(kind, a, b, c);
 
-  i64 index = builder.query_invalidation_count;
-
-  builder.query_invalidation_count += 1;
-  raz_compiler_rt_arena_set(builder.query_invalidation_kinds, index, kind);
-  raz_compiler_rt_arena_set(builder.query_invalidation_a, index, a);
-  raz_compiler_rt_arena_set(builder.query_invalidation_b, index, b);
-  raz_compiler_rt_arena_set(builder.query_invalidation_c, index, c);
-  return true;
+  return (
+  raz_compiler_rt_arena_get(builder.query_cache_states, slot) == -1 &&
+  raz_compiler_rt_arena_get(builder.query_cache_kinds, slot) == kind &&
+  raz_compiler_rt_arena_get(builder.query_cache_a, slot) == a &&
+  raz_compiler_rt_arena_get(builder.query_cache_b, slot) == b &&
+  raz_compiler_rt_arena_get(builder.query_cache_c, slot) == c
+  );
 }
 
-fn hir_query_invalidate_exact(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) {
-  builder.query_invalidation_count = 0;
-  if (!hir_query_push_invalidation(builder, kind, a, b, c)) {
-    return;
-  }
+fn hir_query_propagate_invalidations(HirBuilder&mut builder) {
+  bool changed = true;
 
-  i64 cursor = 0;
-
-  while (cursor < builder.query_invalidation_count) {
-    i64 current_kind = raz_compiler_rt_arena_get(builder.query_invalidation_kinds, cursor);
-    i64 current_a = raz_compiler_rt_arena_get(builder.query_invalidation_a, cursor);
-    i64 current_b = raz_compiler_rt_arena_get(builder.query_invalidation_b, cursor);
-    i64 current_c = raz_compiler_rt_arena_get(builder.query_invalidation_c, cursor);
-    i64 slot = hir_query_slot(current_kind, current_a, current_b, current_c);
-
-    if (hir_query_cache_key_matches(builder, slot, current_kind, current_a, current_b, current_c)) {
-      raz_compiler_rt_arena_set(builder.query_cache_states, slot, 0);
-      builder.query_invalidation_total += 1;
-    }
-
+  while (changed) {
+    changed = false;
     i64 dependency = 0;
 
     while (dependency < builder.query_dependency_count) {
-      if (
-      raz_compiler_rt_arena_get(builder.query_dependency_child_kinds, dependency) == current_kind &&
-      raz_compiler_rt_arena_get(builder.query_dependency_child_a, dependency) == current_a &&
-      raz_compiler_rt_arena_get(builder.query_dependency_child_b, dependency) == current_b &&
-      raz_compiler_rt_arena_get(builder.query_dependency_child_c, dependency) == current_c
-      ) {
-        hir_query_push_invalidation(
+      if (hir_query_dependency_child_marked(builder, dependency)) {
+        if (hir_query_mark_invalidation(
         builder,
         raz_compiler_rt_arena_get(builder.query_dependency_parent_kinds, dependency),
         raz_compiler_rt_arena_get(builder.query_dependency_parent_a, dependency),
         raz_compiler_rt_arena_get(builder.query_dependency_parent_b, dependency),
         raz_compiler_rt_arena_get(builder.query_dependency_parent_c, dependency),
-        );
+        )) {
+          changed = true;
+        }
       }
       dependency += 1;
     }
-    cursor += 1;
   }
-  builder.query_invalidation_count = 0;
+
+  i64 slot = 0;
+
+  while (slot < 1024) {
+    if (raz_compiler_rt_arena_get(builder.query_cache_states, slot) == -1) {
+      raz_compiler_rt_arena_set(builder.query_cache_states, slot, 0);
+    }
+    slot += 1;
+  }
+}
+
+fn hir_query_invalidate_exact(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) {
+  if (!hir_query_mark_invalidation(builder, kind, a, b, c)) {
+    return;
+  }
+  hir_query_propagate_invalidations(builder);
 }
 
 fn hir_query_invalidate_kind_transitive(HirBuilder&mut builder, i64 kind) {
   i64 slot = 0;
+  bool changed = false;
 
   while (slot < 1024) {
     if (
     raz_compiler_rt_arena_get(builder.query_cache_states, slot) != 0 &&
     raz_compiler_rt_arena_get(builder.query_cache_kinds, slot) == kind
     ) {
-      hir_query_invalidate_exact(
-      builder,
-      kind,
-      raz_compiler_rt_arena_get(builder.query_cache_a, slot),
-      raz_compiler_rt_arena_get(builder.query_cache_b, slot),
-      raz_compiler_rt_arena_get(builder.query_cache_c, slot),
-      );
+      raz_compiler_rt_arena_set(builder.query_cache_states, slot, -1);
+      builder.query_invalidation_total += 1;
+      changed = true;
     }
     slot += 1;
+  }
+
+  if (changed) {
+    hir_query_propagate_invalidations(builder);
   }
 }
 

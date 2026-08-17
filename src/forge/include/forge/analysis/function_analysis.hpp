@@ -15,6 +15,8 @@
 
 namespace forge::analysis {
 
+enum class InvalidationScope : std::uint8_t { none, operations, control_flow, all };
+
 struct ControlFlowGraph {
     std::unordered_map<std::string, std::vector<std::string>> successors;
     std::unordered_map<std::string, std::vector<std::string>> predecessors;
@@ -27,8 +29,16 @@ struct UseDefInfo {
         std::size_t operation_index{};
         bool is_parameter{};
     };
+    struct BlockContribution {
+        std::vector<std::string> definitions;
+        std::unordered_map<std::string, std::size_t> use_count;
+    };
     std::unordered_map<std::string, Definition> definitions;
     std::unordered_map<std::string, std::size_t> use_count;
+    // Retained per-block contributions make operation-local invalidation cheap:
+    // touched blocks can be subtracted and rescanned without walking the rest
+    // of the function. Structural edits still use the conservative full path.
+    std::unordered_map<std::string, BlockContribution> block_contributions;
 };
 
 
@@ -45,6 +55,10 @@ struct MemoryLocation {
 
 struct AliasAnalysis {
     std::unordered_map<std::string, MemoryLocation> pointers;
+    // Reverse SSA dependency metadata lets operation-local rewrites invalidate
+    // only pointer values transitively derived from touched definitions.
+    std::unordered_map<std::string, std::vector<std::string>> dependents;
+    std::unordered_map<std::string, std::string> defining_blocks;
 
     [[nodiscard]] MemoryLocation location(const std::string& value,
                                           std::uint32_t access_size = 0) const;
@@ -90,7 +104,17 @@ public:
     [[nodiscard]] const AliasAnalysis& aliases();
     [[nodiscard]] const LoopInfo& loops();
 
+    void invalidate(InvalidationScope scope);
+    void invalidate(InvalidationScope scope, const std::vector<std::string>& touched_blocks);
+    void invalidate_operations();
+    void invalidate_operations(const std::vector<std::string>& touched_blocks);
+    void invalidate_control_flow();
+    void invalidate_control_flow(const std::vector<std::string>& touched_blocks);
     void invalidate_all();
+
+    // Repair a materialized use-def cache after known operation-local edits.
+    // If no cache exists yet, this materializes the post-edit graph once.
+    void repair_use_def(const std::vector<std::string>& touched_blocks);
 
 private:
     const ir::Function* function_;

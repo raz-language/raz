@@ -566,14 +566,13 @@ LowerResult lower_module(const ir::Module& source) {
             auto& machine_block = lowered.blocks[block_index];
             const auto append_control_successors = [&](const ir::Operation& operation, Instruction& target_instruction) -> bool {
                 for (std::size_t successor_index = 0; successor_index < operation.successors.size(); ++successor_index) {
-                    const auto target_it = std::find_if(function.blocks.begin(), function.blocks.end(), [&](const ir::Block& candidate) {
-                        return candidate.name == operation.successors[successor_index];
-                    });
-                    if (target_it == function.blocks.end()) {
+                    const auto target_lookup = block_indices.find(operation.successors[successor_index]);
+                    if (target_lookup == block_indices.end()) {
                         error(result.diagnostics, "unknown lowering successor '" + operation.successors[successor_index] + "' in @" + function.name);
                         return false;
                     }
-                    const auto target_index = static_cast<std::size_t>(std::distance(function.blocks.begin(), target_it));
+                    const auto target_index = target_lookup->second;
+                    const auto& target_block = function.blocks[target_index];
                     Successor successor;
                     successor.block = operation.successors[successor_index];
                     for (std::size_t argument_index = 0; argument_index < operation.successor_arguments[successor_index].size(); ++argument_index) {
@@ -588,8 +587,8 @@ LowerResult lower_module(const ir::Module& source) {
                             error(result.diagnostics, "undefined edge argument '" + argument + "' in @" + function.name);
                             return false;
                         }
-                        if (argument_index < target_it->parameters.size() && target_it->parameters[argument_index].owned) {
-                            const auto& parameter = target_it->parameters[argument_index];
+                        if (argument_index < target_block.parameters.size() && target_block.parameters[argument_index].owned) {
+                            const auto& parameter = target_block.parameters[argument_index];
                             const auto& sizes = parameter.aggregate_kind == ir::AggregateRefKind::structure ? struct_sizes : array_sizes;
                             const auto size_it = sizes.find(parameter.aggregate_name);
                             const auto& storage = owned_block_storage[target_index][argument_index];

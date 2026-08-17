@@ -29,7 +29,16 @@ PassRunReport PassManager::run_with_report(ir::Module& module, bool verify_each)
             report.total += result;
             report.records.push_back({function.name, pass->name(), result,
                                       std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)});
-            if (result.changed) analyses.invalidate_all();
+            if (result.changed) {
+                // New passes default to conservative invalidation until they
+                // explicitly describe their mutation scope. Scalar/MIR passes
+                // can preserve CFG, dominators, and loop information across
+                // operation-only rewrites instead of throwing those analyses
+                // away at every pass boundary.
+                const auto scope = result.invalidation == analysis::InvalidationScope::none
+                    ? analysis::InvalidationScope::all : result.invalidation;
+                analyses.invalidate(scope, result.touched_blocks);
+            }
             if (verify_each) verify_or_throw(module, pass->name());
         }
     }

@@ -5,6 +5,7 @@
 #include "forge/target/data_layout.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 #include <utility>
 
 namespace forge::runtime {
@@ -125,15 +126,19 @@ Diagnostics BindingRegistry::validate(const ir::Module& module) const {
         if (!global.is_constant && binding.read_only) add_error(diagnostics, "external writable global @" + global.name + " cannot use read-only storage");
     }
 
+    std::unordered_map<std::string_view, const ir::Function*> signatures;
+    signatures.reserve(module.functions().size());
+    for (const auto& function : module.functions())
+        if (function.is_signature) signatures.emplace(function.name, &function);
+
     for (const auto& [name, binding] : bindings_) {
         if (binding.signature_name.empty()) continue;
-        const auto signature_it = std::find_if(module.functions().begin(), module.functions().end(),
-            [&](const ir::Function& function) { return function.name == binding.signature_name && function.is_signature; });
-        if (signature_it == module.functions().end()) {
+        const auto signature_it = signatures.find(binding.signature_name);
+        if (signature_it == signatures.end()) {
             add_error(diagnostics, "runtime callback @" + name + " references unknown signature @" + binding.signature_name);
             continue;
         }
-        const auto& function = *signature_it;
+        const auto& function = *signature_it->second;
         const auto& signature = binding.signature;
         if (signature.result != function.return_type || signature.result_owned != function.return_owned ||
             signature.result_borrow_mode != function.return_borrow_mode ||

@@ -12,6 +12,8 @@ A release build has three roles:
 
 Generation numbering is an implementation detail of the build driver and is not part of the Raz user-facing toolchain.
 
+The native seed is optimized for bootstrap throughput rather than treated as a second production compiler. Generated host inputs are only rewritten when their contents change, and reproducibility workspaces hard-link immutable compiler sources when the filesystem supports it. These choices reduce redundant native compilation and file copying without changing the canonical compiler source, generated objects, or deterministic-convergence checks.
+
 ## Compiler source
 
 The canonical compiler is split into semantic modules under `compiler/src/` and is built through the normal Raz project/module graph. `compiler/host-source-order.txt` exists only to provide deterministic source ordering to the native host compiler where required; it is not the production compiler's module model.

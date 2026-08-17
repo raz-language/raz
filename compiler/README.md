@@ -83,6 +83,7 @@ src/
     package.rz
     project.rz
     registry.rz
+    registry_install.rz
     tooling.rz
   main.rz
 ```

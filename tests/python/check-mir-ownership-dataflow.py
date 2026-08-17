@@ -35,7 +35,7 @@ checks = {
     'instruction compaction remaps ownership-event positions':
         'mir.ownership_event_instructions' in remap and 'mir_map_target(mir, &map, instruction)' in remap,
     'ownership firewall executes the CFG move verifier':
-        'verify_mir_local_move_dataflow(mir)' in drops and 'verify_mir_ownership_semantics(mir)' in pipeline,
+        'verify_mir_local_move_dataflow_with_cfg(mir, &cfg)' in drops and 'verify_mir_ownership_semantics(mir)' in pipeline,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

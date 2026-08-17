@@ -122,17 +122,14 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
     if (function.blocks.empty() || function.register_count == 0U) return stats;
 
     // This is an optional code-quality transform, not a correctness requirement.
-    // It recomputes full CFG liveness after every individual split, which is
-    // intentionally precise for ordinary functions but becomes pathological for
-    // generated/production compiler functions with thousands of SSA values and
-    // hundreds of calls. The allocator already handles call-crossing values via
-    // callee-saved registers and spills, so use that bounded fallback for large
-    // functions instead of turning object emission into a multi-minute fixed
-    // point.
-    // Full liveness is a block_count x register_count bit matrix and this
-    // transform recomputes it after each split. A register-only cutoff misses
-    // compiler-shaped functions with 1-2k values spread across hundreds of
-    // blocks, where an optional code-quality pass can dominate object emission.
+    // Each split class now consumes one whole-function liveness snapshot rather
+    // than iterating to a fixed point, but the dense block_count x register_count
+    // matrices can still be expensive for generated compiler functions. The
+    // allocator already handles call-crossing values via callee-saved registers
+    // and spills, so keep a problem-size cutoff for very large functions. A
+    // register-only cutoff misses compiler-shaped functions with 1-2k values
+    // spread across hundreds of blocks, where even a few optional full-function
+    // analyses can dominate object emission.
     // The baseline allocator is already correct without splitting, so bound the
     // transform by the actual liveness problem size instead.
     constexpr std::size_t max_split_liveness_cells = 100000U;
@@ -142,118 +139,125 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
 
     // Split only where the current ABI model has no cheap register solution:
     // floating values live across a call and integer pressure above the two
-    // available callee-saved registers. The transformation is deliberately
-    // restricted to values whose remaining uses stay in the same block, which
-    // makes the rename dominance-exact without introducing edge copies.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        const auto liveness = analyze_liveness(function);
-        const auto intervals = compute_live_intervals(function);
-        for (std::size_t block_index = 0; block_index < function.blocks.size() && !changed; ++block_index) {
-            auto& block = function.blocks[block_index];
-            for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
-                const auto& call = block.instructions[instruction_index];
-                if (!is_call_opcode(call.opcode)) continue;
-
-                std::vector<VirtualRegister> floating_candidates;
-                std::vector<VirtualRegister> integer_candidates;
-                for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
-                    if (!liveness.live_after[block_index][instruction_index][reg] ||
-                        liveness.live_out[block_index][reg] || reg == call.result) continue;
-                    bool used_after = false;
-                    for (std::size_t later = instruction_index + 1U; later < block.instructions.size() && !used_after; ++later) {
-                        const auto& instruction = block.instructions[later];
-                        used_after = std::find(instruction.inputs.begin(), instruction.inputs.end(), reg) != instruction.inputs.end();
-                        if (!used_after) {
-                            for (const auto& successor : instruction.successors) {
-                                if (std::find(successor.arguments.begin(), successor.arguments.end(), reg) != successor.arguments.end()) {
-                                    used_after = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (!used_after) continue;
-                    const bool floating = reg < function.register_classes.size() &&
-                                          function.register_classes[reg] == RegisterClass::floating;
-                    (floating ? floating_candidates : integer_candidates).push_back(reg);
-                }
-
-                std::stable_sort(integer_candidates.begin(), integer_candidates.end(), [&](VirtualRegister left, VirtualRegister right) {
-                    if (intervals[left].spill_weight != intervals[right].spill_weight)
-                        return intervals[left].spill_weight < intervals[right].spill_weight;
-                    return left < right;
-                });
-                std::vector<VirtualRegister> selected = floating_candidates;
-                if (integer_candidates.size() > 2U)
-                    selected.insert(selected.end(), integer_candidates.begin(), integer_candidates.end() - 2);
-                if (selected.empty()) continue;
-
-                std::vector<Instruction> stores;
-                std::vector<Instruction> loads;
-                stores.reserve(selected.size());
-                loads.reserve(selected.size());
-                std::vector<std::pair<VirtualRegister, VirtualRegister>> replacements;
-                replacements.reserve(selected.size());
-                for (const auto reg : selected) {
-                    const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{64};
-                    const auto register_class = reg < function.register_classes.size()
-                        ? function.register_classes[reg] : RegisterClass::integer;
-                    const Instruction* rematerializable = nullptr;
-                    for (std::size_t earlier = instruction_index; earlier-- > 0U;) {
-                        const auto& candidate = block.instructions[earlier];
-                        if (candidate.result != reg) continue;
-                        if (candidate.opcode == Opcode::load_immediate_f32 ||
-                            candidate.opcode == Opcode::load_immediate_f64)
-                            rematerializable = &candidate;
-                        break;
-                    }
-                    const auto replacement = function.register_count++;
-                    function.register_widths.push_back(width);
-                    function.register_classes.push_back(register_class);
-                    if (rematerializable != nullptr) {
-                        auto reload = *rematerializable;
-                        reload.result = replacement;
-                        loads.push_back(std::move(reload));
-                        ++stats.transition_loads;
-                        stats.transition_bytes += 8U;
-                    } else {
-                        function.local_stack_size += 8U;
-                        const auto offset = -static_cast<std::int64_t>(function.local_stack_size);
-                        stores.push_back({split_store_opcode(register_class, width), 0U, {reg}, offset, 0U, {}, {}});
-                        loads.push_back({split_load_opcode(register_class, width), replacement, {}, offset, 0U, {}, {}});
-                        ++stats.transition_stores;
-                        ++stats.transition_loads;
-                        stats.transition_bytes += 16U;
-                    }
-                    replacements.emplace_back(reg, replacement);
-                    ++stats.split_values;
-                }
-
-                block.instructions.insert(block.instructions.begin() + static_cast<std::ptrdiff_t>(instruction_index),
-                                          stores.begin(), stores.end());
-                instruction_index += stores.size();
-                block.instructions.insert(block.instructions.begin() + static_cast<std::ptrdiff_t>(instruction_index + 1U),
-                                          loads.begin(), loads.end());
-                const auto rewrite_start = instruction_index + 1U + loads.size();
-                for (std::size_t later = rewrite_start; later < block.instructions.size(); ++later)
-                    for (const auto& [from, to] : replacements)
-                        rewrite_register(block.instructions[later], from, to);
-                changed = true;
-                break;
-            }
+    // available callee-saved registers. Same-block splitting is intentionally
+    // processed backwards from one immutable liveness snapshot. An earlier
+    // split then rewrites the transition store of any later split, so values
+    // crossing several calls form the correct reload chain without rebuilding
+    // whole-function liveness after each local insertion.
+    const auto same_block_register_count = function.register_count;
+    const auto same_block_liveness = analyze_liveness(function);
+    const auto same_block_intervals = compute_live_intervals(function, same_block_liveness);
+    std::vector<std::vector<std::size_t>> same_block_last_use(function.blocks.size(),
+        std::vector<std::size_t>(same_block_register_count, 0U));
+    std::vector<std::vector<std::uint8_t>> same_block_has_use(function.blocks.size(),
+        std::vector<std::uint8_t>(same_block_register_count, 0U));
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        const auto& block = function.blocks[block_index];
+        for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
+            const auto& instruction = block.instructions[instruction_index];
+            const auto record_use = [&](VirtualRegister reg) {
+                if (reg >= same_block_register_count) return;
+                same_block_has_use[block_index][reg] = 1U;
+                same_block_last_use[block_index][reg] = instruction_index;
+            };
+            for (const auto reg : instruction.inputs) record_use(reg);
+            for (const auto& edge : instruction.successors)
+                for (const auto reg : edge.arguments) record_use(reg);
         }
     }
-    // Extend splitting across a simple CFG continuation. This handles the
-    // common call-at-end-of-block shape when the continuation block has a
-    // single predecessor, so the reload dominates every rewritten use without
-    // requiring critical-edge copies or phi repair.
-    bool cross_block_changed = true;
-    while (cross_block_changed) {
-        cross_block_changed = false;
+
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        auto& block = function.blocks[block_index];
+        std::vector<std::size_t> call_sites;
+        call_sites.reserve(block.instructions.size() / 8U + 1U);
+        for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index)
+            if (is_call_opcode(block.instructions[instruction_index].opcode)) call_sites.push_back(instruction_index);
+
+        for (auto call_it = call_sites.rbegin(); call_it != call_sites.rend(); ++call_it) {
+            const auto instruction_index = *call_it;
+            const auto call_result = block.instructions[instruction_index].result;
+            std::vector<VirtualRegister> floating_candidates;
+            std::vector<VirtualRegister> integer_candidates;
+            for (VirtualRegister reg = 0; reg < same_block_register_count; ++reg) {
+                if (!same_block_liveness.live_after[block_index][instruction_index][reg] ||
+                    same_block_liveness.live_out[block_index][reg] || reg == call_result) continue;
+                if (!same_block_has_use[block_index][reg] ||
+                    same_block_last_use[block_index][reg] <= instruction_index) continue;
+                const bool floating = reg < function.register_classes.size() &&
+                                      function.register_classes[reg] == RegisterClass::floating;
+                (floating ? floating_candidates : integer_candidates).push_back(reg);
+            }
+
+            std::stable_sort(integer_candidates.begin(), integer_candidates.end(), [&](VirtualRegister left, VirtualRegister right) {
+                if (same_block_intervals[left].spill_weight != same_block_intervals[right].spill_weight)
+                    return same_block_intervals[left].spill_weight < same_block_intervals[right].spill_weight;
+                return left < right;
+            });
+            std::vector<VirtualRegister> selected = floating_candidates;
+            if (integer_candidates.size() > 2U)
+                selected.insert(selected.end(), integer_candidates.begin(), integer_candidates.end() - 2);
+            if (selected.empty()) continue;
+
+            std::vector<Instruction> stores;
+            std::vector<Instruction> loads;
+            stores.reserve(selected.size());
+            loads.reserve(selected.size());
+            std::vector<std::pair<VirtualRegister, VirtualRegister>> replacements;
+            replacements.reserve(selected.size());
+            for (const auto reg : selected) {
+                const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{64};
+                const auto register_class = reg < function.register_classes.size()
+                    ? function.register_classes[reg] : RegisterClass::integer;
+                const Instruction* rematerializable = nullptr;
+                for (std::size_t earlier = instruction_index; earlier-- > 0U;) {
+                    const auto& candidate = block.instructions[earlier];
+                    if (candidate.result != reg) continue;
+                    if (candidate.opcode == Opcode::load_immediate_f32 ||
+                        candidate.opcode == Opcode::load_immediate_f64)
+                        rematerializable = &candidate;
+                    break;
+                }
+                const auto replacement = function.register_count++;
+                function.register_widths.push_back(width);
+                function.register_classes.push_back(register_class);
+                if (rematerializable != nullptr) {
+                    auto reload = *rematerializable;
+                    reload.result = replacement;
+                    loads.push_back(std::move(reload));
+                    ++stats.transition_loads;
+                    stats.transition_bytes += 8U;
+                } else {
+                    function.local_stack_size += 8U;
+                    const auto offset = -static_cast<std::int64_t>(function.local_stack_size);
+                    stores.push_back({split_store_opcode(register_class, width), 0U, {reg}, offset, 0U, {}, {}});
+                    loads.push_back({split_load_opcode(register_class, width), replacement, {}, offset, 0U, {}, {}});
+                    ++stats.transition_stores;
+                    ++stats.transition_loads;
+                    stats.transition_bytes += 16U;
+                }
+                replacements.emplace_back(reg, replacement);
+                ++stats.split_values;
+            }
+
+            block.instructions.insert(block.instructions.begin() + static_cast<std::ptrdiff_t>(instruction_index),
+                                      stores.begin(), stores.end());
+            const auto call_index = instruction_index + stores.size();
+            block.instructions.insert(block.instructions.begin() + static_cast<std::ptrdiff_t>(call_index + 1U),
+                                      loads.begin(), loads.end());
+            const auto rewrite_start = call_index + 1U + loads.size();
+            for (std::size_t later = rewrite_start; later < block.instructions.size(); ++later)
+                for (const auto& [from, to] : replacements)
+                    rewrite_register(block.instructions[later], from, to);
+        }
+    }
+    // Extend splitting across a simple CFG continuation. This phase also uses
+    // one analysis snapshot. Calls are visited backwards and each value is
+    // split at most once for a given continuation, which picks the latest call
+    // that actually needs the transition and avoids fixed-point reanalysis.
+    {
+        const auto cross_register_count = function.register_count;
         const auto liveness = analyze_liveness(function);
-        const auto intervals = compute_live_intervals(function);
+        const auto intervals = compute_live_intervals(function, liveness);
         std::unordered_map<std::string, std::size_t> block_indices;
         std::vector<std::uint32_t> predecessor_counts(function.blocks.size(), 0U);
         for (std::size_t index = 0; index < function.blocks.size(); ++index)
@@ -265,54 +269,47 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                 if (target != block_indices.end()) ++predecessor_counts[target->second];
             }
         }
+        std::vector<std::vector<std::size_t>> last_use(function.blocks.size(),
+            std::vector<std::size_t>(cross_register_count, 0U));
+        std::vector<std::vector<std::uint8_t>> has_use(function.blocks.size(),
+            std::vector<std::uint8_t>(cross_register_count, 0U));
+        for (std::size_t use_block_index = 0; use_block_index < function.blocks.size(); ++use_block_index) {
+            const auto& use_block = function.blocks[use_block_index];
+            for (std::size_t use_instruction_index = 0; use_instruction_index < use_block.instructions.size(); ++use_instruction_index) {
+                const auto& use_instruction = use_block.instructions[use_instruction_index];
+                const auto record_use = [&](VirtualRegister reg) {
+                    if (reg >= cross_register_count) return;
+                    has_use[use_block_index][reg] = 1U;
+                    last_use[use_block_index][reg] = use_instruction_index;
+                };
+                for (const auto reg : use_instruction.inputs) record_use(reg);
+                for (const auto& edge : use_instruction.successors)
+                    for (const auto reg : edge.arguments) record_use(reg);
+            }
+        }
 
-        for (std::size_t block_index = 0; block_index < function.blocks.size() && !cross_block_changed; ++block_index) {
+        for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
             auto& block = function.blocks[block_index];
             if (block.instructions.empty() || block.instructions.back().successors.size() != 1U) continue;
             const auto successor_it = block_indices.find(block.instructions.back().successors.front().block);
             if (successor_it == block_indices.end() || predecessor_counts[successor_it->second] != 1U) continue;
             const auto successor_index = successor_it->second;
 
-            for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
-                const auto& call = block.instructions[instruction_index];
-                if (!is_call_opcode(call.opcode)) continue;
+            std::vector<std::uint8_t> transitioned(cross_register_count, 0U);
+            std::vector<std::size_t> call_sites;
+            for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index)
+                if (is_call_opcode(block.instructions[instruction_index].opcode)) call_sites.push_back(instruction_index);
 
+            for (auto call_it = call_sites.rbegin(); call_it != call_sites.rend(); ++call_it) {
+                const auto instruction_index = *call_it;
+                const auto call_result = block.instructions[instruction_index].result;
                 std::vector<VirtualRegister> floating_candidates;
                 std::vector<VirtualRegister> integer_candidates;
-                for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
-                    if (!liveness.live_after[block_index][instruction_index][reg] ||
-                        !liveness.live_out[block_index][reg] || reg == call.result) continue;
-                    bool used_later_in_block = false;
-                    for (std::size_t later = instruction_index + 1U; later < block.instructions.size(); ++later) {
-                        const auto& instruction = block.instructions[later];
-                        used_later_in_block = std::find(instruction.inputs.begin(), instruction.inputs.end(), reg) != instruction.inputs.end();
-                        if (!used_later_in_block) {
-                            for (const auto& edge : instruction.successors) {
-                                if (std::find(edge.arguments.begin(), edge.arguments.end(), reg) != edge.arguments.end()) {
-                                    used_later_in_block = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (used_later_in_block) break;
-                    }
-                    if (used_later_in_block) continue;
-
-                    bool used_in_successor = false;
-                    for (const auto& instruction : function.blocks[successor_index].instructions) {
-                        if (std::find(instruction.inputs.begin(), instruction.inputs.end(), reg) != instruction.inputs.end()) {
-                            used_in_successor = true;
-                            break;
-                        }
-                        for (const auto& edge : instruction.successors) {
-                            if (std::find(edge.arguments.begin(), edge.arguments.end(), reg) != edge.arguments.end()) {
-                                used_in_successor = true;
-                                break;
-                            }
-                        }
-                        if (used_in_successor) break;
-                    }
-                    if (!used_in_successor) continue;
+                for (VirtualRegister reg = 0; reg < cross_register_count; ++reg) {
+                    if (transitioned[reg] || !liveness.live_after[block_index][instruction_index][reg] ||
+                        !liveness.live_out[block_index][reg] || reg == call_result) continue;
+                    if (has_use[block_index][reg] && last_use[block_index][reg] > instruction_index) continue;
+                    if (!has_use[successor_index][reg]) continue;
                     const bool floating = reg < function.register_classes.size() &&
                                           function.register_classes[reg] == RegisterClass::floating;
                     (floating ? floating_candidates : integer_candidates).push_back(reg);
@@ -332,6 +329,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                 std::vector<Instruction> loads;
                 std::vector<std::pair<VirtualRegister, VirtualRegister>> replacements;
                 for (const auto reg : selected) {
+                    transitioned[reg] = 1U;
                     const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{64};
                     const auto register_class = reg < function.register_classes.size()
                         ? function.register_classes[reg] : RegisterClass::integer;
@@ -357,86 +355,79 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                 for (std::size_t later = loads.size(); later < successor_block.instructions.size(); ++later)
                     for (const auto& [from, to] : replacements)
                         rewrite_register(successor_block.instructions[later], from, to);
-                cross_block_changed = true;
-                break;
             }
         }
     }
 
-
     // Extend splitting through multi-predecessor continuations by introducing
-    // an explicit edge block and a block parameter in the merge block. Every
-    // predecessor supplies either the original value or the post-call reload,
-    // which gives the renamed continuation a proper SSA merge point.
-    bool critical_edge_changed = true;
-    std::uint32_t edge_serial = 0U;
-    while (critical_edge_changed) {
-        critical_edge_changed = false;
+    // an explicit edge block and a block parameter in the merge block. Critical
+    // edges are structural, so take one fresh snapshot after the simpler split
+    // phases and batch at most one split set per merge continuation. The normal
+    // allocator remains the fallback for other incoming call paths; correctness
+    // never depends on repeatedly rebuilding liveness to discover more splits.
+    {
+        const auto critical_register_count = function.register_count;
+        const auto critical_block_count = function.blocks.size();
         const auto liveness = analyze_liveness(function);
-        const auto intervals = compute_live_intervals(function);
+        const auto intervals = compute_live_intervals(function, liveness);
         std::unordered_map<std::string, std::size_t> block_indices;
-        std::vector<std::uint32_t> predecessor_counts(function.blocks.size(), 0U);
-        for (std::size_t index = 0; index < function.blocks.size(); ++index)
+        std::vector<std::uint32_t> predecessor_counts(critical_block_count, 0U);
+        for (std::size_t index = 0; index < critical_block_count; ++index)
             block_indices.emplace(function.blocks[index].name, index);
-        for (const auto& candidate_block : function.blocks) {
+        for (std::size_t index = 0; index < critical_block_count; ++index) {
+            const auto& candidate_block = function.blocks[index];
             if (candidate_block.instructions.empty()) continue;
             for (const auto& successor : candidate_block.instructions.back().successors) {
                 const auto target = block_indices.find(successor.block);
                 if (target != block_indices.end()) ++predecessor_counts[target->second];
             }
         }
+        std::vector<std::vector<std::size_t>> last_use(critical_block_count,
+            std::vector<std::size_t>(critical_register_count, 0U));
+        std::vector<std::vector<std::uint8_t>> has_use(critical_block_count,
+            std::vector<std::uint8_t>(critical_register_count, 0U));
+        for (std::size_t use_block_index = 0; use_block_index < critical_block_count; ++use_block_index) {
+            const auto& use_block = function.blocks[use_block_index];
+            for (std::size_t use_instruction_index = 0; use_instruction_index < use_block.instructions.size(); ++use_instruction_index) {
+                const auto& use_instruction = use_block.instructions[use_instruction_index];
+                const auto record_use = [&](VirtualRegister reg) {
+                    if (reg >= critical_register_count) return;
+                    has_use[use_block_index][reg] = 1U;
+                    last_use[use_block_index][reg] = use_instruction_index;
+                };
+                for (const auto reg : use_instruction.inputs) record_use(reg);
+                for (const auto& edge : use_instruction.successors)
+                    for (const auto reg : edge.arguments) record_use(reg);
+            }
+        }
 
-        for (std::size_t block_index = 0; block_index < function.blocks.size() && !critical_edge_changed; ++block_index) {
+        std::unordered_set<std::string> split_successors;
+        std::uint32_t edge_serial = 0U;
+        for (std::size_t block_index = 0; block_index < critical_block_count; ++block_index) {
             if (function.blocks[block_index].instructions.empty() ||
                 function.blocks[block_index].instructions.back().successors.size() != 1U) continue;
             const auto successor_name = function.blocks[block_index].instructions.back().successors.front().block;
             const auto successor_it = block_indices.find(successor_name);
-            if (successor_it == block_indices.end() || predecessor_counts[successor_it->second] <= 1U) continue;
+            if (successor_it == block_indices.end() || predecessor_counts[successor_it->second] <= 1U ||
+                split_successors.contains(successor_name)) continue;
             const auto successor_index = successor_it->second;
 
+            std::vector<std::size_t> call_sites;
             for (std::size_t instruction_index = 0;
-                 instruction_index < function.blocks[block_index].instructions.size(); ++instruction_index) {
-                const auto& call = function.blocks[block_index].instructions[instruction_index];
-                if (!is_call_opcode(call.opcode)) continue;
+                 instruction_index < function.blocks[block_index].instructions.size(); ++instruction_index)
+                if (is_call_opcode(function.blocks[block_index].instructions[instruction_index].opcode))
+                    call_sites.push_back(instruction_index);
 
+            for (auto call_it = call_sites.rbegin(); call_it != call_sites.rend(); ++call_it) {
+                const auto instruction_index = *call_it;
+                const auto call_result = function.blocks[block_index].instructions[instruction_index].result;
                 std::vector<VirtualRegister> floating_candidates;
                 std::vector<VirtualRegister> integer_candidates;
-                for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
+                for (VirtualRegister reg = 0; reg < critical_register_count; ++reg) {
                     if (!liveness.live_after[block_index][instruction_index][reg] ||
-                        !liveness.live_out[block_index][reg] || reg == call.result) continue;
-                    bool used_later_in_block = false;
-                    for (std::size_t later = instruction_index + 1U;
-                         later < function.blocks[block_index].instructions.size(); ++later) {
-                        const auto& instruction = function.blocks[block_index].instructions[later];
-                        if (std::find(instruction.inputs.begin(), instruction.inputs.end(), reg) != instruction.inputs.end()) {
-                            used_later_in_block = true;
-                            break;
-                        }
-                        for (const auto& edge : instruction.successors) {
-                            if (std::find(edge.arguments.begin(), edge.arguments.end(), reg) != edge.arguments.end()) {
-                                used_later_in_block = true;
-                                break;
-                            }
-                        }
-                        if (used_later_in_block) break;
-                    }
-                    if (used_later_in_block) continue;
-
-                    bool used_in_successor = false;
-                    for (const auto& instruction : function.blocks[successor_index].instructions) {
-                        if (std::find(instruction.inputs.begin(), instruction.inputs.end(), reg) != instruction.inputs.end()) {
-                            used_in_successor = true;
-                            break;
-                        }
-                        for (const auto& edge : instruction.successors) {
-                            if (std::find(edge.arguments.begin(), edge.arguments.end(), reg) != edge.arguments.end()) {
-                                used_in_successor = true;
-                                break;
-                            }
-                        }
-                        if (used_in_successor) break;
-                    }
-                    if (!used_in_successor) continue;
+                        !liveness.live_out[block_index][reg] || reg == call_result) continue;
+                    if (has_use[block_index][reg] && last_use[block_index][reg] > instruction_index) continue;
+                    if (!has_use[successor_index][reg]) continue;
                     const bool floating = reg < function.register_classes.size() &&
                                           function.register_classes[reg] == RegisterClass::floating;
                     (floating ? floating_candidates : integer_candidates).push_back(reg);
@@ -521,7 +512,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                 edge_block.instructions.push_back(std::move(jump));
                 function.blocks.push_back(std::move(edge_block));
                 ++stats.critical_edge_blocks;
-                critical_edge_changed = true;
+                split_successors.insert(successor_name);
                 break;
             }
         }
@@ -530,56 +521,27 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
     return stats;
 }
 
-std::vector<LiveInterval> compute_live_intervals(const Function& function) {
+std::vector<LiveInterval> compute_live_intervals(const Function& function, const LivenessAnalysis& liveness) {
     std::vector<LiveInterval> intervals(function.register_count);
     for (VirtualRegister reg = 0; reg < function.register_count; ++reg)
         intervals[reg] = {reg, undefined_position, 0, 0, 0, 0, 0, {}};
 
     const auto block_count = function.blocks.size();
-    std::unordered_map<std::string, std::size_t> block_indices;
-    for (std::size_t index = 0; index < block_count; ++index)
-        block_indices.emplace(function.blocks[index].name, index);
-
-    const auto liveness = analyze_liveness(function);
     const auto& live_in = liveness.live_in;
     const auto& live_out = liveness.live_out;
     const auto& successors = liveness.successors;
-    std::vector<std::vector<bool>> defs(block_count, std::vector<bool>(function.register_count));
     std::vector<std::uint32_t> block_starts(block_count);
     std::vector<std::uint32_t> block_ends(block_count);
 
+    // Instruction positions depend only on block sizes. Establish boundaries
+    // without walking every instruction, then make one metadata pass after loop
+    // depth is known. The old implementation scanned instructions once to build
+    // ranges/use counts and again to rebuild weighted use costs.
     std::uint32_t position = 0;
     for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
-        const auto& block = function.blocks[block_index];
         block_starts[block_index] = position;
-        for (const auto parameter : block.parameters) {
-            if (parameter < function.register_count) defs[block_index][parameter] = true;
-            touch(intervals, parameter, position);
-        }
-        ++position;
-        for (const auto& instruction : block.instructions) {
-            const bool loop_weighted = std::any_of(instruction.successors.begin(), instruction.successors.end(),
-                [&](const Successor& successor) {
-                    const auto target = block_indices.find(successor.block);
-                    return target != block_indices.end() && target->second <= block_index;
-                });
-            const auto record_use = [&](VirtualRegister reg, std::uint32_t weight = 1U) {
-                if (reg >= function.register_count) return;
-                touch(intervals, reg, position);
-                ++intervals[reg].use_count;
-                intervals[reg].spill_weight += weight * (loop_weighted ? 8U : 1U);
-            };
-            for (const auto input : instruction.inputs) record_use(input, 2U);
-            for (const auto& successor : instruction.successors) {
-                for (const auto argument : successor.arguments) record_use(argument, 4U);
-            }
-            if (produces_result(instruction.opcode) && instruction.result < function.register_count) {
-                defs[block_index][instruction.result] = true;
-                touch(intervals, instruction.result, position);
-                ++intervals[instruction.result].spill_weight;
-            }
-            ++position;
-        }
+        ++position; // block-parameter position
+        position += static_cast<std::uint32_t>(function.blocks[block_index].instructions.size());
         block_ends[block_index] = position;
     }
 
@@ -596,66 +558,67 @@ std::vector<LiveInterval> compute_live_intervals(const Function& function) {
         }
     }
 
-    // Recompute weighted use costs with the block loop depth now known.
-    for (auto& interval : intervals) interval.spill_weight = interval.use_count == 0 ? 0U : 1U;
-    position = 0;
-    for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
-        ++position;
-        const auto depth = block_loop_depth[block_index];
-        const auto loop_multiplier = depth == 0U ? 1U : (depth == 1U ? 8U : 32U);
-        for (const auto& instruction : function.blocks[block_index].instructions) {
-            for (const auto input : instruction.inputs) {
-                if (input < intervals.size()) {
-                    intervals[input].spill_weight += 2U * loop_multiplier;
-                    intervals[input].loop_depth = std::max(intervals[input].loop_depth, depth);
-                }
-            }
-            for (const auto& successor : instruction.successors) {
-                for (const auto argument : successor.arguments) {
-                    if (argument < intervals.size()) {
-                        intervals[argument].spill_weight += 4U * loop_multiplier;
-                        intervals[argument].loop_depth = std::max(intervals[argument].loop_depth, depth);
-                    }
-                }
-            }
-            ++position;
-        }
-    }
+    // Reuse segment scratch for every block. Only registers actually touched in
+    // the block are reset/emitted, avoiding two register-sized allocations and
+    // a full register scan solely to discover empty segment entries per block.
+    std::vector<std::uint32_t> first(function.register_count, undefined_position);
+    std::vector<std::uint32_t> last(function.register_count, 0U);
+    std::vector<VirtualRegister> touched_registers;
+    touched_registers.reserve(std::min<std::size_t>(function.register_count, 256U));
 
-    for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
-        for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
-            if (live_in[block_index][reg]) touch(intervals, reg, block_starts[block_index]);
-            if (live_out[block_index][reg]) touch(intervals, reg, block_ends[block_index]);
-        }
-    }
-
-    // Preserve liveness as disjoint per-block segments instead of only one
-    // bounding range. This exposes holes created by interleaved mutually
-    // exclusive CFG paths and allows the allocator to recover false spills.
     for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
         const auto& block = function.blocks[block_index];
-        std::vector<std::uint32_t> first(function.register_count, undefined_position);
-        std::vector<std::uint32_t> last(function.register_count, 0U);
+        const auto depth = block_loop_depth[block_index];
+        const auto loop_multiplier = depth == 0U ? 1U : (depth == 1U ? 8U : 32U);
+        touched_registers.clear();
+
         const auto mark = [&](VirtualRegister reg, std::uint32_t at) {
             if (reg >= function.register_count) return;
+            if (first[reg] == undefined_position) touched_registers.push_back(reg);
             first[reg] = std::min(first[reg], at);
             last[reg] = std::max(last[reg], at);
         };
-        for (VirtualRegister reg = 0; reg < function.register_count; ++reg)
-            if (live_in[block_index][reg]) mark(reg, block_starts[block_index]);
-        for (const auto parameter : block.parameters) mark(parameter, block_starts[block_index]);
+
+        // Boundary liveness both extends the global interval and contributes the
+        // boundary endpoints of this block's disjoint segment.
+        live_in[block_index].for_each_set_bit([&](VirtualRegister reg) {
+            touch(intervals, reg, block_starts[block_index]);
+            mark(reg, block_starts[block_index]);
+        });
+        live_out[block_index].for_each_set_bit([&](VirtualRegister reg) {
+            touch(intervals, reg, block_ends[block_index]);
+            mark(reg, block_ends[block_index]);
+        });
+
+        for (const auto parameter : block.parameters) {
+            touch(intervals, parameter, block_starts[block_index]);
+            mark(parameter, block_starts[block_index]);
+        }
+
         auto at = block_starts[block_index] + 1U;
         for (const auto& instruction : block.instructions) {
-            for (const auto input : instruction.inputs) mark(input, at);
+            const auto record_use = [&](VirtualRegister reg, std::uint32_t weight) {
+                if (reg >= function.register_count) return;
+                touch(intervals, reg, at);
+                mark(reg, at);
+                if (intervals[reg].use_count++ == 0U) intervals[reg].spill_weight = 1U;
+                intervals[reg].spill_weight += weight * loop_multiplier;
+                intervals[reg].loop_depth = std::max(intervals[reg].loop_depth, depth);
+            };
+            for (const auto input : instruction.inputs) record_use(input, 2U);
             for (const auto& successor : instruction.successors)
-                for (const auto argument : successor.arguments) mark(argument, at);
-            if (produces_result(instruction.opcode)) mark(instruction.result, at);
+                for (const auto argument : successor.arguments) record_use(argument, 4U);
+            if (produces_result(instruction.opcode) && instruction.result < function.register_count) {
+                touch(intervals, instruction.result, at);
+                mark(instruction.result, at);
+            }
             ++at;
         }
-        for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
-            if (live_out[block_index][reg]) mark(reg, block_ends[block_index]);
-            if (first[reg] != undefined_position)
-                intervals[reg].segments.push_back({first[reg], last[reg]});
+
+        for (const auto reg : touched_registers) {
+            intervals[reg].segments.push_back({first[reg], last[reg]});
+            first[reg] = undefined_position;
+            last[reg] = 0U;
         }
     }
 
@@ -663,6 +626,11 @@ std::vector<LiveInterval> compute_live_intervals(const Function& function) {
         if (interval.start == undefined_position) interval.start = interval.end = 0;
     }
     return intervals;
+}
+
+std::vector<LiveInterval> compute_live_intervals(const Function& function) {
+    const auto liveness = analyze_liveness(function, false);
+    return compute_live_intervals(function, liveness);
 }
 
 namespace {
@@ -784,18 +752,24 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
             ++position;
         }
     }
-    const auto crosses_call = [&](const LiveInterval& interval) {
-        return std::any_of(call_positions.begin(), call_positions.end(), [&](std::uint32_t call) {
-            return interval.start < call && call < interval.end;
-        });
-    };
+    // call_positions is naturally sorted by instruction order.  Count call
+    // crossings with binary searches instead of rescanning every call for
+    // every interval (and then rescanning them again in crosses_call).
+    std::vector<std::uint8_t> interval_crosses_call(allocation.intervals.size(), 0U);
     for (auto& interval : allocation.intervals) {
-        interval.call_crossing_count = static_cast<std::uint32_t>(std::count_if(
-            call_positions.begin(), call_positions.end(), [&](std::uint32_t call) {
-                return interval.start < call && call < interval.end;
-            }));
-        if (interval.call_crossing_count != 0U) ++allocation.call_crossing_interval_count;
+        const auto first = std::upper_bound(call_positions.begin(), call_positions.end(), interval.start);
+        const auto last = std::lower_bound(first, call_positions.end(), interval.end);
+        interval.call_crossing_count = static_cast<std::uint32_t>(std::distance(first, last));
+        if (interval.call_crossing_count != 0U) {
+            ++allocation.call_crossing_interval_count;
+            if (interval.virtual_register < interval_crosses_call.size())
+                interval_crosses_call[interval.virtual_register] = 1U;
+        }
     }
+    const auto crosses_call = [&](const LiveInterval& interval) {
+        return interval.virtual_register < interval_crosses_call.size() &&
+               interval_crosses_call[interval.virtual_register] != 0U;
+    };
 
     // Measure pressure from disjoint liveness segments rather than bounding
     // intervals. Interleaved blocks on mutually exclusive CFG paths therefore

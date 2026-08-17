@@ -11,6 +11,7 @@ Backend selection must not change language semantics. See [Backends](BACKENDS.md
 ## Project contract
 
 Projects are defined by `raz.toml`. `[package].source` defaults to `src`; `[package].entry` defaults to `src/main.rz`. Dependencies are resolved deterministically, cycles are rejected, duplicate graph identities are deduplicated, and conflicting versions or canonical roots are errors rather than order-dependent choices.
+Packages may additionally declare executable tool entries with `[[bin]]` records containing `name` and `entry`. The normal project build continues to use `[package].entry`; an explicit tool/binary selection may override the entry for that build without mutating the manifest.
 
 Each physical source module has deterministic package/module ownership. Imports support aliases and public re-exports. Visibility is enforced at semantic composition boundaries: `public` crosses packages, default visibility is package-internal, and `private` is module-only.
 

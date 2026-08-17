@@ -269,8 +269,15 @@ std::int64_t raz_rt_fs_metadata(const char* path, std::int64_t length, std::int6
                           std::filesystem::perms::others_write;
   const auto readonly = (status.permissions() & write_bits) == std::filesystem::perms::none ? 1 : 0;
   std::int64_t modified_millis = -1;
+  std::int64_t modified_ticks = -1;
   const auto modified = std::filesystem::last_write_time(fs_path, error);
   if (!error) {
+    auto raw_ticks = modified.time_since_epoch().count();
+    modified_ticks = raw_ticks > static_cast<decltype(raw_ticks)>(std::numeric_limits<std::int64_t>::max())
+        ? std::numeric_limits<std::int64_t>::max()
+        : raw_ticks < static_cast<decltype(raw_ticks)>(std::numeric_limits<std::int64_t>::min())
+            ? std::numeric_limits<std::int64_t>::min()
+            : static_cast<std::int64_t>(raw_ticks);
     // Convert file_clock into system_clock without assuming identical epochs.
     const auto system_now = std::chrono::system_clock::now();
     const auto file_now = decltype(modified)::clock::now();
@@ -285,6 +292,7 @@ std::int64_t raz_rt_fs_metadata(const char* path, std::int64_t length, std::int6
   output[3] = readonly;
   output[4] = std::filesystem::is_symlink(status) ? 1 : 0;
   output[5] = std::filesystem::exists(status) ? 1 : 0;
+  if (capacity >= 7) output[6] = modified_ticks;
   raz_clear_last_error();
   return 1;
 }

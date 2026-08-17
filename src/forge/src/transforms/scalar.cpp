@@ -28,6 +28,7 @@ pass::PassResult ConstantFoldPass::run(ir::Function& function,
         std::size_t operation_index{};
     };
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     std::unordered_map<std::string, ConstantDefinition> constants;
     const auto& dominators = analyses.dominators();
     for (auto& block : function.blocks) {
@@ -65,6 +66,7 @@ pass::PassResult ConstantFoldPass::run(ir::Function& function,
                 constants[operation.result] = {value, block.name, index};
                 result.changed = true;
                 ++result.operations_rewritten;
+                result.touch_block(block.name);
             }
         }
     }
@@ -80,6 +82,7 @@ pass::PassResult CopyPropagationPass::run(ir::Function& function,
     };
 
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     std::unordered_map<std::string, CopyDefinition> copies;
     for (const auto& block : function.blocks) {
         for (std::size_t index = 0; index < block.operations.size(); ++index) {
@@ -96,6 +99,7 @@ pass::PassResult CopyPropagationPass::run(ir::Function& function,
 
     const auto& dominators = analyses.dominators();
     for (auto& block : function.blocks) {
+        bool block_changed = false;
         for (std::size_t index = 0; index < block.operations.size(); ++index) {
             auto& operation = block.operations[index];
             const auto rewrite = [&](std::string& value) {
@@ -105,16 +109,24 @@ pass::PassResult CopyPropagationPass::run(ir::Function& function,
                 const bool available = copy.block == block.name
                     ? copy.operation_index < index
                     : dominators.dominates(copy.block, block.name);
-                if (!available) return;
+                if (!available || value == copy.source) return;
                 value = copy.source;
+                block_changed = true;
             };
             for (auto& operand : operation.operands) rewrite(operand);
             for (auto& arguments : operation.successor_arguments)
                 for (auto& argument : arguments) rewrite(argument);
         }
+        if (block_changed) {
+            result.changed = true;
+            result.touch_block(block.name);
+        }
     }
 
-    const auto uses = analysis::build_use_def(function);
+    // This pass consumes use-def after mutating operands. Repair the already
+    // materialized cache locally before using it to decide which copies died.
+    if (!result.touched_blocks.empty()) analyses.repair_use_def(result.touched_blocks);
+    const auto& uses = analyses.use_def();
     for (auto& block : function.blocks) {
         const auto before = block.operations.size();
         block.operations.erase(std::remove_if(block.operations.begin(), block.operations.end(),
@@ -122,17 +134,15 @@ pass::PassResult CopyPropagationPass::run(ir::Function& function,
                 const auto iterator = copies.find(operation.result);
                 if (operation.opcode != "copy" || iterator == copies.end()) return false;
                 const auto use_iterator = uses.use_count.find(operation.result);
-                // Rebuild use-def after rewriting and only erase a copy whose
-                // result is genuinely unused. A rewritten copy can introduce a
-                // new use of an earlier copy source (for example A<-B, C<-A,
-                // use(C)); comparing pre-rewrite replacement counts with the
-                // post-rewrite graph can otherwise delete A while the new use
-                // still references it.
                 return use_iterator == uses.use_count.end() || use_iterator->second == 0;
             }), block.operations.end());
-        result.operations_removed += before - block.operations.size();
+        const auto removed = before - block.operations.size();
+        if (removed != 0) {
+            result.operations_removed += removed;
+            result.changed = true;
+            result.touch_block(block.name);
+        }
     }
-    result.changed = result.operations_removed != 0;
     return result;
 }
 
@@ -145,6 +155,7 @@ pass::PassResult BranchFoldPass::run(ir::Function& function,
     };
 
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
     std::unordered_map<std::string, ConstantDefinition> constants;
     for (const auto& block : function.blocks) {
         for (std::size_t index = 0; index < block.operations.size(); ++index) {
@@ -177,6 +188,7 @@ pass::PassResult BranchFoldPass::run(ir::Function& function,
         terminator.successors = {terminator.successors[selected]};
         terminator.successor_arguments = {terminator.successor_arguments[selected]};
         result.changed = true;
+        result.touch_block(block.name);
         ++result.operations_rewritten;
     }
     return result;
@@ -185,6 +197,7 @@ pass::PassResult BranchFoldPass::run(ir::Function& function,
 pass::PassResult ScalarStackPromotionPass::run(
     ir::Function& function, analysis::FunctionAnalysisManager& analyses) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
 
     // Promote non-escaping scalar entry slots across arbitrary reducible
     // control flow.  Slot liveness determines where block parameters are
@@ -546,6 +559,7 @@ pass::PassResult MemoryForwardingPass::run(ir::Function& function,
     using MemoryState = std::vector<AvailableMemoryValue>;
 
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     const auto& aliases = analyses.aliases();
     const auto& cfg = analyses.cfg();
     const auto& dominators = analyses.dominators();
@@ -719,6 +733,7 @@ pass::PassResult DeadStoreEliminationPass::run(
     ir::Function& function, analysis::FunctionAnalysisManager& analyses) {
     using LocationSet = std::vector<analysis::MemoryLocation>;
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     const auto& aliases = analyses.aliases();
     const auto& cfg = analyses.cfg();
     const auto size_of = [](ir::Type type) -> std::uint32_t {
@@ -875,6 +890,7 @@ pass::PassResult DeadStoreEliminationPass::run(
 pass::PassResult LoopInvariantCodeMotionPass::run(ir::Function& function,
                                                    analysis::FunctionAnalysisManager& analyses) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     const auto loop_info = analyses.loops();
     if (loop_info.loops.empty()) return result;
 
@@ -948,6 +964,7 @@ pass::PassResult LoopInvariantCodeMotionPass::run(ir::Function& function,
 pass::PassResult DeadCodeEliminationPass::run(ir::Function& function,
                                               analysis::FunctionAnalysisManager&) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     struct Location { std::size_t block{}; std::size_t operation{}; };
 
     // SSA dead-code elimination is a reachability problem, not a fixed-point
@@ -1001,10 +1018,12 @@ pass::PassResult DeadCodeEliminationPass::run(ir::Function& function,
         auto& operations = function.blocks[bi].operations;
         std::vector<ir::Operation> retained;
         retained.reserve(operations.size());
+        const auto removed_before = result.operations_removed;
         for (std::size_t oi = 0; oi < operations.size(); ++oi) {
             if (live[bi][oi]) retained.push_back(std::move(operations[oi]));
             else ++result.operations_removed;
         }
+        if (result.operations_removed != removed_before) result.touch_block(function.blocks[bi].name);
         operations = std::move(retained);
     }
     result.changed = result.operations_removed != 0;
@@ -1014,6 +1033,7 @@ pass::PassResult DeadCodeEliminationPass::run(ir::Function& function,
 pass::PassResult IfConversionPass::run(ir::Function& function,
                                         analysis::FunctionAnalysisManager&) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
     if (function.blocks.size() < 4U) return result;
     std::unordered_map<std::string, std::size_t> indices;
     std::unordered_map<std::string, std::size_t> predecessors;
@@ -1102,6 +1122,7 @@ pass::PassResult IfConversionPass::run(ir::Function& function,
 pass::PassResult MergeParameterSimplificationPass::run(
     ir::Function& function, analysis::FunctionAnalysisManager& analyses) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     if (function.blocks.empty()) return result;
 
     const auto& dominators = analyses.dominators();
@@ -1169,6 +1190,7 @@ pass::PassResult MergeParameterSimplificationPass::run(
 pass::PassResult SimplifyCFGPass::run(ir::Function& function,
                                       analysis::FunctionAnalysisManager& analyses) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
     if (function.blocks.empty()) return result;
     const auto reachable = analyses.cfg().reachable;
     const auto before = function.blocks.size();
@@ -1193,6 +1215,7 @@ pass::PassResult AlgebraicSimplificationPass::run(ir::Function& function,
         std::size_t operation_index{};
     };
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     std::unordered_map<std::string, ConstantDefinition> constants;
     std::unordered_map<std::string, ValueDefinition> definitions;
     for (const auto& block : function.blocks) {
@@ -1203,6 +1226,7 @@ pass::PassResult AlgebraicSimplificationPass::run(ir::Function& function,
     }
     const auto& dominators = analyses.dominators();
     for (auto& block : function.blocks) {
+        const auto rewritten_before = result.operations_rewritten;
         for (std::size_t index = 0; index < block.operations.size(); ++index) {
             auto& operation = block.operations[index];
             if (operation.opcode == "const" && operation.operands.size() == 1 && !operation.result.empty()) {
@@ -1339,6 +1363,7 @@ pass::PassResult AlgebraicSimplificationPass::run(ir::Function& function,
                     make_copy(operation.operands[0]);
             }
         }
+        if (result.operations_rewritten != rewritten_before) result.touch_block(block.name);
     }
     return result;
 }
@@ -1354,6 +1379,7 @@ pass::PassResult CommonSubexpressionEliminationPass::run(ir::Function& function,
         std::size_t operation_index{};
     };
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::operations;
     std::vector<Expression> available;
     const auto& dominators = analyses.dominators();
     const auto is_candidate = [](const ir::Operation& operation) {
@@ -1367,6 +1393,7 @@ pass::PassResult CommonSubexpressionEliminationPass::run(ir::Function& function,
         return !operation.result.empty() && pure.contains(operation.opcode);
     };
     for (auto& block : function.blocks) {
+        const auto rewritten_before = result.operations_rewritten;
         for (std::size_t index = 0; index < block.operations.size(); ++index) {
             auto& operation = block.operations[index];
             if (!is_candidate(operation)) continue;
@@ -1408,6 +1435,7 @@ pass::PassResult CommonSubexpressionEliminationPass::run(ir::Function& function,
                                      operation.result, block.name, index});
             }
         }
+        if (result.operations_rewritten != rewritten_before) result.touch_block(block.name);
     }
     return result;
 }
@@ -1423,22 +1451,24 @@ pass::PassResult SparseConditionalConstantPropagationPass::run(
         auto folded = fold.run(function, analyses);
         total += folded;
         changed = changed || folded.changed;
-        if (folded.changed) analyses.invalidate_all();
+        if (folded.changed) analyses.invalidate(
+            analysis::InvalidationScope::operations, folded.touched_blocks);
         BranchFoldPass branch;
         auto branched = branch.run(function, analyses);
         total += branched;
         changed = changed || branched.changed;
-        if (branched.changed) analyses.invalidate_all();
+        if (branched.changed) analyses.invalidate_control_flow(branched.touched_blocks);
         SimplifyCFGPass cfg;
         auto simplified = cfg.run(function, analyses);
         total += simplified;
         changed = changed || simplified.changed;
-        if (simplified.changed) analyses.invalidate_all();
+        if (simplified.changed) analyses.invalidate_control_flow();
         CopyPropagationPass copies;
         auto propagated = copies.run(function, analyses);
         total += propagated;
         changed = changed || propagated.changed;
-        if (propagated.changed) analyses.invalidate_all();
+        if (propagated.changed) analyses.invalidate(
+            analysis::InvalidationScope::operations, propagated.touched_blocks);
     }
     total.changed = total.changed || changed;
     return total;
@@ -1458,17 +1488,23 @@ pass::PassResult ScalarCleanupFixpointPass::run(
 
     for (std::size_t iteration = 0; iteration < max_iterations_; ++iteration) {
         pass::PassResult round;
-        auto run = [&](pass::FunctionPass& pass) {
+        auto run_pass = [&](pass::FunctionPass& pass) {
             auto result = pass.run(function, analyses);
             round += result;
-            if (result.changed) analyses.invalidate_all();
+            if (!result.changed) return;
+            // Honor the pass's mutation contract. SCCP may change control flow,
+            // while the surrounding scalar passes generally mutate operations
+            // only; treating SCCP as operation-only retained stale CFG state.
+            const auto scope = result.invalidation == analysis::InvalidationScope::none
+                ? analysis::InvalidationScope::all : result.invalidation;
+            analyses.invalidate(scope, result.touched_blocks);
         };
-        run(sccp);
-        run(algebraic);
-        run(cse);
-        run(copies);
-        run(dce);
-        run(cfg);
+        run_pass(sccp);
+        run_pass(algebraic);
+        run_pass(cse);
+        run_pass(copies);
+        run_pass(dce);
+        run_pass(cfg);
         total += round;
         if (!round.changed) break;
     }
@@ -1617,6 +1653,7 @@ ir::Operation make_operation(std::string result_name, std::string opcode, ir::Ty
 pass::PassResult ConstantTripLoopUnrollPass::run(
     ir::Function& function, analysis::FunctionAnalysisManager&) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
     if (function.blocks.size() < 4U) return result;
 
     std::unordered_map<std::string, std::size_t> block_index;
@@ -1757,6 +1794,7 @@ pass::PassResult ConstantTripLoopUnrollPass::run(
 pass::PassResult LoopReductionPass::run(ir::Function& function,
                                         analysis::FunctionAnalysisManager&) {
     pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
     const auto match = match_affine_reduction(function);
     if (!match) return result;
 

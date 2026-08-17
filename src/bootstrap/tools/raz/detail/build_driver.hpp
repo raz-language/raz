@@ -612,7 +612,9 @@ int compile_module_worker(const SessionOptions& session) {
 
 std::string native_link_command(const std::vector<std::filesystem::path>& inputs,
                                 const std::filesystem::path& output,
-                                bool shared = false) {
+                                bool shared = false,
+                                const std::vector<std::string>& native_libraries = {},
+                                const std::vector<std::filesystem::path>& native_library_paths = {}) {
   const std::string linker = native_linker();
   std::ostringstream command;
 #if defined(_WIN32)
@@ -620,6 +622,8 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
     command << shell_quote(std::filesystem::path(linker)) << " /nologo ";
     if (shared) command << "/LD ";
     for (const auto& input : inputs) command << shell_quote(input) << ' ';
+    for (const auto& path : native_library_paths) command << "/LIBPATH:" << shell_quote(path) << ' ';
+    for (const auto& library : native_libraries) command << shell_quote(std::filesystem::path(library + ".lib")) << ' ';
 #ifdef RAZ_RUNTIME_LIBRARY_PATH
     command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
 #endif
@@ -643,6 +647,8 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
   command << shell_quote(std::filesystem::path(linker)) << ' ';
   if (shared) command << "-shared ";
   for (const auto& input : inputs) command << shell_quote(input) << ' ';
+  for (const auto& path : native_library_paths) command << "-L" << shell_quote(path) << ' ';
+  for (const auto& library : native_libraries) command << "-l" << shell_quote(std::filesystem::path(library)) << ' ';
 #ifdef RAZ_RUNTIME_LIBRARY_PATH
   command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
 #endif
@@ -1029,6 +1035,19 @@ void collect_native_dependency_artifacts(const ProjectGraph& graph, const Option
     if (std::filesystem::exists(artifact)) inputs.push_back(artifact);
     collect_native_dependency_artifacts(dependency, options, inputs);
   }
+}
+
+void collect_native_link_requirements(const ProjectGraph& graph,
+                                      std::vector<std::string>& libraries,
+                                      std::vector<std::filesystem::path>& library_paths) {
+  for (const auto& dependency : graph.dependencies)
+    collect_native_link_requirements(dependency, libraries, library_paths);
+  for (const auto& path : graph.manifest.native_library_paths)
+    if (std::find(library_paths.begin(), library_paths.end(), path) == library_paths.end())
+      library_paths.push_back(path);
+  for (const auto& library : graph.manifest.native_libraries)
+    if (std::find(libraries.begin(), libraries.end(), library) == libraries.end())
+      libraries.push_back(library);
 }
 
 struct FirFunctionDefinition final {
@@ -1432,8 +1451,12 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
 
   std::vector<std::filesystem::path> link_inputs = objects;
   collect_native_dependency_artifacts(graph, options, link_inputs);
+  std::vector<std::string> native_libraries;
+  std::vector<std::filesystem::path> native_library_paths;
+  collect_native_link_requirements(graph, native_libraries, native_library_paths);
   const std::string command = native_link_command(
-      link_inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library);
+      link_inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library,
+      native_libraries, native_library_paths);
   const auto link_input_state_path = native_root / "link-inputs.state";
   auto link_input_cache = read_link_input_cache(link_input_state_path);
   auto link_hash = hash_text("raz-native-link-v4");

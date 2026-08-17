@@ -40,7 +40,9 @@ Projection overlap is structural: ancestor/descendant paths overlap while
 sibling fields remain independent. Reborrows retain parent-loan provenance and
 must remain within the parent lifetime. The ownership verifier runs before and
 after optimization, preventing transformed MIR from reaching a backend if its
-semantics are no longer valid.
+semantics are no longer valid. CFG-aware ownership analyses share one immutable
+CFG and one loan-last-use table per verification pass so independent legality
+checks do not rebuild identical analysis state.
 
 ## Optimization
 
