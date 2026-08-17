@@ -20,6 +20,8 @@ The host-only `compiler/host-source-order.txt` file supplies deterministic physi
 
 Release qualification constructs the production compiler, rebuilds it with itself, and compares the resulting compiler artifacts. Equivalent inputs must converge to identical output before distribution artifacts are accepted.
 
+Release self-host generations use Forge `-O2` by default so each generated compiler is representative of the optimized production toolchain instead of forcing later generations to run an artificial `-O0` compiler. Debug qualification defaults to `-O0`. The level can be overridden with `tools/bootstrap.py --repro-opt` or the `bootstrap.repro-opt` setting; deterministic comparison is always performed on objects produced with the selected level.
+
 The check is intentionally broader than a compiler unit test: it exercises project loading, parsing, semantic analysis, HIR/MIR, Forge lowering, native object emission, linking, filesystem behavior, and deterministic metadata together.
 
 ## Performance-sensitive implementation

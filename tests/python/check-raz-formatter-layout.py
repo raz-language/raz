@@ -38,6 +38,33 @@ fn process(i64 session, Source& source, HirModule& hir, ForgeWriter& mut name, F
 }
 """
 
+
+MODULE_SOURCE = """// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+
+namespace raz_compiler_driver_cli;
+
+
+public import raz_compiler_driver_project;
+// Human-facing compiler CLI.
+extern fn raz_rt_stdio_is_terminal(i64 stream) -> i64;
+"""
+MODULE_EXPECTED_PREFIX = """// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_cli;
+
+public import raz_compiler_driver_project;
+
+// Human-facing compiler CLI.
+extern fn raz_rt_stdio_is_terminal(i64 stream) -> i64;
+"""
+module_formatted = module.format_text(MODULE_SOURCE)
+if module_formatted != MODULE_EXPECTED_PREFIX:
+    print(module_formatted)
+    raise SystemExit("formatter-layout: FAIL module preamble spacing")
+
 formatted = module.format_text(SOURCE)
 second = module.format_text(formatted)
 if formatted != second:
@@ -45,11 +72,11 @@ if formatted != second:
 checks = {
     "mutable reference": "ForgeWriter&mut name,",
     "multiline signature": "fn process(\n    i64 session,",
-    "trailing parameter comma": "    ForgeWriter&mut aggregate_name,\n) -> bool {",
+    "parameter token preservation": "    ForgeWriter&mut aggregate_name\n) -> bool {",
     "short call compact": "writer_structure_name(name, source, hir, structure);",
     "boolean wrap": "if (\n            raz_compiler_rt_arena_get(hir.struct_field_references, structure) != 0 ||",
     "long call wrap": "raz_compiler_forge_session_add_aggregate_array_i64(\n",
-    "trailing argument comma": "                0,\n            );",
+    "argument token preservation": "                0\n            );",
 }
 for label, needle in checks.items():
     if needle not in formatted:

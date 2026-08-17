@@ -19,8 +19,8 @@ pipeline=(root/'compiler/src/mir/transform/pipeline.rz').read_text(encoding='utf
 live=(root/'compiler/src/mir/analysis/liveness.rz').read_text(encoding='utf-8')
 for needle in ['MirInstructionMap','build_mir_instruction_map','compact_mir_instructions','mir_replace_value_uses','mir_map_target']:
     if needle not in remap: problems.append(f'remap layer missing {needle}')
-if 'mir_replace_value_uses(mir, ip, source)' not in copy: problems.append('copy propagation does not rewrite MIR consumers')
-if 'compact_mir_instructions(mir, keep)' not in dce: problems.append('DCE does not compact through remapping')
+if 'mir_apply_value_replacements(mir, replacements)' not in copy: problems.append('copy propagation does not bulk-rewrite MIR consumers')
+if 'compact_mir_instructions(mir, state)' not in dce: problems.append('DCE does not compact through remapping')
 if 'eliminate_mir_dead_values(mir)' not in pipeline: problems.append('pipeline does not run compacting DCE')
 if 'mir.call_argument_count' not in live: problems.append('liveness does not account for auxiliary call/capture arguments')
 if problems:
@@ -28,6 +28,6 @@ if problems:
     for problem in problems: print(' ',problem)
     sys.exit(1)
 print('mir-remap: PASS')
-print('  value replacement is metadata-safe')
+print('  value replacement is metadata-safe and copy propagation rewrites consumers in one bulk pass')
 print('  DCE compacts instruction-indexed MIR through a total remapping table')
 print('  branch targets, function ranges, register operands, and call/capture values are rewritten')

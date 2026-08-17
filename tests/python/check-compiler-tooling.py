@@ -76,6 +76,32 @@ def main() -> int:
     if source.read_bytes() != before:
         raise RuntimeError('formatter is not idempotent')
 
+    fmt_tree = work / 'fmt-tree'
+    (fmt_tree / 'nested').mkdir(parents=True, exist_ok=True)
+    tree_a = fmt_tree / 'a.rz'
+    tree_b = fmt_tree / 'nested' / 'b.rz'
+    ignored = fmt_tree / 'notes.txt'
+    tree_a.write_text('fn a() -> i64 {\n return 1;   \n}\n', encoding='utf-8')
+    tree_b.write_text('fn b() -> i64 {\n        return 2;\n}\n', encoding='utf-8')
+    ignored.write_text('do not touch\n', encoding='utf-8')
+    run([str(compiler), 'fmt', '--check', str(fmt_tree)], cwd=work, env=env, expect=1)
+    run([str(compiler), 'fmt', str(fmt_tree)], cwd=work, env=env)
+    run([str(compiler), 'fmt', '--check', str(fmt_tree)], cwd=work, env=env)
+    if tree_a.read_text(encoding='utf-8') != 'fn a() -> i64 {\n    return 1;\n}\n':
+        raise RuntimeError('directory formatter did not format root .rz file')
+    if tree_b.read_text(encoding='utf-8') != 'fn b() -> i64 {\n    return 2;\n}\n':
+        raise RuntimeError('directory formatter did not format nested .rz file')
+    if ignored.read_text(encoding='utf-8') != 'do not touch\n':
+        raise RuntimeError('directory formatter modified a non-Raz file')
+
+    current_dir_source = fmt_tree / 'current.rz'
+    current_dir_source.write_text('fn current() -> i64 {\n return 3;\n}\n', encoding='utf-8')
+    run([str(compiler), 'fmt', '--check'], cwd=fmt_tree, env=env, expect=1)
+    run([str(compiler), 'fmt'], cwd=fmt_tree, env=env)
+    run([str(compiler), 'fmt', '--check'], cwd=fmt_tree, env=env)
+    if current_dir_source.read_text(encoding='utf-8') != 'fn current() -> i64 {\n    return 3;\n}\n':
+        raise RuntimeError('formatter without a path did not format the current directory')
+
     passing = work / 'tests-pass.rz'
     passing.write_text('fn test_zero() -> i64 { return 0; }\nfn test_math() -> i64 { if (2 + 2 == 4) { return 0; } return 1; }\nfn main() -> i64 { return 99; }\n', encoding='utf-8')
     run([str(compiler), 'test', str(passing)], cwd=work, env=env)

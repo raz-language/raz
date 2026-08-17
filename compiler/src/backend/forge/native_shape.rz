@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_backend_forge_native_shape;
+
 public import raz_compiler_backend_forge_tls_codegen;
+
 // Forge native MIR aggregate-shape discovery. Kept before the main native
 // code generator so recursive compiler parsing sees these helpers before use.
 // Resolve the aggregate shape carried by a MIR value in one recursive walk.
@@ -10,326 +12,332 @@ public import raz_compiler_backend_forge_tls_codegen;
 // between structure and array discovery, which is important for recursive
 // compiler stages where function bodies are resolved in declaration order.
 fn forge_native_hir_local_index(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
-  if (function_index < 0 || function_index >= hir.function_count || local_slot < 0) {
-    return -1;
-  }
-
-  i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
-
-  if (local_slot >= declared_count) {
-    return -1;
-  }
-
-  i64 cursor = raz_compiler_rt_arena_get(hir.function_local_starts, function_index);
-
-  while (cursor < hir.local_count) {
-    if (
-    raz_compiler_rt_arena_get(hir.local_function_indices, cursor) == function_index &&
-    raz_compiler_rt_arena_get(hir.local_slots, cursor) == local_slot
-    ) {
-      return cursor;
+    if (function_index < 0 || function_index >= hir.function_count || local_slot < 0) {
+        return -1;
     }
-    cursor += 1;
-  }
-  return -1;
+
+    i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
+
+    if (local_slot >= declared_count) {
+        return -1;
+    }
+
+    i64 cursor = raz_compiler_rt_arena_get(hir.function_local_starts, function_index);
+
+    while (cursor < hir.local_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.local_function_indices, cursor) == function_index &&
+            raz_compiler_rt_arena_get(hir.local_slots, cursor) == local_slot
+        ) {
+            return cursor;
+        }
+        cursor += 1;
+    }
+    return -1;
 }
 
 fn forge_native_constant_index(MirModule& mir, i64 value) -> i64 {
-  if (value < 0 || value >= mir.instruction_count || raz_compiler_rt_arena_get(mir.opcodes, value) != 1) {
-    return -1;
-  }
-  return raz_compiler_rt_arena_get(mir.op_a, value);
+    if (value < 0 || value >= mir.instruction_count || raz_compiler_rt_arena_get(mir.opcodes, value) != 1) {
+        return -1;
+    }
+    return raz_compiler_rt_arena_get(mir.op_a, value);
 }
 
 fn forge_native_register_aggregate_info(
-HirModule& hir,
-MirModule& mir,
-i64 function_index,
-i64 value,
-i64 depth,
-i64&mut kind,
-i64&mut extent,
-i64&mut element_type,
-i64&mut element_structure,
-i64&mut structure,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 value,
+    i64 depth,
+    i64&mut kind,
+    i64&mut extent,
+    i64&mut element_type,
+    i64&mut element_structure,
+    i64&mut structure,
 ) -> bool {
-  *kind = 0;
-  *extent = -1;
-  *element_type = -1;
-  *element_structure = -1;
-  *structure = -1;
-  if (value < 0 || value >= mir.instruction_count || depth > 32) {
-    return false;
-  }
-
-  i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, value);
-
-  if (opcode == 30) {
-    i64 aggregate_kind = raz_compiler_rt_arena_get(mir.op_b, value);
-
-    if (aggregate_kind == 1) {
-      *kind = 1;
-      *structure = raz_compiler_rt_arena_get(mir.op_c, value);
-      return *structure >= 0;
-    }
-    if (aggregate_kind == 2) {
-      *kind = 2;
-      *extent = raz_compiler_rt_arena_get(mir.op_a, value);
-      *element_structure = raz_compiler_rt_arena_get(mir.op_c, value);
-      *element_type = raz_compiler_rt_arena_get(mir.op_d, value);
-      return *extent >= 0;
-    }
-  }
-  if (opcode == 3) {
-    // Preserve aggregate identity across MIR local loads. Structured Forge
-    // stores aggregate locals as native stack images, so loading the local
-    // yields a pointer whose structure/array shape is still known from HIR.
-
-    i64 local_slot = raz_compiler_rt_arena_get(mir.op_a, value);
-    i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
-
-    if (local_slot >= 0 && local_slot < declared_count) {
-      i64 local_index = forge_native_hir_local_index(hir, function_index, local_slot);
-
-      if (local_index < 0) {
+    *kind = 0;
+    *extent = -1;
+    *element_type = -1;
+    *element_structure = -1;
+    *structure = -1;
+    if (value < 0 || value >= mir.instruction_count || depth > 32) {
         return false;
-      }
+    }
 
-      i64 local_extent = raz_compiler_rt_arena_get(hir.local_array_extents, local_index);
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, value);
 
-      if (local_extent >= 0) {
-        *kind = 2;
-        *extent = local_extent;
-        *element_type = raz_compiler_rt_arena_get(hir.local_types, local_index);
-        *element_structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
-        return true;
-      }
-      if (raz_compiler_rt_arena_get(hir.local_slices, local_index) == 0) {
-        i64 local_structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+    if (opcode == 30) {
+        i64 aggregate_kind = raz_compiler_rt_arena_get(mir.op_b, value);
 
-        if (local_structure >= 0) {
-          *kind = 1;
-          *structure = local_structure;
-          return true;
-        }
-      }
-    } else if (local_slot >= declared_count) {
-      i64 parameter = local_slot - declared_count;
-      i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
-      i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
-
-      if (parameter >= 0 && parameter < parameter_count) {
-        i64 parameter_index = parameter_start + parameter;
-        i64 parameter_extent = raz_compiler_rt_arena_get(hir.parameter_array_extents, parameter_index);
-
-        if (parameter_extent >= 0) {
-          *kind = 2;
-          *extent = parameter_extent;
-          *element_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_index);
-          *element_structure = raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter_index);
-          return true;
-        }
-        if (raz_compiler_rt_arena_get(hir.parameter_slices, parameter_index) == 0) {
-          i64 parameter_structure = raz_compiler_rt_arena_get(
-          hir.parameter_type_structs,
-          parameter_index,
-          );
-          if (parameter_structure >= 0) {
+        if (aggregate_kind == 1) {
             *kind = 1;
-            *structure = parameter_structure;
+            *structure = raz_compiler_rt_arena_get(mir.op_c, value);
+            return *structure >= 0;
+        }
+        if (aggregate_kind == 2) {
+            *kind = 2;
+            *extent = raz_compiler_rt_arena_get(mir.op_a, value);
+            *element_structure = raz_compiler_rt_arena_get(mir.op_c, value);
+            *element_type = raz_compiler_rt_arena_get(mir.op_d, value);
+            return *extent >= 0;
+        }
+    }
+    if (opcode == 3) {
+        // Preserve aggregate identity across MIR local loads. Structured Forge
+        // stores aggregate locals as native stack images, so loading the local
+        // yields a pointer whose structure/array shape is still known from HIR.
+
+        i64 local_slot = raz_compiler_rt_arena_get(mir.op_a, value);
+        i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
+
+        if (local_slot >= 0 && local_slot < declared_count) {
+            i64 local_index = forge_native_hir_local_index(hir, function_index, local_slot);
+
+            if (local_index < 0) {
+                return false;
+            }
+
+            i64 local_extent = raz_compiler_rt_arena_get(hir.local_array_extents, local_index);
+
+            if (local_extent >= 0) {
+                *kind = 2;
+                *extent = local_extent;
+                *element_type = raz_compiler_rt_arena_get(hir.local_types, local_index);
+                *element_structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+                return true;
+            }
+            if (raz_compiler_rt_arena_get(hir.local_slices, local_index) == 0) {
+                i64 local_structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+
+                if (local_structure >= 0) {
+                    *kind = 1;
+                    *structure = local_structure;
+                    return true;
+                }
+            }
+        } else if (local_slot >= declared_count) {
+            i64 parameter = local_slot - declared_count;
+            i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+            i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+
+            if (parameter >= 0 && parameter < parameter_count) {
+                i64 parameter_index = parameter_start + parameter;
+
+                i64 parameter_extent = raz_compiler_rt_arena_get(
+                    hir.parameter_array_extents,
+                    parameter_index
+                );
+                if (parameter_extent >= 0) {
+                    *kind = 2;
+                    *extent = parameter_extent;
+                    *element_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_index);
+                    *element_structure = raz_compiler_rt_arena_get(
+                        hir.parameter_type_structs,
+                        parameter_index
+                    );
+                    return true;
+                }
+                if (raz_compiler_rt_arena_get(hir.parameter_slices, parameter_index) == 0) {
+                    i64 parameter_structure = raz_compiler_rt_arena_get(
+                        hir.parameter_type_structs,
+                        parameter_index,
+                    );
+                    if (parameter_structure >= 0) {
+                        *kind = 1;
+                        *structure = parameter_structure;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if (opcode == 2) {
+        i64 parameter = raz_compiler_rt_arena_get(mir.op_a, value);
+        i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+        i64 count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+
+        if (parameter >= 0 && parameter < count) {
+            i64 parameter_index = start + parameter;
+            i64 parameter_extent = raz_compiler_rt_arena_get(hir.parameter_array_extents, parameter_index);
+
+            if (parameter_extent >= 0) {
+                *kind = 2;
+                *extent = parameter_extent;
+                *element_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_index);
+                *element_structure = raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter_index);
+                return true;
+            }
+            if (raz_compiler_rt_arena_get(hir.parameter_slices, parameter_index) == 0) {
+                i64 parameter_structure = raz_compiler_rt_arena_get(
+                    hir.parameter_type_structs,
+                    parameter_index,
+                );
+                if (parameter_structure >= 0) {
+                    *kind = 1;
+                    *structure = parameter_structure;
+                    return true;
+                }
+            }
+        }
+    }
+    if (opcode == 8) {
+        i64 target = raz_compiler_rt_arena_get(mir.op_a, value);
+
+        if (
+            target >= 0 &&
+            target < hir.function_count &&
+            raz_compiler_rt_arena_get(hir.function_return_slices, target) == 0
+        ) {
+            i64 return_structure = raz_compiler_rt_arena_get(hir.function_return_type_structs, target);
+
+            if (return_structure >= 0) {
+                *kind = 1;
+                *structure = return_structure;
+                return true;
+            }
+        }
+    }
+    if (opcode == 26) {
+        i64 raw_structure = raz_compiler_rt_arena_get(mir.op_b, value);
+        i64 raw_extent = raz_compiler_rt_arena_get(mir.op_c, value);
+
+        if (raw_structure >= 0) {
+            *kind = 1;
+            *structure = raw_structure;
             return true;
-          }
         }
-      }
-    }
-  }
-  if (opcode == 2) {
-    i64 parameter = raz_compiler_rt_arena_get(mir.op_a, value);
-    i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
-    i64 count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
-
-    if (parameter >= 0 && parameter < count) {
-      i64 parameter_index = start + parameter;
-      i64 parameter_extent = raz_compiler_rt_arena_get(hir.parameter_array_extents, parameter_index);
-
-      if (parameter_extent >= 0) {
-        *kind = 2;
-        *extent = parameter_extent;
-        *element_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_index);
-        *element_structure = raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter_index);
-        return true;
-      }
-      if (raz_compiler_rt_arena_get(hir.parameter_slices, parameter_index) == 0) {
-        i64 parameter_structure = raz_compiler_rt_arena_get(
-        hir.parameter_type_structs,
-        parameter_index,
-        );
-        if (parameter_structure >= 0) {
-          *kind = 1;
-          *structure = parameter_structure;
-          return true;
+        if (raw_extent >= 0) {
+            *kind = 2;
+            *extent = raw_extent;
+            *element_type = raz_compiler_rt_arena_get(mir.op_types, value);
+            *element_structure = raw_structure;
+            return true;
         }
-      }
     }
-  }
-  if (opcode == 8) {
-    i64 target = raz_compiler_rt_arena_get(mir.op_a, value);
+    if (opcode == 28) {
+        i64 base = raz_compiler_rt_arena_get(mir.op_a, value);
+        i64 index = forge_native_constant_index(mir, raz_compiler_rt_arena_get(mir.op_b, value));
+        i64 parent_kind = 0;
+        i64 parent_extent = -1;
+        i64 parent_element_type = -1;
+        i64 parent_element_structure = -1;
+        i64 parent_structure = -1;
 
-    if (
-    target >= 0 &&
-    target < hir.function_count &&
-    raz_compiler_rt_arena_get(hir.function_return_slices, target) == 0
-    ) {
-      i64 return_structure = raz_compiler_rt_arena_get(hir.function_return_type_structs, target);
-
-      if (return_structure >= 0) {
-        *kind = 1;
-        *structure = return_structure;
-        return true;
-      }
-    }
-  }
-  if (opcode == 26) {
-    i64 raw_structure = raz_compiler_rt_arena_get(mir.op_b, value);
-    i64 raw_extent = raz_compiler_rt_arena_get(mir.op_c, value);
-
-    if (raw_structure >= 0) {
-      *kind = 1;
-      *structure = raw_structure;
-      return true;
-    }
-    if (raw_extent >= 0) {
-      *kind = 2;
-      *extent = raw_extent;
-      *element_type = raz_compiler_rt_arena_get(mir.op_types, value);
-      *element_structure = raw_structure;
-      return true;
-    }
-  }
-  if (opcode == 28) {
-    i64 base = raz_compiler_rt_arena_get(mir.op_a, value);
-    i64 index = forge_native_constant_index(mir, raz_compiler_rt_arena_get(mir.op_b, value));
-    i64 parent_kind = 0;
-    i64 parent_extent = -1;
-    i64 parent_element_type = -1;
-    i64 parent_element_structure = -1;
-    i64 parent_structure = -1;
-
-    if (
-    !forge_native_register_aggregate_info(
-    hir,
-    mir,
-    function_index,
-    base,
-    depth + 1,
-    &mut parent_kind,
-    &mut parent_extent,
-    &mut parent_element_type,
-    &mut parent_element_structure,
-    &mut parent_structure,
-    )
-    ) {
-      return false;
-    }
-    if (
-    parent_kind == 1 &&
-    parent_structure >= 0 &&
-    index >= 0 &&
-    index < raz_compiler_rt_arena_get(hir.struct_field_counts, parent_structure)
-    ) {
-      i64 metadata = raz_compiler_rt_arena_get(hir.struct_field_starts, parent_structure) + index;
-      i64 field_extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
-
-      if (field_extent >= 0) {
-        *kind = 2;
-        *extent = field_extent;
-        *element_type = raz_compiler_rt_arena_get(hir.struct_field_types, metadata);
-        *element_structure = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
-        return true;
-      }
-      if (
-      raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0 &&
-      raz_compiler_rt_arena_get(hir.struct_field_slices, metadata) == 0
-      ) {
-        i64 field_structure = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
-
-        if (field_structure >= 0) {
-          *kind = 1;
-          *structure = field_structure;
-          return true;
+        if (
+            !forge_native_register_aggregate_info(
+                hir,
+                mir,
+                function_index,
+                base,
+                depth + 1,
+                &mut parent_kind,
+                &mut parent_extent,
+                &mut parent_element_type,
+                &mut parent_element_structure,
+                &mut parent_structure,
+            )
+        ) {
+            return false;
         }
-      }
+        if (
+            parent_kind == 1 &&
+            parent_structure >= 0 &&
+            index >= 0 &&
+            index < raz_compiler_rt_arena_get(hir.struct_field_counts, parent_structure)
+        ) {
+            i64 metadata = raz_compiler_rt_arena_get(hir.struct_field_starts, parent_structure) + index;
+            i64 field_extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+
+            if (field_extent >= 0) {
+                *kind = 2;
+                *extent = field_extent;
+                *element_type = raz_compiler_rt_arena_get(hir.struct_field_types, metadata);
+                *element_structure = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+                return true;
+            }
+            if (
+                raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0 &&
+                raz_compiler_rt_arena_get(hir.struct_field_slices, metadata) == 0
+            ) {
+                i64 field_structure = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+
+                if (field_structure >= 0) {
+                    *kind = 1;
+                    *structure = field_structure;
+                    return true;
+                }
+            }
+        }
+        if (parent_kind == 2 && parent_element_structure >= 0) {
+            *kind = 1;
+            *structure = parent_element_structure;
+            return true;
+        }
     }
-    if (parent_kind == 2 && parent_element_structure >= 0) {
-      *kind = 1;
-      *structure = parent_element_structure;
-      return true;
-    }
-  }
-  return false;
+    return false;
 }
 
 fn forge_native_register_structure_id(
-HirModule& hir,
-MirModule& mir,
-i64 function_index,
-i64 value,
-i64 depth,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 value,
+    i64 depth,
 ) -> i64 {
-  i64 kind = 0;
-  i64 extent = -1;
-  i64 element_type = -1;
-  i64 element_structure = -1;
-  i64 structure = -1;
+    i64 kind = 0;
+    i64 extent = -1;
+    i64 element_type = -1;
+    i64 element_structure = -1;
+    i64 structure = -1;
 
-  if (
-  forge_native_register_aggregate_info(
-  hir,
-  mir,
-  function_index,
-  value,
-  depth,
-  &mut kind,
-  &mut extent,
-  &mut element_type,
-  &mut element_structure,
-  &mut structure,
-  ) &&
-  kind == 1
-  ) {
-    return structure;
-  }
-  return -1;
+    if (
+        forge_native_register_aggregate_info(
+            hir,
+            mir,
+            function_index,
+            value,
+            depth,
+            &mut kind,
+            &mut extent,
+            &mut element_type,
+            &mut element_structure,
+            &mut structure,
+        ) &&
+        kind == 1
+    ) {
+        return structure;
+    }
+    return -1;
 }
 
 fn forge_native_register_array_info(
-HirModule& hir,
-MirModule& mir,
-i64 function_index,
-i64 value,
-i64 depth,
-i64&mut extent,
-i64&mut element_type,
-i64&mut element_structure,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 value,
+    i64 depth,
+    i64&mut extent,
+    i64&mut element_type,
+    i64&mut element_structure,
 ) -> bool {
-  i64 kind = 0;
-  i64 structure = -1;
+    i64 kind = 0;
+    i64 structure = -1;
 
-  if (
-  !forge_native_register_aggregate_info(
-  hir,
-  mir,
-  function_index,
-  value,
-  depth,
-  &mut kind,
-  extent,
-  element_type,
-  element_structure,
-  &mut structure,
-  )
-  ) {
-    return false;
-  }
-  return kind == 2;
+    if (
+        !forge_native_register_aggregate_info(
+            hir,
+            mir,
+            function_index,
+            value,
+            depth,
+            &mut kind,
+            extent,
+            element_type,
+            element_structure,
+            &mut structure,
+        )
+    ) {
+        return false;
+    }
+    return kind == 2;
 }

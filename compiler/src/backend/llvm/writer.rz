@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_backend_llvm_writer;
+
 public import raz_compiler_backend_forge_codegen;
+
 // Shared LLVM textual-IR writer and ABI helpers.
 // Kept ahead of globals/function emission so the compiler dependency graph is acyclic.
 // LLVM textual IR backend, implemented entirely in Raz.
@@ -10,834 +12,834 @@ public import raz_compiler_backend_forge_codegen;
 // async frame/state-machine path are lowered here in Raz. Backend capability
 // gaps fail explicitly rather than falling back to Forge or changing semantics.
 fn llvm_chars(ForgeWriter&mut out, i64[]data, i64 length) {
-  i64 i = 0;
+    i64 i = 0;
 
-  while (i < length) {
-    writer_put(out, data[i]);
-    i += 1;
-  }
+    while (i < length) {
+        writer_put(out, data[i]);
+        i += 1;
+    }
 }
 
 fn llvm_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 function_index) {
-  i64 offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
-  i64 length = raz_compiler_rt_arena_get(hir.function_name_lengths, function_index);
+    i64 offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
+    i64 length = raz_compiler_rt_arena_get(hir.function_name_lengths, function_index);
 
-  if (
-  length == 4 &&
-  source_byte(source, offset) == 109 &&
-  source_byte(source, offset + 1) == 97 &&
-  source_byte(source, offset + 2) == 105 &&
-  source_byte(source, offset + 3) == 110
-  ) {
-    // LLVM needs a C ABI entry wrapper named `main`; keep Raz's language
-    // main distinct so the wrapper can normalize its return width.
+    if (
+        length == 4 &&
+        source_byte(source, offset) == 109 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 105 &&
+        source_byte(source, offset + 3) == 110
+    ) {
+        // LLVM needs a C ABI entry wrapper named `main`; keep Raz's language
+        // main distinct so the wrapper can normalize its return width.
 
-    i64 raz_main[11] = [64, 95, 95, 114, 97, 122, 95, 109, 97, 105, 110];
+        i64 raz_main[11] = [64, 95, 95, 114, 97, 122, 95, 109, 97, 105, 110];
 
-    llvm_chars(out, &raz_main, 11);
-    return;
-  }
-  writer_function_name(out, source, hir, function_index);
+        llvm_chars(out, &raz_main, 11);
+        return;
+    }
+    writer_function_name(out, source, hir, function_index);
 }
 
 fn llvm_type(ForgeWriter&mut out, i64 type_kind) {
-  if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
-    i64 ptr[3] = [112, 116, 114];
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        i64 ptr[3] = [112, 116, 114];
 
-    llvm_chars(out, &ptr, 3);
-    return;
-  }
-  if (type_kind == 1) {
-    i64 word[6] = [100, 111, 117, 98, 108, 101];
+        llvm_chars(out, &ptr, 3);
+        return;
+    }
+    if (type_kind == 1) {
+        i64 word[6] = [100, 111, 117, 98, 108, 101];
 
-    llvm_chars(out, &word, 6);
-    return;
-  }
-  if (type_kind == 11) {
-    i64 word[5] = [102, 108, 111, 97, 116];
+        llvm_chars(out, &word, 6);
+        return;
+    }
+    if (type_kind == 11) {
+        i64 word[5] = [102, 108, 111, 97, 116];
 
-    llvm_chars(out, &word, 5);
-    return;
-  }
+        llvm_chars(out, &word, 5);
+        return;
+    }
 
-  i64 width = primitive_type_width(type_kind);
+    i64 width = primitive_type_width(type_kind);
 
-  writer_put(out, 105);
-  if (width == 8) {
-    writer_put(out, 56);
-  } else if (width == 16) {
-    writer_put(out, 49);
-    writer_put(out, 54);
-  } else if (width == 32) {
-    writer_put(out, 51);
-    writer_put(out, 50);
-  } else {
-    writer_put(out, 54);
-    writer_put(out, 52);
-  }
+    writer_put(out, 105);
+    if (width == 8) {
+        writer_put(out, 56);
+    } else if (width == 16) {
+        writer_put(out, 49);
+        writer_put(out, 54);
+    } else if (width == 32) {
+        writer_put(out, 51);
+        writer_put(out, 50);
+    } else {
+        writer_put(out, 54);
+        writer_put(out, 52);
+    }
 }
 
 fn llvm_value(ForgeWriter&mut out, i64 instruction) {
-  writer_put(out, 37);
-  writer_put(out, 114);
-  writer_decimal(out, instruction);
+    writer_put(out, 37);
+    writer_put(out, 114);
+    writer_decimal(out, instruction);
 }
 
 fn llvm_parameter(ForgeWriter&mut out, i64 parameter) {
-  writer_put(out, 37);
-  writer_put(out, 112);
-  writer_decimal(out, parameter);
+    writer_put(out, 37);
+    writer_put(out, 112);
+    writer_decimal(out, parameter);
 }
 
 fn llvm_emit_assignment(ForgeWriter&mut out, i64 instruction) {
-  writer_space(out);
-  writer_space(out);
-  llvm_value(out, instruction);
-  writer_space(out);
-  writer_put(out, 61);
-  writer_space(out);
-}
-
-fn llvm_function_return_type(ForgeWriter&mut out, HirModule& hir, i64 function_index) {
-  if (raz_compiler_rt_arena_get(hir.function_returns_value, function_index) == 0) {
-    i64 word[4] = [118, 111, 105, 100];
-
-    llvm_chars(out, &word, 4);
-  } else if (raz_compiler_rt_arena_get(hir.function_return_function_types, function_index) >= 0) {
-    i64 word[3] = [112, 116, 114];
-
-    llvm_chars(out, &word, 3);
-  } else if (
-  raz_compiler_rt_arena_get(hir.function_return_references, function_index) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index) >= 0
-  ) {
-    writer_i64(out);
-  } else {
-    llvm_type(out, raz_compiler_rt_arena_get(hir.function_return_types, function_index));
-  }
-}
-
-fn llvm_parameter_type(ForgeWriter&mut out, HirModule& hir, i64 function_index, i64 parameter) {
-  i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
-  i64 index = start + parameter;
-
-  if (raz_compiler_rt_arena_get(hir.parameter_function_types, index) >= 0) {
-    i64 word[3] = [112, 116, 114];
-
-    llvm_chars(out, &word, 3);
-  } else if (
-  raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
-  raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
-  raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
-  raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
-  ) {
-    writer_i64(out);
-  } else {
-    llvm_type(out, raz_compiler_rt_arena_get(hir.parameter_types, index));
-  }
-}
-
-fn llvm_emit_binary_opcode(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
-  bool floating = primitive_type_is_float(type_kind);
-
-  if (opcode == 4) {
-    if (floating) {
-      i64 word[4] = [102, 97, 100, 100];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[3] = [97, 100, 100];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 5) {
-    if (floating) {
-      i64 word[4] = [102, 115, 117, 98];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[3] = [115, 117, 98];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 6) {
-    if (floating) {
-      i64 word[4] = [102, 109, 117, 108];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[3] = [109, 117, 108];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 7) {
-    if (floating) {
-      i64 word[4] = [102, 100, 105, 118];
-
-      llvm_chars(out, &word, 4);
-    } else if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[4] = [117, 100, 105, 118];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[4] = [115, 100, 105, 118];
-
-      llvm_chars(out, &word, 4);
-    }
-  } else if (opcode == 34) {
-    if (floating) {
-      i64 word[4] = [102, 114, 101, 109];
-
-      llvm_chars(out, &word, 4);
-    } else if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[4] = [117, 114, 101, 109];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[4] = [115, 114, 101, 109];
-
-      llvm_chars(out, &word, 4);
-    }
-  } else if (floating) {
-    return false;
-  } else if (opcode == 35) {
-    i64 word[3] = [97, 110, 100];
-
-    llvm_chars(out, &word, 3);
-  } else if (opcode == 36) {
-    i64 word[2] = [111, 114];
-
-    llvm_chars(out, &word, 2);
-  } else if (opcode == 37) {
-    i64 word[3] = [120, 111, 114];
-
-    llvm_chars(out, &word, 3);
-  } else if (opcode == 38) {
-    i64 word[3] = [115, 104, 108];
-
-    llvm_chars(out, &word, 3);
-  } else if (opcode == 39) {
-    if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[4] = [108, 115, 104, 114];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[4] = [97, 115, 104, 114];
-
-      llvm_chars(out, &word, 4);
-    }
-  } else {
-    return false;
-  }
-  return true;
-}
-
-fn llvm_emit_compare_predicate(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
-  if (primitive_type_is_float(type_kind)) {
-    if (opcode == 11) {
-      i64 word[3] = [111, 101, 113];
-
-      llvm_chars(out, &word, 3);
-    } else if (opcode == 12) {
-      i64 word[3] = [111, 110, 101];
-
-      llvm_chars(out, &word, 3);
-    } else if (opcode == 13) {
-      i64 word[3] = [111, 108, 116];
-
-      llvm_chars(out, &word, 3);
-    } else if (opcode == 14) {
-      i64 word[3] = [111, 108, 101];
-
-      llvm_chars(out, &word, 3);
-    } else if (opcode == 15) {
-      i64 word[3] = [111, 103, 116];
-
-      llvm_chars(out, &word, 3);
-    } else if (opcode == 16) {
-      i64 word[3] = [111, 103, 101];
-
-      llvm_chars(out, &word, 3);
-    } else {
-      return false;
-    }
-    return true;
-  }
-  if (opcode == 11) {
-    i64 word[2] = [101, 113];
-
-    llvm_chars(out, &word, 2);
-  } else if (opcode == 12) {
-    i64 word[2] = [110, 101];
-
-    llvm_chars(out, &word, 2);
-  } else if (opcode == 13) {
-    if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[3] = [117, 108, 116];
-
-      llvm_chars(out, &word, 3);
-    } else {
-      i64 word[3] = [115, 108, 116];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 14) {
-    if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[3] = [117, 108, 101];
-
-      llvm_chars(out, &word, 3);
-    } else {
-      i64 word[3] = [115, 108, 101];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 15) {
-    if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[3] = [117, 103, 116];
-
-      llvm_chars(out, &word, 3);
-    } else {
-      i64 word[3] = [115, 103, 116];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else if (opcode == 16) {
-    if (primitive_type_is_unsigned(type_kind)) {
-      i64 word[3] = [117, 103, 101];
-
-      llvm_chars(out, &word, 3);
-    } else {
-      i64 word[3] = [115, 103, 101];
-
-      llvm_chars(out, &word, 3);
-    }
-  } else {
-    return false;
-  }
-  return true;
-}
-
-fn llvm_temp(ForgeWriter&mut out, i64 category, i64 instruction) {
-  writer_put(out, 37);
-  writer_put(out, 116);
-  writer_decimal(out, category);
-  writer_put(out, 95);
-  writer_decimal(out, instruction);
-}
-
-fn llvm_local(ForgeWriter&mut out, i64 slot) {
-  writer_put(out, 37);
-  writer_put(out, 108);
-  writer_decimal(out, slot);
-}
-
-fn llvm_block(ForgeWriter&mut out, i64 instruction) {
-  writer_put(out, 98);
-  writer_put(out, 98);
-  writer_decimal(out, instruction);
-}
-
-fn llvm_value_result_type(MirModule& mir, i64 instruction) -> i64 {
-  if (instruction < 0 || instruction >= mir.instruction_count) {
-    return 0;
-  }
-
-  i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
-
-  if (opcode >= 11 && opcode <= 16) {
-    return 0;
-  }
-  return raz_compiler_rt_arena_get(mir.op_types, instruction);
-}
-
-fn llvm_emit_raw_to_value(
-ForgeWriter&mut out,
-i64 instruction,
-i64 raw_category,
-i64 raw_instruction,
-i64 type_kind,
-) {
-  if (type_kind == 11) {
     writer_space(out);
     writer_space(out);
-    llvm_temp(out, 22, instruction);
+    llvm_value(out, instruction);
     writer_space(out);
     writer_put(out, 61);
     writer_space(out);
+}
 
-    i64 truncword[5] = [116, 114, 117, 110, 99];
+fn llvm_function_return_type(ForgeWriter&mut out, HirModule& hir, i64 function_index) {
+    if (raz_compiler_rt_arena_get(hir.function_returns_value, function_index) == 0) {
+        i64 word[4] = [118, 111, 105, 100];
 
-    llvm_chars(out, &truncword, 5);
-    writer_space(out);
-    writer_i64(out);
-    writer_space(out);
-    llvm_temp(out, raw_category, raw_instruction);
+        llvm_chars(out, &word, 4);
+    } else if (raz_compiler_rt_arena_get(hir.function_return_function_types, function_index) >= 0) {
+        i64 word[3] = [112, 116, 114];
 
-    i64 toi32[7] = [32, 116, 111, 32, 105, 51, 50];
+        llvm_chars(out, &word, 3);
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_return_references, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_return_types, function_index));
+    }
+}
 
-    llvm_chars(out, &toi32, 7);
-    writer_newline(out);
+fn llvm_parameter_type(ForgeWriter&mut out, HirModule& hir, i64 function_index, i64 parameter) {
+    i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 index = start + parameter;
+
+    if (raz_compiler_rt_arena_get(hir.parameter_function_types, index) >= 0) {
+        i64 word[3] = [112, 116, 114];
+
+        llvm_chars(out, &word, 3);
+    } else if (
+        raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.parameter_types, index));
+    }
+}
+
+fn llvm_emit_binary_opcode(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    bool floating = primitive_type_is_float(type_kind);
+
+    if (opcode == 4) {
+        if (floating) {
+            i64 word[4] = [102, 97, 100, 100];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[3] = [97, 100, 100];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 5) {
+        if (floating) {
+            i64 word[4] = [102, 115, 117, 98];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[3] = [115, 117, 98];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 6) {
+        if (floating) {
+            i64 word[4] = [102, 109, 117, 108];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[3] = [109, 117, 108];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 7) {
+        if (floating) {
+            i64 word[4] = [102, 100, 105, 118];
+
+            llvm_chars(out, &word, 4);
+        } else if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[4] = [117, 100, 105, 118];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[4] = [115, 100, 105, 118];
+
+            llvm_chars(out, &word, 4);
+        }
+    } else if (opcode == 34) {
+        if (floating) {
+            i64 word[4] = [102, 114, 101, 109];
+
+            llvm_chars(out, &word, 4);
+        } else if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[4] = [117, 114, 101, 109];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[4] = [115, 114, 101, 109];
+
+            llvm_chars(out, &word, 4);
+        }
+    } else if (floating) {
+        return false;
+    } else if (opcode == 35) {
+        i64 word[3] = [97, 110, 100];
+
+        llvm_chars(out, &word, 3);
+    } else if (opcode == 36) {
+        i64 word[2] = [111, 114];
+
+        llvm_chars(out, &word, 2);
+    } else if (opcode == 37) {
+        i64 word[3] = [120, 111, 114];
+
+        llvm_chars(out, &word, 3);
+    } else if (opcode == 38) {
+        i64 word[3] = [115, 104, 108];
+
+        llvm_chars(out, &word, 3);
+    } else if (opcode == 39) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[4] = [108, 115, 104, 114];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[4] = [97, 115, 104, 114];
+
+            llvm_chars(out, &word, 4);
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn llvm_emit_compare_predicate(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    if (primitive_type_is_float(type_kind)) {
+        if (opcode == 11) {
+            i64 word[3] = [111, 101, 113];
+
+            llvm_chars(out, &word, 3);
+        } else if (opcode == 12) {
+            i64 word[3] = [111, 110, 101];
+
+            llvm_chars(out, &word, 3);
+        } else if (opcode == 13) {
+            i64 word[3] = [111, 108, 116];
+
+            llvm_chars(out, &word, 3);
+        } else if (opcode == 14) {
+            i64 word[3] = [111, 108, 101];
+
+            llvm_chars(out, &word, 3);
+        } else if (opcode == 15) {
+            i64 word[3] = [111, 103, 116];
+
+            llvm_chars(out, &word, 3);
+        } else if (opcode == 16) {
+            i64 word[3] = [111, 103, 101];
+
+            llvm_chars(out, &word, 3);
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (opcode == 11) {
+        i64 word[2] = [101, 113];
+
+        llvm_chars(out, &word, 2);
+    } else if (opcode == 12) {
+        i64 word[2] = [110, 101];
+
+        llvm_chars(out, &word, 2);
+    } else if (opcode == 13) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[3] = [117, 108, 116];
+
+            llvm_chars(out, &word, 3);
+        } else {
+            i64 word[3] = [115, 108, 116];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 14) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[3] = [117, 108, 101];
+
+            llvm_chars(out, &word, 3);
+        } else {
+            i64 word[3] = [115, 108, 101];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 15) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[3] = [117, 103, 116];
+
+            llvm_chars(out, &word, 3);
+        } else {
+            i64 word[3] = [115, 103, 116];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else if (opcode == 16) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            i64 word[3] = [117, 103, 101];
+
+            llvm_chars(out, &word, 3);
+        } else {
+            i64 word[3] = [115, 103, 101];
+
+            llvm_chars(out, &word, 3);
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn llvm_temp(ForgeWriter&mut out, i64 category, i64 instruction) {
+    writer_put(out, 37);
+    writer_put(out, 116);
+    writer_decimal(out, category);
+    writer_put(out, 95);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_local(ForgeWriter&mut out, i64 slot) {
+    writer_put(out, 37);
+    writer_put(out, 108);
+    writer_decimal(out, slot);
+}
+
+fn llvm_block(ForgeWriter&mut out, i64 instruction) {
+    writer_put(out, 98);
+    writer_put(out, 98);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_value_result_type(MirModule& mir, i64 instruction) -> i64 {
+    if (instruction < 0 || instruction >= mir.instruction_count) {
+        return 0;
+    }
+
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
+
+    if (opcode >= 11 && opcode <= 16) {
+        return 0;
+    }
+    return raz_compiler_rt_arena_get(mir.op_types, instruction);
+}
+
+fn llvm_emit_raw_to_value(
+    ForgeWriter&mut out,
+    i64 instruction,
+    i64 raw_category,
+    i64 raw_instruction,
+    i64 type_kind,
+) {
+    if (type_kind == 11) {
+        writer_space(out);
+        writer_space(out);
+        llvm_temp(out, 22, instruction);
+        writer_space(out);
+        writer_put(out, 61);
+        writer_space(out);
+
+        i64 truncword[5] = [116, 114, 117, 110, 99];
+
+        llvm_chars(out, &truncword, 5);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        i64 toi32[7] = [32, 116, 111, 32, 105, 51, 50];
+
+        llvm_chars(out, &toi32, 7);
+        writer_newline(out);
+        llvm_emit_assignment(out, instruction);
+
+        i64 bitword[7] = [98, 105, 116, 99, 97, 115, 116];
+
+        llvm_chars(out, &bitword, 7);
+        writer_space(out);
+        writer_i32(out);
+        writer_space(out);
+        llvm_temp(out, 22, instruction);
+
+        i64 tofloat[9] = [32, 116, 111, 32, 102, 108, 111, 97, 116];
+
+        llvm_chars(out, &tofloat, 9);
+        writer_newline(out);
+        return;
+    }
     llvm_emit_assignment(out, instruction);
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        i64 word[8] = [105, 110, 116, 116, 111, 112, 116, 114];
 
-    i64 bitword[7] = [98, 105, 116, 99, 97, 115, 116];
+        llvm_chars(out, &word, 8);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
 
-    llvm_chars(out, &bitword, 7);
-    writer_space(out);
-    writer_i32(out);
-    writer_space(out);
-    llvm_temp(out, 22, instruction);
+        i64 toword[7] = [32, 116, 111, 32, 112, 116, 114];
 
-    i64 tofloat[9] = [32, 116, 111, 32, 102, 108, 111, 97, 116];
+        llvm_chars(out, &toword, 7);
+    } else if (type_kind == 1) {
+        i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
 
-    llvm_chars(out, &tofloat, 9);
+        llvm_chars(out, &word, 7);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        i64 toword[10] = [32, 116, 111, 32, 100, 111, 117, 98, 108, 101];
+
+        llvm_chars(out, &toword, 10);
+    } else if (primitive_type_width(type_kind) < 64) {
+        i64 word[5] = [116, 114, 117, 110, 99];
+
+        llvm_chars(out, &word, 5);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        i64 toword[4] = [32, 116, 111, 32];
+
+        llvm_chars(out, &toword, 4);
+        llvm_type(out, type_kind);
+    } else {
+        i64 word[3] = [97, 100, 100];
+
+        llvm_chars(out, &word, 3);
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+        writer_put(out, 44);
+        writer_space(out);
+        writer_decimal(out, 0);
+    }
     writer_newline(out);
-    return;
-  }
-  llvm_emit_assignment(out, instruction);
-  if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
-    i64 word[8] = [105, 110, 116, 116, 111, 112, 116, 114];
+}
 
-    llvm_chars(out, &word, 8);
+fn llvm_emit_value_to_raw(ForgeWriter&mut out, i64 instruction, i64 value, i64 type_kind) -> i64 {
+    if (type_kind == 0 || primitive_type_width(type_kind) == 64) {
+        if (!primitive_type_is_float(type_kind) && type_kind != 12 && type_kind != 13 && type_kind != 14) {
+            return value;
+        }
+    }
     writer_space(out);
-    writer_i64(out);
     writer_space(out);
-    llvm_temp(out, raw_category, raw_instruction);
-
-    i64 toword[7] = [32, 116, 111, 32, 112, 116, 114];
-
-    llvm_chars(out, &toword, 7);
-  } else if (type_kind == 1) {
-    i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
-
-    llvm_chars(out, &word, 7);
+    llvm_temp(out, 20, instruction);
     writer_space(out);
-    writer_i64(out);
+    writer_put(out, 61);
     writer_space(out);
-    llvm_temp(out, raw_category, raw_instruction);
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        i64 word[8] = [112, 116, 114, 116, 111, 105, 110, 116];
 
-    i64 toword[10] = [32, 116, 111, 32, 100, 111, 117, 98, 108, 101];
+        llvm_chars(out, &word, 8);
+        writer_space(out);
 
-    llvm_chars(out, &toword, 10);
-  } else if (primitive_type_width(type_kind) < 64) {
-    i64 word[5] = [116, 114, 117, 110, 99];
+        i64 ptr[3] = [112, 116, 114];
 
-    llvm_chars(out, &word, 5);
+        llvm_chars(out, &ptr, 3);
+        writer_space(out);
+        llvm_value(out, value);
+
+        i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
+
+        llvm_chars(out, &toword, 7);
+    } else if (type_kind == 1) {
+        i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
+
+        llvm_chars(out, &word, 7);
+        writer_space(out);
+
+        i64 d[6] = [100, 111, 117, 98, 108, 101];
+
+        llvm_chars(out, &d, 6);
+        writer_space(out);
+        llvm_value(out, value);
+
+        i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
+
+        llvm_chars(out, &toword, 7);
+    } else if (type_kind == 11) {
+        i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
+
+        llvm_chars(out, &word, 7);
+        writer_space(out);
+
+        i64 f[5] = [102, 108, 111, 97, 116];
+
+        llvm_chars(out, &f, 5);
+        writer_space(out);
+        llvm_value(out, value);
+
+        i64 toword[7] = [32, 116, 111, 32, 105, 51, 50];
+
+        llvm_chars(out, &toword, 7);
+        writer_newline(out);
+        writer_space(out);
+        writer_space(out);
+        llvm_temp(out, 21, instruction);
+        writer_space(out);
+        writer_put(out, 61);
+        writer_space(out);
+
+        i64 zext[4] = [122, 101, 120, 116];
+
+        llvm_chars(out, &zext, 4);
+        writer_space(out);
+        writer_i32(out);
+        writer_space(out);
+        llvm_temp(out, 20, instruction);
+
+        i64 to64[7] = [32, 116, 111, 32, 105, 54, 52];
+
+        llvm_chars(out, &to64, 7);
+        writer_newline(out);
+        return -21;
+    } else {
+        i64 word[4] = [122, 101, 120, 116];
+
+        llvm_chars(out, &word, 4);
+        writer_space(out);
+        llvm_type(out, type_kind);
+        writer_space(out);
+        llvm_value(out, value);
+
+        i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
+
+        llvm_chars(out, &toword, 7);
+    }
+    writer_newline(out);
+    return -20;
+}
+
+fn llvm_emit_numeric_cast(
+    ForgeWriter&mut out,
+    i64 instruction,
+    i64 source,
+    i64 source_type,
+    i64 target_type,
+) -> bool {
+    llvm_emit_assignment(out, instruction);
+    if (source_type == 12 || target_type == 12) {
+        if (source_type == 12 && target_type == 12) {
+            i64 gep[13] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114];
+
+            llvm_chars(out, &gep, 13);
+
+            i64 tail[9] = [32, 105, 56, 44, 32, 112, 116, 114, 32];
+
+            llvm_chars(out, &tail, 9);
+            llvm_value(out, source);
+
+            i64 zero[7] = [44, 32, 105, 54, 52, 32, 48];
+
+            llvm_chars(out, &zero, 7);
+        } else if (source_type == 12) {
+            i64 word[8] = [112, 116, 114, 116, 111, 105, 110, 116];
+
+            llvm_chars(out, &word, 8);
+
+            i64 ptr_space[4] = [32, 112, 116, 114];
+
+            llvm_chars(out, &ptr_space, 4);
+            writer_space(out);
+            llvm_value(out, source);
+
+            i64 toword[4] = [32, 116, 111, 32];
+
+            llvm_chars(out, &toword, 4);
+            llvm_type(out, target_type);
+        } else {
+            i64 word[8] = [105, 110, 116, 116, 111, 112, 116, 114];
+
+            llvm_chars(out, &word, 8);
+            writer_space(out);
+            llvm_type(out, source_type);
+            writer_space(out);
+            llvm_value(out, source);
+
+            i64 toword[4] = [32, 116, 111, 32];
+
+            llvm_chars(out, &toword, 4);
+
+            i64 ptr_word[3] = [112, 116, 114];
+
+            llvm_chars(out, &ptr_word, 3);
+        }
+        writer_newline(out);
+        return true;
+    }
+    if (source_type == target_type) {
+        if (primitive_type_is_float(target_type)) {
+            i64 word[4] = [102, 97, 100, 100];
+
+            llvm_chars(out, &word, 4);
+            writer_space(out);
+            llvm_type(out, target_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_put(out, 48);
+            writer_put(out, 46);
+            writer_put(out, 48);
+        } else {
+            i64 word[3] = [97, 100, 100];
+
+            llvm_chars(out, &word, 3);
+            writer_space(out);
+            llvm_type(out, target_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_decimal(out, 0);
+        }
+        writer_newline(out);
+        return true;
+    }
+
+    bool source_float = primitive_type_is_float(source_type);
+    bool target_float = primitive_type_is_float(target_type);
+
+    if (source_float && target_float) {
+        if (primitive_type_width(source_type) < primitive_type_width(target_type)) {
+            i64 word[5] = [102, 112, 101, 120, 116];
+
+            llvm_chars(out, &word, 5);
+        } else {
+            i64 word[7] = [102, 112, 116, 114, 117, 110, 99];
+
+            llvm_chars(out, &word, 7);
+        }
+    } else if (source_float) {
+        if (primitive_type_is_unsigned(target_type)) {
+            i64 word[6] = [102, 112, 116, 111, 117, 105];
+
+            llvm_chars(out, &word, 6);
+        } else {
+            i64 word[6] = [102, 112, 116, 111, 115, 105];
+
+            llvm_chars(out, &word, 6);
+        }
+    } else if (target_float) {
+        if (primitive_type_is_unsigned(source_type)) {
+            i64 word[6] = [117, 105, 116, 111, 102, 112];
+
+            llvm_chars(out, &word, 6);
+        } else {
+            i64 word[6] = [115, 105, 116, 111, 102, 112];
+
+            llvm_chars(out, &word, 6);
+        }
+    } else {
+        i64 source_width = primitive_type_width(source_type);
+        i64 target_width = primitive_type_width(target_type);
+
+        if (source_width == target_width) {
+            i64 word[3] = [97, 100, 100];
+
+            llvm_chars(out, &word, 3);
+            writer_space(out);
+            llvm_type(out, source_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_decimal(out, 0);
+            writer_newline(out);
+            return true;
+        }
+        if (source_width > target_width) {
+            i64 word[5] = [116, 114, 117, 110, 99];
+
+            llvm_chars(out, &word, 5);
+        } else if (primitive_type_is_unsigned(source_type)) {
+            i64 word[4] = [122, 101, 120, 116];
+
+            llvm_chars(out, &word, 4);
+        } else {
+            i64 word[4] = [115, 101, 120, 116];
+
+            llvm_chars(out, &word, 4);
+        }
+    }
     writer_space(out);
-    writer_i64(out);
+    llvm_type(out, source_type);
     writer_space(out);
-    llvm_temp(out, raw_category, raw_instruction);
+    llvm_value(out, source);
 
     i64 toword[4] = [32, 116, 111, 32];
 
     llvm_chars(out, &toword, 4);
-    llvm_type(out, type_kind);
-  } else {
-    i64 word[3] = [97, 100, 100];
-
-    llvm_chars(out, &word, 3);
-    writer_space(out);
-    writer_i64(out);
-    writer_space(out);
-    llvm_temp(out, raw_category, raw_instruction);
-    writer_put(out, 44);
-    writer_space(out);
-    writer_decimal(out, 0);
-  }
-  writer_newline(out);
-}
-
-fn llvm_emit_value_to_raw(ForgeWriter&mut out, i64 instruction, i64 value, i64 type_kind) -> i64 {
-  if (type_kind == 0 || primitive_type_width(type_kind) == 64) {
-    if (!primitive_type_is_float(type_kind) && type_kind != 12 && type_kind != 13 && type_kind != 14) {
-      return value;
-    }
-  }
-  writer_space(out);
-  writer_space(out);
-  llvm_temp(out, 20, instruction);
-  writer_space(out);
-  writer_put(out, 61);
-  writer_space(out);
-  if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
-    i64 word[8] = [112, 116, 114, 116, 111, 105, 110, 116];
-
-    llvm_chars(out, &word, 8);
-    writer_space(out);
-
-    i64 ptr[3] = [112, 116, 114];
-
-    llvm_chars(out, &ptr, 3);
-    writer_space(out);
-    llvm_value(out, value);
-
-    i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
-
-    llvm_chars(out, &toword, 7);
-  } else if (type_kind == 1) {
-    i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
-
-    llvm_chars(out, &word, 7);
-    writer_space(out);
-
-    i64 d[6] = [100, 111, 117, 98, 108, 101];
-
-    llvm_chars(out, &d, 6);
-    writer_space(out);
-    llvm_value(out, value);
-
-    i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
-
-    llvm_chars(out, &toword, 7);
-  } else if (type_kind == 11) {
-    i64 word[7] = [98, 105, 116, 99, 97, 115, 116];
-
-    llvm_chars(out, &word, 7);
-    writer_space(out);
-
-    i64 f[5] = [102, 108, 111, 97, 116];
-
-    llvm_chars(out, &f, 5);
-    writer_space(out);
-    llvm_value(out, value);
-
-    i64 toword[7] = [32, 116, 111, 32, 105, 51, 50];
-
-    llvm_chars(out, &toword, 7);
-    writer_newline(out);
-    writer_space(out);
-    writer_space(out);
-    llvm_temp(out, 21, instruction);
-    writer_space(out);
-    writer_put(out, 61);
-    writer_space(out);
-
-    i64 zext[4] = [122, 101, 120, 116];
-
-    llvm_chars(out, &zext, 4);
-    writer_space(out);
-    writer_i32(out);
-    writer_space(out);
-    llvm_temp(out, 20, instruction);
-
-    i64 to64[7] = [32, 116, 111, 32, 105, 54, 52];
-
-    llvm_chars(out, &to64, 7);
-    writer_newline(out);
-    return -21;
-  } else {
-    i64 word[4] = [122, 101, 120, 116];
-
-    llvm_chars(out, &word, 4);
-    writer_space(out);
-    llvm_type(out, type_kind);
-    writer_space(out);
-    llvm_value(out, value);
-
-    i64 toword[7] = [32, 116, 111, 32, 105, 54, 52];
-
-    llvm_chars(out, &toword, 7);
-  }
-  writer_newline(out);
-  return -20;
-}
-
-fn llvm_emit_numeric_cast(
-ForgeWriter&mut out,
-i64 instruction,
-i64 source,
-i64 source_type,
-i64 target_type,
-) -> bool {
-  llvm_emit_assignment(out, instruction);
-  if (source_type == 12 || target_type == 12) {
-    if (source_type == 12 && target_type == 12) {
-      i64 gep[13] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114];
-
-      llvm_chars(out, &gep, 13);
-
-      i64 tail[9] = [32, 105, 56, 44, 32, 112, 116, 114, 32];
-
-      llvm_chars(out, &tail, 9);
-      llvm_value(out, source);
-
-      i64 zero[7] = [44, 32, 105, 54, 52, 32, 48];
-
-      llvm_chars(out, &zero, 7);
-    } else if (source_type == 12) {
-      i64 word[8] = [112, 116, 114, 116, 111, 105, 110, 116];
-
-      llvm_chars(out, &word, 8);
-
-      i64 ptr_space[4] = [32, 112, 116, 114];
-
-      llvm_chars(out, &ptr_space, 4);
-      writer_space(out);
-      llvm_value(out, source);
-
-      i64 toword[4] = [32, 116, 111, 32];
-
-      llvm_chars(out, &toword, 4);
-      llvm_type(out, target_type);
-    } else {
-      i64 word[8] = [105, 110, 116, 116, 111, 112, 116, 114];
-
-      llvm_chars(out, &word, 8);
-      writer_space(out);
-      llvm_type(out, source_type);
-      writer_space(out);
-      llvm_value(out, source);
-
-      i64 toword[4] = [32, 116, 111, 32];
-
-      llvm_chars(out, &toword, 4);
-
-      i64 ptr_word[3] = [112, 116, 114];
-
-      llvm_chars(out, &ptr_word, 3);
-    }
+    llvm_type(out, target_type);
     writer_newline(out);
     return true;
-  }
-  if (source_type == target_type) {
-    if (primitive_type_is_float(target_type)) {
-      i64 word[4] = [102, 97, 100, 100];
-
-      llvm_chars(out, &word, 4);
-      writer_space(out);
-      llvm_type(out, target_type);
-      writer_space(out);
-      llvm_value(out, source);
-      writer_put(out, 44);
-      writer_space(out);
-      writer_put(out, 48);
-      writer_put(out, 46);
-      writer_put(out, 48);
-    } else {
-      i64 word[3] = [97, 100, 100];
-
-      llvm_chars(out, &word, 3);
-      writer_space(out);
-      llvm_type(out, target_type);
-      writer_space(out);
-      llvm_value(out, source);
-      writer_put(out, 44);
-      writer_space(out);
-      writer_decimal(out, 0);
-    }
-    writer_newline(out);
-    return true;
-  }
-
-  bool source_float = primitive_type_is_float(source_type);
-  bool target_float = primitive_type_is_float(target_type);
-
-  if (source_float && target_float) {
-    if (primitive_type_width(source_type) < primitive_type_width(target_type)) {
-      i64 word[5] = [102, 112, 101, 120, 116];
-
-      llvm_chars(out, &word, 5);
-    } else {
-      i64 word[7] = [102, 112, 116, 114, 117, 110, 99];
-
-      llvm_chars(out, &word, 7);
-    }
-  } else if (source_float) {
-    if (primitive_type_is_unsigned(target_type)) {
-      i64 word[6] = [102, 112, 116, 111, 117, 105];
-
-      llvm_chars(out, &word, 6);
-    } else {
-      i64 word[6] = [102, 112, 116, 111, 115, 105];
-
-      llvm_chars(out, &word, 6);
-    }
-  } else if (target_float) {
-    if (primitive_type_is_unsigned(source_type)) {
-      i64 word[6] = [117, 105, 116, 111, 102, 112];
-
-      llvm_chars(out, &word, 6);
-    } else {
-      i64 word[6] = [115, 105, 116, 111, 102, 112];
-
-      llvm_chars(out, &word, 6);
-    }
-  } else {
-    i64 source_width = primitive_type_width(source_type);
-    i64 target_width = primitive_type_width(target_type);
-
-    if (source_width == target_width) {
-      i64 word[3] = [97, 100, 100];
-
-      llvm_chars(out, &word, 3);
-      writer_space(out);
-      llvm_type(out, source_type);
-      writer_space(out);
-      llvm_value(out, source);
-      writer_put(out, 44);
-      writer_space(out);
-      writer_decimal(out, 0);
-      writer_newline(out);
-      return true;
-    }
-    if (source_width > target_width) {
-      i64 word[5] = [116, 114, 117, 110, 99];
-
-      llvm_chars(out, &word, 5);
-    } else if (primitive_type_is_unsigned(source_type)) {
-      i64 word[4] = [122, 101, 120, 116];
-
-      llvm_chars(out, &word, 4);
-    } else {
-      i64 word[4] = [115, 101, 120, 116];
-
-      llvm_chars(out, &word, 4);
-    }
-  }
-  writer_space(out);
-  llvm_type(out, source_type);
-  writer_space(out);
-  llvm_value(out, source);
-
-  i64 toword[4] = [32, 116, 111, 32];
-
-  llvm_chars(out, &toword, 4);
-  llvm_type(out, target_type);
-  writer_newline(out);
-  return true;
 }
 
 fn llvm_function_type_return_type(ForgeWriter&mut out, HirModule& hir, i64 signature) {
-  if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, signature) >= 0) {
-    i64 word[3] = [112, 116, 114];
+    if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, signature) >= 0) {
+        i64 word[3] = [112, 116, 114];
 
-    llvm_chars(out, &word, 3);
-  } else if (
-  raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
-  ) {
-    writer_i64(out);
-  } else {
-    llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_return_types, signature));
-  }
+        llvm_chars(out, &word, 3);
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_return_types, signature));
+    }
 }
 
 fn llvm_function_type_parameter_type(ForgeWriter&mut out, HirModule& hir, i64 signature, i64 parameter) {
-  i64 start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
-  i64 index = start + parameter;
+    i64 start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+    i64 index = start + parameter;
 
-  if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, index) >= 0) {
-    i64 word[3] = [112, 116, 114];
+    if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, index) >= 0) {
+        i64 word[3] = [112, 116, 114];
 
-    llvm_chars(out, &word, 3);
-  } else if (
-  raz_compiler_rt_arena_get(hir.function_type_parameter_references, index) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_type_parameter_slices, index) != 0 ||
-  raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, index) >= 0
-  ) {
-    writer_i64(out);
-  } else {
-    llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_parameter_types, index));
-  }
+        llvm_chars(out, &word, 3);
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_type_parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_parameter_types, index));
+    }
 }
 
 fn llvm_emit_runtime_declarations(ForgeWriter&mut out) {
-  i64 create_decl[45] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 41, 10];
+    i64 create_decl[45] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &create_decl, 45);
+    llvm_chars(out, &create_decl, 45);
 
-  i64 get_decl[47] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
+    i64 get_decl[47] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &get_decl, 47);
+    llvm_chars(out, &get_decl, 47);
 
-  i64 set_decl[53] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 115, 101, 116, 40, 105, 54, 52, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
+    i64 set_decl[53] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 115, 101, 116, 40, 105, 54, 52, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &set_decl, 53);
+    llvm_chars(out, &set_decl, 53);
 
-  i64 destroy_decl[47] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54, 52, 41, 10];
+    i64 destroy_decl[47] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &destroy_decl, 47);
-  writer_newline(out);
+    llvm_chars(out, &destroy_decl, 47);
+    writer_newline(out);
 
-  i64 async_decl_0[44] = [100, 101, 99, 108, 97, 114, 101, 32, 112, 116, 114, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 41, 10];
+    i64 async_decl_0[44] = [100, 101, 99, 108, 97, 114, 101, 32, 112, 116, 114, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_0, 44);
+    llvm_chars(out, &async_decl_0, 44);
 
-  i64 async_decl_1[54] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 115, 101, 116, 95, 112, 111, 108, 108, 101, 114, 40, 112, 116, 114, 44, 32, 112, 116, 114, 41, 10];
+    i64 async_decl_1[54] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 115, 101, 116, 95, 112, 111, 108, 108, 101, 114, 40, 112, 116, 114, 44, 32, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_1, 54);
+    llvm_chars(out, &async_decl_1, 54);
 
-  i64 async_decl_2[48] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 102, 117, 116, 117, 114, 101, 95, 105, 54, 52, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_2[48] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 102, 117, 116, 117, 114, 101, 95, 105, 54, 52, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_2, 48);
+    llvm_chars(out, &async_decl_2, 48);
 
-  i64 async_decl_3[42] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 108, 111, 97, 100, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_3[42] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 108, 111, 97, 100, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_3, 42);
+    llvm_chars(out, &async_decl_3, 42);
 
-  i64 async_decl_4[49] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 51, 50, 41, 10];
+    i64 async_decl_4[49] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 51, 50, 41, 10];
 
-  llvm_chars(out, &async_decl_4, 49);
+    llvm_chars(out, &async_decl_4, 49);
 
-  i64 async_decl_5[46] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 108, 111, 97, 100, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
+    i64 async_decl_5[46] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 108, 111, 97, 100, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_5, 46);
+    llvm_chars(out, &async_decl_5, 46);
 
-  i64 async_decl_6[53] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
+    i64 async_decl_6[53] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_6, 53);
+    llvm_chars(out, &async_decl_6, 53);
 
-  i64 async_decl_7[50] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
+    i64 async_decl_7[50] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_7, 50);
+    llvm_chars(out, &async_decl_7, 50);
 
-  i64 async_decl_8[48] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 99, 97, 110, 99, 101, 108, 95, 114, 101, 113, 117, 101, 115, 116, 101, 100, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_8[48] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 99, 97, 110, 99, 101, 108, 95, 114, 101, 113, 117, 101, 115, 116, 101, 100, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_8, 48);
+    llvm_chars(out, &async_decl_8, 48);
 
-  i64 async_decl_9[45] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 97, 110, 99, 101, 108, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_9[45] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 97, 110, 99, 101, 108, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_9, 45);
+    llvm_chars(out, &async_decl_9, 45);
 
-  i64 async_decl_10[52] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 112, 111, 108, 108, 40, 112, 116, 114, 44, 32, 112, 116, 114, 44, 32, 105, 51, 50, 41, 10];
+    i64 async_decl_10[52] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 112, 111, 108, 108, 40, 112, 116, 114, 44, 32, 112, 116, 114, 44, 32, 105, 51, 50, 41, 10];
 
-  llvm_chars(out, &async_decl_10, 52);
+    llvm_chars(out, &async_decl_10, 52);
 
-  i64 async_decl_11[44] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 114, 101, 115, 117, 108, 116, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_11[44] = [100, 101, 99, 108, 97, 114, 101, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 114, 101, 115, 117, 108, 116, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_11, 44);
+    llvm_chars(out, &async_decl_11, 44);
 
-  i64 async_decl_12[46] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 100, 101, 115, 116, 114, 111, 121, 40, 112, 116, 114, 41, 10];
+    i64 async_decl_12[46] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 100, 101, 115, 116, 114, 111, 121, 40, 112, 116, 114, 41, 10];
 
-  llvm_chars(out, &async_decl_12, 46);
+    llvm_chars(out, &async_decl_12, 46);
 
-  i64 async_decl_13[64] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 95, 111, 119, 110, 101, 100, 40, 112, 116, 114, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
+    i64 async_decl_13[64] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 95, 111, 119, 110, 101, 100, 40, 112, 116, 114, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_13, 64);
+    llvm_chars(out, &async_decl_13, 64);
 
-  i64 async_decl_14[49] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 100, 105, 115, 97, 114, 109, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
+    i64 async_decl_14[49] = [100, 101, 99, 108, 97, 114, 101, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 100, 105, 115, 97, 114, 109, 40, 112, 116, 114, 44, 32, 105, 54, 52, 41, 10];
 
-  llvm_chars(out, &async_decl_14, 49);
-  writer_newline(out);
+    llvm_chars(out, &async_decl_14, 49);
+    writer_newline(out);
 }
 
 fn llvm_module_global_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 global_index) {
-  writer_put(out, 64);
-  if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
-    i64 prefix[13] = [95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 95];
+    writer_put(out, 64);
+    if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
+        i64 prefix[13] = [95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 95];
 
-    llvm_chars(out, &prefix, 13);
-  }
-  writer_text(
-  out,
-  source,
-  raz_compiler_rt_arena_get(hir.global_name_offsets, global_index),
-  raz_compiler_rt_arena_get(hir.global_name_lengths, global_index),
-  );
-  if (writer_module_global_needs_identity_suffix(source, hir, global_index)) {
-    writer_put(out, 95);
-    writer_put(out, 103);
-    writer_decimal(out, global_index);
-  }
+        llvm_chars(out, &prefix, 13);
+    }
+    writer_text(
+        out,
+        source,
+        raz_compiler_rt_arena_get(hir.global_name_offsets, global_index),
+        raz_compiler_rt_arena_get(hir.global_name_lengths, global_index),
+    );
+    if (writer_module_global_needs_identity_suffix(source, hir, global_index)) {
+        writer_put(out, 95);
+        writer_put(out, 103);
+        writer_decimal(out, global_index);
+    }
 }

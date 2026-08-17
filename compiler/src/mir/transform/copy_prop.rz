@@ -2,27 +2,47 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_mir_transform_copy_prop;
+
 public import raz_compiler_mir_transform_remap;
+
 // Numeric cast opcode 40 is a semantic copy when source and destination MIR
-// types are identical. Rewrite all consumers to the original value; DCE can
-// then remove the redundant cast in the same pipeline iteration.
+// types are identical. Collect every redundant copy first, then rewrite all
+// consumers in one pass. The old implementation rescanned the complete MIR for
+// every copy, making copy propagation quadratic on copy-heavy functions.
 fn propagate_mir_copies(MirModule&mut mir) -> bool {
-  i64 ip = 0;
+    i64 replacements = raz_compiler_rt_arena_create(mir.instruction_count + 1);
 
-  while (ip < mir.instruction_count) {
-    if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 40) {
-      i64 source = raz_compiler_rt_arena_get(mir.op_a, ip);
-
-      if (source >= 0 && source < mir.instruction_count) {
-        i64 target_type = raz_compiler_rt_arena_get(mir.op_types, ip);
-        i64 source_type = raz_compiler_rt_arena_get(mir.op_types, source);
-
-        if (target_type == source_type && !mir_replace_value_uses(mir, ip, source)) {
-          return false;
-        }
-      }
+    if (replacements == 0) {
+        return false;
     }
-    ip += 1;
-  }
-  return true;
+
+    bool changed = false;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get_unchecked(mir.opcodes, ip) == 40) {
+            i64 source = raz_compiler_rt_arena_get_unchecked(mir.op_a, ip);
+
+            if (source >= 0 && source < mir.instruction_count) {
+                i64 target_type = raz_compiler_rt_arena_get_unchecked(mir.op_types, ip);
+                i64 source_type = raz_compiler_rt_arena_get_unchecked(mir.op_types, source);
+
+                if (target_type == source_type && source != ip) {
+                    // Encode source + 1 because zero means "not replaced" in the
+                    // allocator's already-zero-filled replacement table.
+                    raz_compiler_rt_arena_set_unchecked(replacements, ip, source + 1);
+                    changed = true;
+                }
+            }
+        }
+        ip += 1;
+    }
+
+    bool ok = true;
+
+    if (changed) {
+        ok = mir_apply_value_replacements(mir, replacements);
+    }
+    raz_compiler_rt_arena_destroy(replacements);
+    return ok;
 }

@@ -29,7 +29,8 @@ checks = {
     'legacy generic and associated-type result caches removed': not any(x in model + builder + combined for x in legacy),
     'canonical monomorph identities are stored in HirBuilder': all(x in model for x in [
         'query_monomorph_count', 'query_monomorph_entity_kinds', 'query_monomorph_argument_starts',
-        'query_monomorph_argument_structures', 'query_monomorph_argument_types']),
+        'query_monomorph_argument_structures', 'query_monomorph_argument_types',
+        'query_monomorph_buckets', 'query_monomorph_next']),
     'canonical identity storage is centrally managed': all(x in builder for x in [
         'query_monomorph_entity_kinds = raz_compiler_rt_arena_create',
         'query_monomorph_argument_structures = raz_compiler_rt_arena_create',
@@ -37,7 +38,8 @@ checks = {
         'raz_compiler_rt_arena_destroy(out.query_monomorph_argument_structures)']),
     'monomorph identities compare exact packed arguments': all(x in identity for x in [
         'hir_query_intern_monomorphization', 'hir_query_monomorph_arguments_same',
-        'query_monomorph_argument_structures', 'query_monomorph_argument_types']),
+        'query_monomorph_argument_structures', 'query_monomorph_argument_types',
+        'query_monomorph_buckets', 'query_monomorph_next']),
     'generic function instantiation is query orchestrated': all(x in instantiate for x in [
         'hir_query_intern_monomorphization', 'hir_query_kind_monomorphization()',
         'hir_query_begin(builder, hir_query_kind_monomorphization()',

@@ -600,9 +600,11 @@ def _wrap_argument(arg: str, indent: str, width: int) -> list[str]:
     prefix = prefix_text + "("
     lines = [indent + prefix]
     child_indent = indent + " " * INDENT_WIDTH
-    for item in items:
+    had_trailing_comma = inner.rstrip().endswith(",")
+    for index, item in enumerate(items):
         wrapped = _wrap_argument(item, child_indent, width)
-        wrapped[-1] += ","
+        if index + 1 < len(items) or had_trailing_comma:
+            wrapped[-1] += ","
         lines.extend(wrapped)
     lines.append(indent + ")" + suffix)
     return lines
@@ -617,14 +619,15 @@ def _wrap_line(line: str, width: int) -> list[str]:
     # Long boolean returns are easier to scan as a parenthesized condition block.
     if stripped.startswith("return ") and stripped.endswith(";"):
         expression = stripped[len("return "):-1].strip()
+        grouped_expression: str | None = None
         if expression.startswith("("):
             close = _matching_paren(expression, 0)
             if close == len(expression) - 1:
                 grouped = expression[1:-1].strip()
                 if len(_split_boolean_condition(grouped)) > 1:
-                    expression = grouped
-        chunks = _split_boolean_condition(expression)
-        if len(chunks) > 1:
+                    grouped_expression = grouped
+        if grouped_expression is not None:
+            chunks = _split_boolean_condition(grouped_expression)
             lines = [base + "return ("]
             child = base + " " * INDENT_WIDTH
             for chunk, op in chunks:
@@ -633,6 +636,19 @@ def _wrap_line(line: str, width: int) -> list[str]:
                     wrapped[-1] += " " + op
                 lines.extend(wrapped)
             lines.append(base + ");")
+            return lines
+        chunks = _split_boolean_condition(expression)
+        if len(chunks) > 1:
+            first_chunk, first_op = chunks[0]
+            lines = [base + "return " + first_chunk + (" " + first_op if first_op else "")]
+            child = base + " " * INDENT_WIDTH
+            for index, (chunk, op) in enumerate(chunks[1:]):
+                wrapped = _wrap_argument(chunk, child, width)
+                if op:
+                    wrapped[-1] += " " + op
+                elif index == len(chunks) - 2:
+                    wrapped[-1] += ";"
+                lines.extend(wrapped)
             return lines
         arithmetic = _split_top_level_arithmetic(expression)
         if len(arithmetic) > 1:
@@ -699,9 +715,11 @@ def _wrap_line(line: str, width: int) -> list[str]:
     suffix = stripped[close_index + 1:]
     lines = [base + prefix]
     child = base + " " * INDENT_WIDTH
-    for item in items:
+    had_trailing_comma = inner.rstrip().endswith(",")
+    for index, item in enumerate(items):
         wrapped = _wrap_argument(item, child, width)
-        wrapped[-1] += ","
+        if index + 1 < len(items) or had_trailing_comma:
+            wrapped[-1] += ","
         lines.extend(wrapped)
     lines.append(base + ")" + suffix)
     return lines
@@ -804,6 +822,65 @@ def _separate_logical_phases(text: str) -> str:
         previous_kind = current_kind
         previous_indent = current_indent
     return "\n".join(output).rstrip() + "\n"
+
+
+
+
+def _normalize_module_preamble(text: str) -> str:
+    """Canonicalize module-header spacing without disturbing declaration comments."""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+
+    output: list[str] = []
+    index = 0
+
+    # A normal Raz module starts with one namespace declaration. Keep exactly
+    # one empty line between it and the import/declaration section.
+    if lines[index].startswith("namespace ") and lines[index].endswith(";"):
+        output.append(lines[index].rstrip())
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        output.append("")
+
+    # Imports form one visual block. Blank lines inside that block are removed,
+    # and exactly one blank line separates the block from the module body.
+    saw_import = False
+    while index < len(lines):
+        if not lines[index].strip():
+            lookahead = index + 1
+            while lookahead < len(lines) and not lines[lookahead].strip():
+                lookahead += 1
+            if lookahead < len(lines) and lines[lookahead].lstrip().startswith(("import ", "public import ")):
+                index = lookahead
+                continue
+            break
+        stripped = lines[index].lstrip()
+        if not stripped.startswith(("import ", "public import ")):
+            break
+        output.append(lines[index].rstrip())
+        saw_import = True
+        index += 1
+    if saw_import:
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        output.append("")
+
+    output.extend(line.rstrip() for line in lines[index:])
+
+    # Formatter output never contains runs of blank lines. Individual blank
+    # lines remain meaningful separators between declarations/logical phases.
+    collapsed: list[str] = []
+    for line in output:
+        if not line and collapsed and not collapsed[-1]:
+            continue
+        collapsed.append(line)
+    return "\n".join(collapsed).rstrip() + "\n"
+
+def _token_spellings(text: str) -> tuple[str, ...]:
+    """Return the exact non-whitespace token stream used by the formatter guard."""
+    return tuple(token.text for token in _scan_tokens(text))
 
 
 def format_text(text: str) -> str:
@@ -930,11 +1007,14 @@ def format_text(text: str) -> str:
     # Empty declarations are clearer as `trait Marker {}` than as two lines
     # containing no body. Keep non-empty blocks expanded.
     formatted = re.sub(r" \{\n\s*\}", " {}", formatted)
-    formatted = _remove_compact_trailing_commas(formatted)
     formatted = _layout_width(formatted)
     formatted = _separate_logical_phases(formatted)
+    formatted = _normalize_module_preamble(formatted)
 
-    return license_prefix + formatted
+    result = license_prefix + formatted
+    if _token_spellings(text) != _token_spellings(result):
+        raise ValueError("formatter changed the Raz token stream; refusing to emit output")
+    return result
 
 
 def _is_generated_source(path: Path) -> bool:

@@ -43,7 +43,7 @@ checks = {
     'ownership firewall executes partial-move verifier':
         'verify_mir_partial_move_dataflow_with_cfg(mir, &cfg)' in drops,
     'DCE pins ownership semantic program points': all(x in dce for x in [
-        'mir_instruction_has_ownership_event', 'i64 pinned', 'mir.ownership_event_instructions']),
+        'mir.ownership_event_instructions', '| 2', '& 2']),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

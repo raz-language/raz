@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -525,6 +526,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap-profile", "-BootstrapProfile", choices=("debug", "release"), default=str(config.get("bootstrap-profile", "debug")))
     parser.add_argument("--host-preset", "-HostPreset", choices=("debug", "release"), default=str(config.get("host-preset", "release")))
+    parser.add_argument(
+        "--repro-opt",
+        choices=("0", "1", "2", "3", "s", "z"),
+        default=None,
+        help="Forge optimization level for self-host reproducibility generations (default: 2 for release, 0 for debug)",
+    )
     parser.add_argument("--jobs", "-Jobs", type=int, default=int(config.get("jobs", max(1, os.cpu_count() or 1))))
     parser.add_argument("--status-interval", type=int, default=int(config.get("status-interval", 15)))
     parser.add_argument("--clean", "-Clean", action="store_true", default=bool(config.get("clean", False)))
@@ -532,6 +539,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+
+    repro_opt = args.repro_opt
+    if repro_opt is None:
+        configured_repro_opt = config.get("repro-opt")
+        if configured_repro_opt is not None:
+            repro_opt = str(configured_repro_opt)
+        else:
+            repro_opt = "2" if args.bootstrap_profile == "release" else "0"
+    if repro_opt not in {"0", "1", "2", "3", "s", "z"}:
+        parser.error("--repro-opt/bootstrap.repro-opt must be one of 0, 1, 2, 3, s, z")
 
     env = import_visual_studio_environment(os.environ.copy())
     repair_future_timestamps(ROOT)
@@ -619,18 +636,35 @@ def main() -> int:
     ]
     host_backend = compiler_project / "src" / "driver" / "backend.rz"
     backend_text = host_backend.read_text(encoding="utf-8")
-    backend_text = backend_text.replace("public import raz_compiler_backend_rxe_codegen;", "public import raz_compiler_backend_llvm_codegen;")
-    wasm_options = backend_text.find("  // --backend=wasm\n")
-    if wasm_options >= 0:
-        option_end = backend_text.find("  return -1;\n", wasm_options)
-        if option_end < 0:
-            raise RuntimeError("Could not prepare host-compatible backend option view.")
-        backend_text = backend_text[:wasm_options] + backend_text[option_end:]
-    for block in (
-        "  if (backend == 2) {\n    return emit_wasm_module(source, hir, mir, output_path, output_path_length);\n  }\n",
-        "  if (backend == 3) {\n    return emit_rxe_module(source, hir, mir, output_path, output_path_length);\n  }\n",
-    ):
-        backend_text = backend_text.replace(block, "")
+    backend_text = backend_text.replace(
+        "public import raz_compiler_backend_rxe_codegen;",
+        "public import raz_compiler_backend_llvm_codegen;",
+    )
+
+    # Build the compatibility-host view by syntax landmarks, not indentation.
+    # `raz fmt` is free to change whitespace, so bootstrap construction must not
+    # depend on an exact pretty-printed spelling of these optional backend blocks.
+    backend_text, option_replacements = re.subn(
+        r"(?ms)^[ \t]*// --backend=wasm\r?\n.*?(?=^[ \t]*return -1;)",
+        "",
+        backend_text,
+        count=1,
+    )
+    if option_replacements != 1:
+        raise RuntimeError("Could not prepare host-compatible backend option view.")
+
+    for backend_kind, emitter in ((2, "emit_wasm_module"), (3, "emit_rxe_module")):
+        pattern = (
+            rf"(?ms)^[ \t]*if \(backend == {backend_kind}\) \{{\r?\n"
+            rf"[ \t]*return {emitter}\([^;]*\);\r?\n"
+            rf"[ \t]*\}}\r?\n"
+        )
+        backend_text, replacements = re.subn(pattern, "", backend_text, count=1)
+        if replacements != 1:
+            raise RuntimeError(f"Could not remove compatibility-host {emitter} dispatch.")
+
+    if "emit_wasm_module(" in backend_text or "emit_rxe_module(" in backend_text:
+        raise RuntimeError("Optional backend dispatch leaked into compatibility-host compiler view.")
     host_backend.write_text(backend_text, encoding="utf-8")
     for source in (compiler_project / "src").rglob("*.rz"):
         lines = source.read_text(encoding="utf-8").splitlines()
@@ -664,7 +698,7 @@ def main() -> int:
                 "--backend=forge",
                 "--forge-native",
                 "--forge-structured-only",
-                "--opt=0",
+                f"--opt={repro_opt}",
                 "raz.toml",
                 obj.name,
             ],
@@ -694,7 +728,7 @@ def main() -> int:
     summary = qualification / "BUILD-SUMMARY.txt"
     summary.write_text(
         "Raz compiler construction and reproducibility qualification succeeded.\n\n"
-        f"Platform: {platform.platform()}\nHost preset: {args.host_preset}\nBootstrap profile: {args.bootstrap_profile}\nC++ compiler: {compiler}\n\n"
+        f"Platform: {platform.platform()}\nHost preset: {args.host_preset}\nBootstrap profile: {args.bootstrap_profile}\nRepro optimization: {repro_opt}\nC++ compiler: {compiler}\n\n"
         + "\n".join(f"Reproducibility build {generation}: {exe}" for generation, _, exe, _ in generated)
         + f"\n\nFixed-point object bytes: {fixed_size}\nFixed-point SHA-256: {fixed_hash}\nDeterministic convergence: yes\n",
         encoding="utf-8",

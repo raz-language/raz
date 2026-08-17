@@ -10,7 +10,7 @@ writer=(root/'compiler/src/backend/rxe/writer.rz').read_text()
 decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text()
 codegen=(root/'compiler/src/backend/rxe/codegen.rz').read_text()
 spec=(root/'docs/RXE-v1-FORMAT.md').read_text()
-assert 'rxe_format_version() -> i64 { return 7; }' in isa
+assert re.search(r'fn\s+rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+7;\s*\}', isa)
 assert 'i64 header_bytes = 104;' in writer
 assert 'module.layout_count' in writer and 'module.layout_field_count' in writer
 for token in ['RxeBinaryHeader','rxe_decode_header','rxe_decode_geometry','rxe_decode_canonical','rxe_decode_verify_semantics','rxe_decode_reencode','rxe_decode_roundtrip_bytes','rxe_validate_written_module']:

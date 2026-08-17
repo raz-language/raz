@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_backend_rxe_registers;
+
 public import raz_compiler_backend_rxe_dataflow;
 
 fn rxe_opcode_writes_dst(i64 op) -> bool {
@@ -97,19 +98,36 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
     i64 reg_slot = raz_compiler_rt_arena_create(rxe_register_count());
 
     if (
-        slot_first == 0 || slot_last == 0 || slot_reg == 0 ||
-        slot_blocked == 0 || loop_store_seen == 0 || reg_slot == 0
+        slot_first == 0 ||
+        slot_last == 0 ||
+        slot_reg == 0 ||
+        slot_blocked == 0 ||
+        loop_store_seen == 0 ||
+        reg_slot == 0
     ) {
-        if (slot_first != 0) { raz_compiler_rt_arena_destroy(slot_first); }
-        if (slot_last != 0) { raz_compiler_rt_arena_destroy(slot_last); }
-        if (slot_reg != 0) { raz_compiler_rt_arena_destroy(slot_reg); }
-        if (slot_blocked != 0) { raz_compiler_rt_arena_destroy(slot_blocked); }
-        if (loop_store_seen != 0) { raz_compiler_rt_arena_destroy(loop_store_seen); }
-        if (reg_slot != 0) { raz_compiler_rt_arena_destroy(reg_slot); }
+        if (slot_first != 0) {
+            raz_compiler_rt_arena_destroy(slot_first);
+        }
+        if (slot_last != 0) {
+            raz_compiler_rt_arena_destroy(slot_last);
+        }
+        if (slot_reg != 0) {
+            raz_compiler_rt_arena_destroy(slot_reg);
+        }
+        if (slot_blocked != 0) {
+            raz_compiler_rt_arena_destroy(slot_blocked);
+        }
+        if (loop_store_seen != 0) {
+            raz_compiler_rt_arena_destroy(loop_store_seen);
+        }
+        if (reg_slot != 0) {
+            raz_compiler_rt_arena_destroy(reg_slot);
+        }
         return false;
     }
 
     i64 slot = 0;
+
     while (slot <= slot_count) {
         raz_compiler_rt_arena_set(slot_first, slot, -1);
         raz_compiler_rt_arena_set(slot_last, slot, -1);
@@ -118,17 +136,22 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         raz_compiler_rt_arena_set(loop_store_seen, slot, 0);
         slot += 1;
     }
+
     i64 reg = 0;
+
     while (reg < rxe_register_count()) {
         raz_compiler_rt_arena_set(reg_slot, reg, -1);
         reg += 1;
     }
 
     i64 ip = start;
+
     while (ip < end) {
         i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
         if (op == rxe_op_load_slot() || op == rxe_op_store_slot()) {
             i64 s = raz_compiler_rt_arena_get(module.immediates, ip);
+
             if (s < 0 || s >= slot_count) {
                 raz_compiler_rt_arena_destroy(slot_first);
                 raz_compiler_rt_arena_destroy(slot_last);
@@ -142,32 +165,42 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
                 raz_compiler_rt_arena_set(slot_first, s, ip);
                 // A frame value cannot be replaced by a register if its first
                 // access is a load; the register has no defining instruction.
-                if (op == rxe_op_load_slot()) { raz_compiler_rt_arena_set(slot_blocked, s, 1); }
+                if (op == rxe_op_load_slot()) {
+                    raz_compiler_rt_arena_set(slot_blocked, s, 1);
+                }
             }
             raz_compiler_rt_arena_set(slot_last, s, ip);
         }
         ip += 1;
     }
-
     // Analyze each backward edge independently. A slot loaded before any store
     // in the loop body is loop-carried/invariant and remains memory-backed.
     ip = start;
     while (ip < end) {
         i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
         if (op == rxe_op_jmp() || op == rxe_op_brnz()) {
             i64 target = raz_compiler_rt_arena_get(module.immediates, ip);
+
             if (target >= start && target <= ip) {
                 slot = 0;
                 while (slot < slot_count) {
                     raz_compiler_rt_arena_set(loop_store_seen, slot, 0);
                     slot += 1;
                 }
+
                 i64 cursor = target;
+
                 while (cursor <= ip) {
                     i64 cursor_op = raz_compiler_rt_arena_get(module.opcodes, cursor);
+
                     if (cursor_op == rxe_op_load_slot() || cursor_op == rxe_op_store_slot()) {
                         i64 s = raz_compiler_rt_arena_get(module.immediates, cursor);
-                        if (cursor_op == rxe_op_load_slot() && raz_compiler_rt_arena_get(loop_store_seen, s) == 0) {
+
+                        if (
+                            cursor_op == rxe_op_load_slot() &&
+                            raz_compiler_rt_arena_get(loop_store_seen, s) == 0
+                        ) {
                             // A load-before-store at the loop header is a machine-level phi
                             // when the slot has a proven preheader definition. Keeping one
                             // stable register across the backedge carries the updated value.
@@ -193,19 +226,13 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         }
         ip += 1;
     }
-
     // Extend the preliminary intervals with fixed-point block liveness. This
     // makes joins and loop-carried values explicit instead of relying only on
     // backward-edge heuristics. The earlier loop analysis remains a cheap
     // conservative guard for values with no materializable incoming definition.
-    if (!rxe_dataflow_extend_slot_intervals(
-        module,
-        function,
-        slot_count,
-        slot_first,
-        slot_last,
-        slot_blocked
-    )) {
+    if (
+        !rxe_dataflow_extend_slot_intervals(module, function, slot_count, slot_first, slot_last, slot_blocked)
+    ) {
         raz_compiler_rt_arena_destroy(slot_first);
         raz_compiler_rt_arena_destroy(slot_last);
         raz_compiler_rt_arena_destroy(slot_reg);
@@ -214,7 +241,6 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         raz_compiler_rt_arena_destroy(reg_slot);
         return false;
     }
-
     // Deterministic interval allocation. Slots are visited by first program
     // position then slot number; lowest free architectural register wins.
     ip = start;
@@ -222,6 +248,7 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         reg = 6;
         while (reg < rxe_register_count()) {
             i64 active = raz_compiler_rt_arena_get(reg_slot, reg);
+
             if (active >= 0 && raz_compiler_rt_arena_get(slot_last, active) < ip) {
                 raz_compiler_rt_arena_set(reg_slot, reg, -1);
             }
@@ -234,7 +261,9 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
                 raz_compiler_rt_arena_get(slot_blocked, slot) == 0
             ) {
                 reg = 6;
-                while (reg < rxe_register_count() && raz_compiler_rt_arena_get(reg_slot, reg) >= 0) { reg += 1; }
+                while (reg < rxe_register_count() && raz_compiler_rt_arena_get(reg_slot, reg) >= 0) {
+                    reg += 1;
+                }
                 if (reg < rxe_register_count()) {
                     raz_compiler_rt_arena_set(slot_reg, slot, reg);
                     raz_compiler_rt_arena_set(reg_slot, reg, slot);
@@ -244,14 +273,15 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         }
         ip += 1;
     }
-
     // Rewrite only slots with a proven stable register assignment.
     ip = start;
     while (ip < end) {
         i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
         if (op == rxe_op_store_slot() || op == rxe_op_load_slot()) {
             i64 s = raz_compiler_rt_arena_get(module.immediates, ip);
             i64 assigned = raz_compiler_rt_arena_get(slot_reg, s);
+
             if (assigned >= 6) {
                 raz_compiler_rt_arena_set(module.opcodes, ip, rxe_op_mov());
                 if (op == rxe_op_store_slot()) {
@@ -266,7 +296,6 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
         }
         ip += 1;
     }
-
     raz_compiler_rt_arena_destroy(slot_first);
     raz_compiler_rt_arena_destroy(slot_last);
     raz_compiler_rt_arena_destroy(slot_reg);
@@ -274,8 +303,6 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
     raz_compiler_rt_arena_destroy(loop_store_seen);
     raz_compiler_rt_arena_destroy(reg_slot);
     return true;
-
-
 }
 
 // Secondary cache promotion handles looped functions and any values that spill

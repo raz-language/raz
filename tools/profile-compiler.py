@@ -2,37 +2,113 @@
 # Copyright 2026 Mario Vinciguerra
 # SPDX-License-Identifier: Apache-2.0
 
-import argparse, os, pathlib, shutil, subprocess, time
+"""Profile the canonical Raz compiler build without modifying the compiler."""
+from __future__ import annotations
 
-def main():
-    ap=argparse.ArgumentParser(description="Profile Raz production compiler phase boundaries without modifying the compiler being measured.")
-    ap.add_argument("compiler")
-    ap.add_argument("source_root")
-    ap.add_argument("workdir")
-    ap.add_argument("--output", default="stage-profile.o")
-    ap.add_argument("--opt", default="0")
-    args=ap.parse_args()
-    src=pathlib.Path(args.source_root).resolve(); work=pathlib.Path(args.workdir).resolve()
-    shutil.rmtree(work, ignore_errors=True); (work/'src').mkdir(parents=True)
-    for f in (src/'src').iterdir():
-        if f.is_file(): shutil.copy2(f, work/'src'/f.name)
-    shutil.copy2(src/'host-source-order.txt', work/'stage-input.txt')
-    diag=work/'compiler-diagnostic.txt'; forge_profile=work/'forge-phase-profile.txt'
-    env=os.environ.copy(); env['RAZ_FORGE_PHASE_PROFILE']=str(forge_profile)
-    cmd=[str(pathlib.Path(args.compiler).resolve()), '--forge-structured-only', f'--opt={args.opt}', 'stage-input.txt', args.output]
-    start=time.perf_counter(); proc=subprocess.Popen(cmd,cwd=work,env=env); last=''; seen={}
-    while proc.poll() is None:
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+
+
+def _link_or_copy(source: str, destination: str) -> str:
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(source, destination)
+
+
+def _stage_compiler(source_root: Path, work: Path) -> None:
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(
+        source_root,
+        work,
+        ignore=shutil.ignore_patterns(".raz", "target", "compiler-diagnostic.txt", "forge-phase-profile.txt"),
+        copy_function=_link_or_copy,
+    )
+    order = source_root / "host-source-order.txt"
+    manifest = source_root / "raz.toml"
+    if not order.is_file() or not manifest.is_file():
+        raise RuntimeError(f"{source_root} is not a canonical Raz compiler project")
+    (work / "source-order.txt").write_text(order.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("compiler", help="production raz-compiler executable to measure")
+    parser.add_argument("source_root", help="compiler project root (normally ./compiler)")
+    parser.add_argument("workdir", help="disposable profiling workspace")
+    parser.add_argument("--output", default="stage-profile.o")
+    parser.add_argument("--opt", choices=("0", "1", "2", "3", "s", "z"), default="2")
+    parser.add_argument("--status-interval", type=float, default=15.0)
+    args = parser.parse_args()
+
+    compiler = Path(args.compiler).resolve()
+    source_root = Path(args.source_root).resolve()
+    work = Path(args.workdir).resolve()
+    if not compiler.is_file():
+        raise RuntimeError(f"compiler does not exist: {compiler}")
+
+    _stage_compiler(source_root, work)
+    diagnostic = work / "compiler-diagnostic.txt"
+    forge_profile = work / "forge-phase-profile.txt"
+    query_profile = work / "compiler-query-profile.txt"
+    env = os.environ.copy()
+    env["RAZ_FORGE_PHASE_PROFILE"] = str(forge_profile)
+
+    command = [
+        str(compiler),
+        "build",
+        "--backend=forge",
+        "--forge-native",
+        "--forge-structured-only",
+        "--profile-queries",
+        f"--opt={args.opt}",
+        "raz.toml",
+        args.output,
+    ]
+    print("[profile] " + " ".join(command), flush=True)
+    start = time.perf_counter()
+    process = subprocess.Popen(command, cwd=work, env=env)
+    last_diagnostic = ""
+    last_report = 0.0
+    phase_times: list[tuple[str, float]] = []
+
+    while process.poll() is None:
+        elapsed = time.perf_counter() - start
         try:
-            raw=diag.read_text().strip()
-            if raw and raw != last:
-                elapsed=time.perf_counter()-start; phase=int(raw.split()[0]); seen.setdefault(phase,elapsed)
-                print(f"phase {phase}: {elapsed:.6f}s ({raw})", flush=True); last=raw
-        except (OSError,ValueError): pass
-        time.sleep(0.003)
-    rc=proc.wait(); total=time.perf_counter()-start
-    print(f"exit={rc} total={total:.6f}s")
-    if 92 in seen and 93 in seen: print(f"hir~={seen[93]-seen[92]:.6f}s")
-    if 93 in seen and 94 in seen: print(f"mir~={seen[94]-seen[93]:.6f}s")
-    if forge_profile.exists(): print(forge_profile.read_text(), end='')
-    raise SystemExit(rc)
-if __name__ == '__main__': main()
+            raw = diagnostic.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+        if raw and raw != last_diagnostic:
+            last_diagnostic = raw
+            phase_times.append((raw, elapsed))
+            print(f"[phase {elapsed:8.3f}s] {raw}", flush=True)
+        if args.status_interval > 0 and elapsed - last_report >= args.status_interval:
+            last_report = elapsed
+            print(f"[profile {elapsed:8.1f}s] compiling", flush=True)
+        time.sleep(0.05)
+
+    return_code = process.wait()
+    total = time.perf_counter() - start
+    print(f"[profile] exit={return_code} total={total:.3f}s")
+
+    previous = 0.0
+    for diagnostic_text, elapsed in phase_times:
+        print(f"  +{elapsed - previous:8.3f}s  {diagnostic_text}")
+        previous = elapsed
+
+    if query_profile.is_file():
+        print("\n[semantic-query-profile]")
+        print(query_profile.read_text(encoding="utf-8"), end="")
+    if forge_profile.is_file():
+        print("\n[forge-phase-profile]")
+        print(forge_profile.read_text(encoding="utf-8"), end="")
+    return return_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

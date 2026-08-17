@@ -20,11 +20,15 @@ order = (root / "compiler/host-source-order.txt").read_text(encoding="utf-8")
 checks = {
     "symbol interner stores exact semantic names": all(x in model + builder + symbols for x in [
         "query_symbol_count", "query_symbol_hashes", "query_symbol_offsets",
-        "query_symbol_lengths", "hir_query_intern_symbol", "token_same"]),
+        "query_symbol_lengths", "hir_query_intern_symbol", "token_same",
+        "query_symbol_buckets", "query_symbol_next"]),
     "type interner stores complete canonical HIR type shape": all(x in model + builder + types for x in [
         "query_type_count", "query_type_structures", "query_type_kinds",
         "query_type_references", "query_type_array_extents",
-        "query_type_function_signatures", "query_type_trait_objects", "hir_query_intern_type"]),
+        "query_type_function_signatures", "query_type_trait_objects", "hir_query_intern_type",
+        "query_type_hashes", "query_type_buckets", "query_type_next"]),
+    "semantic identity interning uses bucketed lookup rather than full linear scans": all(x in symbols + types for x in [
+        "query_symbol_buckets", "query_symbol_next", "query_type_buckets", "query_type_next"]),
     "semantic revision remains telemetry rather than global cache validity": all(x in model + builder + invalidation for x in [
         "query_revision", "query_cache_revisions", "hir_query_sync_inputs",
         "query_input_traits_fingerprint", "query_invalidation_total"]),

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_mir_core_builder;
+
 public import raz_compiler_mir_core_model;
+
 // Allocation, mutation, and instruction construction primitives for MIR.
 fn init_mir(MirModule&mut out) -> bool {
     out.function_count = 0;
@@ -109,19 +111,35 @@ fn mir_emit(MirModule&mut out, i64 opcode, i64 a, i64 b, i64 c, i64 d) -> i64 {
     i64 index = out.instruction_count;
 
     out.instruction_count += 1;
-    raz_compiler_rt_arena_set(out.opcodes, index, opcode);
-    raz_compiler_rt_arena_set(out.op_types, index, 0);
-    raz_compiler_rt_arena_set(out.op_a, index, a);
-    raz_compiler_rt_arena_set(out.op_b, index, b);
-    raz_compiler_rt_arena_set(out.op_c, index, c);
-    raz_compiler_rt_arena_set(out.op_d, index, d);
+    // MIR instruction lanes are fixed-capacity compiler-owned tables. Keep the
+    // legacy checked fallback for an overflowed index, but make the normal
+    // in-capacity emission path pay no repeated arena-header validation.
+    if (index >= 0 && index < 524288) {
+        raz_compiler_rt_arena_set_unchecked(out.opcodes, index, opcode);
+        raz_compiler_rt_arena_set_unchecked(out.op_types, index, 0);
+        raz_compiler_rt_arena_set_unchecked(out.op_a, index, a);
+        raz_compiler_rt_arena_set_unchecked(out.op_b, index, b);
+        raz_compiler_rt_arena_set_unchecked(out.op_c, index, c);
+        raz_compiler_rt_arena_set_unchecked(out.op_d, index, d);
+    } else {
+        raz_compiler_rt_arena_set(out.opcodes, index, opcode);
+        raz_compiler_rt_arena_set(out.op_types, index, 0);
+        raz_compiler_rt_arena_set(out.op_a, index, a);
+        raz_compiler_rt_arena_set(out.op_b, index, b);
+        raz_compiler_rt_arena_set(out.op_c, index, c);
+        raz_compiler_rt_arena_set(out.op_d, index, d);
+    }
     return index;
 }
 
 fn mir_emit_typed(MirModule&mut out, i64 opcode, i64 a, i64 b, i64 c, i64 d, i64 type_kind) -> i64 {
     i64 instruction = mir_emit(out, opcode, a, b, c, d);
 
-    raz_compiler_rt_arena_set(out.op_types, instruction, type_kind);
+    if (instruction >= 0 && instruction < 524288) {
+        raz_compiler_rt_arena_set_unchecked(out.op_types, instruction, type_kind);
+    } else {
+        raz_compiler_rt_arena_set(out.op_types, instruction, type_kind);
+    }
     return instruction;
 }
 

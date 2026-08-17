@@ -2,148 +2,202 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_hir_query_engine;
+
 public import raz_compiler_hir_query_invalidation;
+
 // Shared semantic query runtime. Cache validity is controlled by semantic
 // input invalidation and reverse dependency propagation, so unrelated semantic
 // mutations do not flush otherwise reusable query results.
-fn hir_query_same(HirBuilder&mut builder, i64 index, i64 kind, i64 a, i64 b, i64 c) -> bool {
-  return (
-  raz_compiler_rt_arena_get(builder.query_active_kinds, index) == kind &&
-  raz_compiler_rt_arena_get(builder.query_active_a, index) == a &&
-  raz_compiler_rt_arena_get(builder.query_active_b, index) == b &&
-  raz_compiler_rt_arena_get(builder.query_active_c, index) == c
-  );
+fn hir_query_same(HirBuilder&mut builder, i64 index, i64 hash, i64 kind, i64 a, i64 b, i64 c, ) -> bool {
+    // Query hashes are accelerators only. The complete key remains the semantic
+    // identity so a hash collision can never alias two compiler queries.
+    return (
+        raz_compiler_rt_arena_get_unchecked(builder.query_active_hashes, index) == hash &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_active_kinds, index) == kind &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_active_a, index) == a &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_active_b, index) == b &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_active_c, index) == c
+    );
 }
 
-fn hir_query_record_dependency(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) {
-  if (builder.query_active_count == 0 || builder.query_dependency_count >= 16384) {
-    return;
-  }
+fn hir_query_record_dependency(HirBuilder&mut builder, i64 child_hash, i64 kind, i64 a, i64 b, i64 c, ) {
+    if (builder.query_active_count == 0 || builder.query_dependency_count >= 16384) {
+        return;
+    }
 
-  i64 parent = builder.query_active_count - 1;
+    i64 parent = builder.query_active_count - 1;
+    i64 parent_hash = raz_compiler_rt_arena_get_unchecked(builder.query_active_hashes, parent);
 
-  if (hir_query_same(builder, parent, kind, a, b, c)) {
-    return;
-  }
+    if (hir_query_same(builder, parent, child_hash, kind, a, b, c)) {
+        return;
+    }
 
-  i64 dependency = builder.query_dependency_count;
+    i64 parent_kind = raz_compiler_rt_arena_get_unchecked(builder.query_active_kinds, parent);
+    i64 parent_a = raz_compiler_rt_arena_get_unchecked(builder.query_active_a, parent);
+    i64 parent_b = raz_compiler_rt_arena_get_unchecked(builder.query_active_b, parent);
+    i64 parent_c = raz_compiler_rt_arena_get_unchecked(builder.query_active_c, parent);
+    i64 bucket = child_hash % 32768;
+    i64 link = raz_compiler_rt_arena_get_unchecked(builder.query_dependency_buckets, bucket);
 
-  raz_compiler_rt_arena_set(
-  builder.query_dependency_parent_kinds,
-  dependency,
-  raz_compiler_rt_arena_get(builder.query_active_kinds, parent),
-  );
-  raz_compiler_rt_arena_set(
-  builder.query_dependency_parent_a,
-  dependency,
-  raz_compiler_rt_arena_get(builder.query_active_a, parent),
-  );
-  raz_compiler_rt_arena_set(
-  builder.query_dependency_parent_b,
-  dependency,
-  raz_compiler_rt_arena_get(builder.query_active_b, parent),
-  );
-  raz_compiler_rt_arena_set(
-  builder.query_dependency_parent_c,
-  dependency,
-  raz_compiler_rt_arena_get(builder.query_active_c, parent),
-  );
-  raz_compiler_rt_arena_set(builder.query_dependency_child_kinds, dependency, kind);
-  raz_compiler_rt_arena_set(builder.query_dependency_child_a, dependency, a);
-  raz_compiler_rt_arena_set(builder.query_dependency_child_b, dependency, b);
-  raz_compiler_rt_arena_set(builder.query_dependency_child_c, dependency, c);
-  builder.query_dependency_count += 1;
+    // A parent can request the same child more than once while evaluating one
+    // semantic query. Keep one exact graph edge rather than making invalidation
+    // revisit duplicates forever. Stored hashes reject almost every unrelated
+    // candidate before the eight exact key lanes are touched.
+    while (link > 0) {
+        i64 existing = link - 1;
+
+        if (
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_child_hashes, existing) == child_hash &&
+            raz_compiler_rt_arena_get_unchecked(
+                builder.query_dependency_parent_hashes,
+                existing
+            ) == parent_hash &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_child_kinds, existing) == kind &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_child_a, existing) == a &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_child_b, existing) == b &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_child_c, existing) == c &&
+            raz_compiler_rt_arena_get_unchecked(
+                builder.query_dependency_parent_kinds,
+                existing
+            ) == parent_kind &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_parent_a, existing) == parent_a &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_parent_b, existing) == parent_b &&
+            raz_compiler_rt_arena_get_unchecked(builder.query_dependency_parent_c, existing) == parent_c
+        ) {
+            return;
+        }
+        link = raz_compiler_rt_arena_get_unchecked(builder.query_dependency_next, existing);
+    }
+
+    i64 dependency = builder.query_dependency_count;
+
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_parent_hashes, dependency, parent_hash);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_parent_kinds, dependency, parent_kind);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_parent_a, dependency, parent_a);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_parent_b, dependency, parent_b);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_parent_c, dependency, parent_c);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_child_hashes, dependency, child_hash);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_child_kinds, dependency, kind);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_child_a, dependency, a);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_child_b, dependency, b);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_child_c, dependency, c);
+    // Reverse-index the edge by child key. Invalidation can now walk only the
+    // dependency chains rooted at an actually invalidated query instead of
+    // rescanning every recorded edge until a fixed point is reached.
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_next, dependency, link);
+    raz_compiler_rt_arena_set_unchecked(builder.query_dependency_buckets, bucket, dependency + 1);
+    builder.query_dependency_count += 1;
 }
 
 fn hir_query_lookup(
-HirBuilder&mut builder,
-i64 kind,
-i64 a,
-i64 b,
-i64 c,
-i64 epoch0,
-i64 epoch1,
-i64&mut out_result0,
-i64&mut out_result1,
+    HirBuilder&mut builder,
+    i64 kind,
+    i64 a,
+    i64 b,
+    i64 c,
+    i64 epoch0,
+    i64 epoch1,
+    i64&mut out_result0,
+    i64&mut out_result1,
 ) -> bool {
-  hir_query_record_dependency(builder, kind, a, b, c);
+    // Compute the full query hash once on the hit path and reuse it for both
+    // dependency indexing and direct-cache selection.
 
-  i64 slot = hir_query_slot(kind, a, b, c);
+    i64 hash = hir_query_hash(kind, a, b, c);
 
-  if (
-  raz_compiler_rt_arena_get(builder.query_cache_states, slot) != 0 &&
-  raz_compiler_rt_arena_get(builder.query_cache_kinds, slot) == kind &&
-  raz_compiler_rt_arena_get(builder.query_cache_a, slot) == a &&
-  raz_compiler_rt_arena_get(builder.query_cache_b, slot) == b &&
-  raz_compiler_rt_arena_get(builder.query_cache_c, slot) == c &&
-  raz_compiler_rt_arena_get(builder.query_cache_epoch0, slot) == epoch0 &&
-  raz_compiler_rt_arena_get(builder.query_cache_epoch1, slot) == epoch1
-  ) {
-    *out_result0 = raz_compiler_rt_arena_get(builder.query_cache_result0, slot);
-    *out_result1 = raz_compiler_rt_arena_get(builder.query_cache_result1, slot);
-    builder.query_cache_hits += 1;
-    return true;
-  }
-  builder.query_cache_misses += 1;
-  return false;
+    hir_query_record_dependency(builder, hash, kind, a, b, c);
+
+    i64 slot = hash % 4096;
+
+    if (
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_states, slot) != 0 &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_hashes, slot) == hash &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_kinds, slot) == kind &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_a, slot) == a &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_b, slot) == b &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_c, slot) == c &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_epoch0, slot) == epoch0 &&
+        raz_compiler_rt_arena_get_unchecked(builder.query_cache_epoch1, slot) == epoch1
+    ) {
+        *out_result0 = raz_compiler_rt_arena_get_unchecked(builder.query_cache_result0, slot);
+        *out_result1 = raz_compiler_rt_arena_get_unchecked(builder.query_cache_result1, slot);
+        builder.query_cache_hits += 1;
+        return true;
+    }
+    builder.query_cache_misses += 1;
+    return false;
 }
 
+// Lookup records the caller -> query dependency before deciding hit or miss.
+// Begin owns only the active-stack/cycle role; recording again here duplicates
+// every miss edge and makes transitive invalidation scan redundant entries.
 fn hir_query_begin(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
-  hir_query_record_dependency(builder, kind, a, b, c);
+    i64 hash = hir_query_hash(kind, a, b, c);
+    i64 active = 0;
 
-  i64 active = 0;
-
-  while (active < builder.query_active_count) {
-    if (hir_query_same(builder, active, kind, a, b, c)) {
-      builder.query_cycle_count += 1;
-      return false;
+    while (active < builder.query_active_count) {
+        if (hir_query_same(builder, active, hash, kind, a, b, c)) {
+            builder.query_cycle_count += 1;
+            return false;
+        }
+        active += 1;
     }
-    active += 1;
-  }
-  if (builder.query_active_count >= 128) {
-    builder.query_cycle_count += 1;
-    return false;
-  }
+    if (builder.query_active_count >= 128) {
+        builder.query_cycle_count += 1;
+        return false;
+    }
 
-  i64 index = builder.query_active_count;
+    i64 index = builder.query_active_count;
 
-  raz_compiler_rt_arena_set(builder.query_active_kinds, index, kind);
-  raz_compiler_rt_arena_set(builder.query_active_a, index, a);
-  raz_compiler_rt_arena_set(builder.query_active_b, index, b);
-  raz_compiler_rt_arena_set(builder.query_active_c, index, c);
-  builder.query_active_count += 1;
-  return true;
+    raz_compiler_rt_arena_set_unchecked(builder.query_active_hashes, index, hash);
+    raz_compiler_rt_arena_set_unchecked(builder.query_active_kinds, index, kind);
+    raz_compiler_rt_arena_set_unchecked(builder.query_active_a, index, a);
+    raz_compiler_rt_arena_set_unchecked(builder.query_active_b, index, b);
+    raz_compiler_rt_arena_set_unchecked(builder.query_active_c, index, c);
+    builder.query_active_count += 1;
+    return true;
 }
 
 fn hir_query_end(
-HirBuilder&mut builder,
-i64 kind,
-i64 a,
-i64 b,
-i64 c,
-i64 epoch0,
-i64 epoch1,
-i64 result0,
-i64 result1,
-bool cache_result,
+    HirBuilder&mut builder,
+    i64 kind,
+    i64 a,
+    i64 b,
+    i64 c,
+    i64 epoch0,
+    i64 epoch1,
+    i64 result0,
+    i64 result1,
+    bool cache_result,
 ) {
-  if (builder.query_active_count > 0) {
-    builder.query_active_count -= 1;
-  }
-  if (!cache_result) {
-    return;
-  }
+    i64 hash = hir_query_hash(kind, a, b, c);
 
-  i64 slot = hir_query_slot(kind, a, b, c);
+    if (builder.query_active_count > 0) {
+        // Begin already computed and stored this exact query hash. Reuse it on
+        // completion rather than hashing the same four-lane identity a third
+        // time on every cache miss. The fallback above only covers defensive
+        // callers that end without an active query frame.
+        hash = raz_compiler_rt_arena_get_unchecked(
+            builder.query_active_hashes,
+            builder.query_active_count - 1,
+        );
+        builder.query_active_count -= 1;
+    }
+    if (!cache_result) {
+        return;
+    }
 
-  raz_compiler_rt_arena_set(builder.query_cache_kinds, slot, kind);
-  raz_compiler_rt_arena_set(builder.query_cache_a, slot, a);
-  raz_compiler_rt_arena_set(builder.query_cache_b, slot, b);
-  raz_compiler_rt_arena_set(builder.query_cache_c, slot, c);
-  raz_compiler_rt_arena_set(builder.query_cache_epoch0, slot, epoch0);
-  raz_compiler_rt_arena_set(builder.query_cache_epoch1, slot, epoch1);
-  raz_compiler_rt_arena_set(builder.query_cache_result0, slot, result0);
-  raz_compiler_rt_arena_set(builder.query_cache_result1, slot, result1);
-  raz_compiler_rt_arena_set(builder.query_cache_revisions, slot, builder.query_revision);
-  raz_compiler_rt_arena_set(builder.query_cache_states, slot, 1);
+    i64 slot = hash % 4096;
+
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_hashes, slot, hash);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_kinds, slot, kind);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_a, slot, a);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_b, slot, b);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_c, slot, c);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_epoch0, slot, epoch0);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_epoch1, slot, epoch1);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_result0, slot, result0);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_result1, slot, result1);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_revisions, slot, builder.query_revision);
+    raz_compiler_rt_arena_set_unchecked(builder.query_cache_states, slot, 1);
 }

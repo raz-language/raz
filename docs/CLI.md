@@ -70,9 +70,11 @@ Use `raz forge --help` or `raz llvm --help` for backend-specific target, optimiz
 raz new <name>
 raz init [path]
 raz clean
-raz fmt [--check] <file.rz>
+raz fmt [--check] [file-or-directory]
 raz doc <file.rz> [output.md]
 ```
+
+`raz fmt` formats a single `.rz` file or recursively formats every `.rz` file under a directory. With no path it formats the current directory. `--check` reports every file that would change and exits nonzero without rewriting source.
 
 `raz test` discovers zero-argument, non-extern functions whose names begin with `test_`. A return value of zero means success; a nonzero result fails the test command.
 

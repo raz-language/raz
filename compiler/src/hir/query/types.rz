@@ -2,57 +2,93 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_hir_query_types;
+
 public import raz_compiler_hir_query_symbols;
+
 // Canonical HIR type identity used by semantic queries. Exact structural fields
 // define identity; the returned integer is stable for the lifetime of the HIR
 // semantic database and independent of source location.
-fn hir_query_intern_type(
-HirBuilder&mut builder,
-i64 structure,
-i64 type_kind,
-i64 reference,
-i64 reference_mutable,
-i64 slice,
-i64 slice_mutable,
-i64 array_extent,
-i64 function_signature,
-i64 trait_object,
-) -> i64 {
-  i64 type_id = 0;
+fn hir_query_type_hash_mix(i64 hash, i64 value) -> i64 {
+    i64 normalized = value % 281474976710597;
 
-  while (type_id < builder.query_type_count) {
-    if (
-    raz_compiler_rt_arena_get(builder.query_type_structures, type_id) == structure &&
-    raz_compiler_rt_arena_get(builder.query_type_kinds, type_id) == type_kind &&
-    raz_compiler_rt_arena_get(builder.query_type_references, type_id) == reference &&
-    raz_compiler_rt_arena_get(builder.query_type_reference_mutable, type_id) == reference_mutable &&
-    raz_compiler_rt_arena_get(builder.query_type_slices, type_id) == slice &&
-    raz_compiler_rt_arena_get(builder.query_type_slice_mutable, type_id) == slice_mutable &&
-    raz_compiler_rt_arena_get(builder.query_type_array_extents, type_id) == array_extent &&
-    raz_compiler_rt_arena_get(builder.query_type_function_signatures, type_id) == function_signature &&
-    raz_compiler_rt_arena_get(builder.query_type_trait_objects, type_id) == trait_object
-    ) {
-      return type_id;
+    if (normalized < 0) {
+        normalized += 281474976710597;
     }
-    type_id += 1;
-  }
-  if (builder.query_type_count >= 8192) {
-    return -1;
-  }
-  type_id = builder.query_type_count;
-  builder.query_type_count += 1;
-  raz_compiler_rt_arena_set(builder.query_type_structures, type_id, structure);
-  raz_compiler_rt_arena_set(builder.query_type_kinds, type_id, type_kind);
-  raz_compiler_rt_arena_set(builder.query_type_references, type_id, reference);
-  raz_compiler_rt_arena_set(builder.query_type_reference_mutable, type_id, reference_mutable);
-  raz_compiler_rt_arena_set(builder.query_type_slices, type_id, slice);
-  raz_compiler_rt_arena_set(builder.query_type_slice_mutable, type_id, slice_mutable);
-  raz_compiler_rt_arena_set(builder.query_type_array_extents, type_id, array_extent);
-  raz_compiler_rt_arena_set(builder.query_type_function_signatures, type_id, function_signature);
-  raz_compiler_rt_arena_set(builder.query_type_trait_objects, type_id, trait_object);
-  return type_id;
+    return (hash * 131 + normalized + 1) % 281474976710597;
+}
+
+fn hir_query_intern_type(
+    HirBuilder&mut builder,
+    i64 structure,
+    i64 type_kind,
+    i64 reference,
+    i64 reference_mutable,
+    i64 slice,
+    i64 slice_mutable,
+    i64 array_extent,
+    i64 function_signature,
+    i64 trait_object,
+) -> i64 {
+    i64 hash = 29;
+
+    hash = hir_query_type_hash_mix(hash, structure);
+    hash = hir_query_type_hash_mix(hash, type_kind);
+    hash = hir_query_type_hash_mix(hash, reference);
+    hash = hir_query_type_hash_mix(hash, reference_mutable);
+    hash = hir_query_type_hash_mix(hash, slice);
+    hash = hir_query_type_hash_mix(hash, slice_mutable);
+    hash = hir_query_type_hash_mix(hash, array_extent);
+    hash = hir_query_type_hash_mix(hash, function_signature);
+    hash = hir_query_type_hash_mix(hash, trait_object);
+
+    i64 bucket = hash % 16384;
+    i64 link = raz_compiler_rt_arena_get(builder.query_type_buckets, bucket);
+
+    while (link > 0) {
+        i64 type_id = link - 1;
+
+        if (
+            raz_compiler_rt_arena_get(builder.query_type_hashes, type_id) == hash &&
+            raz_compiler_rt_arena_get(builder.query_type_structures, type_id) == structure &&
+            raz_compiler_rt_arena_get(builder.query_type_kinds, type_id) == type_kind &&
+            raz_compiler_rt_arena_get(builder.query_type_references, type_id) == reference &&
+            raz_compiler_rt_arena_get(builder.query_type_reference_mutable, type_id) == reference_mutable &&
+            raz_compiler_rt_arena_get(builder.query_type_slices, type_id) == slice &&
+            raz_compiler_rt_arena_get(builder.query_type_slice_mutable, type_id) == slice_mutable &&
+            raz_compiler_rt_arena_get(builder.query_type_array_extents, type_id) == array_extent &&
+            raz_compiler_rt_arena_get(builder.query_type_function_signatures, type_id) == function_signature &&
+            raz_compiler_rt_arena_get(builder.query_type_trait_objects, type_id) == trait_object
+        ) {
+            return type_id;
+        }
+        link = raz_compiler_rt_arena_get(builder.query_type_next, type_id);
+    }
+    if (builder.query_type_count >= 8192) {
+        return -1;
+    }
+
+    i64 type_id = builder.query_type_count;
+
+    builder.query_type_count += 1;
+    raz_compiler_rt_arena_set(builder.query_type_hashes, type_id, hash);
+    raz_compiler_rt_arena_set(builder.query_type_structures, type_id, structure);
+    raz_compiler_rt_arena_set(builder.query_type_kinds, type_id, type_kind);
+    raz_compiler_rt_arena_set(builder.query_type_references, type_id, reference);
+    raz_compiler_rt_arena_set(builder.query_type_reference_mutable, type_id, reference_mutable);
+    raz_compiler_rt_arena_set(builder.query_type_slices, type_id, slice);
+    raz_compiler_rt_arena_set(builder.query_type_slice_mutable, type_id, slice_mutable);
+    raz_compiler_rt_arena_set(builder.query_type_array_extents, type_id, array_extent);
+    raz_compiler_rt_arena_set(builder.query_type_function_signatures, type_id, function_signature);
+    raz_compiler_rt_arena_set(builder.query_type_trait_objects, type_id, trait_object);
+    raz_compiler_rt_arena_set(
+        builder.query_type_next,
+        type_id,
+        raz_compiler_rt_arena_get(builder.query_type_buckets, bucket),
+    );
+    raz_compiler_rt_arena_set(builder.query_type_buckets, bucket, type_id + 1);
+    return type_id;
 }
 
 fn hir_query_intern_value_type(HirBuilder&mut builder, i64 structure, i64 type_kind) -> i64 {
-  return hir_query_intern_type(builder, structure, type_kind, 0, 0, 0, 0, -1, -1, -1);
+    return hir_query_intern_type(builder, structure, type_kind, 0, 0, 0, 0, -1, -1, -1);
 }

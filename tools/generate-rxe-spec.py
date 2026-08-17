@@ -8,11 +8,11 @@ import re
 root = Path(__file__).resolve().parents[1]
 isa = (root / 'compiler/src/backend/rxe/isa.rz').read_text()
 writer = (root / 'compiler/src/backend/rxe/writer.rz').read_text()
-fmt = int(re.search(r'rxe_format_version\(\) -> i64 \{ return (\d+); \}', isa).group(1))
-isa_version = int(re.search(r'rxe_isa_version\(\) -> i64 \{ return (\d+); \}', isa).group(1))
+fmt = int(re.search(r'rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa).group(1))
+isa_version = int(re.search(r'rxe_isa_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa).group(1))
 header = int(re.search(r'i64 header_bytes = (\d+);', writer).group(1))
 ops = []
-for name, value in re.findall(r'fn rxe_op_([a-z0-9_]+)\(\) -> i64 \{ return (\d+); \}', isa):
+for name, value in re.findall(r'fn\s+rxe_op_([a-z0-9_]+)\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa):
     ops.append((int(value), name.replace('_', '.')))
 ops.sort()
 

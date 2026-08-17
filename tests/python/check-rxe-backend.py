@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+import re
 root=Path(__file__).resolve().parents[2]
 backend=(root/'compiler/src/driver/backend.rz').read_text()
 order=(root/'compiler/host-source-order.txt').read_text()
@@ -15,7 +16,7 @@ assert '--backend=rxe' in backend
 assert 'return 2;' in backend
 assert 'emit_rxe_module' in backend
 isa=(root/'compiler/src/backend/rxe/isa.rz').read_text()
-assert 'rxe_register_count() -> i64 { return 32; }' in isa
+assert re.search(r'fn\s+rxe_register_count\(\)\s*->\s*i64\s*\{\s*return\s+32;\s*\}', isa)
 assert 'eight bytes' in isa
 for op in ['rxe_op_call','rxe_op_call_indirect','rxe_op_make_closure','rxe_op_func_ref','rxe_op_index_ref','rxe_op_string_ref','rxe_op_trunc8','rxe_op_load_global','rxe_op_rem64','rxe_op_divs64','rxe_op_rems64','rxe_op_sar64','rxe_op_lts64','rxe_op_slice_load','rxe_op_slice_store','rxe_op_slice_ref']:
     assert op in isa, f'missing RXE opcode {op}'

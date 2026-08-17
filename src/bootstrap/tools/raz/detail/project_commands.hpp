@@ -23,20 +23,20 @@ std::string trim_copy(std::string_view value) {
 
 std::string format_raz_source(std::string_view source) {
   std::istringstream input{std::string(source)};
-  std::ostringstream output;
+  std::vector<std::string> lines;
   std::string line;
   std::size_t indent = 0;
-  std::size_t blank_run = 0;
+
   while (std::getline(input, line)) {
     auto text = trim_copy(line);
     if (text.empty()) {
-      if (blank_run == 0) output << '\n';
-      ++blank_run;
+      lines.emplace_back();
       continue;
     }
-    blank_run = 0;
-    if (!text.empty() && text.front() == '}') indent = indent == 0 ? 0 : indent - 1;
-    output << std::string(indent * 2, ' ') << text << '\n';
+
+    if (text.front() == '}') indent = indent == 0 ? 0 : indent - 1;
+    lines.push_back(std::string(indent * 4, ' ') + text);
+
     std::size_t opens = 0, closes = 0;
     bool string = false, character = false, escaped = false;
     for (const char c : text) {
@@ -53,6 +53,37 @@ std::string format_raz_source(std::string_view source) {
     if (opens >= effective_closes) indent += opens - effective_closes;
     else indent = effective_closes - opens >= indent ? 0 : indent - (effective_closes - opens);
   }
+
+  auto kind = [](std::string_view text) -> int {
+    if (text.starts_with("// SPDX-License-Identifier:")) return 1;
+    if (text.starts_with("namespace ") && text.ends_with(';')) return 2;
+    if (text.starts_with("import ") || text.starts_with("public import ")) return 3;
+    return 0;
+  };
+
+  std::ostringstream output;
+  int previous_kind = -1;
+  bool pending_blank = false;
+  bool wrote_line = false;
+  for (const auto& raw : lines) {
+    if (raw.empty()) {
+      pending_blank = wrote_line;
+      continue;
+    }
+
+    const auto text = std::string_view(raw).substr(raw.find_first_not_of(' '));
+    const int current_kind = kind(text);
+    bool blank = pending_blank;
+    if (previous_kind == 1 || previous_kind == 2 || (previous_kind == 3 && current_kind != 3)) blank = true;
+    if (previous_kind == 3 && current_kind == 3) blank = false;
+    if (current_kind == 1) blank = false; // copyright/SPDX stay adjacent
+    if (wrote_line && blank) output << '\n';
+    output << raw << '\n';
+    wrote_line = true;
+    pending_blank = false;
+    previous_kind = current_kind;
+  }
+
   auto result = output.str();
   while (result.size() > 1 && result.ends_with("\n\n")) result.pop_back();
   if (result.empty() || result.back() != '\n') result.push_back('\n');

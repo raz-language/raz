@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 namespace raz_compiler_backend_rxe_dataflow;
+
 public import raz_compiler_backend_rxe_lowering;
 
 // RXE frame-slot dataflow. Frame slots are the correctness representation
@@ -16,9 +17,14 @@ fn rxe_dataflow_predecessor_count(RxeModule& module, i64 function, i64 target) -
     i64 count = raz_compiler_rt_arena_get(module.function_block_counts, function);
     i64 block = first;
     i64 result = 0;
+
     while (block < first + count) {
-        if (raz_compiler_rt_arena_get(module.block_successor0, block) == target) { result += 1; }
-        if (raz_compiler_rt_arena_get(module.block_successor1, block) == target) { result += 1; }
+        if (raz_compiler_rt_arena_get(module.block_successor0, block) == target) {
+            result += 1;
+        }
+        if (raz_compiler_rt_arena_get(module.block_successor1, block) == target) {
+            result += 1;
+        }
         block += 1;
     }
     return result;
@@ -37,6 +43,7 @@ fn rxe_dataflow_build_slot_sets(
     i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
     i64 cells = block_count * slot_count;
     i64 i = 0;
+
     while (i < cells) {
         raz_compiler_rt_arena_set(uses, i, 0);
         raz_compiler_rt_arena_set(defs, i, 0);
@@ -46,19 +53,29 @@ fn rxe_dataflow_build_slot_sets(
     }
 
     i64 local = 0;
+
     while (local < block_count) {
         i64 block = first + local;
         i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
         i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
         i64 ip = start;
+
         while (ip < end) {
             i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
             if (op == rxe_op_load_slot() || op == rxe_op_store_slot()) {
                 i64 slot = raz_compiler_rt_arena_get(module.immediates, ip);
-                if (slot < 0 || slot >= slot_count) { return false; }
+
+                if (slot < 0 || slot >= slot_count) {
+                    return false;
+                }
+
                 i64 cell = rxe_dataflow_cell(local, slot, slot_count);
+
                 if (op == rxe_op_load_slot()) {
-                    if (raz_compiler_rt_arena_get(defs, cell) == 0) { raz_compiler_rt_arena_set(uses, cell, 1); }
+                    if (raz_compiler_rt_arena_get(defs, cell) == 0) {
+                        raz_compiler_rt_arena_set(uses, cell, 1);
+                    }
                 } else {
                     raz_compiler_rt_arena_set(defs, cell, 1);
                 }
@@ -70,29 +87,54 @@ fn rxe_dataflow_build_slot_sets(
 
     bool changed = true;
     i64 rounds = 0;
+
     while (changed) {
         changed = false;
         rounds += 1;
-        if (rounds > block_count * 4 + 8) { return false; }
+        if (rounds > block_count * 4 + 8) {
+            return false;
+        }
         local = block_count - 1;
         while (local >= 0) {
             i64 block = first + local;
             i64 slot = 0;
+
             while (slot < slot_count) {
                 i64 cell = rxe_dataflow_cell(local, slot, slot_count);
                 i64 out_value = 0;
                 i64 successor = raz_compiler_rt_arena_get(module.block_successor0, block);
+
                 if (successor >= first && successor < first + block_count) {
                     i64 successor_local = successor - first;
-                    if (raz_compiler_rt_arena_get(live_in, rxe_dataflow_cell(successor_local, slot, slot_count)) != 0) { out_value = 1; }
+
+                    if (
+                        raz_compiler_rt_arena_get(
+                            live_in,
+                            rxe_dataflow_cell(successor_local, slot, slot_count)
+                        ) != 0
+                    ) {
+                        out_value = 1;
+                    }
                 }
                 successor = raz_compiler_rt_arena_get(module.block_successor1, block);
                 if (successor >= first && successor < first + block_count) {
                     i64 successor_local = successor - first;
-                    if (raz_compiler_rt_arena_get(live_in, rxe_dataflow_cell(successor_local, slot, slot_count)) != 0) { out_value = 1; }
+
+                    if (
+                        raz_compiler_rt_arena_get(
+                            live_in,
+                            rxe_dataflow_cell(successor_local, slot, slot_count)
+                        ) != 0
+                    ) {
+                        out_value = 1;
+                    }
                 }
+
                 i64 in_value = raz_compiler_rt_arena_get(uses, cell);
-                if (in_value == 0 && out_value != 0 && raz_compiler_rt_arena_get(defs, cell) == 0) { in_value = 1; }
+
+                if (in_value == 0 && out_value != 0 && raz_compiler_rt_arena_get(defs, cell) == 0) {
+                    in_value = 1;
+                }
                 if (raz_compiler_rt_arena_get(live_out, cell) != out_value) {
                     raz_compiler_rt_arena_set(live_out, cell, out_value);
                     changed = true;
@@ -122,31 +164,50 @@ fn rxe_dataflow_extend_slot_intervals(
 ) -> bool {
     i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function);
     i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
-    if (slot_count <= 0 || block_count <= 0) { return true; }
+
+    if (slot_count <= 0 || block_count <= 0) {
+        return true;
+    }
+
     i64 cells = block_count * slot_count + 1;
     i64 uses = raz_compiler_rt_arena_create(cells);
     i64 defs = raz_compiler_rt_arena_create(cells);
     i64 live_in = raz_compiler_rt_arena_create(cells);
     i64 live_out = raz_compiler_rt_arena_create(cells);
+
     if (uses == 0 || defs == 0 || live_in == 0 || live_out == 0) {
-        if (uses != 0) { raz_compiler_rt_arena_destroy(uses); }
-        if (defs != 0) { raz_compiler_rt_arena_destroy(defs); }
-        if (live_in != 0) { raz_compiler_rt_arena_destroy(live_in); }
-        if (live_out != 0) { raz_compiler_rt_arena_destroy(live_out); }
+        if (uses != 0) {
+            raz_compiler_rt_arena_destroy(uses);
+        }
+        if (defs != 0) {
+            raz_compiler_rt_arena_destroy(defs);
+        }
+        if (live_in != 0) {
+            raz_compiler_rt_arena_destroy(live_in);
+        }
+        if (live_out != 0) {
+            raz_compiler_rt_arena_destroy(live_out);
+        }
         return false;
     }
+
     bool ok = rxe_dataflow_build_slot_sets(module, function, slot_count, uses, defs, live_in, live_out);
+
     if (ok) {
         i64 local = 0;
+
         while (local < block_count) {
             i64 block = first_block + local;
             i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
             i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block) - 1;
             i64 slot = 0;
+
             while (slot < slot_count) {
                 i64 cell = rxe_dataflow_cell(local, slot, slot_count);
+
                 if (raz_compiler_rt_arena_get(live_in, cell) != 0) {
                     i64 current = raz_compiler_rt_arena_get(slot_first, slot);
+
                     if (current < 0) {
                         // No defining store exists in the function before this
                         // live-in value, so a register cannot materialize it.
@@ -155,7 +216,10 @@ fn rxe_dataflow_extend_slot_intervals(
                         raz_compiler_rt_arena_set(slot_first, slot, start);
                     }
                 }
-                if (raz_compiler_rt_arena_get(live_out, cell) != 0 && end > raz_compiler_rt_arena_get(slot_last, slot)) {
+                if (
+                    raz_compiler_rt_arena_get(live_out, cell) != 0 &&
+                    end > raz_compiler_rt_arena_get(slot_last, slot)
+                ) {
                     raz_compiler_rt_arena_set(slot_last, slot, end);
                 }
                 // A multi-predecessor live-in is safe only when the slot has an
@@ -184,10 +248,12 @@ fn rxe_dataflow_extend_slot_intervals(
 // instruction. This never touches addressable locals/globals or heap memory.
 fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
     i64 function = 0;
+
     while (function < module.function_count) {
         i64 slot_count = raz_compiler_rt_arena_get(module.function_frame_slots, function);
         i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function);
         i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+
         if (slot_count > 0 && block_count > 0) {
             i64 cells = block_count * slot_count + 1;
             i64 uses = raz_compiler_rt_arena_create(cells);
@@ -195,31 +261,58 @@ fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
             i64 live_in = raz_compiler_rt_arena_create(cells);
             i64 live_out = raz_compiler_rt_arena_create(cells);
             i64 live = raz_compiler_rt_arena_create(slot_count + 1);
+
             if (uses == 0 || defs == 0 || live_in == 0 || live_out == 0 || live == 0) {
-                if (uses != 0) { raz_compiler_rt_arena_destroy(uses); }
-                if (defs != 0) { raz_compiler_rt_arena_destroy(defs); }
-                if (live_in != 0) { raz_compiler_rt_arena_destroy(live_in); }
-                if (live_out != 0) { raz_compiler_rt_arena_destroy(live_out); }
-                if (live != 0) { raz_compiler_rt_arena_destroy(live); }
+                if (uses != 0) {
+                    raz_compiler_rt_arena_destroy(uses);
+                }
+                if (defs != 0) {
+                    raz_compiler_rt_arena_destroy(defs);
+                }
+                if (live_in != 0) {
+                    raz_compiler_rt_arena_destroy(live_in);
+                }
+                if (live_out != 0) {
+                    raz_compiler_rt_arena_destroy(live_out);
+                }
+                if (live != 0) {
+                    raz_compiler_rt_arena_destroy(live);
+                }
                 return false;
             }
             if (!rxe_dataflow_build_slot_sets(module, function, slot_count, uses, defs, live_in, live_out)) {
-                raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
-                raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out); raz_compiler_rt_arena_destroy(live);
+                raz_compiler_rt_arena_destroy(uses);
+                raz_compiler_rt_arena_destroy(defs);
+                raz_compiler_rt_arena_destroy(live_in);
+                raz_compiler_rt_arena_destroy(live_out);
+                raz_compiler_rt_arena_destroy(live);
                 return false;
             }
+
             i64 local = 0;
+
             while (local < block_count) {
                 i64 slot = 0;
+
                 while (slot < slot_count) {
-                    raz_compiler_rt_arena_set(live, slot, raz_compiler_rt_arena_get(live_out, rxe_dataflow_cell(local, slot, slot_count)));
+                    raz_compiler_rt_arena_set(
+                        live,
+                        slot,
+                        raz_compiler_rt_arena_get(live_out, rxe_dataflow_cell(local, slot, slot_count))
+                    );
                     slot += 1;
                 }
+
                 i64 block = first_block + local;
-                i64 ip = raz_compiler_rt_arena_get(module.block_code_starts, block) + raz_compiler_rt_arena_get(module.block_code_counts, block) - 1;
+
+                i64 ip =
+                    raz_compiler_rt_arena_get(module.block_code_starts, block) +
+                    raz_compiler_rt_arena_get(module.block_code_counts, block) - 1;
                 i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
+
                 while (ip >= start) {
                     i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
                     if (op == rxe_op_store_slot()) {
                         slot = raz_compiler_rt_arena_get(module.immediates, ip);
                         if (raz_compiler_rt_arena_get(live, slot) == 0) {
@@ -239,8 +332,11 @@ fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
                 }
                 local += 1;
             }
-            raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
-            raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out); raz_compiler_rt_arena_destroy(live);
+            raz_compiler_rt_arena_destroy(uses);
+            raz_compiler_rt_arena_destroy(defs);
+            raz_compiler_rt_arena_destroy(live_in);
+            raz_compiler_rt_arena_destroy(live_out);
+            raz_compiler_rt_arena_destroy(live);
         }
         function += 1;
     }
@@ -260,16 +356,34 @@ fn rxe_dataflow_clear_instruction(RxeModule&mut module, i64 ip) {
 // architectural registers are the values visible to machine optimization.
 fn rxe_dataflow_opcode_writes_dst(i64 op) -> bool {
     return (
-        op == rxe_op_movi() || op == rxe_op_ldc64() || op == rxe_op_mov() || op == rxe_op_load_arg() ||
-        op == rxe_op_load_slot() || op == rxe_op_load_local() || op == rxe_op_load_global() ||
-        op == rxe_op_global_ref() || op == rxe_op_local_ref() || op == rxe_op_load_ref() ||
-        op == rxe_op_func_ref() || op == rxe_op_call() || op == rxe_op_call_indirect() ||
-        op == rxe_op_make_closure() || op == rxe_op_call_closure() ||
+        op == rxe_op_movi() ||
+        op == rxe_op_ldc64() ||
+        op == rxe_op_mov() ||
+        op == rxe_op_load_arg() ||
+        op == rxe_op_load_slot() ||
+        op == rxe_op_load_local() ||
+        op == rxe_op_load_global() ||
+        op == rxe_op_global_ref() ||
+        op == rxe_op_local_ref() ||
+        op == rxe_op_load_ref() ||
+        op == rxe_op_func_ref() ||
+        op == rxe_op_call() ||
+        op == rxe_op_call_indirect() ||
+        op == rxe_op_make_closure() ||
+        op == rxe_op_call_closure() ||
         (op >= rxe_op_add64() && op <= rxe_op_sar64()) ||
         (op >= rxe_op_eq64() && op <= rxe_op_boolize()) ||
-        op == rxe_op_lts64() || op == rxe_op_les64() || op == rxe_op_gts64() || op == rxe_op_ges64() ||
-        op == rxe_op_alloc() || op == rxe_op_index_load() || op == rxe_op_index_ref() ||
-        op == rxe_op_string_ref() || op == rxe_op_mem_copy() || op == rxe_op_slice_load() || op == rxe_op_slice_ref()
+        op == rxe_op_lts64() ||
+        op == rxe_op_les64() ||
+        op == rxe_op_gts64() ||
+        op == rxe_op_ges64() ||
+        op == rxe_op_alloc() ||
+        op == rxe_op_index_load() ||
+        op == rxe_op_index_ref() ||
+        op == rxe_op_string_ref() ||
+        op == rxe_op_mem_copy() ||
+        op == rxe_op_slice_load() ||
+        op == rxe_op_slice_ref()
     );
 }
 
@@ -284,29 +398,72 @@ fn rxe_instruction_reads_register(RxeModule& module, i64 ip, i64 reg) -> bool {
     i64 b = raz_compiler_rt_arena_get(module.src1, ip);
     i64 imm = raz_compiler_rt_arena_get(module.immediates, ip);
 
-    if (op == rxe_op_mov()) { return a == reg; }
-    if (op == rxe_op_store_slot() || op == rxe_op_store_local() || op == rxe_op_store_global()) { return reg == 0; }
-    if (op == rxe_op_load_ref()) { return a == reg; }
-    if (op == rxe_op_store_ref()) { return a == reg || b == reg; }
-    if (op == rxe_op_arg()) { return d == reg; }
-    if (op == rxe_op_call_indirect() || op == rxe_op_call_closure()) { return a == reg; }
-    if (op == rxe_op_free()) { return d == reg; }
-    if (op == rxe_op_index_load() || op == rxe_op_index_ref() || op == rxe_op_slice_load() || op == rxe_op_slice_ref()) { return a == reg || b == reg; }
-    if (op == rxe_op_index_store() || op == rxe_op_slice_store()) { return a == reg || b == reg || imm == reg; }
-    if (op == rxe_op_mem_copy()) { return a == reg || b == reg; }
-    if (op == rxe_op_brnz()) { return a == reg; }
-    if (op == rxe_op_ret()) { return d == reg; }
-    if (op == rxe_op_select()) { return a == reg || b == reg || imm == reg; }
+    if (op == rxe_op_mov()) {
+        return a == reg;
+    }
+    if (op == rxe_op_store_slot() || op == rxe_op_store_local() || op == rxe_op_store_global()) {
+        return reg == 0;
+    }
+    if (op == rxe_op_load_ref()) {
+        return a == reg;
+    }
+    if (op == rxe_op_store_ref()) {
+        return a == reg || b == reg;
+    }
+    if (op == rxe_op_arg()) {
+        return d == reg;
+    }
+    if (op == rxe_op_call_indirect() || op == rxe_op_call_closure()) {
+        return a == reg;
+    }
+    if (op == rxe_op_free()) {
+        return d == reg;
+    }
+    if (
+        op == rxe_op_index_load() ||
+        op == rxe_op_index_ref() ||
+        op == rxe_op_slice_load() ||
+        op == rxe_op_slice_ref()
+    ) {
+        return a == reg || b == reg;
+    }
+    if (op == rxe_op_index_store() || op == rxe_op_slice_store()) {
+        return a == reg || b == reg || imm == reg;
+    }
+    if (op == rxe_op_mem_copy()) {
+        return a == reg || b == reg;
+    }
+    if (op == rxe_op_brnz()) {
+        return a == reg;
+    }
+    if (op == rxe_op_ret()) {
+        return d == reg;
+    }
+    if (op == rxe_op_select()) {
+        return a == reg || b == reg || imm == reg;
+    }
     if (
         (op >= rxe_op_add64() && op <= rxe_op_sar64()) ||
         (op >= rxe_op_eq64() && op <= rxe_op_ge64()) ||
-        op == rxe_op_lts64() || op == rxe_op_les64() || op == rxe_op_gts64() || op == rxe_op_ges64()
-    ) { return a == reg || b == reg; }
+        op == rxe_op_lts64() ||
+        op == rxe_op_les64() ||
+        op == rxe_op_gts64() ||
+        op == rxe_op_ges64()
+    ) {
+        return a == reg || b == reg;
+    }
     if (
-        op == rxe_op_not_bool() || op == rxe_op_boolize() ||
-        op == rxe_op_trunc8() || op == rxe_op_trunc16() || op == rxe_op_trunc32() ||
-        op == rxe_op_sext8() || op == rxe_op_sext16() || op == rxe_op_sext32()
-    ) { return a == reg; }
+        op == rxe_op_not_bool() ||
+        op == rxe_op_boolize() ||
+        op == rxe_op_trunc8() ||
+        op == rxe_op_trunc16() ||
+        op == rxe_op_trunc32() ||
+        op == rxe_op_sext8() ||
+        op == rxe_op_sext16() ||
+        op == rxe_op_sext32()
+    ) {
+        return a == reg;
+    }
     return false;
 }
 
@@ -322,6 +479,7 @@ fn rxe_dataflow_build_register_sets(
     i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
     i64 cells = block_count * rxe_register_count();
     i64 i = 0;
+
     while (i < cells) {
         raz_compiler_rt_arena_set(uses, i, 0);
         raz_compiler_rt_arena_set(defs, i, 0);
@@ -331,23 +489,33 @@ fn rxe_dataflow_build_register_sets(
     }
 
     i64 local = 0;
+
     while (local < block_count) {
         i64 block = first + local;
         i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
         i64 end = start + raz_compiler_rt_arena_get(module.block_code_counts, block);
         i64 ip = start;
+
         while (ip < end) {
             i64 reg = 0;
+
             while (reg < rxe_register_count()) {
                 i64 cell = rxe_dataflow_register_cell(local, reg);
-                if (rxe_instruction_reads_register(module, ip, reg) && raz_compiler_rt_arena_get(defs, cell) == 0) {
+
+                if (
+                    rxe_instruction_reads_register(module, ip, reg) &&
+                    raz_compiler_rt_arena_get(defs, cell) == 0
+                ) {
                     raz_compiler_rt_arena_set(uses, cell, 1);
                 }
                 reg += 1;
             }
+
             i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
             if (rxe_dataflow_opcode_writes_dst(op)) {
                 i64 d = raz_compiler_rt_arena_get(module.dst, ip);
+
                 if (d >= 0 && d < rxe_register_count()) {
                     raz_compiler_rt_arena_set(defs, rxe_dataflow_register_cell(local, d), 1);
                 }
@@ -359,29 +527,58 @@ fn rxe_dataflow_build_register_sets(
 
     bool changed = true;
     i64 rounds = 0;
+
     while (changed) {
         changed = false;
         rounds += 1;
-        if (rounds > block_count * 4 + 8) { return false; }
+        if (rounds > block_count * 4 + 8) {
+            return false;
+        }
         local = block_count - 1;
         while (local >= 0) {
             i64 block = first + local;
             i64 reg = 0;
+
             while (reg < rxe_register_count()) {
                 i64 cell = rxe_dataflow_register_cell(local, reg);
                 i64 out_value = 0;
                 i64 successor = raz_compiler_rt_arena_get(module.block_successor0, block);
+
                 if (successor >= first && successor < first + block_count) {
-                    if (raz_compiler_rt_arena_get(live_in, rxe_dataflow_register_cell(successor - first, reg)) != 0) { out_value = 1; }
+                    if (
+                        raz_compiler_rt_arena_get(
+                            live_in,
+                            rxe_dataflow_register_cell(successor - first, reg)
+                        ) != 0
+                    ) {
+                        out_value = 1;
+                    }
                 }
                 successor = raz_compiler_rt_arena_get(module.block_successor1, block);
                 if (successor >= first && successor < first + block_count) {
-                    if (raz_compiler_rt_arena_get(live_in, rxe_dataflow_register_cell(successor - first, reg)) != 0) { out_value = 1; }
+                    if (
+                        raz_compiler_rt_arena_get(
+                            live_in,
+                            rxe_dataflow_register_cell(successor - first, reg)
+                        ) != 0
+                    ) {
+                        out_value = 1;
+                    }
                 }
+
                 i64 in_value = raz_compiler_rt_arena_get(uses, cell);
-                if (in_value == 0 && out_value != 0 && raz_compiler_rt_arena_get(defs, cell) == 0) { in_value = 1; }
-                if (raz_compiler_rt_arena_get(live_out, cell) != out_value) { raz_compiler_rt_arena_set(live_out, cell, out_value); changed = true; }
-                if (raz_compiler_rt_arena_get(live_in, cell) != in_value) { raz_compiler_rt_arena_set(live_in, cell, in_value); changed = true; }
+
+                if (in_value == 0 && out_value != 0 && raz_compiler_rt_arena_get(defs, cell) == 0) {
+                    in_value = 1;
+                }
+                if (raz_compiler_rt_arena_get(live_out, cell) != out_value) {
+                    raz_compiler_rt_arena_set(live_out, cell, out_value);
+                    changed = true;
+                }
+                if (raz_compiler_rt_arena_get(live_in, cell) != in_value) {
+                    raz_compiler_rt_arena_set(live_in, cell, in_value);
+                    changed = true;
+                }
                 reg += 1;
             }
             local -= 1;
@@ -391,26 +588,52 @@ fn rxe_dataflow_build_register_sets(
 }
 
 fn rxe_opcode_dead_result_safe(i64 op) -> bool {
-    return
-        op == rxe_op_movi() || op == rxe_op_ldc64() || op == rxe_op_mov() || op == rxe_op_load_arg() ||
-        op == rxe_op_func_ref() || op == rxe_op_global_ref() || op == rxe_op_string_ref() ||
-        op == rxe_op_add64() || op == rxe_op_sub64() || op == rxe_op_mul64() ||
-        op == rxe_op_and64() || op == rxe_op_or64() || op == rxe_op_xor64() ||
-        op == rxe_op_shl64() || op == rxe_op_shr64() || op == rxe_op_sar64() ||
-        op == rxe_op_eq64() || op == rxe_op_ne64() || op == rxe_op_lt64() || op == rxe_op_le64() ||
-        op == rxe_op_gt64() || op == rxe_op_ge64() || op == rxe_op_lts64() || op == rxe_op_les64() ||
-        op == rxe_op_gts64() || op == rxe_op_ges64() || op == rxe_op_select() || op == rxe_op_not_bool() ||
-        op == rxe_op_boolize() || op == rxe_op_trunc8() || op == rxe_op_trunc16() || op == rxe_op_trunc32() ||
-        op == rxe_op_sext8() || op == rxe_op_sext16() || op == rxe_op_sext32();
+    return op == rxe_op_movi() ||
+        op == rxe_op_ldc64() ||
+        op == rxe_op_mov() ||
+        op == rxe_op_load_arg() ||
+        op == rxe_op_func_ref() ||
+        op == rxe_op_global_ref() ||
+        op == rxe_op_string_ref() ||
+        op == rxe_op_add64() ||
+        op == rxe_op_sub64() ||
+        op == rxe_op_mul64() ||
+        op == rxe_op_and64() ||
+        op == rxe_op_or64() ||
+        op == rxe_op_xor64() ||
+        op == rxe_op_shl64() ||
+        op == rxe_op_shr64() ||
+        op == rxe_op_sar64() ||
+        op == rxe_op_eq64() ||
+        op == rxe_op_ne64() ||
+        op == rxe_op_lt64() ||
+        op == rxe_op_le64() ||
+        op == rxe_op_gt64() ||
+        op == rxe_op_ge64() ||
+        op == rxe_op_lts64() ||
+        op == rxe_op_les64() ||
+        op == rxe_op_gts64() ||
+        op == rxe_op_ges64() ||
+        op == rxe_op_select() ||
+        op == rxe_op_not_bool() ||
+        op == rxe_op_boolize() ||
+        op == rxe_op_trunc8() ||
+        op == rxe_op_trunc16() ||
+        op == rxe_op_trunc32() ||
+        op == rxe_op_sext8() ||
+        op == rxe_op_sext16() ||
+        op == rxe_op_sext32();
 }
 
 // Eliminate register-producing instructions only when the result is dead and
 // the opcode has no observable side effect or trap behavior.
 fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
     i64 function = 0;
+
     while (function < module.function_count) {
         i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
         i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+
         if (block_count > 0) {
             i64 cells = block_count * rxe_register_count() + 1;
             i64 uses = raz_compiler_rt_arena_create(cells);
@@ -418,33 +641,58 @@ fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
             i64 live_in = raz_compiler_rt_arena_create(cells);
             i64 live_out = raz_compiler_rt_arena_create(cells);
             i64 live = raz_compiler_rt_arena_create(rxe_register_count() + 1);
+
             if (uses == 0 || defs == 0 || live_in == 0 || live_out == 0 || live == 0) {
-                if (uses != 0) { raz_compiler_rt_arena_destroy(uses); }
-                if (defs != 0) { raz_compiler_rt_arena_destroy(defs); }
-                if (live_in != 0) { raz_compiler_rt_arena_destroy(live_in); }
-                if (live_out != 0) { raz_compiler_rt_arena_destroy(live_out); }
-                if (live != 0) { raz_compiler_rt_arena_destroy(live); }
+                if (uses != 0) {
+                    raz_compiler_rt_arena_destroy(uses);
+                }
+                if (defs != 0) {
+                    raz_compiler_rt_arena_destroy(defs);
+                }
+                if (live_in != 0) {
+                    raz_compiler_rt_arena_destroy(live_in);
+                }
+                if (live_out != 0) {
+                    raz_compiler_rt_arena_destroy(live_out);
+                }
+                if (live != 0) {
+                    raz_compiler_rt_arena_destroy(live);
+                }
                 return false;
             }
             if (!rxe_dataflow_build_register_sets(module, function, uses, defs, live_in, live_out)) {
-                raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
-                raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out); raz_compiler_rt_arena_destroy(live);
+                raz_compiler_rt_arena_destroy(uses);
+                raz_compiler_rt_arena_destroy(defs);
+                raz_compiler_rt_arena_destroy(live_in);
+                raz_compiler_rt_arena_destroy(live_out);
+                raz_compiler_rt_arena_destroy(live);
                 return false;
             }
+
             i64 local = 0;
+
             while (local < block_count) {
                 i64 reg = 0;
+
                 while (reg < rxe_register_count()) {
-                    raz_compiler_rt_arena_set(live, reg, raz_compiler_rt_arena_get(live_out, rxe_dataflow_register_cell(local, reg)));
+                    raz_compiler_rt_arena_set(
+                        live,
+                        reg,
+                        raz_compiler_rt_arena_get(live_out, rxe_dataflow_register_cell(local, reg))
+                    );
                     reg += 1;
                 }
+
                 i64 block = first + local;
                 i64 start = raz_compiler_rt_arena_get(module.block_code_starts, block);
                 i64 ip = start + raz_compiler_rt_arena_get(module.block_code_counts, block) - 1;
+
                 while (ip >= start) {
                     i64 op = raz_compiler_rt_arena_get(module.opcodes, ip);
+
                     if (rxe_dataflow_opcode_writes_dst(op)) {
                         i64 d = raz_compiler_rt_arena_get(module.dst, ip);
+
                         if (d >= 0 && d < rxe_register_count()) {
                             if (raz_compiler_rt_arena_get(live, d) == 0 && rxe_opcode_dead_result_safe(op)) {
                                 rxe_dataflow_clear_instruction(module, ip);
@@ -456,15 +704,20 @@ fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
                     }
                     reg = 0;
                     while (reg < rxe_register_count()) {
-                        if (rxe_instruction_reads_register(module, ip, reg)) { raz_compiler_rt_arena_set(live, reg, 1); }
+                        if (rxe_instruction_reads_register(module, ip, reg)) {
+                            raz_compiler_rt_arena_set(live, reg, 1);
+                        }
                         reg += 1;
                     }
                     ip -= 1;
                 }
                 local += 1;
             }
-            raz_compiler_rt_arena_destroy(uses); raz_compiler_rt_arena_destroy(defs);
-            raz_compiler_rt_arena_destroy(live_in); raz_compiler_rt_arena_destroy(live_out); raz_compiler_rt_arena_destroy(live);
+            raz_compiler_rt_arena_destroy(uses);
+            raz_compiler_rt_arena_destroy(defs);
+            raz_compiler_rt_arena_destroy(live_in);
+            raz_compiler_rt_arena_destroy(live_out);
+            raz_compiler_rt_arena_destroy(live);
         }
         function += 1;
     }

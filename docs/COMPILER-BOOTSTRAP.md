@@ -34,4 +34,6 @@ Changes to the host compiler are reserved for compatibility, platform, correctne
 
 Release qualification rebuilds the production compiler recursively and requires deterministic convergence for equivalent source and toolchain inputs. This verifies that the installed compiler is reproducible from the repository source rather than depending on an opaque generated artifact.
 
+For release qualification the self-host generations use the optimized Forge pipeline by default (`-O2`); debug qualification uses `-O0`. This keeps the compilers that execute later generations aligned with production performance while preserving byte-for-byte reproducibility checks at the selected optimization level.
+
 See [Compiler reproducibility](COMPILER-REPRODUCIBILITY.md) and [Windows build](WINDOWS-BUILD.md).

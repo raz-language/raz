@@ -7,11 +7,16 @@ Raz keeps formatting deliberately boring. A contributor should be able to open a
 Raz-owned `.rz` files use four spaces, braces on the same line as declarations/control flow, one statement per line, and semicolon-terminated statements. The repository formatter is the source of truth:
 
 ```text
+raz fmt path/to/source.rz
+raz fmt path/to/directory
+raz fmt --check
+
+# Repository-maintainer equivalent used by source qualification:
 python tools/format-raz.py path/to/source.rz
 python tools/format-raz.py path/to/source.rz --check
 ```
 
-The formatter is deterministic, idempotent, and width-driven. It targets 110 columns for Raz source: short signatures, calls, and conditions stay on one line, while overflowing parameter/argument lists and boolean conditions are expanded structurally with four-space continuation indentation. Multiline parameter and argument lists use a trailing comma; compact single-line lists do not. Mutable references are always spelled `T&mut`.
+The shipped `raz fmt` command and repository formatter are deterministic, idempotent, and token-preserving: it may change whitespace and layout, but never program punctuation or token spelling. It is width-driven. It targets 110 columns for Raz source: short signatures, calls, and conditions stay on one line, while overflowing parameter/argument lists and boolean conditions are expanded structurally with four-space continuation indentation. Line wrapping preserves the program's existing punctuation: formatting never inserts or removes trailing commas, grouping parentheses, or other language tokens. Mutable references are always spelled `T&mut`.
 
 Long boolean conditions break at top-level `&&` / `||` operators, and nested calls are only expanded when their own width requires it. Parentheses used purely for grouping are never treated as comma-list constructs, so formatting cannot turn `(expr)` into a tuple. Generic closing brackets remain parser-safe (`Outer<Inner<T> >`) until the lexer/parser can distinguish nested generic closes from the `>>` shift token without spacing help.
 
