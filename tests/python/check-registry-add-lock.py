@@ -25,6 +25,7 @@ checks = {
     'build constraint validation preserves local path dependency fallback': 'i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);' in registry and 'rl = path_join(root, 1, dependency, dl, manifest_path, 8192);' in registry,
     'semver greater-equal remains inclusive': 'if (mode == 3) {\n        return cmp >= 0;' in registry,
     'project cache records sibling lockfile input': 'fn project_record_lock_input(' in project and 'project_record_input(state, lock_path, lock_length)' in project,
+    'lockfile path join uses arena handle rather than array reference': 'i64 lock_name = raz_compiler_rt_arena_create(8);' in project and 'path_join(root, root_length, lock_name, 8, lock_path, 8192)' in project and '&lock_name' not in project,
     'project assembly records lockfile after manifest root resolution': '!project_record_lock_input(state, root, root_length)' in project,
     'lockfile input is optional for path-only projects': 'raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0' in project,
     'incremental cache schema invalidates pre-lock-aware project caches': 'fn incremental_cache_schema() -> i64 {\n    return 4;\n}' in incremental,
