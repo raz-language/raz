@@ -69,6 +69,20 @@ require("library/collections/hash_set/hash_set.rz", [
 require("library/alloc/hash_map/hash_map.rz", ["hash & (map.capacity - 1)", "fn hash_map_control", "state == control"])
 require("library/alloc/hash_set/hash_set.rz", ["hash & (set.capacity - 1)", "fn hash_set_control", "state == control"])
 require("library/alloc/string/hash.rz", ["raz_rt_hash_bytes(self.data, self.length)"])
+require("library/core/utf8/utf8.rz", [
+    "fn load_byte",
+    "fn store_byte",
+    "public fn decode",
+    "public fn validate",
+    "public fn count_scalars",
+])
+forbid("library/core/utf8/utf8.rz", ["core::bytes::load_u8(", "core::bytes::store_u8("])
+require("library/alloc/string/string.rz", [
+    "import core::utf8;",
+    "return core::utf8::validate(data, length)",
+    "return core::utf8::count_scalars(value.data, value.length)",
+    "DecodeResult decoded = core::utf8::decode",
+])
 require("library/std/io/buffered.rz", [
     "default_buffer_capacity = 65536",
     "fn writer_drain",

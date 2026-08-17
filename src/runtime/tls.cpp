@@ -186,3 +186,48 @@ void raz_rt_tls_destroy(void* handle) {
 
 
 }
+
+extern "C" std::int64_t raz_rt_error_kind(std::int64_t code) {
+#if defined(_WIN32)
+  switch (static_cast<unsigned long>(code)) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case WSAHOST_NOT_FOUND: return 1;
+    case ERROR_ACCESS_DENIED:
+    case WSAEACCES: return 2;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:
+    case WSAEADDRINUSE: return 3;
+    case ERROR_INVALID_PARAMETER:
+    case WSAEINVAL: return 4;
+    case WSAEWOULDBLOCK: return 5;
+    case WSAEINTR: return 6;
+    case WAIT_TIMEOUT:
+    case WSAETIMEDOUT: return 7;
+    case WSAECONNREFUSED: return 8;
+    case WSAECONNRESET: return 9;
+    case ERROR_BROKEN_PIPE:
+    case WSAESHUTDOWN: return 10;
+    default: return 0;
+  }
+#else
+  switch (static_cast<int>(code)) {
+    case ENOENT: return 1;
+    case EACCES:
+    case EPERM: return 2;
+    case EEXIST:
+    case EADDRINUSE: return 3;
+    case EINVAL: return 4;
+    case EAGAIN: return 5;
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK: return 5;
+#endif
+    case EINTR: return 6;
+    case ETIMEDOUT: return 7;
+    case ECONNREFUSED: return 8;
+    case ECONNRESET: return 9;
+    case EPIPE: return 10;
+    default: return 0;
+  }
+#endif
+}

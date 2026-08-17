@@ -132,6 +132,116 @@ std::int64_t raz_rt_hardware_threads() {
   return count == 0 ? 1 : static_cast<std::int64_t>(count);
 }
 
+std::int64_t raz_rt_page_size() {
+#if defined(_WIN32)
+  SYSTEM_INFO info{};
+  GetSystemInfo(&info);
+  return static_cast<std::int64_t>(info.dwPageSize);
+#else
+  const long value = ::sysconf(_SC_PAGESIZE);
+  return value > 0 ? static_cast<std::int64_t>(value) : 4096;
+#endif
+}
+
+std::int64_t raz_rt_current_thread_set_affinity(std::int64_t cpu) {
+  if (cpu < 0) return 0;
+#if defined(_WIN32)
+  constexpr auto bits = static_cast<std::int64_t>(sizeof(DWORD_PTR) * CHAR_BIT);
+  if (cpu >= bits) return 0;
+  const DWORD_PTR mask = static_cast<DWORD_PTR>(1) << static_cast<unsigned>(cpu);
+  return SetThreadAffinityMask(GetCurrentThread(), mask) != 0 ? 1 : 0;
+#elif defined(__linux__)
+  if (cpu >= CPU_SETSIZE) return 0;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(static_cast<int>(cpu), &set);
+  return ::sched_setaffinity(0, sizeof(set), &set) == 0 ? 1 : 0;
+#else
+  (void)cpu;
+  return 0;
+#endif
+}
+
+void* raz_rt_page_alloc(std::int64_t size) {
+  if (size <= 0) return nullptr;
+#if defined(_WIN32)
+  return VirtualAlloc(nullptr, static_cast<SIZE_T>(size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+  void* result = ::mmap(nullptr, static_cast<std::size_t>(size), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return result == MAP_FAILED ? nullptr : result;
+#endif
+}
+
+std::int64_t raz_rt_page_free(void* address, std::int64_t size) {
+  if (address == nullptr || size <= 0) return 0;
+#if defined(_WIN32)
+  return VirtualFree(address, 0, MEM_RELEASE) != 0 ? 1 : 0;
+#else
+  return ::munmap(address, static_cast<std::size_t>(size)) == 0 ? 1 : 0;
+#endif
+}
+
+std::int64_t raz_rt_page_protect(void* address, std::int64_t size, std::int64_t protection) {
+  if (address == nullptr || size <= 0 || protection < 0 || protection > 4) return 0;
+#if defined(_WIN32)
+  DWORD mode = PAGE_NOACCESS;
+  if (protection == 1) mode = PAGE_READONLY;
+  else if (protection == 2) mode = PAGE_READWRITE;
+  else if (protection == 3) mode = PAGE_EXECUTE_READ;
+  else if (protection == 4) mode = PAGE_EXECUTE_READWRITE;
+  DWORD previous = 0;
+  return VirtualProtect(address, static_cast<SIZE_T>(size), mode, &previous) != 0 ? 1 : 0;
+#else
+  int mode = PROT_NONE;
+  if (protection == 1) mode = PROT_READ;
+  else if (protection == 2) mode = PROT_READ | PROT_WRITE;
+  else if (protection == 3) mode = PROT_READ | PROT_EXEC;
+  else if (protection == 4) mode = PROT_READ | PROT_WRITE | PROT_EXEC;
+  return ::mprotect(address, static_cast<std::size_t>(size), mode) == 0 ? 1 : 0;
+#endif
+}
+
+std::int64_t raz_rt_page_lock(void* address, std::int64_t size) {
+  if (address == nullptr || size <= 0) return 0;
+#if defined(_WIN32)
+  return VirtualLock(address, static_cast<SIZE_T>(size)) != 0 ? 1 : 0;
+#else
+  return ::mlock(address, static_cast<std::size_t>(size)) == 0 ? 1 : 0;
+#endif
+}
+
+std::int64_t raz_rt_page_unlock(void* address, std::int64_t size) {
+  if (address == nullptr || size <= 0) return 0;
+#if defined(_WIN32)
+  return VirtualUnlock(address, static_cast<SIZE_T>(size)) != 0 ? 1 : 0;
+#else
+  return ::munlock(address, static_cast<std::size_t>(size)) == 0 ? 1 : 0;
+#endif
+}
+
+double raz_rt_f64_floor(double value) { return std::floor(value); }
+double raz_rt_f64_ceil(double value) { return std::ceil(value); }
+double raz_rt_f64_round(double value) { return std::round(value); }
+double raz_rt_f64_trunc(double value) { return std::trunc(value); }
+double raz_rt_f64_sqrt(double value) { return std::sqrt(value); }
+double raz_rt_f64_cbrt(double value) { return std::cbrt(value); }
+double raz_rt_f64_pow(double base, double exponent) { return std::pow(base, exponent); }
+double raz_rt_f64_exp(double value) { return std::exp(value); }
+double raz_rt_f64_log(double value) { return std::log(value); }
+double raz_rt_f64_log2(double value) { return std::log2(value); }
+double raz_rt_f64_log10(double value) { return std::log10(value); }
+double raz_rt_f64_sin(double value) { return std::sin(value); }
+double raz_rt_f64_cos(double value) { return std::cos(value); }
+double raz_rt_f64_tan(double value) { return std::tan(value); }
+double raz_rt_f64_asin(double value) { return std::asin(value); }
+double raz_rt_f64_acos(double value) { return std::acos(value); }
+double raz_rt_f64_atan(double value) { return std::atan(value); }
+double raz_rt_f64_atan2(double y, double x) { return std::atan2(y, x); }
+std::int64_t raz_rt_f64_is_finite(double value) { return std::isfinite(value) ? 1 : 0; }
+std::int64_t raz_rt_f64_is_nan(double value) { return std::isnan(value) ? 1 : 0; }
+std::int64_t raz_rt_f64_is_infinite(double value) { return std::isinf(value) ? 1 : 0; }
+
 void* raz_rt_alloc(std::int64_t size) { return size <= 0 ? nullptr : std::malloc(static_cast<std::size_t>(size)); }
 void* raz_rt_alloc_aligned(std::int64_t size, std::int64_t alignment) {
   if (size <= 0 || alignment <= 0 || alignment > 4096 ||

@@ -2465,42 +2465,54 @@ fn hir_has_live_local_reference_to_local_storage(HirBuilder&mut builder) -> bool
 // state and merges with a conservative union: a value is unavailable after a
 // join if it is moved on any continuing path. A whole-value assignment clears
 // the moved bit, which also handles reinitialization on every branch.
+fn hir_flow_local_state_capacity(HirBuilder&mut builder) -> i64 {
+  return raz_compiler_rt_arena_get(
+  builder.module.function_local_counts,
+  builder.current_function,
+  ) + 1;
+}
+
+fn hir_flow_parameter_state_capacity(HirBuilder&mut builder) -> i64 {
+  return raz_compiler_rt_arena_get(
+  builder.module.function_parameter_counts,
+  builder.current_function,
+  ) + 1;
+}
+
+fn hir_flow_local_state_slot(HirBuilder&mut builder, i64 local) -> i64 {
+  if (local < 0) {
+    return -1;
+  }
+  return raz_compiler_rt_arena_get(builder.module.local_slots, local);
+}
+
+fn hir_flow_parameter_state_slot(HirBuilder&mut builder, i64 parameter) -> i64 {
+  return parameter - raz_compiler_rt_arena_get(
+  builder.module.function_parameter_starts,
+  builder.current_function,
+  );
+}
+
 fn hir_flow_copy_state(
 HirBuilder&mut builder,
 i64 source,
 i64 destination,
 bool locals,
 ) {
+  i64 index = 0;
+  i64 end = 0;
+
   if (locals) {
-    i64 link = raz_compiler_rt_arena_get(
-    builder.module.function_last_locals,
+    end = raz_compiler_rt_arena_get(
+    builder.module.function_local_counts,
     builder.current_function,
     );
-
-    while (link > 0) {
-      i64 index = link - 1;
-
-      raz_compiler_rt_arena_set(
-      destination,
-      index,
-      raz_compiler_rt_arena_get(source, index),
-      );
-      link = raz_compiler_rt_arena_get(
-      builder.module.local_previous_function_locals,
-      index,
-      );
-    }
-    return;
+  } else {
+    end = raz_compiler_rt_arena_get(
+    builder.module.function_parameter_counts,
+    builder.current_function,
+    );
   }
-
-  i64 index = raz_compiler_rt_arena_get(
-  builder.module.function_parameter_starts,
-  builder.current_function,
-  );
-  i64 end = index + raz_compiler_rt_arena_get(
-  builder.module.function_parameter_counts,
-  builder.current_function,
-  );
 
   while (index < end) {
     raz_compiler_rt_arena_set(
@@ -2519,39 +2531,20 @@ i64 right,
 i64 destination,
 bool locals,
 ) {
+  i64 index = 0;
+  i64 end = 0;
+
   if (locals) {
-    i64 link = raz_compiler_rt_arena_get(
-    builder.module.function_last_locals,
+    end = raz_compiler_rt_arena_get(
+    builder.module.function_local_counts,
     builder.current_function,
     );
-
-    while (link > 0) {
-      i64 index = link - 1;
-      i64 moved = 0;
-
-      if (
-      raz_compiler_rt_arena_get(left, index) != 0 ||
-      raz_compiler_rt_arena_get(right, index) != 0
-      ) {
-        moved = 1;
-      }
-      raz_compiler_rt_arena_set(destination, index, moved);
-      link = raz_compiler_rt_arena_get(
-      builder.module.local_previous_function_locals,
-      index,
-      );
-    }
-    return;
+  } else {
+    end = raz_compiler_rt_arena_get(
+    builder.module.function_parameter_counts,
+    builder.current_function,
+    );
   }
-
-  i64 index = raz_compiler_rt_arena_get(
-  builder.module.function_parameter_starts,
-  builder.current_function,
-  );
-  i64 end = index + raz_compiler_rt_arena_get(
-  builder.module.function_parameter_counts,
-  builder.current_function,
-  );
 
   while (index < end) {
     i64 moved = 0;
@@ -2569,26 +2562,19 @@ HirBuilder&mut builder,
 i64 local_state,
 i64 parameter_state,
 ) {
-  i64 link = raz_compiler_rt_arena_get(
-  builder.module.function_last_locals,
+  i64 local = 0;
+  i64 local_end = raz_compiler_rt_arena_get(
+  builder.module.function_local_counts,
   builder.current_function,
   );
 
-  while (link > 0) {
-    i64 local = link - 1;
-
+  while (local < local_end) {
     raz_compiler_rt_arena_set(local_state, local, 0);
-    link = raz_compiler_rt_arena_get(
-    builder.module.local_previous_function_locals,
-    local,
-    );
+    local += 1;
   }
 
-  i64 parameter = raz_compiler_rt_arena_get(
-  builder.module.function_parameter_starts,
-  builder.current_function,
-  );
-  i64 parameter_end = parameter + raz_compiler_rt_arena_get(
+  i64 parameter = 0;
+  i64 parameter_end = raz_compiler_rt_arena_get(
   builder.module.function_parameter_counts,
   builder.current_function,
   );
@@ -2611,9 +2597,7 @@ fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 pa
   i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, node);
 
   if (kind == 2) {
-    i64 parameter =
-    raz_compiler_rt_arena_get(builder.module.function_parameter_starts, builder.current_function) +
-    raz_compiler_rt_arena_get(builder.module.node_a, node);
+    i64 parameter = raz_compiler_rt_arena_get(builder.module.node_a, node);
     if (raz_compiler_rt_arena_get(parameter_state, parameter) != 0) {
       hir_fail(builder, DiagnosticCode::UseAfterMove);
       return false;
@@ -2621,7 +2605,7 @@ fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 pa
     return true;
   }
   if (kind == 3) {
-    i64 local = hir_flow_local_index(builder, raz_compiler_rt_arena_get(builder.module.node_a, node));
+    i64 local = raz_compiler_rt_arena_get(builder.module.node_a, node);
 
     if (raz_compiler_rt_arena_get(local_state, local) != 0) {
       hir_fail(builder, DiagnosticCode::UseAfterMove);
@@ -2648,9 +2632,17 @@ fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 pa
 
       if (hir_node_path(builder, operand, &mut root_kind, &mut root_index, &mut path) && path == 0) {
         if (root_kind == 3) {
-          raz_compiler_rt_arena_set(local_state, root_index, 1);
+          raz_compiler_rt_arena_set(
+          local_state,
+          hir_flow_local_state_slot(builder, root_index),
+          1,
+          );
         } else if (root_kind == 2) {
-          raz_compiler_rt_arena_set(parameter_state, root_index, 1);
+          raz_compiler_rt_arena_set(
+          parameter_state,
+          hir_flow_parameter_state_slot(builder, root_index),
+          1,
+          );
         }
       }
     }
@@ -2858,10 +2850,10 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
         return false;
       }
 
-      i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-      i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
-      i64 left_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-      i64 left_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+      i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+      i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+      i64 left_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+      i64 left_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
       if (entry_locals == 0 || entry_parameters == 0 || left_locals == 0 || left_parameters == 0) {
         hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -2913,8 +2905,8 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
         return false;
       }
 
-      i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-      i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+      i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+      i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
       if (entry_locals == 0 || entry_parameters == 0) {
         hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -2954,10 +2946,10 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
         return false;
       }
 
-      i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-      i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
-      i64 merged_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-      i64 merged_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+      i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+      i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+      i64 merged_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+      i64 merged_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
       if (entry_locals == 0 || entry_parameters == 0 || merged_locals == 0 || merged_parameters == 0) {
         hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -3040,7 +3032,7 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
         local = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
       }
       if (local >= 0) {
-        raz_compiler_rt_arena_set(local_state, local, 0);
+        raz_compiler_rt_arena_set(local_state, hir_flow_local_state_slot(builder, local), 0);
       }
     } else if (kind == 4) {
       i64 value = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
@@ -3055,7 +3047,7 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
       if (raz_compiler_rt_arena_get(builder.module.node_kinds, target) == 3 && operation == 0) {
         raz_compiler_rt_arena_set(
         local_state,
-        hir_flow_local_index(builder, raz_compiler_rt_arena_get(builder.module.node_a, target)),
+        raz_compiler_rt_arena_get(builder.module.node_a, target),
         0,
         );
       } else if (!hir_flow_check_node(builder, target, local_state, parameter_state)) {
@@ -3093,10 +3085,10 @@ i64 parameter_state,
       return false;
     }
 
-    i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-    i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
-    i64 left_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-    i64 left_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+    i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+    i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+    i64 left_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+    i64 left_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
     if (entry_locals == 0 || entry_parameters == 0 || left_locals == 0 || left_parameters == 0) {
       hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -3150,8 +3142,8 @@ i64 parameter_state,
       return false;
     }
 
-    i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-    i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+    i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+    i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
     if (entry_locals == 0 || entry_parameters == 0) {
       hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -3193,10 +3185,10 @@ i64 parameter_state,
       return false;
     }
 
-    i64 entry_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-    i64 entry_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
-    i64 merged_locals = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-    i64 merged_parameters = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+    i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+    i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+    i64 merged_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+    i64 merged_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
 
     if (entry_locals == 0 || entry_parameters == 0 || merged_locals == 0 || merged_parameters == 0) {
       hir_fail(builder, DiagnosticCode::TooManyItems);
@@ -3272,7 +3264,7 @@ i64 parameter_state,
       local = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
     }
     if (local >= 0) {
-      raz_compiler_rt_arena_set(local_state, local, 0);
+      raz_compiler_rt_arena_set(local_state, hir_flow_local_state_slot(builder, local), 0);
     }
     return true;
   }
@@ -3294,7 +3286,7 @@ i64 parameter_state,
     if (raz_compiler_rt_arena_get(builder.module.node_kinds, target) == 3 && operation == 0) {
       raz_compiler_rt_arena_set(
       local_state,
-      hir_flow_local_index(builder, raz_compiler_rt_arena_get(builder.module.node_a, target)),
+      raz_compiler_rt_arena_get(builder.module.node_a, target),
       0,
       );
       return true;
@@ -3312,8 +3304,31 @@ i64 parameter_state,
 }
 
 fn hir_validate_control_flow_moves(HirBuilder&mut builder) -> bool {
-  i64 local_state = raz_compiler_rt_arena_create(builder.module.local_count + 1);
-  i64 parameter_state = raz_compiler_rt_arena_create(builder.module.parameter_count + 1);
+  i64 max_local_count = 0;
+  i64 max_parameter_count = 0;
+  i64 capacity_function = 0;
+
+  while (capacity_function < builder.module.function_count) {
+    i64 local_count = raz_compiler_rt_arena_get(
+    builder.module.function_local_counts,
+    capacity_function,
+    );
+    i64 parameter_count = raz_compiler_rt_arena_get(
+    builder.module.function_parameter_counts,
+    capacity_function,
+    );
+
+    if (local_count > max_local_count) {
+      max_local_count = local_count;
+    }
+    if (parameter_count > max_parameter_count) {
+      max_parameter_count = parameter_count;
+    }
+    capacity_function += 1;
+  }
+
+  i64 local_state = raz_compiler_rt_arena_create(max_local_count + 1);
+  i64 parameter_state = raz_compiler_rt_arena_create(max_parameter_count + 1);
   i64 root_heads = raz_compiler_rt_arena_create(builder.module.function_count + 1);
   i64 root_tails = raz_compiler_rt_arena_create(builder.module.function_count + 1);
   i64 root_next = raz_compiler_rt_arena_create(builder.module.statement_count + 1);

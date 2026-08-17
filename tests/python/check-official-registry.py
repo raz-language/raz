@@ -72,7 +72,16 @@ def main() -> int:
     if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/driver/project.rz").read_text(encoding="utf-8"):
         fail("project loader does not resolve compact registry constraints through raz.lock")
     if "prepared_submission = true" not in registry or "i64 msg[9] = [80, 114, 101, 112, 97, 114, 101, 100, 32]" not in registry:
-        fail("default raz publish is not distinguished from direct private-registry publishing")
+        fail("credential-free raz publish does not preserve PR-ready staging")
+    if "registry_github_publish_archive(name, nl, version, vl, archive, al)" not in registry:
+        fail("official publishing is not wired to GitHub Contents publishing")
+    if "fn registry_publish_token(" not in transport or "GITHUB_TOKEN" not in transport:
+        # The source stores environment names as byte arrays; accept the byte-level marker below.
+        github_token_bytes = "i64 github_key[12] = [71, 73, 84, 72, 85, 66, 95, 84, 79, 75, 69, 78]"
+        if github_token_bytes not in transport:
+            fail("GitHub token fallback is missing from registry transport")
+    if "fn registry_base64_encode(" not in transport:
+        fail("GitHub Contents publishing has no in-Raz base64 encoder")
 
     publish_path = bytes([46,114,97,122,45,112,117,98,108,105,115,104,47]).decode("ascii")
     if publish_path != ".raz-publish/":
@@ -80,7 +89,7 @@ def main() -> int:
     if "i64 publish[13]" not in transport or "registry_path_prefix(path, length, &publish, 13)" not in transport:
         fail(".raz-publish/ is not excluded from deterministic package trees")
 
-    print(f"official-registry: PASS ({EXPECTED}; discovery + compact shorthand add + validated immutable submission staging)")
+    print(f"official-registry: PASS ({EXPECTED}; static GitHub reads + authenticated Contents publishing + PR fallback)")
     return 0
 
 

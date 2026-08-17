@@ -1,0 +1,78 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+fn channel_producer(i64 address, i64 producer_id, i64 count) -> i64 {
+    usize raw = address as usize;
+    unsafe {
+        ChannelI64&mut channel = &mut *(raw as ChannelI64*mut);
+        i64 index = 0;
+        while (index < count) {
+            if (!std::thread::channel::send(channel, producer_id * count + index)) { return -1; }
+            index += 1;
+        }
+    }
+    return count;
+}
+
+fn channel_consumer(i64 address, i64 seen_address, i64 count, i64 total) -> i64 {
+    usize raw = address as usize;
+    usize seen = seen_address as usize;
+    i64 local = 0;
+    unsafe {
+        ChannelI64&mut channel = &mut *(raw as ChannelI64*mut);
+        while (local < count) {
+            ReceiveI64 item = std::thread::channel::receive(channel);
+            if (!item.received || item.value < 0 || item.value >= total) { return -1; }
+            usize cell = seen + (item.value as usize) * 8;
+            if (core::atomic::exchange_i64(cell, 1) != 0) { return -2; }
+            local += 1;
+        }
+    }
+    return local;
+}
+
+fn main() -> i64 {
+    const i64 per_producer = 5000;
+    const i64 total = 20000;
+
+    usize raw = allocate_type<ChannelI64>();
+    if (raw == 0) { return 1; }
+    ChannelI64 initial = std::thread::channel::create(64);
+    if (!std::thread::channel::valid(&initial)) { return 2; }
+    unsafe { *(raw as ChannelI64*mut) = move initial; }
+
+    usize seen = allocate_zeroed(total * 8);
+    if (seen == 0) { return 3; }
+    i64 address = raw as i64;
+    i64 seen_address = seen as i64;
+
+    JoinHandleI64 p0 = std::thread::spawn_callable(move fn() -> i64 { return channel_producer(address, 0, 5000); });
+    JoinHandleI64 p1 = std::thread::spawn_callable(move fn() -> i64 { return channel_producer(address, 1, 5000); });
+    JoinHandleI64 p2 = std::thread::spawn_callable(move fn() -> i64 { return channel_producer(address, 2, 5000); });
+    JoinHandleI64 p3 = std::thread::spawn_callable(move fn() -> i64 { return channel_producer(address, 3, 5000); });
+
+    JoinHandleI64 c0 = std::thread::spawn_callable(move fn() -> i64 { return channel_consumer(address, seen_address, 5000, 20000); });
+    JoinHandleI64 c1 = std::thread::spawn_callable(move fn() -> i64 { return channel_consumer(address, seen_address, 5000, 20000); });
+    JoinHandleI64 c2 = std::thread::spawn_callable(move fn() -> i64 { return channel_consumer(address, seen_address, 5000, 20000); });
+    JoinHandleI64 c3 = std::thread::spawn_callable(move fn() -> i64 { return channel_consumer(address, seen_address, 5000, 20000); });
+
+    if (std::thread::join(&mut p0) != per_producer || std::thread::join(&mut p1) != per_producer ||
+        std::thread::join(&mut p2) != per_producer || std::thread::join(&mut p3) != per_producer) { return 4; }
+    if (std::thread::join(&mut c0) != 5000 || std::thread::join(&mut c1) != 5000 ||
+        std::thread::join(&mut c2) != 5000 || std::thread::join(&mut c3) != 5000) { return 5; }
+
+    i64 index = 0;
+    while (index < total) {
+        if (core::atomic::load_i64(seen + (index as usize) * 8) != 1) { return 6; }
+        index += 1;
+    }
+
+    unsafe {
+        ChannelI64&mut channel = &mut *(raw as ChannelI64*mut);
+        if (std::thread::channel::len(channel) != 0) { return 7; }
+        std::thread::channel::destroy(channel);
+    }
+    deallocate_type<ChannelI64>(raw);
+    deallocate(seen);
+    return 0;
+}

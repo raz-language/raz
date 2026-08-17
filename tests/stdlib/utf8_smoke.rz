@@ -1,0 +1,78 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+
+fn main() -> i64 {
+    usize data = raz_rt_alloc(32);
+    if (data == 0) { return 1; }
+
+    // Exercise all scalar-width boundaries and the maximum Unicode scalar.
+    i64 first = encode(0, data, 32);
+    i64 second = encode(127, data + first, 32 - first);
+    i64 third = encode(128, data + first + second, 32 - first - second);
+    i64 fourth = encode(2047, data + first + second + third, 32 - first - second - third);
+    i64 fifth = encode(2048, data + first + second + third + fourth, 32 - first - second - third - fourth);
+    i64 sixth = encode(65535, data + first + second + third + fourth + fifth, 32 - first - second - third - fourth - fifth);
+    i64 seventh = encode(65536, data + first + second + third + fourth + fifth + sixth, 32 - first - second - third - fourth - fifth - sixth);
+    i64 eighth = encode(1114111, data + first + second + third + fourth + fifth + sixth + seventh, 32 - first - second - third - fourth - fifth - sixth - seventh);
+    i64 total = first + second + third + fourth + fifth + sixth + seventh + eighth;
+
+    if (first != 1 || second != 1 || third != 2 || fourth != 2 || fifth != 3 || sixth != 3 || seventh != 4 || eighth != 4) {
+        raz_rt_dealloc(data);
+        return 2;
+    }
+    if (!validate(data, total) || count_scalars(data, total) != 8) {
+        raz_rt_dealloc(data);
+        return 3;
+    }
+    if (scalar_valid(-1) || scalar_valid(55296) || scalar_valid(57343) || scalar_valid(1114112)) {
+        raz_rt_dealloc(data);
+        return 4;
+    }
+    if (encode(55296, data, 32) != 0 || encode(1114112, data, 32) != 0) {
+        raz_rt_dealloc(data);
+        return 5;
+    }
+
+    DecodeResult value = decode(data, total, first + second + third + fourth + fifth + sixth + seventh);
+    if (value.scalar != 1114111 || value.width != 4) {
+        raz_rt_dealloc(data);
+        return 6;
+    }
+
+    // Overlong two-byte sequence C0 80.
+    core::bytes::store_u8(data, 192);
+    core::bytes::store_u8(data + 1, 128);
+    if (validate(data, 2)) { raz_rt_dealloc(data); return 7; }
+
+    // Overlong three-byte sequence E0 80 80.
+    core::bytes::store_u8(data, 224);
+    core::bytes::store_u8(data + 1, 128);
+    core::bytes::store_u8(data + 2, 128);
+    if (validate(data, 3)) { raz_rt_dealloc(data); return 8; }
+
+    // UTF-8 encoded surrogate U+D800: ED A0 80.
+    core::bytes::store_u8(data, 237);
+    core::bytes::store_u8(data + 1, 160);
+    core::bytes::store_u8(data + 2, 128);
+    if (validate(data, 3)) { raz_rt_dealloc(data); return 9; }
+
+    // Above U+10FFFF: F4 90 80 80.
+    core::bytes::store_u8(data, 244);
+    core::bytes::store_u8(data + 1, 144);
+    core::bytes::store_u8(data + 2, 128);
+    core::bytes::store_u8(data + 3, 128);
+    if (validate(data, 4)) { raz_rt_dealloc(data); return 10; }
+
+    // Truncated and isolated continuation sequences.
+    core::bytes::store_u8(data, 226);
+    core::bytes::store_u8(data + 1, 130);
+    if (validate(data, 2)) { raz_rt_dealloc(data); return 11; }
+    core::bytes::store_u8(data, 128);
+    if (validate(data, 1)) { raz_rt_dealloc(data); return 12; }
+
+    raz_rt_dealloc(data);
+    return 0;
+}

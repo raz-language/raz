@@ -333,6 +333,51 @@ std::int64_t raz_rt_socket_set_reuse_address(std::int64_t socket_value, std::int
                     reinterpret_cast<const char*>(&value), sizeof(value)) == 0 ? 1 : 0;
 }
 
+
+std::int64_t raz_rt_socket_set_reuse_port(std::int64_t socket_value, std::int64_t enabled) {
+#if defined(SO_REUSEPORT)
+  const int value = enabled != 0 ? 1 : 0;
+  if (setsockopt(static_cast<Socket>(socket_value), SOL_SOCKET, SO_REUSEPORT,
+                 reinterpret_cast<const char*>(&value), sizeof(value)) != 0) {
+    raz_set_socket_error(); return 0;
+  }
+  raz_clear_last_error(); return 1;
+#else
+  (void)socket_value; (void)enabled; raz_set_last_error(ENOTSUP); return 0;
+#endif
+}
+
+std::int64_t raz_rt_socket_set_broadcast(std::int64_t socket_value, std::int64_t enabled) {
+  const int value = enabled != 0 ? 1 : 0;
+  if (setsockopt(static_cast<Socket>(socket_value), SOL_SOCKET, SO_BROADCAST,
+                 reinterpret_cast<const char*>(&value), sizeof(value)) != 0) {
+    raz_set_socket_error(); return 0;
+  }
+  raz_clear_last_error(); return 1;
+}
+
+std::int64_t raz_rt_udp_multicast_ipv4(std::int64_t socket_value, const char* group,
+                                        std::int64_t group_length, const char* interface_address,
+                                        std::int64_t interface_length, std::int64_t join) {
+  const auto group_text = view_text(group, group_length);
+  if (group_text.empty()) { raz_set_last_error(EINVAL); return 0; }
+  ip_mreq request{};
+  if (inet_pton(AF_INET, group_text.c_str(), &request.imr_multiaddr) != 1) {
+    raz_set_last_error(EINVAL); return 0;
+  }
+  const auto interface_text = view_text(interface_address, interface_length);
+  if (interface_text.empty()) request.imr_interface.s_addr = htonl(INADDR_ANY);
+  else if (inet_pton(AF_INET, interface_text.c_str(), &request.imr_interface) != 1) {
+    raz_set_last_error(EINVAL); return 0;
+  }
+  const int option = join != 0 ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP;
+  if (setsockopt(static_cast<Socket>(socket_value), IPPROTO_IP, option,
+                 reinterpret_cast<const char*>(&request), sizeof(request)) != 0) {
+    raz_set_socket_error(); return 0;
+  }
+  raz_clear_last_error(); return 1;
+}
+
 std::int64_t raz_rt_socket_set_buffer_sizes(std::int64_t socket_value, std::int64_t receive_size,
                                              std::int64_t send_size) {
   if (receive_size <= 0 || send_size <= 0) return 0;

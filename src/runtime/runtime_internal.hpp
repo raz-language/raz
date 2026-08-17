@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
@@ -80,6 +82,9 @@
 #include <sys/uio.h>
 #include <sys/mman.h>
 #include <poll.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #if defined(__linux__)
 #include <sys/random.h>
 #endif

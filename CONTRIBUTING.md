@@ -4,7 +4,7 @@ Thank you for helping improve Raz. The production compiler is implemented in Raz
 
 ## Design rules
 
-1. **Forge is the default production backend; LLVM is a supported production option.** Both are driven from the same verified MIR, and neither is a fallback for the other. Do not add a C emitter or any further alternate production code generator.
+1. **Forge remains the sole production backend.** Do not add a C emitter, LLVM fallback, or alternate production code generator.
 2. **Language behavior belongs in Raz.** Do not move compiler semantics or standard-library functionality into native shims simply because the Raz implementation is harder.
 3. **Keep the host compiler compatibility-stable and native boundaries narrow.** C++ is appropriate for the host compiler and permanent runtime/OS/ABI boundaries that cannot reasonably live in Raz. New language semantics belong under `compiler/src/`.
 4. **Preserve determinism.** Source discovery, dependency ordering, generated identifiers, and compiler output must remain reproducible.
@@ -36,14 +36,6 @@ tests/python/check-layout.py
 tests/python/check-native-boundary.py
 tests/python/check-forge-package.py
 tools/format-raz.py
-```
-
-Two reference documents are generated from source and must be regenerated when the
-inputs change. Both accept `--check` for CI use:
-
-```text
-python tools/generate-diagnostic-index.py    # after adding or changing a diagnostic
-python tools/generate-library-index.py       # after changing the library public API
 ```
 
 ## Style and comments

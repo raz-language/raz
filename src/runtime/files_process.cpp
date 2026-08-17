@@ -117,6 +117,104 @@ std::int64_t raz_rt_rename_path(const char* from, std::int64_t from_length,
   return 1;
 }
 
+std::int64_t raz_rt_path_canonical(const char* path, std::int64_t length, char* output, std::int64_t capacity) {
+  std::error_code error;
+  const auto resolved = std::filesystem::canonical(std::filesystem::path(view_text(path, length)), error);
+  if (error) { raz_set_last_error(error.value()); return -1; }
+  raz_clear_last_error();
+  return copy_text(resolved.string(), output, capacity);
+}
+
+std::int64_t raz_rt_path_read_link(const char* path, std::int64_t length, char* output, std::int64_t capacity) {
+  std::error_code error;
+  const auto target = std::filesystem::read_symlink(std::filesystem::path(view_text(path, length)), error);
+  if (error) { raz_set_last_error(error.value()); return -1; }
+  raz_clear_last_error();
+  return copy_text(target.string(), output, capacity);
+}
+
+std::int64_t raz_rt_path_create_symlink(const char* target, std::int64_t target_length,
+                                         const char* link, std::int64_t link_length,
+                                         std::int64_t directory) {
+  std::error_code error;
+  const auto target_path = std::filesystem::path(view_text(target, target_length));
+  const auto link_path = std::filesystem::path(view_text(link, link_length));
+  if (target_path.empty() || link_path.empty()) { raz_set_last_error(EINVAL); return 0; }
+  if (directory != 0) std::filesystem::create_directory_symlink(target_path, link_path, error);
+  else std::filesystem::create_symlink(target_path, link_path, error);
+  if (error) { raz_set_last_error(error.value()); return 0; }
+  raz_clear_last_error();
+  return 1;
+}
+
+std::int64_t raz_rt_temp_directory(char* output, std::int64_t capacity) {
+  std::error_code error;
+  const auto path = std::filesystem::temp_directory_path(error);
+  if (error) { raz_set_last_error(error.value()); return -1; }
+  raz_clear_last_error();
+  return copy_text(path.string(), output, capacity);
+}
+
+std::int64_t raz_rt_create_temp_file(const char* prefix, std::int64_t prefix_length,
+                                      char* output, std::int64_t capacity) {
+  std::error_code error;
+  const auto directory = std::filesystem::temp_directory_path(error);
+  if (error) { raz_set_last_error(error.value()); return -1; }
+  auto stem = view_text(prefix, prefix_length);
+  if (stem.empty()) stem = "raz";
+  static std::atomic<std::uint64_t> sequence{0};
+  std::random_device random;
+  for (std::uint64_t attempt = 0; attempt < 128; ++attempt) {
+    const auto nonce = (static_cast<std::uint64_t>(random()) << 32U) ^ static_cast<std::uint64_t>(random()) ^
+                       sequence.fetch_add(1, std::memory_order_relaxed);
+    const auto path = directory / (stem + "-" + std::to_string(nonce) + ".tmp");
+#if defined(_WIN32)
+    const auto wide = path.wstring();
+    HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      const auto code = GetLastError();
+      if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS) continue;
+      raz_set_last_error(static_cast<std::int64_t>(code));
+      return -1;
+    }
+    CloseHandle(handle);
+#else
+    const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+      if (errno == EEXIST) continue;
+      raz_set_errno_error();
+      return -1;
+    }
+    ::close(fd);
+#endif
+    raz_clear_last_error();
+    return copy_text(path.string(), output, capacity);
+  }
+  raz_set_last_error(EEXIST);
+  return -1;
+}
+
+std::int64_t raz_rt_path_permissions(const char* path, std::int64_t length) {
+  std::error_code error;
+  const auto status = std::filesystem::status(std::filesystem::path(view_text(path, length)), error);
+  if (error) { raz_set_last_error(error.value()); return -1; }
+  const auto raw = static_cast<unsigned>(status.permissions());
+  raz_clear_last_error();
+  return static_cast<std::int64_t>(raw & 0777U);
+}
+
+std::int64_t raz_rt_path_set_permissions(const char* path, std::int64_t length, std::int64_t mode) {
+  if (mode < 0 || mode > 0777) { raz_set_last_error(EINVAL); return 0; }
+  std::error_code error;
+  std::filesystem::permissions(std::filesystem::path(view_text(path, length)),
+                               static_cast<std::filesystem::perms>(static_cast<unsigned>(mode)),
+                               std::filesystem::perm_options::replace, error);
+  if (error) { raz_set_last_error(error.value()); return 0; }
+  raz_clear_last_error();
+  return 1;
+}
+
 std::int64_t raz_rt_copy_file(const char* from, std::int64_t from_length,
                                const char* to, std::int64_t to_length, std::int64_t overwrite) {
   std::error_code error;
@@ -138,17 +236,48 @@ void* raz_rt_file_open(const char* path, std::int64_t length, std::int64_t flags
   const bool append = (flags & 4) != 0;
   const bool create = (flags & 8) != 0;
   const bool truncate = (flags & 16) != 0;
+  const bool exclusive = (flags & 32) != 0;
   if (!read && !write) { raz_set_last_error(EINVAL); return nullptr; }
+  if (exclusive && !create) { raz_set_last_error(EINVAL); return nullptr; }
 
   const char* mode = nullptr;
   if (append) mode = read ? "a+b" : "ab";
   else if (truncate) mode = read ? "w+b" : "wb";
   else if (read && write) mode = "r+b";
-  else if (write) mode = create ? "wb" : "r+b";
+  else if (write) mode = "r+b";
   else mode = "rb";
 
+  // fopen cannot express race-free exclusive creation or create-without-truncate.
+  // Use the native descriptor boundary for those modes, then preserve the FILE*
+  // runtime ABI above it.
+  if (exclusive || (create && !truncate && !append)) {
+#if defined(_WIN32)
+    int open_flags = _O_BINARY | _O_CREAT;
+    if (exclusive) open_flags |= _O_EXCL;
+    if (read && write) open_flags |= _O_RDWR;
+    else if (write) open_flags |= _O_WRONLY;
+    else open_flags |= _O_RDONLY;
+    const int descriptor = _open(value.c_str(), open_flags, _S_IREAD | _S_IWRITE);
+    if (descriptor < 0) { raz_set_errno_error(); return nullptr; }
+    std::FILE* file = _fdopen(descriptor, read && write ? "r+b" : (write ? "wb" : "rb"));
+    if (file == nullptr) { _close(descriptor); raz_set_errno_error(); return nullptr; }
+#else
+    int open_flags = O_CREAT;
+    if (exclusive) open_flags |= O_EXCL;
+    if (read && write) open_flags |= O_RDWR;
+    else if (write) open_flags |= O_WRONLY;
+    else open_flags |= O_RDONLY;
+    const int descriptor = ::open(value.c_str(), open_flags, 0666);
+    if (descriptor < 0) { raz_set_errno_error(); return nullptr; }
+    std::FILE* file = ::fdopen(descriptor, read && write ? "r+b" : (write ? "wb" : "rb"));
+    if (file == nullptr) { ::close(descriptor); raz_set_errno_error(); return nullptr; }
+#endif
+    raz_clear_last_error();
+    return file;
+  }
+
   std::FILE* file = std::fopen(value.c_str(), mode);
-  if (file == nullptr && create && !append && !truncate && read && write) file = std::fopen(value.c_str(), "w+b");
+  if (file == nullptr && create && read && write) file = std::fopen(value.c_str(), "w+b");
   if (file == nullptr) raz_set_errno_error();
   else raz_clear_last_error();
   return file;

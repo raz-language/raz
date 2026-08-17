@@ -1,0 +1,109 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+// True multi-thread MPMC stress.  Worker-local queue values are non-owning
+// views over the owner's atomic positions/slot array; each worker clears its
+// view before return so the backing allocation is released exactly once.
+fn worker_view(usize state, usize slots, i64 capacity, i64 mask) -> MpmcI64 {
+    return MpmcI64 { state: state, slots: slots, capacity: capacity, mask: mask };
+}
+
+fn disarm(MpmcI64&mut queue) {
+    queue.state = 0;
+    queue.slots = 0;
+    queue.capacity = 0;
+    queue.mask = 0;
+}
+
+fn producer(usize state, usize slots, i64 capacity, i64 mask, i64 producer_id, i64 per_producer) -> i64 {
+    MpmcI64 queue = worker_view(state, slots, capacity, mask);
+    i64 index = 0;
+    while (index < per_producer) {
+        i64 value = producer_id * per_producer + index;
+        while (!std::thread::mpmc::try_send(&queue, value)) {
+            std::thread::yield_now();
+        }
+        index += 1;
+    }
+    disarm(&mut queue);
+    return per_producer;
+}
+
+fn consumer(usize state, usize slots, i64 capacity, i64 mask, i64 seen_address, i64 consumed_address, i64 total) -> i64 {
+    MpmcI64 queue = worker_view(state, slots, capacity, mask);
+    usize seen = seen_address as usize;
+    usize consumed = consumed_address as usize;
+    i64 local = 0;
+    while (core::atomic::load_i64(consumed) < total) {
+        MpmcReceiveI64 item = std::thread::mpmc::try_receive(&queue);
+        if (!item.received) {
+            std::thread::yield_now();
+        } else {
+            if (item.value < 0 || item.value >= total) {
+                disarm(&mut queue);
+                return -1;
+            }
+            usize cell = seen + (item.value as usize) * 8;
+            if (core::atomic::exchange_i64(cell, 1) != 0) {
+                disarm(&mut queue);
+                return -2;
+            }
+            core::atomic::fetch_add_i64(consumed, 1);
+            local += 1;
+        }
+    }
+    disarm(&mut queue);
+    return local;
+}
+
+fn main() -> i64 {
+    const i64 producers = 4;
+    const i64 consumers = 4;
+    const i64 per_producer = 10000;
+    const i64 total = producers * per_producer;
+
+    MpmcI64 queue = std::thread::mpmc::create(1024);
+    if (!std::thread::mpmc::valid(&queue)) { return 1; }
+
+    usize seen = alloc::box::allocate_zeroed(total * 8);
+    usize consumed = alloc::box::allocate_zeroed(8);
+    if (seen == 0 || consumed == 0) { return 2; }
+
+    usize state = queue.state;
+    usize slots = queue.slots;
+    i64 capacity = queue.capacity;
+    i64 mask = queue.mask;
+
+    JoinHandleI64 p0 = std::thread::spawn_callable(move fn() -> i64 { return producer(state, slots, capacity, mask, 0, 10000); });
+    JoinHandleI64 p1 = std::thread::spawn_callable(move fn() -> i64 { return producer(state, slots, capacity, mask, 1, 10000); });
+    JoinHandleI64 p2 = std::thread::spawn_callable(move fn() -> i64 { return producer(state, slots, capacity, mask, 2, 10000); });
+    JoinHandleI64 p3 = std::thread::spawn_callable(move fn() -> i64 { return producer(state, slots, capacity, mask, 3, 10000); });
+
+    i64 seen_address = seen as i64;
+    i64 consumed_address = consumed as i64;
+    JoinHandleI64 c0 = std::thread::spawn_callable(move fn() -> i64 { return consumer(state, slots, capacity, mask, seen_address, consumed_address, 40000); });
+    JoinHandleI64 c1 = std::thread::spawn_callable(move fn() -> i64 { return consumer(state, slots, capacity, mask, seen_address, consumed_address, 40000); });
+    JoinHandleI64 c2 = std::thread::spawn_callable(move fn() -> i64 { return consumer(state, slots, capacity, mask, seen_address, consumed_address, 40000); });
+    JoinHandleI64 c3 = std::thread::spawn_callable(move fn() -> i64 { return consumer(state, slots, capacity, mask, seen_address, consumed_address, 40000); });
+
+    if (std::thread::join(&mut p0) != per_producer || std::thread::join(&mut p1) != per_producer ||
+        std::thread::join(&mut p2) != per_producer || std::thread::join(&mut p3) != per_producer) { return 3; }
+
+    i64 received = 0;
+    i64 part = std::thread::join(&mut c0); if (part < 0) { return 4; } received += part;
+    part = std::thread::join(&mut c1); if (part < 0) { return 5; } received += part;
+    part = std::thread::join(&mut c2); if (part < 0) { return 6; } received += part;
+    part = std::thread::join(&mut c3); if (part < 0) { return 7; } received += part;
+
+    if (received != total || core::atomic::load_i64(consumed) != total || !std::thread::mpmc::is_empty(&queue)) { return 8; }
+    i64 index = 0;
+    while (index < total) {
+        if (core::atomic::load_i64(seen + (index as usize) * 8) != 1) { return 9; }
+        index += 1;
+    }
+
+    std::thread::mpmc::destroy(&mut queue);
+    alloc::box::deallocate(consumed);
+    alloc::box::deallocate(seen);
+    return 0;
+}

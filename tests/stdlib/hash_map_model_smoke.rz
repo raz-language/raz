@@ -1,0 +1,69 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_volatile_load_i64(usize address) -> i64;
+extern fn raz_rt_volatile_store_i64(usize address, i64 value);
+
+fn next_random(i64 value) -> i64 { return (value * 48271) % 2147483647; }
+
+fn main() -> i64 {
+    RawHashMap map = raw_hash_map_create(8, 4);
+    usize source = raz_rt_alloc(8);
+    usize output = raz_rt_alloc(8);
+    if (source == 0 || output == 0) { return 1; }
+
+    bool present[256];
+    i64 values[256];
+    i64 i = 0;
+    while (i < 256) { present[i] = false; values[i] = 0; i += 1; }
+
+    i64 expected_len = 0;
+    i64 random = 1;
+    i64 step = 0;
+    while (step < 75000) {
+        random = next_random(random);
+        i64 key = random % 256;
+        random = next_random(random);
+        i64 operation = random % 4;
+        if (operation <= 1) {
+            random = next_random(random);
+            i64 value = random;
+            raz_rt_volatile_store_i64(source, value);
+            if (!raw_hash_map_insert_raw(&mut map, key, source)) { return 2; }
+            if (!present[key]) { expected_len += 1; }
+            present[key] = true;
+            values[key] = value;
+        } else if (operation == 2) {
+            bool removed = raw_hash_map_remove(&mut map, key, output);
+            if (removed != present[key]) { return 3; }
+            if (removed) {
+                if (raz_rt_volatile_load_i64(output) != values[key]) { return 4; }
+                present[key] = false;
+                expected_len -= 1;
+            }
+        } else {
+            bool found = raw_hash_map_get_raw(&map, key, output);
+            if (found != present[key]) { return 5; }
+            if (found && raz_rt_volatile_load_i64(output) != values[key]) { return 6; }
+        }
+        if (raw_hash_map_len(&map) != expected_len) { return 7; }
+
+        if ((step % 257) == 0) {
+            i = 0;
+            while (i < 256) {
+                bool found = raw_hash_map_get_raw(&map, i, output);
+                if (found != present[i]) { return 8; }
+                if (found && raz_rt_volatile_load_i64(output) != values[i]) { return 9; }
+                i += 1;
+            }
+        }
+        step += 1;
+    }
+
+    raw_hash_map_destroy(&mut map);
+    raz_rt_dealloc(output);
+    raz_rt_dealloc(source);
+    return 0;
+}

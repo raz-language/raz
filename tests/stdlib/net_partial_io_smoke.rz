@@ -1,0 +1,65 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+
+fn put(usize data, i64 index, i64 value) {
+    unsafe { *((data + index) as u8*mut) = value as u8; }
+}
+
+fn get(usize data, i64 index) -> i64 {
+    unsafe { return (*((data + index) as u8*const)) as i64; }
+}
+
+fn main() -> i64 {
+    usize host = raz_rt_alloc(9);
+    if (host == 0) { return 1; }
+    i64 host_bytes[9] = [49,50,55,46,48,46,48,46,49];
+    i64 i = 0;
+    while (i < 9) { put(host, i, host_bytes[i]); i += 1; }
+
+    i64 listener = listen_host(host, 9, 0, 8);
+    if (listener < 0) { return 2; }
+    i64 port = local_port(listener);
+    if (port <= 0) { return 3; }
+    i64 client = connect(host, 9, port);
+    if (client < 0) { return 4; }
+    i64 server = accept(listener);
+    if (server < 0) { return 5; }
+
+    usize source = raz_rt_alloc(32);
+    usize output = raz_rt_alloc(32);
+    if (source == 0 || output == 0) { return 6; }
+    i = 0;
+    while (i < 32) { put(source, i, 17 + i); i += 1; }
+
+    // Split one logical record over multiple writes. receive_exact must
+    // accumulate the fragments rather than treating the first short receive
+    // as completion.
+    if (send(client, source, 3) != 3) { return 7; }
+    if (send(client, source + 3, 5) != 5) { return 8; }
+    if (receive_exact(server, output, 8) != 8) { return 9; }
+    i = 0;
+    while (i < 8) {
+        if (get(output, i) != 17 + i) { return 10; }
+        i += 1;
+    }
+
+    // Exercise the opposite helper direction over a larger record.
+    if (send_all(server, source, 32) != 32) { return 11; }
+    if (receive_exact(client, output, 32) != 32) { return 12; }
+    i = 0;
+    while (i < 32) {
+        if (get(output, i) != 17 + i) { return 13; }
+        i += 1;
+    }
+
+    close(server);
+    close(client);
+    close(listener);
+    raz_rt_dealloc(output);
+    raz_rt_dealloc(source);
+    raz_rt_dealloc(host);
+    return 0;
+}

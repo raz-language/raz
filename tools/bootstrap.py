@@ -14,12 +14,37 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 IS_WINDOWS = os.name == "nt"
 EXE = ".exe" if IS_WINDOWS else ""
 OBJ = ".obj" if IS_WINDOWS else ".o"
+
+
+def load_bootstrap_config() -> dict[str, object]:
+    """Load optional repository-local bootstrap.toml settings.
+
+    Command-line flags continue to win.  Keeping configuration in the repository
+    mirrors mature compiler bootstrap workflows without introducing a second
+    bootstrap driver.
+    """
+    path = ROOT / "bootstrap.toml"
+    if not path.is_file():
+        example = ROOT / "bootstrap.example.toml"
+        if example.is_file():
+            print("WARNING: bootstrap.toml was not found; using built-in defaults.")
+            print("HELP: copy bootstrap.example.toml to bootstrap.toml to customize the build.")
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"Could not read {path}: {exc}") from exc
+    section = data.get("bootstrap", {})
+    if not isinstance(section, dict):
+        raise RuntimeError("bootstrap.toml [bootstrap] must be a table.")
+    return section
 
 
 def _normalize_env(env: dict[str, str]) -> dict[str, str]:
@@ -493,13 +518,14 @@ def digest(path: Path) -> str:
 
 
 def main() -> int:
+    config = load_bootstrap_config()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bootstrap-profile", "-BootstrapProfile", choices=("debug", "release"), default="debug")
-    parser.add_argument("--host-preset", "-HostPreset", choices=("debug", "release"), default="release")
-    parser.add_argument("--jobs", "-Jobs", type=int, default=max(1, os.cpu_count() or 1))
-    parser.add_argument("--status-interval", type=int, default=15)
-    parser.add_argument("--clean", "-Clean", action="store_true")
-    parser.add_argument("--run-tests", "-RunTests", action="store_true")
+    parser.add_argument("--bootstrap-profile", "-BootstrapProfile", choices=("debug", "release"), default=str(config.get("bootstrap-profile", "debug")))
+    parser.add_argument("--host-preset", "-HostPreset", choices=("debug", "release"), default=str(config.get("host-preset", "release")))
+    parser.add_argument("--jobs", "-Jobs", type=int, default=int(config.get("jobs", max(1, os.cpu_count() or 1))))
+    parser.add_argument("--status-interval", type=int, default=int(config.get("status-interval", 15)))
+    parser.add_argument("--clean", "-Clean", action="store_true", default=bool(config.get("clean", False)))
+    parser.add_argument("--run-tests", "-RunTests", action="store_true", default=bool(config.get("run-tests", False)))
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")

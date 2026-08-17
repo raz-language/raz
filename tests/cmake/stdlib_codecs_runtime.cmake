@@ -74,6 +74,83 @@ fn main() -> i64 {
         }
     }
 
+    // Deterministic round-trip stress across every short payload length. This
+    // catches tail/padding bugs without making the test nondeterministic.
+    i64 fuzz_length = 0;
+    while (fuzz_length <= 64) {
+        index = 0;
+        while (index < fuzz_length) {
+            core::bytes::store_u8(source + index, (index * 37 + fuzz_length * 11) & 255);
+            index += 1;
+        }
+
+        match std::encoding::hex::encode_lower(source, fuzz_length, encoded, 128) {
+            Result<i64, HexError>::Error(_) => { return 20; }
+            Result<i64, HexError>::Ok(hex_length) => {
+                match std::encoding::hex::decode(encoded, hex_length, decoded, 128) {
+                    Result<i64, HexError>::Error(_) => { return 21; }
+                    Result<i64, HexError>::Ok(decoded_length) => {
+                        if (decoded_length != fuzz_length || !core::bytes::equal(
+                            BytesView { data: source, length: fuzz_length },
+                            BytesView { data: decoded, length: decoded_length }
+                        )) { return 22; }
+                    }
+                }
+            }
+        }
+
+        match std::encoding::base64::encode(source, fuzz_length, encoded, 128) {
+            Result<i64, Base64Error>::Error(_) => { return 23; }
+            Result<i64, Base64Error>::Ok(encoded_count) => {
+                match std::encoding::base64::decode(encoded, encoded_count, decoded, 128) {
+                    Result<i64, Base64Error>::Error(_) => { return 24; }
+                    Result<i64, Base64Error>::Ok(decoded_length) => {
+                        if (decoded_length != fuzz_length || !core::bytes::equal(
+                            BytesView { data: source, length: fuzz_length },
+                            BytesView { data: decoded, length: decoded_length }
+                        )) { return 25; }
+                    }
+                }
+            }
+        }
+
+        match std::encoding::base64::encode_url(source, fuzz_length, encoded, 128) {
+            Result<i64, Base64Error>::Error(_) => { return 26; }
+            Result<i64, Base64Error>::Ok(encoded_count) => {
+                match std::encoding::base64::decode_url(encoded, encoded_count, decoded, 128) {
+                    Result<i64, Base64Error>::Error(_) => { return 27; }
+                    Result<i64, Base64Error>::Ok(decoded_length) => {
+                        if (decoded_length != fuzz_length || !core::bytes::equal(
+                            BytesView { data: source, length: fuzz_length },
+                            BytesView { data: decoded, length: decoded_length }
+                        )) { return 28; }
+                    }
+                }
+            }
+        }
+        fuzz_length += 1;
+    }
+
+    // Invalid padding placement and non-zero discarded bits must be rejected.
+    core::bytes::store_u8(encoded, 90);      // Z
+    core::bytes::store_u8(encoded + 1, 71);  // G
+    core::bytes::store_u8(encoded + 2, 61);  // =
+    core::bytes::store_u8(encoded + 3, 90);  // Z
+    match std::encoding::base64::decode(encoded, 4, decoded, 128) {
+        Result<i64, Base64Error>::Ok(_) => { return 29; }
+        Result<i64, Base64Error>::Error(_) => {}
+    }
+    core::bytes::store_u8(encoded, 90);      // Z
+    core::bytes::store_u8(encoded + 1, 104); // h: low padding bits are nonzero
+    core::bytes::store_u8(encoded + 2, 61);
+    core::bytes::store_u8(encoded + 3, 61);
+    match std::encoding::base64::decode(encoded, 4, decoded, 128) {
+        Result<i64, Base64Error>::Ok(_) => { return 30; }
+        Result<i64, Base64Error>::Error(_) => {}
+    }
+
+    index = 0;
+    while (index < 5) { core::bytes::store_u8(source + index, hello[index]); index += 1; }
     u32 checksum = std::encoding::checksum::crc32(source, 5);
     if (checksum != (0x3610a686 as u32)) { return 10; }
 

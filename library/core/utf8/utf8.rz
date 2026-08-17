@@ -1,0 +1,130 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace core::utf8;
+
+fn load_byte(usize address) -> i64 {
+    unsafe {
+        return (*(address as u8*const))as i64;
+    }
+}
+
+fn store_byte(usize address, i64 value) {
+    unsafe {
+        *(address as u8*mut) = (value & 255)as u8;
+    }
+}
+
+public struct DecodeResult {
+    i64 scalar;
+    i64 width;
+}
+
+public fn scalar_valid(i64 scalar) -> bool {
+    if (scalar < 0 || scalar > 1114111) {
+        return false;
+    }
+    return scalar < 55296 || scalar > 57343;
+}
+
+public fn scalar_width(i64 scalar) -> i64 {
+    if (!scalar_valid(scalar)) { return 0; }
+    if (scalar <= 127) { return 1; }
+    if (scalar <= 2047) { return 2; }
+    if (scalar <= 65535) { return 3; }
+    return 4;
+}
+
+fn continuation(i64 value) -> bool {
+    return value >= 128 && value <= 191;
+}
+
+/// Decodes one UTF-8 scalar. width=0 means invalid input.
+public fn decode(usize data, i64 length, i64 offset) -> DecodeResult {
+    if (data == 0 || offset < 0 || offset >= length) {
+        return DecodeResult { scalar: -1, width: 0 };
+    }
+
+    i64 b0 = load_byte(data + offset);
+    if (b0 <= 127) {
+        return DecodeResult { scalar: b0, width: 1 };
+    }
+    if (b0 >= 194 && b0 <= 223) {
+        if (offset + 1 >= length) { return DecodeResult { scalar: -1, width: 0 }; }
+        i64 b1 = load_byte(data + offset + 1);
+        if (!continuation(b1)) { return DecodeResult { scalar: -1, width: 0 }; }
+        return DecodeResult { scalar: ((b0 & 31) << 6) | (b1 & 63), width: 2 };
+    }
+    if (b0 >= 224 && b0 <= 239) {
+        if (offset + 2 >= length) { return DecodeResult { scalar: -1, width: 0 }; }
+        i64 b1 = load_byte(data + offset + 1);
+        i64 b2 = load_byte(data + offset + 2);
+        if (!continuation(b1) || !continuation(b2)) { return DecodeResult { scalar: -1, width: 0 }; }
+        if (b0 == 224 && b1 < 160) { return DecodeResult { scalar: -1, width: 0 }; }
+        if (b0 == 237 && b1 > 159) { return DecodeResult { scalar: -1, width: 0 }; }
+        return DecodeResult { scalar: ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63), width: 3 };
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (offset + 3 >= length) { return DecodeResult { scalar: -1, width: 0 }; }
+        i64 b1 = load_byte(data + offset + 1);
+        i64 b2 = load_byte(data + offset + 2);
+        i64 b3 = load_byte(data + offset + 3);
+        if (!continuation(b1) || !continuation(b2) || !continuation(b3)) {
+            return DecodeResult { scalar: -1, width: 0 };
+        }
+        if (b0 == 240 && b1 < 144) { return DecodeResult { scalar: -1, width: 0 }; }
+        if (b0 == 244 && b1 > 143) { return DecodeResult { scalar: -1, width: 0 }; }
+        return DecodeResult {
+            scalar: ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63),
+            width: 4
+        };
+    }
+    return DecodeResult { scalar: -1, width: 0 };
+}
+
+public fn validate(usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    i64 offset = 0;
+    while (offset < length) {
+        DecodeResult result = decode(data, length, offset);
+        if (result.width == 0) { return false; }
+        offset += result.width;
+    }
+    return true;
+}
+
+public fn count_scalars(usize data, i64 length) -> i64 {
+    if (length < 0 || (length > 0 && data == 0)) { return -1; }
+    i64 count = 0;
+    i64 offset = 0;
+    while (offset < length) {
+        DecodeResult result = decode(data, length, offset);
+        if (result.width == 0) { return -1; }
+        offset += result.width;
+        count += 1;
+    }
+    return count;
+}
+
+/// Encodes one Unicode scalar into output and returns bytes written, or 0.
+public fn encode(i64 scalar, usize output, i64 capacity) -> i64 {
+    i64 width = scalar_width(scalar);
+    if (width == 0 || capacity < width || output == 0) { return 0; }
+
+    if (width == 1) {
+        store_byte(output, scalar);
+    } else if (width == 2) {
+        store_byte(output, 192 | (scalar >> 6));
+        store_byte(output + 1, 128 | (scalar & 63));
+    } else if (width == 3) {
+        store_byte(output, 224 | (scalar >> 12));
+        store_byte(output + 1, 128 | ((scalar >> 6) & 63));
+        store_byte(output + 2, 128 | (scalar & 63));
+    } else {
+        store_byte(output, 240 | (scalar >> 18));
+        store_byte(output + 1, 128 | ((scalar >> 12) & 63));
+        store_byte(output + 2, 128 | ((scalar >> 6) & 63));
+        store_byte(output + 3, 128 | (scalar & 63));
+    }
+    return width;
+}
