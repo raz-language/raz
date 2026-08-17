@@ -19,7 +19,6 @@ The specification is the normative prose reference; the repository conformance s
 
 | Document | What it covers |
 |---|---|
-| [Installation](INSTALLATION.md) | MSI, portable archive, silent install, and `razup` toolchain management |
 | [CLI reference](CLI.md) | Every `raz` and `razc` command, plus diagnostics, formats, and warning policy |
 | [Package management](PACKAGE-MANAGEMENT.md) | Manifests, dependencies, lockfiles, registries, the shared store, vendoring, publishing |
 | [Standard library](STANDARD-LIBRARY.md) | Module map of every layer, module, and public item |

@@ -10,7 +10,6 @@
 [![Packages](https://img.shields.io/badge/packages-registry-111827?style=flat-square)](https://github.com/raz-language/packages)
 
 [Getting started](docs/GETTING-STARTED.md) ·
-[Installation](docs/INSTALLATION.md) ·
 [Language specification](docs/LANGUAGE-SPECIFICATION.md) ·
 [CLI reference](docs/CLI.md) ·
 [Documentation](docs/README.md)
@@ -57,7 +56,7 @@ Raz uses type-first declarations and semicolon-terminated statements. The [langu
 
 Releases provide an MSI installer and a portable archive for Windows, with `razup` for toolchain management. Confirm the environment with `raz --version` and `raz doctor`, then create a project with `raz new` and run it with `raz run`.
 
-See [Installation](docs/INSTALLATION.md) for installer, portable, silent-install, and toolchain-management details, and [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough.
+See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough.
 
 ## Toolchain
 
