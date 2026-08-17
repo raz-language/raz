@@ -1768,6 +1768,46 @@ fn project_record_input(i64 state, i64 path, i64 path_length) -> bool {
     return true;
 }
 
+// A package graph can change while raz.toml stays byte-for-byte identical.  In
+// particular `raz update` rewrites raz.lock when a registry dependency advances
+// to a new immutable package checksum.  The assembled-project cache therefore
+// records the sibling lockfile as an input whenever one exists.  Without this,
+// an old content-addressed package can remain a valid *old* cache input and the
+// cached combined source can survive a lockfile upgrade.
+fn project_record_lock_input(i64 state, i64 root, i64 root_length) -> bool {
+    if (state == 0 || root == 0 || root_length <= 0 || raz_compiler_rt_arena_get(state, 18) == 0) {
+        return true;
+    }
+
+    i64 lock_name[8] = [114, 97, 122, 46, 108, 111, 99, 107];
+    i64 lock_path = raz_compiler_rt_arena_create(8192);
+
+    if (lock_path == 0) {
+        raz_compiler_rt_arena_set(state, 18, 0);
+        return false;
+    }
+
+    i64 lock_length = path_join(root, root_length, &lock_name, 8, lock_path, 8192);
+
+    if (lock_length <= 0) {
+        raz_compiler_rt_arena_destroy(lock_path);
+        raz_compiler_rt_arena_set(state, 18, 0);
+        return false;
+    }
+    // A missing lockfile is valid for path-only/unlocked projects.  raz add
+    // changes raz.toml when introducing a registry dependency, so creation of
+    // the first lockfile cannot incorrectly preserve an older project cache.
+    if (raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0) {
+        raz_compiler_rt_arena_destroy(lock_path);
+        return true;
+    }
+
+    bool ok = project_record_input(state, lock_path, lock_length);
+
+    raz_compiler_rt_arena_destroy(lock_path);
+    return ok;
+}
+
 fn project_path_range_less(
     i64 list,
     i64 left_start,
@@ -2853,6 +2893,12 @@ fn append_project_manifest(i64 manifest_path, i64 manifest_path_length, i64 stat
     }
 
     i64 root_length = path_dirname(canonical_manifest, canonical_length, root, 4096);
+
+    if (root_length > 0 && !project_record_lock_input(state, root, root_length)) {
+        write_compiler_diagnostic(4, 105, depth);
+        return false;
+    }
+
     i64 source_name_length = manifest_source_directory(manifest, manifest_length, source_name, 4096);
     i64 package_name_length = manifest_package_name(manifest, manifest_length, package_name, 4096);
     i64 entry_name_length = manifest_entry_path(manifest, manifest_length, entry_name, 4096);

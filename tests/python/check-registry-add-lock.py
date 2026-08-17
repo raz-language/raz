@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 package = (ROOT / 'compiler/src/driver/package.rz').read_text(encoding='utf-8')
 registry = (ROOT / 'compiler/src/driver/registry.rz').read_text(encoding='utf-8')
+project = (ROOT / 'compiler/src/driver/project.rz').read_text(encoding='utf-8')
+incremental = (ROOT / 'compiler/src/driver/incremental.rz').read_text(encoding='utf-8')
 
 checks = {
     'root raz.toml lock path uses exact 10-byte length': 'package_lock_collect(\n        mp,\n        10,' in package,
@@ -22,6 +24,10 @@ checks = {
     'build constraint validation resolves registry alias through verified store cache': 'i64 rl = package_lock_registry_cached_root(alias, alias_length, root, 8192);' in registry,
     'build constraint validation preserves local path dependency fallback': 'i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);' in registry and 'rl = path_join(root, 1, dependency, dl, manifest_path, 8192);' in registry,
     'semver greater-equal remains inclusive': 'if (mode == 3) {\n        return cmp >= 0;' in registry,
+    'project cache records sibling lockfile input': 'fn project_record_lock_input(' in project and 'project_record_input(state, lock_path, lock_length)' in project,
+    'project assembly records lockfile after manifest root resolution': '!project_record_lock_input(state, root, root_length)' in project,
+    'lockfile input is optional for path-only projects': 'raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0' in project,
+    'incremental cache schema invalidates pre-lock-aware project caches': 'fn incremental_cache_schema() -> i64 {\n    return 4;\n}' in incremental,
 }
 failed=[name for name,ok in checks.items() if not ok]
 if failed:
