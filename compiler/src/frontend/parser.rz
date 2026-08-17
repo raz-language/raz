@@ -725,9 +725,34 @@ fn parse_type_reference(
             parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
             return false;
         }
-        *type_offset = parser.current.offset;
-        *type_length = parser.current.length;
+        // Preserve the complete qualified type path in the compact frontend.
+        // HIR already resolves namespace/package-qualified types, but the
+        // syntax parser historically stopped after the first identifier.  That
+        // made declarations such as `pkg::module::Type value;` fail before HIR
+        // could perform the qualified lookup.  Consume every `:: identifier`
+        // segment here and keep one contiguous source span for downstream
+        // diagnostics/metadata.
+
+        i64 start = parser.current.offset;
+        i64 finish = parser.current.offset + parser.current.length;
+        bool qualified = false;
+
         parser_advance(parser);
+        while (parser.current.kind == TokenKind::ColonColon) {
+            qualified = true;
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            finish = parser.current.offset + parser.current.length;
+            parser_advance(parser);
+        }
+        *type_offset = start;
+        *type_length = finish - start;
+        if (qualified) {
+            parser.module.complex_source_mode = 1;
+        }
     }
     if (parser.current.kind == TokenKind::LeftBracket) {
         parser_advance(parser);

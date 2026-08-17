@@ -12,6 +12,7 @@ FORBIDDEN_ROOT_FILES = {
     "compiler-all.rz",
     "forge-structured-failure.txt",
     "compiler-diagnostic.txt",
+    "stage1-diagnostic.txt",
 }
 FORBIDDEN_SUFFIXES = {".inc", ".xy", ".xyft", ".raz"}
 FORBIDDEN_DIR_NAMES = {"build", ".raz", "__pycache__"}
@@ -47,6 +48,8 @@ def main() -> int:
         )
         if generated:
             continue
+        if path.is_file() and path.name == "stage1-diagnostic.txt":
+            problems.append(f"legacy stage diagnostic artifact: {rel}")
         if path.is_file() and path.suffix.lower() in FORBIDDEN_SUFFIXES:
             problems.append(f"forbidden source/artifact extension: {rel}")
 
