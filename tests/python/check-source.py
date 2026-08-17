@@ -29,6 +29,7 @@ CHECKS = (
     "check-mir-transform-storage.py",
     "check-mir-copy-propagation.py",
     "check-toolchain-completion.py",
+    "check-cli-package-status.py",
     "check-stdlib-format.py",
     "check-forge-package.py",
     "check-llvm-backend-parity.py",
