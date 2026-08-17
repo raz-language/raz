@@ -52,6 +52,10 @@ Raz is a statically typed language for command-line tools, network services, run
 
 Raz uses type-first declarations and semicolon-terminated statements. The [language specification](docs/LANGUAGE-SPECIFICATION.md) is the normative reference; [Getting Started](docs/GETTING-STARTED.md) is the practical introduction.
 
+## Install and start
+
+Releases provide an MSI installer and a portable archive for Windows, with `razup` for toolchain management. Confirm the environment with `raz --version` and `raz doctor`, then create a project with `raz new` and run it with `raz run`.
+
 See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough.
 
 ## Toolchain

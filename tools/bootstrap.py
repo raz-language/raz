@@ -503,9 +503,9 @@ def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Pat
         # Reproducibility executables are the Raz compiler itself.  Reserve
         # 32 MiB on Windows to match the compiler-specific host link contract;
         # ordinary Raz programs continue to use the smaller default elsewhere.
-        args = [compiler, "/nologo", str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "ws2_32.lib", "bcrypt.lib", f"/Fe:{output}", "/link", "/STACK:33554432"]
+        args = [compiler, "/nologo", str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "ws2_32.lib", "bcrypt.lib", "crypt32.lib", f"/Fe:{output}", "/link", "/STACK:33554432"]
     elif IS_WINDOWS:
-        args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-lws2_32", "-lbcrypt"]
+        args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-lws2_32", "-lbcrypt", "-lcrypt32"]
     else:
         args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-pthread"]
         if sys.platform.startswith("linux"):

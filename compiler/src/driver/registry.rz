@@ -1515,29 +1515,59 @@ fn registry_dependency_version(i64 alias, i64 alias_length, i64 output, i64 capa
     i64 root = raz_compiler_rt_arena_create(8192);
     i64 manifest_path = raz_compiler_rt_arena_create(8192);
     i64 manifest = raz_compiler_rt_arena_create(65536);
-
-    if (dependency == 0 || root == 0 || manifest_path == 0 || manifest == 0) {
-        return -1;
-    }
-
-    i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);
-
-    if (dl <= 0) {
-        return -1;
-    }
-    raz_compiler_rt_arena_set(root, 0, 46);
-
-    i64 rl = path_join(root, 1, dependency, dl, manifest_path, 8192);
     i64 full = raz_compiler_rt_arena_create(8192);
 
-    if (full == 0) {
+    if (dependency == 0 || root == 0 || manifest_path == 0 || manifest == 0 || full == 0) {
         return -1;
     }
+    // Registry dependencies are represented in raz.toml by a semantic version
+    // constraint (for example, ">=0.0.0"), not by a filesystem directory.
+    // Resolve the dependency alias through the derived cache first so ordinary
+    // build/check validation reads the exact verified package that raz.lock
+    // names in the shared content-addressed store. Path dependencies retain the
+    // original manifest-path fallback below.
 
-    i64 ml = package_manifest_path_from_root(manifest_path, rl, full, 8192);
+    i64 rl = package_lock_registry_cached_root(alias, alias_length, root, 8192);
+
+    if (rl <= 0) {
+        i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);
+
+        if (dl <= 0) {
+            raz_compiler_rt_arena_destroy(dependency);
+            raz_compiler_rt_arena_destroy(root);
+            raz_compiler_rt_arena_destroy(manifest_path);
+            raz_compiler_rt_arena_destroy(manifest);
+            raz_compiler_rt_arena_destroy(full);
+            return -1;
+        }
+        raz_compiler_rt_arena_set(root, 0, 46);
+        rl = path_join(root, 1, dependency, dl, manifest_path, 8192);
+        if (rl <= 0) {
+            raz_compiler_rt_arena_destroy(dependency);
+            raz_compiler_rt_arena_destroy(root);
+            raz_compiler_rt_arena_destroy(manifest_path);
+            raz_compiler_rt_arena_destroy(manifest);
+            raz_compiler_rt_arena_destroy(full);
+            return -1;
+        }
+
+        i64 i = 0;
+
+        while (i < rl) {
+            raz_compiler_rt_arena_set(root, i, raz_compiler_rt_arena_get(manifest_path, i));
+            i += 1;
+        }
+    }
+
+    i64 ml = package_manifest_path_from_root(root, rl, full, 8192);
     i64 length = raz_compiler_rt_read_ascii(full, ml, manifest, 65536);
 
     if (length <= 0) {
+        raz_compiler_rt_arena_destroy(dependency);
+        raz_compiler_rt_arena_destroy(root);
+        raz_compiler_rt_arena_destroy(manifest_path);
+        raz_compiler_rt_arena_destroy(manifest);
+        raz_compiler_rt_arena_destroy(full);
         return -1;
     }
 

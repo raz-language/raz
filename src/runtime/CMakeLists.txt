@@ -33,7 +33,7 @@ if(WIN32)
   # std::max, and numeric_limits<T>::max() in this target and transitive
   # third-party Windows includes (notably OpenSSL).
   target_compile_definitions(raz_runtime PRIVATE NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
-  target_link_libraries(raz_runtime PUBLIC ws2_32 bcrypt)
+  target_link_libraries(raz_runtime PUBLIC ws2_32 bcrypt crypt32)
 endif()
 
 if(MSVC)

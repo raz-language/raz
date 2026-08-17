@@ -1,9 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
-
 namespace std::compress::lz4;
-
 
 // Allocation-reusing LZ4 block encoder. The 4K hash table is allocated once
 // and cleared in bulk between blocks; compression/decompression themselves
@@ -11,7 +9,6 @@ namespace std::compress::lz4;
 extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
 extern fn raz_rt_fill(usize destination, i64 value, i64 size);
-
 const i64 hash_slots = 4096;
 const i64 hash_bytes = 32768;
 
@@ -20,32 +17,35 @@ public struct Encoder {
 }
 
 fn load_u8(usize address) -> i64 {
-    unsafe { return (*(address as u8*const))as i64; }
+    unsafe {
+        return (*(address as u8*const))as i64;
+    }
 }
 
 fn store_u8(usize address, i64 value) {
-    unsafe { *(address as u8*mut) = value as u8; }
+    unsafe {
+        *(address as u8*mut) = value as u8;
+    }
 }
 
 fn load_u32(usize address) -> u64 {
-    return (
-        (load_u8(address) as u64) |
-        ((load_u8(address + 1) as u64) << 8) |
-        ((load_u8(address + 2) as u64) << 16) |
-        ((load_u8(address + 3) as u64) << 24)
-    );
+    return ((load_u8(address)as u64) | ((load_u8(address + 1)as u64) << 8) | ((load_u8(address + 2)as u64) << 16) | ((load_u8(address + 3)as u64) << 24));
 }
 
 fn table_get(Encoder& encoder, i64 index) -> i64 {
-    unsafe { return *((encoder.table + index * 8) as i64*const); }
+    unsafe {
+        return *((encoder.table + index * 8)as i64*const);
+    }
 }
 
 fn table_set(Encoder&mut encoder, i64 index, i64 value) {
-    unsafe { *((encoder.table + index * 8) as i64*mut) = value; }
+    unsafe {
+        *((encoder.table + index * 8)as i64*mut) = value;
+    }
 }
 
 fn hash_sequence(u64 sequence) -> i64 {
-    return (((sequence * (2654435761 as u64)) >> 20) & (4095 as u64)) as i64;
+    return (((sequence * (2654435761 as u64)) >> 20) & (4095 as u64))as i64;
 }
 
 fn equal4(usize left, usize right) -> bool {
@@ -54,13 +54,18 @@ fn equal4(usize left, usize right) -> bool {
 
 fn emit_length(usize output, i64 capacity, i64&mut cursor, i64 length) -> bool {
     i64 remaining = length;
+
     while (remaining >= 255) {
-        if (*cursor >= capacity) { return false; }
+        if (*cursor >= capacity) {
+            return false;
+        }
         store_u8(output + *cursor, 255);
         *cursor += 1;
         remaining -= 255;
     }
-    if (*cursor >= capacity) { return false; }
+    if (*cursor >= capacity) {
+        return false;
+    }
     store_u8(output + *cursor, remaining);
     *cursor += 1;
     return true;
@@ -68,6 +73,7 @@ fn emit_length(usize output, i64 capacity, i64&mut cursor, i64 length) -> bool {
 
 fn copy_bytes(usize source, usize destination, i64 length) {
     i64 index = 0;
+
     while (index < length) {
         store_u8(destination + index, load_u8(source + index));
         index += 1;
@@ -76,10 +82,13 @@ fn copy_bytes(usize source, usize destination, i64 length) {
 
 public fn create_encoder() -> Encoder {
     usize table = raz_rt_alloc_aligned(hash_bytes, 64);
+
     if (table != 0) {
         raz_rt_fill(table, 255, hash_bytes);
     }
-    return Encoder { table: table };
+    return Encoder {
+        table: table
+    };
 }
 
 public fn encoder_valid(Encoder& encoder) -> bool {
@@ -110,14 +119,19 @@ public fn compress(
     i64 output_capacity,
 ) -> i64 {
     if (
-        encoder.table == 0 || input_length < 0 || output_capacity < 0 ||
-        (input_length > 0 && input == 0) || (output_capacity > 0 && output == 0)
+        encoder.table == 0 ||
+        input_length < 0 ||
+        output_capacity < 0 ||
+        (input_length > 0 && input == 0) ||
+        (output_capacity > 0 && output == 0)
     ) {
         return -1;
     }
     reset(encoder);
     if (input_length == 0) {
-        if (output_capacity < 1) { return -1; }
+        if (output_capacity < 1) {
+            return -1;
+        }
         store_u8(output, 0);
         return 1;
     }
@@ -131,53 +145,76 @@ public fn compress(
         u64 sequence = load_u32(input + index);
         i64 slot = hash_sequence(sequence);
         i64 candidate = table_get(encoder, slot);
-        table_set(encoder, slot, index);
 
+        table_set(encoder, slot, index);
         if (
-            candidate >= 0 && candidate < index && index - candidate <= 65535 &&
-            candidate <= match_limit && equal4(input + candidate, input + index)
+            candidate >= 0 &&
+            candidate < index &&
+            index - candidate <= 65535 &&
+            candidate <= match_limit &&
+            equal4(input + candidate, input + index)
         ) {
             i64 literal_length = index - anchor;
             i64 match_length = 4;
+
             while (
                 index + match_length < input_length &&
                 load_u8(input + candidate + match_length) == load_u8(input + index + match_length)
             ) {
                 match_length += 1;
             }
-
-            if (cursor >= output_capacity) { return -1; }
-            i64 token_index = cursor;
-            cursor += 1;
-            i64 literal_token = literal_length;
-            if (literal_token > 15) { literal_token = 15; }
-            i64 match_token = match_length - 4;
-            if (match_token > 15) { match_token = 15; }
-            store_u8(output + token_index, (literal_token << 4) | match_token);
-
-            if (literal_length >= 15) {
-                if (!emit_length(output, output_capacity, &mut cursor, literal_length - 15)) { return -1; }
+            if (cursor >= output_capacity) {
+                return -1;
             }
-            if (literal_length > output_capacity - cursor) { return -1; }
+
+            i64 token_index = cursor;
+
+            cursor += 1;
+
+            i64 literal_token = literal_length;
+
+            if (literal_token > 15) {
+                literal_token = 15;
+            }
+
+            i64 match_token = match_length - 4;
+
+            if (match_token > 15) {
+                match_token = 15;
+            }
+            store_u8(output + token_index, (literal_token << 4) | match_token);
+            if (literal_length >= 15) {
+                if (!emit_length(output, output_capacity, &mut cursor, literal_length - 15)) {
+                    return -1;
+                }
+            }
+            if (literal_length > output_capacity - cursor) {
+                return -1;
+            }
             copy_bytes(input + anchor, output + cursor, literal_length);
             cursor += literal_length;
 
             i64 distance = index - candidate;
-            if (cursor > output_capacity - 2) { return -1; }
+
+            if (cursor > output_capacity - 2) {
+                return -1;
+            }
             store_u8(output + cursor, distance & 255);
             store_u8(output + cursor + 1, (distance >> 8) & 255);
             cursor += 2;
-
             if (match_length - 4 >= 15) {
-                if (!emit_length(output, output_capacity, &mut cursor, match_length - 19)) { return -1; }
+                if (!emit_length(output, output_capacity, &mut cursor, match_length - 19)) {
+                    return -1;
+                }
             }
-
             index += match_length;
             anchor = index;
             if (index <= match_limit) {
                 // Seed the immediately preceding sequence as well; this keeps
                 // compression quality high after long matches without a scan.
+
                 i64 previous = index - 2;
+
                 if (previous >= 0 && previous <= match_limit) {
                     table_set(encoder, hash_sequence(load_u32(input + previous)), previous);
                 }
@@ -188,16 +225,29 @@ public fn compress(
     }
 
     i64 literals = input_length - anchor;
-    if (cursor >= output_capacity) { return -1; }
+
+    if (cursor >= output_capacity) {
+        return -1;
+    }
+
     i64 token_index = cursor;
+
     cursor += 1;
+
     i64 literal_token = literals;
-    if (literal_token > 15) { literal_token = 15; }
+
+    if (literal_token > 15) {
+        literal_token = 15;
+    }
     store_u8(output + token_index, literal_token << 4);
     if (literals >= 15) {
-        if (!emit_length(output, output_capacity, &mut cursor, literals - 15)) { return -1; }
+        if (!emit_length(output, output_capacity, &mut cursor, literals - 15)) {
+            return -1;
+        }
     }
-    if (literals > output_capacity - cursor) { return -1; }
+    if (literals > output_capacity - cursor) {
+        return -1;
+    }
     copy_bytes(input + anchor, output + cursor, literals);
     cursor += literals;
     return cursor;
@@ -205,33 +255,42 @@ public fn compress(
 
 /// Decompresses one independent LZ4 block into caller-owned storage. Returns
 /// decoded bytes or -1 for malformed/truncated input or insufficient output.
-public fn decompress(
-    usize input,
-    i64 input_length,
-    usize output,
-    i64 output_capacity,
-) -> i64 {
+public fn decompress(usize input, i64 input_length, usize output, i64 output_capacity, ) -> i64 {
     if (
-        input_length < 0 || output_capacity < 0 ||
-        (input_length > 0 && input == 0) || (output_capacity > 0 && output == 0)
+        input_length < 0 ||
+        output_capacity < 0 ||
+        (input_length > 0 && input == 0) ||
+        (output_capacity > 0 && output == 0)
     ) {
         return -1;
     }
+
     i64 source = 0;
     i64 destination = 0;
 
     while (source < input_length) {
         i64 token = load_u8(input + source);
+
         source += 1;
+
         i64 literal_length = token >> 4;
+
         if (literal_length == 15) {
             while (true) {
-                if (source >= input_length) { return -1; }
+                if (source >= input_length) {
+                    return -1;
+                }
+
                 i64 extra = load_u8(input + source);
+
                 source += 1;
-                if (literal_length > 9223372036854775807 - extra) { return -1; }
+                if (literal_length > 9223372036854775807 - extra) {
+                    return -1;
+                }
                 literal_length += extra;
-                if (extra != 255) { break; }
+                if (extra != 255) {
+                    break;
+                }
             }
         }
         if (literal_length > input_length - source || literal_length > output_capacity - destination) {
@@ -243,24 +302,43 @@ public fn decompress(
         if (source == input_length) {
             return destination;
         }
-        if (source > input_length - 2) { return -1; }
+        if (source > input_length - 2) {
+            return -1;
+        }
+
         i64 distance = load_u8(input + source) | (load_u8(input + source + 1) << 8);
+
         source += 2;
-        if (distance <= 0 || distance > destination) { return -1; }
+        if (distance <= 0 || distance > destination) {
+            return -1;
+        }
 
         i64 match_length = (token & 15) + 4;
+
         if ((token & 15) == 15) {
             while (true) {
-                if (source >= input_length) { return -1; }
+                if (source >= input_length) {
+                    return -1;
+                }
+
                 i64 extra = load_u8(input + source);
+
                 source += 1;
-                if (match_length > 9223372036854775807 - extra) { return -1; }
+                if (match_length > 9223372036854775807 - extra) {
+                    return -1;
+                }
                 match_length += extra;
-                if (extra != 255) { break; }
+                if (extra != 255) {
+                    break;
+                }
             }
         }
-        if (match_length > output_capacity - destination) { return -1; }
+        if (match_length > output_capacity - destination) {
+            return -1;
+        }
+
         i64 copied = 0;
+
         while (copied < match_length) {
             store_u8(output + destination + copied, load_u8(output + destination - distance + copied));
             copied += 1;

@@ -639,7 +639,7 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
 #ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
     command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
 #endif
-    command << "ws2_32.lib bcrypt.lib /Fe:" << shell_quote(output);
+    command << "ws2_32.lib bcrypt.lib crypt32.lib /Fe:" << shell_quote(output);
     if (!shared) {
       // The self-hosted compiler recursively walks large syntax/HIR trees and
       // needs more stack than ordinary Raz applications on Windows. Keep the
@@ -675,7 +675,7 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
   command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
 #endif
 #if defined(_WIN32)
-  command << "-lws2_32 -lbcrypt ";
+  command << "-lws2_32 -lbcrypt -lcrypt32 ";
 #else
   command << "-pthread ";
 #endif

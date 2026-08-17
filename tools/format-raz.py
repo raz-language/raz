@@ -380,6 +380,18 @@ def _separate_top_level_declarations(lines: list[str]) -> list[str]:
         starts_declaration = line.startswith(DECLARATION_PREFIXES)
         follows_declaration = bool(output) and output[-1] == "}" and not line.startswith("else")
 
+        # A top-level comment/doc block belongs visually to the declaration that
+        # follows it, but it is still a new logical section when it follows a
+        # completed declaration.  Insert the separator *before* the comment so
+        # the comment remains attached to its declaration.
+        starts_comment = is_top_level and line.startswith(("//", "/*"))
+        if starts_comment and output and output[-1]:
+            previous_line = output[-1].lstrip()
+            if not previous_line.startswith(("//", "/*", "*")) and (
+                previous_line == "}" or previous_line.endswith(";")
+            ):
+                output.append("")
+
         if is_top_level and output and output[-1] and (starts_declaration or follows_declaration):
             previous_line = output[-1].lstrip()
             comment_attached = previous_line.startswith(("//", "/*", "*"))

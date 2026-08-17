@@ -60,6 +60,7 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include <bcrypt.h>
 #include <direct.h>
 #include <io.h>
@@ -697,6 +698,33 @@ inline void raz_tls_cache_session(const std::string& hostname, SSL* ssl) {
   entry.session = captured;
 }
 
+#if defined(_WIN32)
+inline bool raz_tls_load_windows_roots(SSL_CTX* context) {
+  if (context == nullptr) return false;
+  HCERTSTORE roots = CertOpenSystemStoreA(static_cast<HCRYPTPROV_LEGACY>(0), "ROOT");
+  if (roots == nullptr) return false;
+
+  X509_STORE* store = SSL_CTX_get_cert_store(context);
+  PCCERT_CONTEXT certificate = nullptr;
+  std::size_t imported = 0;
+  while ((certificate = CertEnumCertificatesInStore(roots, certificate)) != nullptr) {
+    const unsigned char* cursor = certificate->pbCertEncoded;
+    X509* x509 = d2i_X509(nullptr, &cursor, static_cast<long>(certificate->cbCertEncoded));
+    if (x509 == nullptr) {
+      ERR_clear_error();
+      continue;
+    }
+    if (X509_STORE_add_cert(store, x509) == 1) imported += 1;
+    // Duplicate roots are expected when OpenSSL's configured CA bundle overlaps
+    // the Windows store. They are harmless and must not poison later TLS errors.
+    ERR_clear_error();
+    X509_free(x509);
+  }
+  CertCloseStore(roots, 0);
+  return imported != 0;
+}
+#endif
+
 inline SSL_CTX* raz_tls_client_context() {
   static std::once_flag once;
   static SSL_CTX* context = nullptr;
@@ -709,7 +737,14 @@ inline SSL_CTX* raz_tls_client_context() {
     // OpenSSL keeps ticket/session internals opaque; Raz owns reuse policy at
     // the connection layer without serializing cryptographic state.
     SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
-    if (SSL_CTX_set_default_verify_paths(context) != 1) {
+    bool trust_available = SSL_CTX_set_default_verify_paths(context) == 1;
+#if defined(_WIN32)
+    // OpenSSL does not automatically consume the Windows system ROOT store.
+    // Import it so HTTPS works on a normal Windows installation without asking
+    // users to set SSL_CERT_FILE/SSL_CERT_DIR manually.
+    trust_available = raz_tls_load_windows_roots(context) || trust_available;
+#endif
+    if (!trust_available) {
       SSL_CTX_free(context);
       context = nullptr;
     }

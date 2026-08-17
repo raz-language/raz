@@ -1,9 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
-
 namespace std::thread::mpmc;
-
 
 // Bounded many-producer/many-consumer i64 queue based on monotonically
 // increasing positions and one sequence word per slot. Producers and
@@ -13,9 +11,14 @@ extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
 extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
 extern fn raz_rt_atomic_load_i64_ordered(usize value, i64 order) -> i64;
 extern fn raz_rt_atomic_store_i64_ordered(usize value, i64 desired, i64 order);
-extern fn raz_rt_atomic_compare_exchange_i64_ordered(usize value, i64 expected, i64 desired, i64 success_order, i64 failure_order) -> i64;
+extern fn raz_rt_atomic_compare_exchange_i64_ordered(
+    usize value,
+    i64 expected,
+    i64 desired,
+    i64 success_order,
+    i64 failure_order
+) -> i64;
 extern fn raz_rt_cpu_relax();
-
 const i64 relaxed_order = 0;
 const i64 acquire_order = 1;
 const i64 release_order = 2;
@@ -36,7 +39,9 @@ fn normalized_capacity(i64 requested) -> i64 {
     if (requested <= 0) {
         return 0;
     }
+
     i64 capacity = 2;
+
     while (capacity < requested) {
         // 128 bytes of state plus 16 bytes per slot must remain representable.
         if (capacity > 576460752303423479) {
@@ -65,20 +70,34 @@ fn sequence_address(MpmcI64& queue, i64 position) -> usize {
 
 public fn create(i64 requested_capacity) -> MpmcI64 {
     i64 capacity = normalized_capacity(requested_capacity);
-    if (capacity == 0 || capacity > 576460752303423479) {
-        return MpmcI64 { state: 0, slots: 0, capacity: 0, mask: 0 };
-    }
 
+    if (capacity == 0 || capacity > 576460752303423479) {
+        return MpmcI64 {
+            state: 0,
+            slots: 0,
+            capacity: 0,
+            mask: 0
+        };
+    }
     // Enqueue and dequeue positions occupy separate cache lines. Slot records
     // follow at +128 and contain { sequence, value }.
+
     usize state = raz_rt_alloc_aligned(128 + capacity * 16, 64);
+
     if (state == 0) {
-        return MpmcI64 { state: 0, slots: 0, capacity: 0, mask: 0 };
+        return MpmcI64 {
+            state: 0,
+            slots: 0,
+            capacity: 0,
+            mask: 0
+        };
     }
     store_plain_i64(state, 0);
     store_plain_i64(state + 64, 0);
+
     usize slots = state + 128;
     i64 index = 0;
+
     while (index < capacity) {
         store_plain_i64(slots + index * 16, index);
         index += 1;
@@ -105,9 +124,11 @@ public fn len(MpmcI64& queue) -> i64 {
     if (!valid(queue)) {
         return 0;
     }
+
     i64 enqueue = raz_rt_atomic_load_i64_ordered(queue.state, acquire_order);
     i64 dequeue = raz_rt_atomic_load_i64_ordered(queue.state + 64, acquire_order);
     i64 count = enqueue - dequeue;
+
     if (count < 0) {
         return 0;
     }
@@ -127,12 +148,22 @@ public fn try_send(MpmcI64& queue, i64 value) -> bool {
     }
 
     i64 position = raz_rt_atomic_load_i64_ordered(queue.state, relaxed_order);
+
     while (true) {
         usize sequence = sequence_address(queue, position);
         i64 observed = raz_rt_atomic_load_i64_ordered(sequence, acquire_order);
         i64 difference = observed - position;
+
         if (difference == 0) {
-            if (raz_rt_atomic_compare_exchange_i64_ordered(queue.state, position, position + 1, relaxed_order, relaxed_order) == 1) {
+            if (
+                raz_rt_atomic_compare_exchange_i64_ordered(
+                    queue.state,
+                    position,
+                    position + 1,
+                    relaxed_order,
+                    relaxed_order
+                ) == 1
+            ) {
                 store_plain_i64(sequence + 8, value);
                 raz_rt_atomic_store_i64_ordered(sequence, position + 1, release_order);
                 return true;
@@ -148,27 +179,50 @@ public fn try_send(MpmcI64& queue, i64 value) -> bool {
 
 public fn try_receive(MpmcI64& queue) -> MpmcReceiveI64 {
     if (!valid(queue)) {
-        return MpmcReceiveI64 { received: false, value: 0 };
+        return MpmcReceiveI64 {
+            received: false,
+            value: 0
+        };
     }
 
     i64 position = raz_rt_atomic_load_i64_ordered(queue.state + 64, relaxed_order);
+
     while (true) {
         usize sequence = sequence_address(queue, position);
         i64 observed = raz_rt_atomic_load_i64_ordered(sequence, acquire_order);
         i64 difference = observed - (position + 1);
+
         if (difference == 0) {
-            if (raz_rt_atomic_compare_exchange_i64_ordered(queue.state + 64, position, position + 1, relaxed_order, relaxed_order) == 1) {
+            if (
+                raz_rt_atomic_compare_exchange_i64_ordered(
+                    queue.state + 64,
+                    position,
+                    position + 1,
+                    relaxed_order,
+                    relaxed_order
+                ) == 1
+            ) {
                 i64 value = load_plain_i64(sequence + 8);
+
                 raz_rt_atomic_store_i64_ordered(sequence, position + queue.capacity, release_order);
-                return MpmcReceiveI64 { received: true, value: value };
+                return MpmcReceiveI64 {
+                    received: true,
+                    value: value
+                };
             }
         } else if (difference < 0) {
-            return MpmcReceiveI64 { received: false, value: 0 };
+            return MpmcReceiveI64 {
+                received: false,
+                value: 0
+            };
         }
         raz_rt_cpu_relax();
         position = raz_rt_atomic_load_i64_ordered(queue.state + 64, relaxed_order);
     }
-    return MpmcReceiveI64 { received: false, value: 0 };
+    return MpmcReceiveI64 {
+        received: false,
+        value: 0
+    };
 }
 
 public fn destroy(MpmcI64&mut queue) {

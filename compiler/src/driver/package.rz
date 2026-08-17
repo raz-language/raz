@@ -380,7 +380,12 @@ fn package_print_metadata_manifest(
 
                 i64 al = package_copy_key(manifest, start, equal, alias, 4096);
                 i64 dl = copy_quoted_value(manifest, equal + 1, end, dep, 4096);
-                i64 drl = path_join(root, root_length, dep, dl, dep_root, 8192);
+                i64 drl = package_lock_registry_cached_root(alias, al, dep_root, 8192);
+
+                if (drl <= 0) {
+                    drl = path_join(root, root_length, dep, dl, dep_root, 8192);
+                }
+
                 i64 dml = package_manifest_path_from_root(dep_root, drl, dep_manifest, 8192);
 
                 if (!graph_mode) {
@@ -685,6 +690,112 @@ fn package_lock_identity_append(
     return true;
 }
 
+// Resolve a registry dependency alias through the derived resolution cache.
+// .raz.cache rows are: alias name version store-path checksum. The manifest
+// remains authoritative for the requested constraint; the cache only supplies
+// the checksum needed to reconstruct the verified content-addressed store path.
+fn package_lock_registry_cached_root(i64 alias, i64 alias_length, i64 output, i64 capacity) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(13);
+    i64 data = raz_compiler_rt_arena_create(1048576);
+
+    if (path == 0 || data == 0 || output == 0 || alias_length <= 0) {
+        return -1;
+    }
+
+    i64 pb[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+    i64 i = 0;
+
+    while (i < 12) {
+        raz_compiler_rt_arena_set(path, i, pb[i]);
+        i += 1;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(path, 12, data, 1048576);
+
+    raz_compiler_rt_arena_destroy(path);
+    if (length <= 0) {
+        raz_compiler_rt_arena_destroy(data);
+        return -1;
+    }
+
+    i64 pos = 0;
+
+    while (pos < length) {
+        i64 start = pos;
+
+        while (pos < length && raz_compiler_rt_arena_get(data, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos < length) {
+            pos += 1;
+        }
+
+        i64 cursor = start;
+        i64 ordinal = 0;
+        i64 alias_start = 0;
+        i64 alias_len = 0;
+        i64 checksum_start = 0;
+        i64 checksum_len = 0;
+
+        while (cursor < end) {
+            while (cursor < end && ascii_is_space(raz_compiler_rt_arena_get(data, cursor))) {
+                cursor += 1;
+            }
+            if (cursor >= end) {
+                break;
+            }
+
+            i64 token_start = cursor;
+
+            while (cursor < end && !ascii_is_space(raz_compiler_rt_arena_get(data, cursor))) {
+                cursor += 1;
+            }
+            if (ordinal == 0) {
+                alias_start = token_start;
+                alias_len = cursor - token_start;
+            } else if (ordinal == 4) {
+                checksum_start = token_start;
+                checksum_len = cursor - token_start;
+            }
+            ordinal += 1;
+        }
+
+        bool same = alias_len == alias_length;
+
+        i = 0;
+        while (same && i < alias_length) {
+            if (raz_compiler_rt_arena_get(data, alias_start + i) != raz_compiler_rt_arena_get(alias, i)) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (same && checksum_len> 0) {
+            i64 checksum = raz_compiler_rt_arena_create(checksum_len);
+
+            if (checksum == 0) {
+                raz_compiler_rt_arena_destroy(data);
+                return -1;
+            }
+            i = 0;
+            while (i < checksum_len) {
+                raz_compiler_rt_arena_set(checksum, i, raz_compiler_rt_arena_get(data, checksum_start + i));
+                i += 1;
+            }
+
+            i64 store_length = registry_store_path(checksum, checksum_len, output, capacity);
+
+            raz_compiler_rt_arena_destroy(checksum);
+            raz_compiler_rt_arena_destroy(data);
+            return store_length;
+        }
+    }
+    raz_compiler_rt_arena_destroy(data);
+    return -1;
+}
+
 fn package_lock_collect(
     i64 manifest_path,
     i64 manifest_path_length,
@@ -920,15 +1031,22 @@ fn package_lock_collect(
             }
             if (equal<end) {
                 i64 dep = raz_compiler_rt_arena_create(4096);
+                i64 dep_alias = raz_compiler_rt_arena_create(4096);
                 i64 dep_root = raz_compiler_rt_arena_create(8192);
                 i64 dep_manifest = raz_compiler_rt_arena_create(8192);
 
-                if (dep == 0 || dep_root == 0 || dep_manifest == 0) {
+                if (dep == 0 || dep_alias == 0 || dep_root == 0 || dep_manifest == 0) {
                     return 40;
                 }
 
                 i64 dl = copy_quoted_value(manifest, equal + 1, end, dep, 4096);
-                i64 drl = path_join(root, root_length, dep, dl, dep_root, 8192);
+                i64 dal = package_copy_key(manifest, start, equal, dep_alias, 4096);
+                i64 drl = package_lock_registry_cached_root(dep_alias, dal, dep_root, 8192);
+
+                if (drl <= 0) {
+                    drl = path_join(root, root_length, dep, dl, dep_root, 8192);
+                }
+
                 i64 dml = package_manifest_path_from_root(dep_root, drl, dep_manifest, 8192);
 
                 i64 status = package_lock_collect(
@@ -949,6 +1067,7 @@ fn package_lock_collect(
                     return status;
                 }
                 raz_compiler_rt_arena_destroy(dep);
+                raz_compiler_rt_arena_destroy(dep_alias);
                 raz_compiler_rt_arena_destroy(dep_root);
                 raz_compiler_rt_arena_destroy(dep_manifest);
             }
@@ -990,7 +1109,7 @@ fn package_lock_command() -> i64 {
     package_append_literal(out, 2097152, &mut cursor, &hdr, 55);
     i64 status = package_lock_collect(
         mp,
-        11,
+        10,
         root,
         1,
         out,
@@ -1224,7 +1343,7 @@ fn package_rewrite_dependency_in_section(
     if (remove && !replaced) {
         return 59;
     }
-    if (raz_compiler_rt_write_ascii(mp, 11, out, cursor) != cursor) {
+    if (raz_compiler_rt_write_ascii(mp, 10, out, cursor) != cursor) {
         return 56;
     }
     raz_compiler_rt_arena_destroy(mp);
