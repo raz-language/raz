@@ -69,9 +69,10 @@ for path in root.rglob('*'):
         continue
     rel = path.relative_to(root)
     if is_generated_dir(rel):
-        # Root build/out are expected local workspaces and are not source-tree
-        # violations. Nested package/cache output is.
-        if rel.parts and rel.parts[0] in {'build', 'out'}:
+        # Root build/out are expected local workspaces, and .git is repository
+        # metadata rather than committed source. Nested package/cache output is
+        # still a violation.
+        if rel.parts and rel.parts[0] in {'build', 'out', '.git'}:
             continue
         generated.append(str(rel))
 if generated:
