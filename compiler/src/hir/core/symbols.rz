@@ -163,38 +163,40 @@ fn hir_parse_import_path(HirBuilder&mut builder, i64&mut out_package, i64&mut ou
 
     first_hash = hir_namespace_hash_token(builder, first_hash, &builder.current);
 
+    i64 dependency_package = hir_find_package_dependency(
+        builder,
+        builder.current_package_hash,
+        first_hash,
+    );
     i64 full_hash = first_hash;
-    i64 remaining_hash = 17;
-    bool has_remaining = false;
+    i64 target_hash = first_hash;
+
+    if (dependency_package >= 0) {
+        // Dependency aliases replace the package-root component.  Preserve the
+        // remainder of the namespace while hashing it onto the target package
+        // identity: `re::program` -> `regex::program`.
+        target_hash = dependency_package;
+    }
 
     hir_advance(builder);
     while (builder.current.kind == TokenKind::ColonColon) {
         full_hash = hir_namespace_hash_byte(full_hash, 58);
         full_hash = hir_namespace_hash_byte(full_hash, 58);
+        target_hash = hir_namespace_hash_byte(target_hash, 58);
+        target_hash = hir_namespace_hash_byte(target_hash, 58);
         hir_advance(builder);
         if (builder.current.kind != TokenKind::Identifier) {
             hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
             return false;
         }
-        if (has_remaining) {
-            remaining_hash = hir_namespace_hash_byte(remaining_hash, 58);
-            remaining_hash = hir_namespace_hash_byte(remaining_hash, 58);
-        }
         full_hash = hir_namespace_hash_token(builder, full_hash, &builder.current);
-        remaining_hash = hir_namespace_hash_token(builder, remaining_hash, &builder.current);
-        has_remaining = true;
+        target_hash = hir_namespace_hash_token(builder, target_hash, &builder.current);
         hir_advance(builder);
     }
 
-    i64 dependency_package = hir_find_package_dependency(builder, builder.current_package_hash, first_hash);
-
     if (dependency_package >= 0) {
         *out_package = dependency_package;
-        if (has_remaining) {
-            *out_namespace = remaining_hash;
-        } else {
-            *out_namespace = dependency_package;
-        }
+        *out_namespace = target_hash;
     } else {
         *out_package = builder.current_package_hash;
         *out_namespace = full_hash;
