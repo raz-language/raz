@@ -11,7 +11,15 @@ namespace forge::machine {
 
 using VirtualRegister = std::uint32_t;
 
-enum class RegisterClass : std::uint8_t { integer, floating };
+// `vector` values live in the same XMM/YMM/ZMM physical file as `floating`
+// ones, so the two classes are allocated from a single pool. Giving vectors
+// their own pool over the same registers would let the allocator hand xmm2 to a
+// float and a packed value at the same time.
+enum class RegisterClass : std::uint8_t { integer, floating, vector };
+
+[[nodiscard]] constexpr bool uses_vector_register_file(RegisterClass value) noexcept {
+    return value == RegisterClass::floating || value == RegisterClass::vector;
+}
 
 enum class Opcode : std::uint8_t {
     load_argument,
@@ -72,6 +80,28 @@ enum class Opcode : std::uint8_t {
     or_i64,
     xor_i32,
     xor_i64,
+    // SLP-formed packed forms. These are memory-to-memory: the inputs are base
+    // pointers and `immediate` carries the lane count, so a single instruction
+    // stands for a whole unrolled run of scalar lanes. `argument_index` holds
+    // the scalar Opcode each lane performs and `vector_bits` the width the cost
+    // model selected.
+    reduce_add_i32_contiguous,
+    reduce_add_i64_contiguous,
+    add_i64_contiguous_inplace,
+    binary_i32_contiguous_inplace,
+    binary_i64_contiguous_inplace,
+    binary_i32_contiguous_map,
+    binary_i64_contiguous_map,
+    binary_i32_contiguous_map2,
+    binary_i64_contiguous_map2,
+    binary_i32_contiguous_map3,
+    binary_i64_contiguous_map3,
+    binary_i32_contiguous_chain,
+    binary_i64_contiguous_chain,
+    binary_i32_contiguous_dag,
+    binary_i64_contiguous_dag,
+    binary_i32_contiguous_dag_reuse,
+    binary_i64_contiguous_dag_reuse,
     select_i32,
     select_i64,
     shl_i32,
@@ -125,6 +155,14 @@ enum class Opcode : std::uint8_t {
     store_stack_i64,
     store_stack_f32,
     store_stack_f64,
+    // Packed spill and reload. These use unaligned moves so a spill slot only
+    // has to be non-overlapping, not aligned to its width.
+    load_stack_v128,
+    load_stack_v256,
+    load_stack_v512,
+    store_stack_v128,
+    store_stack_v256,
+    store_stack_v512,
     load_ptr_i8,
     load_ptr_i16,
     load_ptr_i32,
@@ -171,6 +209,13 @@ struct Instruction {
     std::uint32_t argument_index{};
     std::string symbol;
     std::vector<Successor> successors;
+    // Selected packed width for target-aware vector pseudos, in bits. Zero
+    // means the instruction is scalar, so every existing opcode keeps its
+    // current meaning without being rewritten.
+    std::uint16_t vector_bits{};
+    // Active lane count for masked AVX-512 emission. Zero means unmasked, so a
+    // fully populated vector needs no opmask register.
+    std::uint8_t vector_mask_lanes{};
 };
 
 struct Block {

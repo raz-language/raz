@@ -37,7 +37,13 @@ if(WIN32)
 endif()
 
 if(MSVC)
-  target_compile_options(raz_runtime PRIVATE /W4 /permissive-)
+  # Raz executables are linked by ObLink first.  Keep the runtime free of the
+  # MSVC compiler-injected security-cookie dependency so a normal runtime
+  # archive does not require vcruntime merely because /GS is enabled by the
+  # host compiler defaults.  Bounds/ownership safety is enforced by Raz and
+  # explicit runtime checks; this switch only removes the host C++ stack-cookie
+  # ABI edge from these boundary objects.
+  target_compile_options(raz_runtime PRIVATE /W4 /permissive- /GS-)
   if(RAZ_ENABLE_WERROR)
     target_compile_options(raz_runtime PRIVATE /WX)
   endif()

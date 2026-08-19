@@ -32,8 +32,13 @@ checks = {
         'kind == 1 || kind == 2' in loans and
         'mir_local_active_loan_conflicts' in loans and 'current,' in loans and 'true,' in loans,
     'ownership firewall executes loan verifier': 'verify_mir_loan_regions_with_cfg(mir, &cfg, loan_last_uses)' in drops,
+    # DCE must not delete an instruction that carries an ownership event, or the
+    # loan verifier loses the program point it reasons about. The predicate this
+    # used to name was replaced by a precomputed pin map built once from
+    # ownership_event_instructions, so assert the pinning itself.
     'loan program points remain DCE-pinned':
-        'mir_instruction_has_ownership_event' in dce,
+        'mir.ownership_event_instructions' in dce and
+        'while (event < mir.ownership_event_count)' in dce,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

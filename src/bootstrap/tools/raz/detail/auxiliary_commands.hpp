@@ -503,7 +503,7 @@ int doctor_toolchain(const Options& options) {
 }
 
 int cache_project(const ProjectGraph& graph, const Options& options) {
-  const auto cache_root = graph.manifest.root / ".raz" / "cache";
+  const auto cache_root = graph.manifest.root / "target" / "cache";
   if (options.prune_cache) {
     std::error_code error;
     const auto removed = std::filesystem::remove_all(cache_root, error);

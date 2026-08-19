@@ -74,7 +74,22 @@ bool is_call_opcode(Opcode opcode) noexcept {
     }
 }
 
+// A spill slot has to be at least as large as the value it holds. Integer and
+// floating values all fit in eight bytes, but a packed value needs its full
+// width or the next slot allocated below it overlaps.
+std::uint32_t spill_slot_bytes(RegisterClass register_class, std::uint8_t width) noexcept {
+    if (register_class != RegisterClass::vector) return 8U;
+    if (width > 32U) return 64U;
+    if (width > 16U) return 32U;
+    return 16U;
+}
+
 Opcode split_store_opcode(RegisterClass register_class, std::uint8_t width) noexcept {
+    if (register_class == RegisterClass::vector) {
+        if (width > 32U) return Opcode::store_stack_v512;
+        if (width > 16U) return Opcode::store_stack_v256;
+        return Opcode::store_stack_v128;
+    }
     if (register_class == RegisterClass::floating)
         return width == 8U ? Opcode::store_stack_f64 : Opcode::store_stack_f32;
     if (width <= 1U) return Opcode::store_stack_i8;
@@ -84,6 +99,11 @@ Opcode split_store_opcode(RegisterClass register_class, std::uint8_t width) noex
 }
 
 Opcode split_load_opcode(RegisterClass register_class, std::uint8_t width) noexcept {
+    if (register_class == RegisterClass::vector) {
+        if (width > 32U) return Opcode::load_stack_v512;
+        if (width > 16U) return Opcode::load_stack_v256;
+        return Opcode::load_stack_v128;
+    }
     if (register_class == RegisterClass::floating)
         return width == 8U ? Opcode::load_stack_f64 : Opcode::load_stack_f32;
     if (width <= 1U) return Opcode::load_stack_i8;
@@ -184,7 +204,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                 if (!same_block_has_use[block_index][reg] ||
                     same_block_last_use[block_index][reg] <= instruction_index) continue;
                 const bool floating = reg < function.register_classes.size() &&
-                                      function.register_classes[reg] == RegisterClass::floating;
+                                      uses_vector_register_file(function.register_classes[reg]);
                 (floating ? floating_candidates : integer_candidates).push_back(reg);
             }
 
@@ -227,7 +247,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                     ++stats.transition_loads;
                     stats.transition_bytes += 8U;
                 } else {
-                    function.local_stack_size += 8U;
+                    function.local_stack_size += spill_slot_bytes(register_class, width);
                     const auto offset = -static_cast<std::int64_t>(function.local_stack_size);
                     stores.push_back({split_store_opcode(register_class, width), 0U, {reg}, offset, 0U, {}, {}});
                     loads.push_back({split_load_opcode(register_class, width), replacement, {}, offset, 0U, {}, {}});
@@ -311,7 +331,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                     if (has_use[block_index][reg] && last_use[block_index][reg] > instruction_index) continue;
                     if (!has_use[successor_index][reg]) continue;
                     const bool floating = reg < function.register_classes.size() &&
-                                          function.register_classes[reg] == RegisterClass::floating;
+                                          uses_vector_register_file(function.register_classes[reg]);
                     (floating ? floating_candidates : integer_candidates).push_back(reg);
                 }
 
@@ -333,7 +353,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                     const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{64};
                     const auto register_class = reg < function.register_classes.size()
                         ? function.register_classes[reg] : RegisterClass::integer;
-                    function.local_stack_size += 8U;
+                    function.local_stack_size += spill_slot_bytes(register_class, width);
                     const auto offset = -static_cast<std::int64_t>(function.local_stack_size);
                     stores.push_back({split_store_opcode(register_class, width), 0U, {reg}, offset, 0U, {}, {}});
                     const auto replacement = function.register_count++;
@@ -429,7 +449,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                     if (has_use[block_index][reg] && last_use[block_index][reg] > instruction_index) continue;
                     if (!has_use[successor_index][reg]) continue;
                     const bool floating = reg < function.register_classes.size() &&
-                                          function.register_classes[reg] == RegisterClass::floating;
+                                          uses_vector_register_file(function.register_classes[reg]);
                     (floating ? floating_candidates : integer_candidates).push_back(reg);
                 }
 
@@ -451,7 +471,7 @@ LiveRangeSplitStats split_live_ranges_around_calls(Function& function) {
                     const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{64};
                     const auto register_class = reg < function.register_classes.size()
                         ? function.register_classes[reg] : RegisterClass::integer;
-                    function.local_stack_size += 8U;
+                    function.local_stack_size += spill_slot_bytes(register_class, width);
                     const auto offset = -static_cast<std::int64_t>(function.local_stack_size);
                     stores.push_back({split_store_opcode(register_class, width), 0U, {reg}, offset, 0U, {}, {}});
 
@@ -691,11 +711,11 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
                 const auto argument = successor.arguments[index];
                 if (parameter >= function.register_count || argument >= function.register_count || parameter == argument)
                     continue;
-                const bool parameter_floating = parameter < function.register_classes.size() &&
-                                                function.register_classes[parameter] == RegisterClass::floating;
-                const bool argument_floating = argument < function.register_classes.size() &&
-                                               function.register_classes[argument] == RegisterClass::floating;
-                if (parameter_floating != argument_floating) continue;
+                const auto parameter_class = parameter < function.register_classes.size()
+                    ? function.register_classes[parameter] : RegisterClass::integer;
+                const auto argument_class = argument < function.register_classes.size()
+                    ? function.register_classes[argument] : RegisterClass::integer;
+                if (parameter_class != argument_class) continue;
                 copy_sources[parameter] = argument;
                 ++allocation.copy_hint_count;
             }
@@ -795,7 +815,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
     for (const auto& interval : allocation.intervals) {
         if (interval.use_count == 0U) continue;
         const bool floating = interval.virtual_register < function.register_classes.size() &&
-                              function.register_classes[interval.virtual_register] == RegisterClass::floating;
+                              uses_vector_register_file(function.register_classes[interval.virtual_register]);
         for (const auto& segment : interval.segments) {
             events.push_back({segment.start, interval.virtual_register, floating, true});
             events.push_back({segment.end, interval.virtual_register, floating, false});
@@ -884,7 +904,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
 
     for (const auto& interval : ordered) {
         const bool floating = interval.virtual_register < function.register_classes.size() &&
-                              function.register_classes[interval.virtual_register] == RegisterClass::floating;
+                              uses_vector_register_file(function.register_classes[interval.virtual_register]);
         if (floating) {
             for (auto iterator = floating_active.begin(); iterator != floating_active.end();) {
                 if (iterator->interval.end < interval.start) {
@@ -1063,7 +1083,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
         if (allocation.locations[reg].kind != LocationKind::stack_slot || allocation.intervals[reg].use_count == 0U)
             continue;
         const bool floating = reg < function.register_classes.size() &&
-                              function.register_classes[reg] == RegisterClass::floating;
+                              uses_vector_register_file(function.register_classes[reg]);
         bool recovered = false;
         if (floating) {
             if (!crosses_call(allocation.intervals[reg]) && !forced_floating_spill[reg]) {
@@ -1108,11 +1128,12 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
         if (allocation.intervals[source].end != allocation.intervals[destination].start &&
             segments_overlap(allocation.intervals[source], allocation.intervals[destination]))
             continue;
-        const bool floating = destination < function.register_classes.size() &&
-                              function.register_classes[destination] == RegisterClass::floating;
-        const bool source_floating = source < function.register_classes.size() &&
-                                     function.register_classes[source] == RegisterClass::floating;
-        if (floating != source_floating) continue;
+        const auto destination_class = destination < function.register_classes.size()
+            ? function.register_classes[destination] : RegisterClass::integer;
+        const auto source_class = source < function.register_classes.size()
+            ? function.register_classes[source] : RegisterClass::integer;
+        if (destination_class != source_class) continue;
+        const bool floating = uses_vector_register_file(destination_class);
         auto& destination_location = allocation.locations[destination];
         const auto& source_location = allocation.locations[source];
         if (floating && source_location.kind == LocationKind::floating_register &&
@@ -1273,7 +1294,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
         for (const auto member : feeders) {
             if (member >= function.register_count) continue;
             const bool floating = member < function.register_classes.size() &&
-                                  function.register_classes[member] == RegisterClass::floating;
+                                  uses_vector_register_file(function.register_classes[member]);
             if (floating) { safe = false; break; }
         }
         if (!safe) continue;
@@ -1305,11 +1326,15 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
             allocation.intervals[source].use_count == 0U) continue;
         if (copy_segments_conflict(allocation.intervals[source], allocation.intervals[destination])) continue;
 
-        const bool floating = destination < function.register_classes.size() &&
-                              function.register_classes[destination] == RegisterClass::floating;
-        const bool source_floating = source < function.register_classes.size() &&
-                                     function.register_classes[source] == RegisterClass::floating;
-        if (floating != source_floating) continue;
+        // Coalescing requires the same kind of value, not merely the same
+        // register file: a float and a packed value both live in XMM but are
+        // not interchangeable.
+        const auto destination_class = destination < function.register_classes.size()
+            ? function.register_classes[destination] : RegisterClass::integer;
+        const auto source_class = source < function.register_classes.size()
+            ? function.register_classes[source] : RegisterClass::integer;
+        if (destination_class != source_class) continue;
+        const bool floating = uses_vector_register_file(destination_class);
 
         auto& destination_location = allocation.locations[destination];
         auto& source_location = allocation.locations[source];
@@ -1402,9 +1427,23 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
             return left.virtual_register < right.virtual_register;
         });
 
+    // Slots are sized rather than assumed to be eight bytes wide. A packed
+    // value needs its full width, and a slot reused by several intervals has to
+    // fit the largest of them, so offsets come from a running total of slot
+    // sizes instead of a fixed stride.
+    const auto slot_bytes_for = [&](VirtualRegister reg) {
+        const auto register_class = reg < function.register_classes.size()
+            ? function.register_classes[reg] : RegisterClass::integer;
+        const auto width = reg < function.register_widths.size()
+            ? function.register_widths[reg] : std::uint8_t{8};
+        return spill_slot_bytes(register_class, width);
+    };
+
     std::vector<ReusableSlot> active_slots;
     std::vector<std::uint32_t> free_slots;
-    std::uint32_t slot_count = 0;
+    std::vector<std::uint32_t> slot_sizes;
+    std::vector<std::pair<VirtualRegister, std::uint32_t>> slot_assignment;
+    std::uint32_t unreused_bytes = 0;
     for (const auto& interval : spilled_intervals) {
         for (auto iterator = active_slots.begin(); iterator != active_slots.end();) {
             if (iterator->end < interval.start) {
@@ -1412,22 +1451,34 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
                 iterator = active_slots.erase(iterator);
             } else ++iterator;
         }
+        const auto needed = slot_bytes_for(interval.virtual_register);
+        unreused_bytes += needed;
         std::uint32_t slot = 0;
         if (!free_slots.empty()) {
             slot = free_slots.back();
             free_slots.pop_back();
             ++allocation.reused_spill_slot_count;
         } else {
-            slot = slot_count++;
+            slot = static_cast<std::uint32_t>(slot_sizes.size());
+            slot_sizes.push_back(0U);
         }
-        allocation.locations[interval.virtual_register].stack_offset =
-            -static_cast<std::int32_t>(function.local_stack_size + (slot + 1U) * 8U);
+        slot_sizes[slot] = std::max(slot_sizes[slot], needed);
+        slot_assignment.emplace_back(interval.virtual_register, slot);
         active_slots.push_back({interval.end, slot});
     }
 
-    allocation.spill_slot_count = slot_count;
-    allocation.frame_size_before_slot_reuse = align_frame(function.local_stack_size + allocation.spill_count * 8U);
-    allocation.frame_size = align_frame(function.local_stack_size + slot_count * 8U);
+    std::vector<std::uint32_t> slot_end(slot_sizes.size(), 0U);
+    std::uint32_t running = function.local_stack_size;
+    for (std::size_t slot = 0; slot < slot_sizes.size(); ++slot) {
+        running += slot_sizes[slot];
+        slot_end[slot] = running;
+    }
+    for (const auto& [reg, slot] : slot_assignment)
+        allocation.locations[reg].stack_offset = -static_cast<std::int32_t>(slot_end[slot]);
+
+    allocation.spill_slot_count = static_cast<std::uint32_t>(slot_sizes.size());
+    allocation.frame_size_before_slot_reuse = align_frame(function.local_stack_size + unreused_bytes);
+    allocation.frame_size = align_frame(running);
     allocation.frame_bytes_saved = allocation.frame_size_before_slot_reuse - allocation.frame_size;
     return allocation;
 }

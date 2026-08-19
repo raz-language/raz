@@ -22,7 +22,7 @@ set(frontend "${project}/compiler-compiler.rz")
 materialize_compiler_source("${SOURCE_ROOT}" "${frontend}")
 
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${project}" --target host --profile debug --force
+  COMMAND "${RAZ_EXE}" build "${project}" --profile debug --force
   RESULT_VARIABLE candidate_build_result
   OUTPUT_VARIABLE candidate_build_output
   ERROR_VARIABLE candidate_build_error)
@@ -31,11 +31,11 @@ if(NOT candidate_build_result EQUAL 0)
 endif()
 
 if(WIN32)
-  set(candidate_executable "${project}/target/host/debug/raz-compiler.exe")
+  set(candidate_executable "${project}/target/debug/raz-compiler.exe")
   set(production_object "${project}/production-output.obj")
   set(production_executable "${WORK_ROOT}/production.exe")
 else()
-  set(candidate_executable "${project}/target/host/debug/raz-compiler")
+  set(candidate_executable "${project}/target/debug/raz-compiler")
   set(production_object "${project}/production-output.o")
   set(production_executable "${WORK_ROOT}/production")
 endif()

@@ -1,3 +1,28 @@
+## Unreleased
+
+### Compile throughput
+
+- `PassManager::run` no longer delegates to `run_with_report`. Production
+  compilation ran the reporting path, which timestamps every pass and appends a
+  record per function/pass pair; none of that is observable from `run`. Scoped
+  analysis invalidation is unchanged — only the telemetry is skipped.
+- `forge compile` verifies once at the optimized-IR boundary instead of
+  re-verifying the whole module after every pass. `forge opt` keeps per-pass
+  verification for diagnosing which pass broke the IR.
+- Measured on `benchmarks/broad/kernels.fir` at `-O3`: 191 ms to 44 ms
+  (best of five, same host), with byte-identical object output.
+
+### Build
+
+- Restored `tests/target/data_layout_tests.cpp` and
+  `tests/target/abi_classification_tests.cpp`. `CMakeLists.txt` referenced both,
+  but neither was present, so the project could not configure at all and CI
+  could never have run.
+- Added `is_power_of_two`, `is_aligned`, `checked_align_to`, and `align_to` to
+  `forge/target/data_layout.hpp`. `checked_align_to` reports overflow rather
+  than wrapping, so a hostile or generated alignment cannot silently place a
+  field before the start of its aggregate.
+
 ## C API v14 / binary IR v24
 
 - Added first-class thread-local globals and `tls.address` through IR, verifier, interpreter, machine lowering, x86-64 encoding, C API, and binary serialization.

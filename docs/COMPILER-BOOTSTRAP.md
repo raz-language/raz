@@ -12,6 +12,8 @@ A release build has three roles:
 
 Generation numbering is an implementation detail of the build driver and is not part of the Raz user-facing toolchain.
 
+Raz repository build artifacts and Raz-compiler artifacts use separate roots. The CMake seed/host toolchain build lives under `build/<profile>/`. Compiler construction and reproducibility generations, because they are produced by the Raz compiler pipeline, live under `target/bootstrap/`. This keeps ordinary repository builds in `build/` while preserving the invariant that compiler-produced artifacts stay in `target/`.
+
 The native seed is optimized for bootstrap throughput rather than treated as a second production compiler. Generated host inputs are only rewritten when their contents change, and reproducibility workspaces hard-link immutable compiler sources when the filesystem supports it. These choices reduce redundant native compilation and file copying without changing the canonical compiler source, generated objects, or deterministic-convergence checks.
 
 ## Compiler source

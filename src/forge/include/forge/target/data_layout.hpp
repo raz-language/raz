@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -52,5 +53,28 @@ struct DataLayout {
     [[nodiscard]] std::optional<std::size_t> aggregate_alignment(
         const ir::Module& module, ir::AggregateRefKind kind, const std::string& name) const;
 };
+
+// Alignment arithmetic used by layout, ABI classification, and machine
+// lowering. `checked_align_to` reports overflow rather than wrapping, which
+// matters when a declared alignment is attacker- or generator-controlled.
+[[nodiscard]] constexpr bool is_power_of_two(std::size_t value) noexcept {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+[[nodiscard]] constexpr bool is_aligned(std::size_t value, std::size_t alignment) noexcept {
+    return is_power_of_two(alignment) && (value & (alignment - 1)) == 0;
+}
+
+[[nodiscard]] constexpr std::optional<std::size_t> checked_align_to(
+    std::size_t value, std::size_t alignment) noexcept {
+    if (!is_power_of_two(alignment)) return std::nullopt;
+    const auto mask = alignment - 1;
+    if (value > std::numeric_limits<std::size_t>::max() - mask) return std::nullopt;
+    return (value + mask) & ~mask;
+}
+
+[[nodiscard]] constexpr std::size_t align_to(std::size_t value, std::size_t alignment) noexcept {
+    return checked_align_to(value, alignment).value_or(value);
+}
 
 } // namespace forge::target

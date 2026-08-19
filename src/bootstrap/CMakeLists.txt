@@ -29,6 +29,24 @@ add_library(raz_forge_bridge STATIC
 add_library(Raz::forge_bridge ALIAS raz_forge_bridge)
 target_link_libraries(raz_forge_bridge PUBLIC Forge::forge)
 target_compile_features(raz_forge_bridge PUBLIC cxx_std_20)
+target_compile_definitions(raz_forge_bridge PRIVATE
+  RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>")
+if(TARGET oblink)
+  target_compile_definitions(raz_forge_bridge PRIVATE RAZ_OBLINK_PATH="$<TARGET_FILE:oblink>")
+  add_dependencies(raz_forge_bridge oblink)
+endif()
+# OpenSSL::SSL / OpenSSL::Crypto are imported targets, and find_package created
+# them in src/runtime's directory scope, where imported targets stay by default.
+# Testing for them here without finding them first is always false, which left
+# the bridge -- and so every `raz build` -- unable to name the OpenSSL archives
+# the runtime was compiled against. raz_host's block below finds them the same way.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  target_compile_definitions(raz_forge_bridge PRIVATE
+    RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::SSL>"
+    RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::Crypto>")
+endif()
+add_dependencies(raz_forge_bridge raz_runtime)
 
 target_include_directories(raz_bootstrap_compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(raz_bootstrap_compiler PUBLIC Forge::forge)
@@ -115,6 +133,10 @@ if(RAZ_BUILD_TOOLS)
     RAZ_FORGE_BRIDGE_LIBRARY_PATH="$<TARGET_FILE:raz_forge_bridge>"
     RAZ_FORGE_LIBRARY_PATH="$<TARGET_FILE:forge>"
     RAZ_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
+  if(TARGET oblink)
+    target_compile_definitions(raz_host PRIVATE RAZ_OBLINK_PATH="$<TARGET_FILE:oblink>")
+    add_dependencies(raz_host oblink)
+  endif()
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
     target_compile_definitions(raz_host PRIVATE

@@ -247,7 +247,7 @@ int benchmark_project(const ProjectGraph& graph, const Options& options) {
     std::cerr << "raz bench: no benches directory at " << bench_root << '\n';
     return 1;
   }
-  const auto output_root = graph.manifest.root / "target" / options.target / options.profile / "benches";
+  const auto output_root = project_output_root(graph, options) / "benches";
   std::filesystem::create_directories(output_root);
   std::size_t count = 0;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(bench_root)) {

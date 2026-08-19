@@ -31,19 +31,19 @@ def main() -> int:
     work = Path(args.work)
     if work.exists(): shutil.rmtree(work)
     shutil.copytree(args.fixture, work)
-    shutil.rmtree(work / '.raz', ignore_errors=True)
+    shutil.rmtree(work / 'target', ignore_errors=True)
     shutil.rmtree(work / 'target', ignore_errors=True)
 
-    base = [args.raz, 'build', str(work), '--target', 'host', '--color', 'never']
+    base = [args.raz, 'build', str(work), '--color', 'never']
     run(base + ['--force'])
 
-    workspace = work / '.raz/cache/workspace-v1.state'
+    workspace = work / 'target/cache/workspace-v1.state'
     if not workspace.is_file(): raise SystemExit('missing persistent workspace graph')
     ws = workspace.read_text()
     edge = 'edge "hello-package@0.1.0::main" "hello-package@0.1.0::util::math"'
     if edge not in ws: raise SystemExit('missing main -> util::math workspace edge')
 
-    cache = work / '.raz/cache/host/debug'
+    cache = work / 'target/cache/debug'
     for stem in ('main', 'util__math'):
         stage = cache / f'{stem}.incremental'
         if not stage.is_file(): raise SystemExit(f'missing stage cache: {stage}')
@@ -51,7 +51,7 @@ def main() -> int:
         for field in ('source=', 'imports=', 'interface=', 'semantic=', 'hir=', 'mir=', 'forge_ir=', 'build='):
             if field not in text: raise SystemExit(f'missing {field} in {stage}')
 
-    native = work / 'target/host/debug/native/modules'
+    native = work / 'target/debug/native/modules'
     main_obj = native / ('main.obj' if __import__('os').name == 'nt' else 'main.o')
     util_obj = native / ('util__math.obj' if __import__('os').name == 'nt' else 'util__math.o')
     if not main_obj.is_file() or not util_obj.is_file(): raise SystemExit('missing per-module native objects')
@@ -66,7 +66,7 @@ def main() -> int:
     # preserve both the object and final executable timestamps and skip linking.
     util_state = native / 'util__math.object.fingerprint'
     if not util_state.is_file(): raise SystemExit('missing util native object cache state')
-    artifact = work / 'target/host/debug' / ('hello-package.exe' if __import__('os').name == 'nt' else 'hello-package')
+    artifact = work / 'target/debug' / ('hello-package.exe' if __import__('os').name == 'nt' else 'hello-package')
     if not artifact.is_file(): raise SystemExit('missing native executable')
     object_stamp_before = util_obj.stat().st_mtime_ns
     artifact_stamp_before = artifact.stat().st_mtime_ns

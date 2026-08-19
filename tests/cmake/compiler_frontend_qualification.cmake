@@ -29,15 +29,15 @@ if(NOT ir_output MATCHES "func @next_token" OR NOT ir_output MATCHES "func @toke
   message(FATAL_ERROR "compiler candidate frontend Forge IR is missing lexer/parser/HIR/MIR entry points")
 endif()
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${project}" --target host --profile debug --force
+  COMMAND "${RAZ_EXE}" build "${project}" --profile debug --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "compiler candidate native lexer/parser/HIR/MIR build failed:\n${build_output}\n${build_error}")
 endif()
 if(WIN32)
-  set(executable "${project}/target/host/debug/raz-compiler.exe")
+  set(executable "${project}/target/debug/raz-compiler.exe")
 else()
-  set(executable "${project}/target/host/debug/raz-compiler")
+  set(executable "${project}/target/debug/raz-compiler")
 endif()
 if(NOT EXISTS "${executable}")
   message(FATAL_ERROR "compiler candidate lexer/parser/semantic executable missing: ${executable}")

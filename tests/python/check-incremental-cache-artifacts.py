@@ -26,8 +26,15 @@ checks = {
         '[82, 65, 90, 77, 73, 82, 32, 50, 10]' in inc and
         'incremental_hir_module_fingerprint' in inc and
         'incremental_mir_module_fingerprint' in inc,
+    # Ordering matters: classification marks modules dirty and the cache load
+    # must observe those marks. Compare statement positions rather than an exact
+    # indentation-sensitive spelling of the two adjacent lines, which silently
+    # stopped matching when the entrypoint was reindented.
     'cache state is loaded after semantic dirty classification':
-        'incremental_classify_module_changes(cli_manifest_path, cli_manifest_length, &mut hir);\n  incremental_load_module_cache_state' in main,
+        'incremental_classify_module_changes(' in main and
+        'incremental_load_module_cache_state(' in main and
+        main.index('incremental_classify_module_changes(') <
+        main.index('incremental_load_module_cache_state('),
     'cache arenas are initialized and destroyed with HIR':
         'out.incremental_module_hir_fingerprints = raz_compiler_rt_arena_create(4096);' in model and
         'raz_compiler_rt_arena_destroy(out.incremental_module_hir_fingerprints);' in model and

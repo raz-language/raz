@@ -69,8 +69,8 @@ def main():
         github_env.pop(key,None)
     first=run([compiler,'publish'],publisher,github_env)
     assert first.stdout.startswith('Prepared widget@1.4.0 '), first.stdout
-    staged=publisher/'.raz-publish/packages/widget/1.4.0.dpk'
-    staged_index=publisher/'.raz-publish/index.txt'
+    staged=publisher/'target/publish/packages/widget/1.4.0.dpk'
+    staged_index=publisher/'target/publish/index.txt'
     assert staged.is_file() and staged_index.is_file()
     first_bytes=staged.read_bytes(); first_index=staged_index.read_bytes()
     second=run([compiler,'publish'],publisher,github_env)

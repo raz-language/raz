@@ -27,11 +27,11 @@ def main() -> int:
     if work.exists():
         shutil.rmtree(work)
     shutil.copytree(args.fixture, work)
-    shutil.rmtree(work / '.raz', ignore_errors=True)
+    shutil.rmtree(work / 'target', ignore_errors=True)
     shutil.rmtree(work / 'target', ignore_errors=True)
 
-    run([args.raz, 'build', str(work), '--target', 'host', '--force', '--color', 'never'])
-    state = work / '.raz' / 'cache' / 'workspace-v1.state'
+    run([args.raz, 'build', str(work), '--force', '--color', 'never'])
+    state = work / 'target' / 'cache' / 'workspace-v1.state'
     if not state.is_file():
         raise SystemExit('workspace graph was not persisted')
     text = state.read_text()
@@ -47,7 +47,7 @@ def main() -> int:
 
     util = work / 'src' / 'util' / 'math.rz'
     util.write_text(util.read_text() + '\nfn internal_increment(i64 value) -> i64 { return value + 1; }\n')
-    changed = run([args.raz, 'build', str(work), '--target', 'host', '--verbose', '--color', 'never'])
+    changed = run([args.raz, 'build', str(work), '--verbose', '--color', 'never'])
     combined = changed.stdout + changed.stderr
     if 'Workspace 2 dirty module(s)' not in combined and 'Workspace 2 dirty module(s),' not in combined:
         raise SystemExit(f'dependent dirty propagation was not reported:\n{combined}')

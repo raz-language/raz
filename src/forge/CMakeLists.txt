@@ -127,6 +127,7 @@ forge_add_test(forge-dependency-build-tests tests/frontend/dependency_build_test
  forge_add_test(forge-binary-tests tests/serialization/binary_tests.cpp)
  forge_add_test(forge-codegen-tests tests/codegen/codegen_tests.cpp)
  forge_add_test(forge-abi-hardening-tests tests/codegen/abi_hardening_tests.cpp)
+ forge_add_test(forge-vector-register-class-tests tests/codegen/vector_register_class_tests.cpp)
  forge_add_test(forge-interpreter-tests tests/interpreter/interpreter_tests.cpp)
  forge_add_test(forge-float-interpreter-tests tests/interpreter/float_tests.cpp)
  forge_add_test(forge-optimization-tests tests/analysis/optimization_tests.cpp)

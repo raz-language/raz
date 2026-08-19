@@ -35,7 +35,7 @@ def main() -> int:
     shutil.copytree(root / 'compiler', project)
     env = os.environ.copy()
     env['RAZ_LINKER'] = ns.linker
-    run([ns.raz, 'build', str(project), '--target', 'host', '--profile', 'debug', '--force'], cwd=root, env=env)
+    run([ns.raz, 'build', str(project), '--profile', 'debug', '--force'], cwd=root, env=env)
     compiler = project / 'target' / 'host' / 'debug' / ('raz-compiler.exe' if os.name == 'nt' else 'raz-compiler')
     if not compiler.is_file():
         raise RuntimeError(f'missing production compiler: {compiler}')

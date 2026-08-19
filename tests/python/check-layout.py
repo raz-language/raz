@@ -2,7 +2,8 @@
 # Copyright 2026 Mario Vinciguerra
 # SPDX-License-Identifier: Apache-2.0
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import subprocess
 import sys
 sys.dont_write_bytecode = True
 
@@ -15,6 +16,7 @@ cpp_extensions = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'}
 allowed_cpp_roots = (
     Path('src/bootstrap'),
     Path('src/forge'),
+    Path('src/oblink'),
     Path('src/runtime'),
     Path('tests/native'),
     Path('benchmarks/reference/c'),
@@ -33,7 +35,7 @@ for path in root.rglob('*'):
     violations.append(str(rel))
 
 if violations:
-    print('Native C/C++ files must remain inside src/bootstrap, src/forge, src/runtime, tests/native, or benchmarks/reference/c:')
+    print('Native C/C++ files must remain inside src/bootstrap, src/forge, src/oblink, src/runtime, tests/native, or benchmarks/reference/c:')
     print('\n'.join(f'  {item}' for item in violations))
     sys.exit(1)
 print('repository native-source layout: PASS')
@@ -63,6 +65,36 @@ if found:
 # No generated compiler/build state belongs in the source tree.  Use the
 # centralized path policy: Forge has real semantic source directories named
 # `target`, so basename-only cleanup/checking is forbidden.
+def tracked_directories() -> set[str] | None:
+    """Directories containing at least one git-tracked file, or None without git.
+
+    The question this check asks is whether generated state was *committed*, and
+    only git can answer that. Testing the filesystem instead reports every local
+    build directory -- `target/`, `__pycache__/`, and each `tests/examples/
+    projects/*/target/` -- even though .gitignore already excludes them, so the
+    check could never pass on a machine that had run `bootstrap.bat` or the test
+    suite. It stayed green in CI only because CI checks out a clean tree and
+    never builds.
+    """
+    try:
+        listed = subprocess.run(
+            ['git', '-C', str(root), 'ls-files', '-z'],
+            capture_output=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    directories: set[str] = set()
+    for entry in listed.stdout.split(b'\0'):
+        if not entry:
+            continue
+        current = PurePosixPath(entry.decode('utf-8', 'surrogateescape')).parent
+        while current != PurePosixPath('.'):
+            directories.add(str(current))
+            current = current.parent
+    return directories
+
+
+tracked = tracked_directories()
 generated = []
 for path in root.rglob('*'):
     if not path.is_dir():
@@ -70,9 +102,17 @@ for path in root.rglob('*'):
     rel = path.relative_to(root)
     if is_generated_dir(rel):
         # Root build/out are expected local workspaces, and .git is repository
-        # metadata rather than committed source. Nested package/cache output is
-        # still a violation.
+        # metadata rather than committed source.
         if rel.parts and rel.parts[0] in {'build', 'out', '.git'}:
+            continue
+        if tracked is not None:
+            # Committed means git tracks something inside it.
+            if rel.as_posix() in tracked:
+                generated.append(str(rel))
+            continue
+        # Without git, fall back to trusting .gitignore's own exclusions so the
+        # check does not fail purely because the tree has been built.
+        if rel.parts[0] == 'target' or 'target' in rel.parts or '__pycache__' in rel.parts:
             continue
         generated.append(str(rel))
 if generated:

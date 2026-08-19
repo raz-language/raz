@@ -43,4 +43,18 @@ The build driver discovers the Visual Studio environment and preserves include/l
 
 ## Output
 
-Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.
+Repository build output and compiler output are intentionally split:
+
+```text
+build/
+├─ debug/
+└─ release/
+
+target/bootstrap/
+├─ candidate/
+├─ repro-1/
+├─ repro-2/
+└─ repro-3/
+```
+
+On Windows the final qualified compiler is `target/bootstrap/repro-3/raz-compiler.exe`. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.

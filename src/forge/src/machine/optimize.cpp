@@ -12,6 +12,61 @@
 #include <vector>
 
 namespace forge::machine {
+
+SlpCostModel SlpCostModel::x86_64(X86VectorIsa isa) noexcept {
+    SlpCostModel model;
+    model.sse2 = true;
+    model.vector_bits = 128;
+    model.backend_vector_bits = isa == X86VectorIsa::avx512 ? 512 :
+        (isa == X86VectorIsa::avx2 ? 256 : 128);
+    model.vector_register_budget = 12;
+
+    switch (isa) {
+    case X86VectorIsa::sse2:
+        break;
+    case X86VectorIsa::sse41:
+        model.sse41 = true;
+        model.shuffle_cost = 0.70;
+        break;
+    case X86VectorIsa::avx:
+        model.sse41 = true;
+        model.avx = true;
+        // AVX1 does not widen packed integer arithmetic beyond 128 bits.
+        model.vector_bits = 128;
+        model.shuffle_cost = 0.65;
+        model.vector_setup_cost = 0.16;
+        break;
+    case X86VectorIsa::avx2:
+        model.sse41 = true;
+        model.avx = true;
+        model.avx2 = true;
+        model.vector_bits = 256;
+        model.vector_integer_throughput = 0.33;
+        model.vector_memory_cost = 0.85;
+        model.broadcast_cost = 0.40;
+        model.shuffle_cost = 0.55;
+        model.vector_setup_cost = 0.14;
+        break;
+    case X86VectorIsa::avx512:
+        model.sse41 = true;
+        model.avx = true;
+        model.avx2 = true;
+        model.avx512f = true;
+        model.avx512bw = true;
+        model.avx512vl = true;
+        model.vector_bits = 512;
+        model.vector_register_budget = 28;
+        model.mask_register_budget = 7;
+        model.vector_integer_throughput = 0.30;
+        model.vector_memory_cost = 0.82;
+        model.broadcast_cost = 0.35;
+        model.shuffle_cost = 0.50;
+        model.vector_setup_cost = 0.12;
+        break;
+    }
+    return model;
+}
+
 namespace {
 
 
@@ -152,9 +207,120 @@ std::size_t pointer_operand_index(Opcode opcode) noexcept {
     }
 }
 
+struct SlpCandidateCost {
+    std::size_t lane_bytes{};
+    std::size_t lanes{};
+    std::size_t operations_per_lane{1U};
+    std::size_t loads_per_lane{1U};
+    std::size_t stores_per_lane{1U};
+    std::size_t vector_live_values{2U};
+    Opcode primary_opcode{Opcode::add_i64};
+    SlpMemoryPattern memory_pattern{SlpMemoryPattern::contiguous_unaligned};
+    std::size_t broadcasts_per_chunk{};
+    std::size_t shuffles_per_chunk{};
+    double operation_mix_multiplier{1.0};
+};
+
+double slp_memory_multiplier(SlpMemoryPattern pattern, const SlpCostModel& model) noexcept {
+    switch (pattern) {
+    case SlpMemoryPattern::contiguous_aligned: return model.aligned_memory_multiplier;
+    case SlpMemoryPattern::contiguous_unaligned: return model.unaligned_memory_multiplier;
+    case SlpMemoryPattern::broadcast: return 1.0;
+    case SlpMemoryPattern::interleaved: return model.interleaved_memory_multiplier;
+    case SlpMemoryPattern::strided: return model.strided_memory_multiplier;
+    case SlpMemoryPattern::gather_scatter: return model.gather_scatter_multiplier;
+    }
+    return 1.0;
+}
+
+double slp_operation_multiplier(Opcode opcode, const SlpCostModel& model) noexcept {
+    switch (opcode) {
+    case Opcode::and_i32: case Opcode::and_i64:
+    case Opcode::or_i32: case Opcode::or_i64:
+    case Opcode::xor_i32: case Opcode::xor_i64:
+        return 0.80;
+    case Opcode::add_i32: case Opcode::add_i64:
+    case Opcode::sub_i32: case Opcode::sub_i64:
+        return 1.00;
+    case Opcode::mul_i32:
+        return model.sse41 ? 1.35 : 2.25;
+    case Opcode::mul_i64:
+        // No native packed i64 multiply in SSE2/AVX2; treat it as expensive
+        // unless a future backend teaches the vectorizer a lowering sequence.
+        return model.avx512f ? 2.0 : 4.0;
+    case Opcode::shl_i32: case Opcode::shl_i64:
+    case Opcode::shr_s_i32: case Opcode::shr_s_i64:
+    case Opcode::shr_u_i32: case Opcode::shr_u_i64:
+        return 1.25;
+    default:
+        return 1.0;
+    }
+}
+
+std::uint16_t slp_selected_vector_bits(std::size_t lane_bytes, std::size_t lanes, const SlpCostModel& model) noexcept {
+    const auto total_bits = lane_bytes * lanes * 8U;
+    const auto effective = static_cast<std::size_t>(model.effective_vector_bits());
+    const auto usable = std::min(total_bits, effective);
+    if (usable >= 512U) return 512U;
+    if (usable >= 256U) return 256U;
+    return 128U;
+}
+
+bool slp_profitable(const SlpCandidateCost& candidate, const SlpCostModel& model, OptimizationStats& stats) noexcept {
+    ++stats.slp_candidates_considered;
+    const auto effective_bits = model.effective_vector_bits();
+    if (!model.vector_integer_available || !model.sse2 || effective_bits < 64U || candidate.lane_bytes == 0U || candidate.lanes < 2U) {
+        ++stats.slp_candidates_rejected_target;
+        return false;
+    }
+    const auto vector_bytes = static_cast<std::size_t>(effective_bits / 8U);
+    if (vector_bytes < candidate.lane_bytes) {
+        ++stats.slp_candidates_rejected_target;
+        return false;
+    }
+
+    const auto total_bytes = candidate.lane_bytes * candidate.lanes;
+    const auto chunks = (total_bytes + vector_bytes - 1U) / vector_bytes;
+    const auto op_multiplier = slp_operation_multiplier(candidate.primary_opcode, model) * candidate.operation_mix_multiplier;
+    const double scalar_op = (model.scalar_integer_latency + model.scalar_integer_throughput) * op_multiplier;
+    const double vector_op = (model.vector_integer_latency + model.vector_integer_throughput) * op_multiplier;
+    const double memory_multiplier = slp_memory_multiplier(candidate.memory_pattern, model);
+
+    const double scalar = static_cast<double>(candidate.lanes) *
+        (static_cast<double>(candidate.operations_per_lane) * scalar_op +
+         static_cast<double>(candidate.loads_per_lane + candidate.stores_per_lane) * model.scalar_memory_cost);
+    const double memory = static_cast<double>(chunks) *
+        static_cast<double>(candidate.loads_per_lane + candidate.stores_per_lane) * model.vector_memory_cost * memory_multiplier;
+    const double shuffle = static_cast<double>(chunks) *
+        (static_cast<double>(candidate.broadcasts_per_chunk) * model.broadcast_cost +
+         static_cast<double>(candidate.shuffles_per_chunk) * model.shuffle_cost);
+    const double pressure = candidate.vector_live_values > model.vector_register_budget
+        ? static_cast<double>(candidate.vector_live_values - model.vector_register_budget) * model.register_pressure_cost * static_cast<double>(chunks)
+        : 0.0;
+    const double vector = static_cast<double>(chunks) *
+        (static_cast<double>(candidate.operations_per_lane) * vector_op + model.vector_setup_cost) + memory + shuffle + pressure;
+
+    stats.slp_estimated_scalar_cost += scalar;
+    stats.slp_estimated_vector_cost += vector;
+    stats.slp_estimated_memory_cost += memory;
+    stats.slp_estimated_shuffle_cost += shuffle;
+    stats.slp_estimated_register_pressure_cost += pressure;
+
+    if (!(vector * model.minimum_speedup < scalar)) {
+        ++stats.slp_candidates_rejected_cost;
+        return false;
+    }
+    ++stats.slp_candidates_selected;
+    const auto selected_bits = slp_selected_vector_bits(candidate.lane_bytes, candidate.lanes, model);
+    if (selected_bits >= 512U) ++stats.slp_width_512_selected;
+    else if (selected_bits >= 256U) ++stats.slp_width_256_selected;
+    else ++stats.slp_width_128_selected;
+    return true;
+}
+
 } // namespace
 
-OptimizationStats optimize_function(Function& function) {
+OptimizationStats optimize_function(Function& function, const SlpCostModel& slp_cost_model) {
     OptimizationStats stats;
     for (const auto& block : function.blocks)
         stats.instructions_before += static_cast<std::uint32_t>(block.instructions.size());
@@ -1068,10 +1234,10 @@ OptimizationStats optimize_function(Function& function) {
     return stats;
 }
 
-OptimizationStats optimize_module(Module& module) {
+OptimizationStats optimize_module(Module& module, const SlpCostModel& slp_cost_model) {
     OptimizationStats total;
     for (auto& function : module.functions) {
-        const auto stats = optimize_function(function);
+        const auto stats = optimize_function(function, slp_cost_model);
         total.instructions_before += stats.instructions_before;
         total.instructions_after += stats.instructions_after;
         total.copies_propagated += stats.copies_propagated;

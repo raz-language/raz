@@ -69,7 +69,7 @@ declaration identity is maintained in an open-addressed `(package, namespace, na
 index, so duplicate detection does not rescan every previously declared symbol.
 
 For unchanged semantic checks, Raz persists a versioned project-source snapshot and
-semantic key under `.raz/cache`. The snapshot is validated against every contributing
+semantic key under `target/cache`. The snapshot is validated against every contributing
 manifest/module using file size and a normalized high-resolution modification tick;
 a valid snapshot avoids project traversal and source rereads, and an exact semantic-key
 match avoids rebuilding HIR. Same-size rewrites therefore invalidate correctly on

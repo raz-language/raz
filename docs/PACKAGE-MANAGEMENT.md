@@ -112,9 +112,9 @@ Git dependencies are deliberately commit-pinned. A source uses this form:
 raz add codec git:https://github.com/example/raz-codec#0123456789abcdef0123456789abcdef01234567
 ```
 
-The revision must be a complete 40-character hexadecimal commit SHA. Raz invokes Git without a shell, materializes the checkout under `.raz/git/<content-key>/`, verifies that it contains `raz.toml`, records the immutable source in `.raz.git`, and writes the concrete cache path into the selected manifest section.
+The revision must be a complete 40-character hexadecimal commit SHA. Raz invokes Git without a shell, materializes the checkout under `target/git/<content-key>/`, verifies that it contains `raz.toml`, records the immutable source in `.raz.git`, and writes the concrete cache path into the selected manifest section.
 
-`raz fetch` and `raz update` recreate missing Git materializations from `.raz.git`. They do not move a Git dependency to another revision; changing a Git revision is an explicit manifest/package-manager change. `.raz/` is cache state, while `.raz.git` is reproducibility metadata and should be committed with the project. Because the manifest points at the project-local Git materialization, Git dependencies are suitable for applications and workspaces but are not accepted in published package archives; publishable libraries should depend on registry packages or vendor the dependency source inside the package.
+`raz fetch` and `raz update` recreate missing Git materializations under `target/git/` from `.raz.git`. They do not move a Git dependency to another revision; changing a Git revision is an explicit manifest/package-manager change. `target/` is generated cache/build state, while `.raz.git` is reproducibility metadata and should be committed with the project. Because the manifest points at the project-local Git materialization, Git dependencies are suitable for applications and workspaces but are not accepted in published package archives; publishable libraries should depend on registry packages or vendor the dependency source inside the package.
 
 ## Registry dependencies
 
@@ -186,7 +186,7 @@ Store selection is:
 1. `RAZ_PACKAGE_STORE`, when set.
 2. `RAZ_HOME/store`, when `RAZ_HOME` is set.
 3. `~/.raz/store` on Unix-like systems or `%USERPROFILE%\.raz\store` on Windows.
-4. `./.raz/store` only when no user-home location is available.
+4. `./target/store` only when no user-home location is available.
 
 Entries are stored as:
 
@@ -204,7 +204,7 @@ Set:
 RAZ_OFFLINE=1
 ```
 
-to prohibit network access and registry-source materialization. Raz keeps the last successfully fetched registry index in `.raz.registry-index`; offline resolution can use that snapshot together with integrity-valid entries already present in the shared store.
+to prohibit network access and registry-source materialization. Raz keeps the last successfully fetched registry index in the user-level shared registry cache (`~/.raz/registry/index.txt` on Unix-like systems or `%USERPROFILE%\.raz\registry\index.txt` on Windows); offline resolution can use that snapshot together with integrity-valid entries already present in the shared store.
 
 A missing or corrupt store entry is an error in offline mode. Raz never silently substitutes mutable source content.
 
@@ -229,7 +229,7 @@ The direct compiler boundary remains network-independent; registry access belong
 
 `raz lock` rebuilds the deterministic lockfile from all declared dependency sections. Registry constraints remain unchanged in `raz.toml`; registry lock entries record the exact portable `registry:<content-hash>` path together with `source = "registry"` and the verified checksum, never the local store directory. If a manifest constraint is edited so the current lockfile no longer satisfies it, normal builds fail with guidance to run `raz update`.
 
-`.raz.registry` may be created as derived internal state to accelerate registry update operations. It is regenerated from `raz.toml` before update/discovery work and is never the source of dependency intent. Projects should commit `raz.toml` and `raz.lock`, not `.raz.registry` or `.raz.cache`.
+Project-local generated package-manager state lives under `target/`: `target/raz.registry` is derived tracking data used to accelerate registry update operations, and `target/raz.cache` records exact resolved package/store rows. Incremental compiler state lives under `target/cache/`, commit-pinned Git materializations under `target/git/`, and official-registry PR staging under `target/publish/`. These are regenerated from durable project metadata and are never the source of dependency intent. Projects should commit `raz.toml` and `raz.lock`, not files beneath `target/`. Raz automatically migrates the older `.raz/raz.registry`, `.raz/raz.cache`, root `.raz.registry`, and root `.raz.cache` layouts on first access.
 
 `raz update` re-evaluates tracked registry constraints, preserves each dependency's original section, restores missing pinned Git materializations, and selects the highest compatible registry version currently available. `raz fetch` instead treats `raz.lock` as authoritative: it materializes the exact locked registry versions/checksums and does not upgrade them. If no lockfile exists, `fetch` performs the initial resolution needed to create one. Repeating either operation without input changes produces byte-stable output.
 
@@ -265,7 +265,7 @@ The default output is `<name>-<version>.dpk`. You can choose another output path
 raz pack dist/widget-1.2.3.dpk
 ```
 
-`pack` excludes generated project state (`.git/`, `.raz/`, `.raz.cache`, `.raz.registry`, `.raz.registry-index`, `.raz.git`, `.raz-publish/`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). It rejects dependency paths that would escape the archive or point into machine-local cache state; published packages must use registry dependencies or vendored paths contained inside the package. The archive uses the same full-tree content hash used by the package store and registry verifier.
+`pack` excludes generated project state (`.git/`, legacy `.raz/`, legacy `.raz.cache` / `.raz.registry`, `.raz.git`, `build/`, `target/`, compiler diagnostics, and existing `.dpk` outputs). It rejects dependency paths that would escape the archive or point into machine-local cache state; published packages must use registry dependencies or vendored paths contained inside the package. The archive uses the same full-tree content hash used by the package store and registry verifier.
 
 ## Publishing
 
@@ -278,7 +278,7 @@ raz publish
 When neither `RAZ_REGISTRY_URL` nor `RAZ_REGISTRY_PUBLISH_DIR` is set, Raz validates and packs the current package and creates a repository-shaped submission under:
 
 ```text
-.raz-publish/
+target/publish/
   index.txt
   packages/
     <name>/
@@ -309,7 +309,7 @@ The explicit private-registry paths retain the existing authenticated/idempotent
 - `RAZ_REGISTRY_URL` — override the official GitHub registry with a primary HTTP/HTTPS registry base URL.
 - `RAZ_REGISTRY_TOKEN` — optional Bearer token used by `raz publish`.
 - `RAZ_REGISTRY_SIGNATURE` — optional detached signature sent as `X-Raz-Signature` during publishing.
-- `RAZ_REGISTRY_PUBLISH_DIR` — filesystem registry destination for local/private registries; when unset with no URL override, `raz publish` writes `.raz-publish/`.
+- `RAZ_REGISTRY_PUBLISH_DIR` — filesystem registry destination for local/private registries; when unset with no URL override, `raz publish` writes `target/publish/`.
 - `RAZ_REGISTRY_MIRRORS` — ordered fallback registry bases for package consumption.
 - `RAZ_PACKAGE_STORE` — explicit content-addressed package store.
 - `RAZ_HOME` — Raz home directory; its `store/` subdirectory is used when no explicit store is configured.

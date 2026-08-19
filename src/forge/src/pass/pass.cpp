@@ -46,7 +46,27 @@ PassRunReport PassManager::run_with_report(ir::Module& module, bool verify_each)
 }
 
 PassResult PassManager::run(ir::Module& module, bool verify_each) const {
-    return run_with_report(module, verify_each).total;
+    // Production compilation runs this path, and it used to delegate to
+    // run_with_report, which timestamps every pass and appends a record per
+    // (function x pass). None of that is observable here, so the work and the
+    // allocations were pure overhead on the hot path. The scoped invalidation
+    // below is deliberately identical to the reporting path: only the telemetry
+    // is dropped, never the analysis-preservation behaviour.
+    PassResult total;
+    for (auto& function : module.functions()) {
+        analysis::FunctionAnalysisManager analyses(function);
+        for (const auto& pass : passes_) {
+            auto result = pass->run(function, analyses);
+            total += result;
+            if (result.changed) {
+                const auto scope = result.invalidation == analysis::InvalidationScope::none
+                    ? analysis::InvalidationScope::all : result.invalidation;
+                analyses.invalidate(scope, result.touched_blocks);
+            }
+            if (verify_each) verify_or_throw(module, pass->name());
+        }
+    }
+    return total;
 }
 
 std::vector<std::string> PassManager::pass_names() const {

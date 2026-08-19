@@ -5,8 +5,8 @@
 from pathlib import Path
 import re, hashlib
 root=Path(__file__).resolve().parents[1]
-isa=(root/'compiler/src/backend/rxe/isa.rz').read_text()
-decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text()
+isa=(root/'compiler/src/backend/rxe/isa.rz').read_text(encoding='utf-8')
+decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text(encoding='utf-8')
 fmt=re.search(r'rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)
 ver=re.search(r'rxe_isa_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)
 regs=re.search(r'rxe_register_count\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)
@@ -41,5 +41,5 @@ lines += ['', '## Decoder trust boundary','',
 'The independent Raz decoder must validate, from serialized bytes alone: section geometry, canonical reserved fields, opcode/register validity, exact feature bitmap, aggregate-layout ranges, signature ranges, recomputed callable selectors, export identity/order, and block partition/successor legality. The production C loader must implement the same consensus-visible checks independently.','',
 '## Version rule','',
 'Changing any opcode behavior above requires a new **RXE ISA version**. Changing only the self-describing container layout requires a new **RXE format version**. Compiler optimization and decoded µop/superinstruction changes do not change ISA version when canonical RXE behavior remains identical.','']
-(root/'docs/RXE-ISA-v1.md').write_text('\n'.join(lines))
+(root/'docs/RXE-ISA-v1.md').write_text('\n'.join(lines), encoding='utf-8')
 print(f'generated RXE ISA v{ver} compatibility manifest ({len(ops)} opcodes) {compatibility_hash[:16]}')

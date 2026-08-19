@@ -63,8 +63,10 @@ def main() -> int:
         fail("build preflight does not hydrate exact lockfile entries")
     if "registry_official_publish_metadata" not in registry or "registry_official_publish_requested" not in registry:
         fail("official publish metadata validation is missing")
-    if "old_length = raz_compiler_rt_read_ascii(fp, 12, old, 1048576)" not in registry:
+    if "old_length = raz_compiler_rt_read_ascii(fp, path_length, old, 1048576)" not in registry:
         fail("registry cache is not preserving existing dependency rows")
+    if "registry_project_state_prepare(0, fp, 20)" not in registry:
+        fail("registry cache is not using the canonical target/raz.cache path")
     if "bool official = argc == 3" not in package or "package_add_official_registry_command(alias, al, section_kind)" not in package:
         fail("raz add does not accept the one-argument official package form")
     if "fn registry_bare_constraint(" not in registry or "bool same_name = al == nl" not in registry:
@@ -83,11 +85,11 @@ def main() -> int:
     if "fn registry_base64_encode(" not in transport:
         fail("GitHub Contents publishing has no in-Raz base64 encoder")
 
-    publish_path = bytes([46,114,97,122,45,112,117,98,108,105,115,104,47]).decode("ascii")
-    if publish_path != ".raz-publish/":
+    publish_path = bytes([116,97,114,103,101,116,47,112,117,98,108,105,115,104,47]).decode("ascii")
+    if publish_path != "target/publish/":
         fail("internal test error decoding publish path")
-    if "i64 publish[13]" not in transport or "registry_path_prefix(path, length, &publish, 13)" not in transport:
-        fail(".raz-publish/ is not excluded from deterministic package trees")
+    if "i64 target[7]" not in transport or "registry_path_prefix(path, length, &target, 7)" not in transport:
+        fail("target/ is not excluded from deterministic package trees")
 
     print(f"official-registry: PASS ({EXPECTED}; static GitHub reads + authenticated Contents publishing + PR fallback)")
     return 0

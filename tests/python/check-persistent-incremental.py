@@ -20,10 +20,15 @@ checks = {
     'cache key includes backend mode': 'key = incremental_mix(key, backend);' in inc and 'llvm_emit_kind' in inc,
     'artifact restore exists': 'fn incremental_try_restore_artifact(' in inc,
     'artifact store exists': 'fn incremental_store_artifact(' in inc,
-    'run/test/check cannot artifact-short-circuit': '!check_only' in main and '!test_after_build' in main and '!run_after_build' in main,
+    # `run` now links and launches the same artifact `build` produces, so a
+    # cached one is legitimate to reuse. `check` and `test` still must not
+    # short-circuit to an artifact: check has its own cache and test has to
+    # execute.
+    'check/test cannot artifact-short-circuit': 'incremental_restore_kind(' in main and 'check_only,' in main and 'test_after_build,' in main,
+    'run executes the restored artifact rather than interpreting it': 'run_after_build,' in main and 'cli_maybe_run_artifact(' in main,
     'HIR exports module fingerprints beyond builder lifetime': 'incremental_module_fingerprint_count' in model and 'builder.query_module_fingerprint_count' in comptime,
     'module source/interface state is persisted': 'fn incremental_persist_module_fingerprints(' in inc and 'incremental_module_interface_fingerprints' in inc,
-    'cache directory is ignored': '.raz/' in ignore,
+    'cache directory is ignored through target root': '/target/' in ignore and '**/target/' in ignore,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

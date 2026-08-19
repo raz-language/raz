@@ -226,7 +226,7 @@ void usage() {
             << "  -V, --version           Print version information\n"
             << "      --profile <name>    Select a manifest build profile (default: debug)\n"
             << "      --release           Alias for --profile release\n"
-            << "      --target <triple>   Select output target (default: host)\n"
+            << "      --target <triple>   Select an explicit non-host target (host is automatic)\n"
             << "  -j, --jobs <n>          Parallel compiler jobs (default: auto, max 64)\n"
             << "  -v, --verbose           Print per-module build actions\n"
             << "  -q, --quiet             Print only errors and requested program output\n"
@@ -251,7 +251,7 @@ void usage_command(std::string_view name) {
     std::cout << "Build options:\n"
               << "      --profile <name>    Select a manifest build profile (default: debug)\n"
               << "      --release           Alias for --profile release\n"
-              << "      --target <triple>   Select output target (default: host)\n"
+              << "      --target <triple>   Select an explicit non-host target (host is automatic)\n"
               << "  -j, --jobs <n>          Parallel compiler jobs (default: auto, max 64)\n"
               << "      --force             Rebuild all modules\n"
               << "      --diagnostic-format <human|short|json>\n"
@@ -262,7 +262,7 @@ void usage_command(std::string_view name) {
     std::cout << "Benchmark build options:\n"
               << "      --profile <name>    Select a manifest build profile (default: debug)\n"
               << "      --release           Alias for --profile release\n"
-              << "      --target <triple>   Select output target (default: host)\n";
+              << "      --target <triple>   Select an explicit non-host target (host is automatic)\n";
   }
   if (name == "run") {
     std::cout << "      -- <args...>        Pass remaining arguments to the executable\n";

@@ -74,6 +74,8 @@ See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough
 | `raz pack` · `raz publish` | Produce and submit deterministic package archives |
 | `raz doctor` · `raz backends` · `raz targets` | Inspect the toolchain, backends, and targets |
 
+Normal executable package builds are native by default: `raz build` writes `target/debug/<package>` (`.exe` on Windows), and `raz build --release` writes `target/release/<package>`. Forge `.fir` output is reserved for explicit backend/emission workflows.
+
 Build output is concise and package-oriented:
 
 ```text
@@ -168,7 +170,7 @@ See [Package management](docs/PACKAGE-MANAGEMENT.md).
 
 ## Building from source
 
-Raz builds from source on Windows and Linux. `bootstrap.bat` and `bootstrap.sh` configure the native host components, construct the Raz compiler, and verify compiler reproducibility before producing the toolchain. Native components alone can be built with the CMake `release` preset.
+Raz builds from source on Windows and Linux. `bootstrap.bat` and `bootstrap.sh` configure the native host components, construct the Raz compiler, and verify compiler reproducibility before producing the toolchain. Repository-native CMake artifacts live under `build/<profile>/`, while compiler-produced qualification and project artifacts live under `target/`. Native components alone can be built with the CMake `release` preset.
 
 See [Compiler bootstrap](docs/COMPILER-BOOTSTRAP.md) and [Windows build](docs/WINDOWS-BUILD.md).
 

@@ -19,9 +19,9 @@ raz diagnostics
 ## Build and execute
 
 ```text
-raz build [options] <input> [output]
+raz build [options] [input] [output]
+raz build --release
 raz run <input>
-raz run <input> -- <program-args...>
 raz check <input>
 raz test <input>
 raz lint <input>
@@ -38,6 +38,7 @@ These apply to `build`, `run`, `check`, `test`, and `lint` unless noted.
 | `--wasm` · `--rxe` | | Select the WebAssembly or RXE target instead of native output. |
 | `--opt=<level>` | `0` `1` `2` `3` `s` `z` | Optimization level; `s` and `z` optimize for size. |
 | `--profile <name>` | `debug` · `release` | Build profile, as declared in `raz.toml`. |
+| `--target <triple>` | target triple | Select an explicit non-host target. Native host builds are automatic and should omit this option. |
 | `--entry=<path>` | | Override the package entry module. |
 | `--features=<a,b>` | | Enable the named build features. |
 | `--all-features` | | Enable every declared feature. |
@@ -49,7 +50,15 @@ These apply to `build`, `run`, `check`, `test`, and `lint` unless noted.
 | `--allow` · `--warn` · `--deny <code\|category>` | | Warning policy, applied in order. |
 | `--deny-warnings` | | Shorthand for making all warnings errors. |
 
-`raz run` passes everything after `--` to the program rather than to the compiler.
+`raz run` builds the package, links a native executable, runs it, and exits with
+the program's status.
+
+> **Known limitation.** Forwarding program arguments with `raz run -- <args>` is
+> implemented in the bootstrap driver but not yet in the shipped compiler, which
+> rejects `--`. Until that lands, a program that needs arguments should be run
+> directly from `target/<profile>/`.
+
+For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug artifacts go to `target/debug/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/<package>`. The Forge object used for native linking is kept under `target/<profile>/native/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
 
 ## Backend commands
 
@@ -73,6 +82,8 @@ raz clean
 raz fmt [--check] [file-or-directory]
 raz doc <file.rz> [output.md]
 ```
+
+`raz clean` removes `target/` (the complete project-local generated-state root) and legacy `build/` / `.raz/` artifacts. Native outputs, incremental caches, Git materializations, registry acceleration files, and publish staging all live beneath `target/` and are regenerated from `raz.toml`, `raz.lock`, and the shared package store. `raz cache clean` remains the explicit command for clearing the per-user shared registry/package cache.
 
 `raz fmt` formats a single `.rz` file or recursively formats every `.rz` file under a directory. With no path it formats the current directory. `--check` reports every file that would change and exits nonzero without rewriting source.
 
@@ -141,7 +152,7 @@ A Git source is written `git:<url>#<commit>`, where the revision must be a 40-ch
 | `raz fetch` · `raz update` | `--workspace` | Operate across all workspace members |
 | Git dependencies | `--no-checkout` | Materialize metadata without checking out a working tree |
 
-`raz search` and `raz info` inspect the static official index without materializing package archives. `raz outdated` compares tracked registry dependencies with the newest published versions and reports the newest version still compatible with each recorded constraint. `raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `.raz-publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
+`raz search` and `raz info` inspect the static official index without materializing package archives. `raz outdated` compares tracked registry dependencies with the newest published versions and reports the newest version still compatible with each recorded constraint. `raz add <package>` and `raz add <package>@<constraint>` resolve from the official [`raz-language/packages`](https://github.com/raz-language/packages) registry. `raz pack` creates a deterministic `.dpk` archive from the current package. Without a registry override, `raz publish` prepares a `target/publish/` submission tree for the official GitHub registry. Explicit HTTP/HTTPS and filesystem registries remain supported for private registries; Bearer authentication uses `RAZ_REGISTRY_TOKEN`.
 
 See [Package management](PACKAGE-MANAGEMENT.md) for the official registry, private registries, mirror fallback, package archives, publishing, the shared content-addressed store, lockfiles, and offline behavior.
 
@@ -184,7 +195,7 @@ Raz keeps normal command output compact and action-oriented. Work is shown at pa
     Finished app [release, host] (3 compiled, 8 fresh) in 412 ms
 ```
 
-`raz run` adds a final aligned `Running` line before transferring control to the built executable. Arguments after `--` are forwarded unchanged to the program, and the program's exit status is preserved. Status labels remain aligned across build, test, package, install, and tooling commands.
+`raz run` adds a final aligned ``Running `<path>` `` line naming the executable it is about to launch, then transfers control to it and exits with the program's status. Status labels remain aligned across build, test, package, install, and tooling commands.
 
 Color is automatic when stdout/stderr is attached to a terminal. It can be controlled explicitly:
 

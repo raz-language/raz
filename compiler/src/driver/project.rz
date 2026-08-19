@@ -7,6 +7,76 @@ public import raz_compiler_driver_incremental;
 
 // Project loading for raz.toml packages, deterministic source ordering, and
 // compiler diagnostics used before the frontend begins parsing source text.
+fn project_registry_cache_path(i64 output, i64 capacity) -> i64 {
+    if (output == 0 || capacity < 16) {
+        return -1;
+    }
+
+    i64 canonical[16] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+    i64 target_dir = raz_compiler_rt_arena_create(6);
+    i64 r16 = raz_compiler_rt_arena_create(16);
+    i64 legacy = raz_compiler_rt_arena_create(12);
+
+    if (target_dir == 0 || r16 == 0 || legacy == 0) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < 16) {
+        raz_compiler_rt_arena_set(output, i, canonical[i]);
+        i += 1;
+    }
+
+    i64 target_bytes[6] = [116, 97, 114, 103, 101, 116];
+
+    i = 0;
+    while (i < 6) {
+        raz_compiler_rt_arena_set(target_dir, i, target_bytes[i]);
+        i += 1;
+    }
+    if (raz_compiler_rt_create_dir_ascii(target_dir, 6) != 0) {
+        return -1;
+    }
+
+    i64 r16_bytes[16] = [46, 47, 46, 114, 97, 122, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+
+    i = 0;
+    while (i < 16) {
+        raz_compiler_rt_arena_set(r16, i, r16_bytes[i]);
+        i += 1;
+    }
+
+    i64 legacy_bytes[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+
+    i = 0;
+    while (i < 12) {
+        raz_compiler_rt_arena_set(legacy, i, legacy_bytes[i]);
+        i += 1;
+    }
+    if (raz_compiler_rt_path_exists_ascii(output, 16) == 0) {
+        if (raz_compiler_rt_path_exists_ascii(r16, 16) != 0) {
+            if (raz_compiler_rt_copy_file_ascii(r16, 16, output, 16) < 0) {
+                return -1;
+            }
+        } else if (raz_compiler_rt_path_exists_ascii(legacy, 12) != 0) {
+            if (raz_compiler_rt_copy_file_ascii(legacy, 12, output, 16) < 0) {
+                return -1;
+            }
+        }
+    }
+    if (raz_compiler_rt_path_exists_ascii(r16, 16) != 0) {
+        raz_compiler_rt_remove_path_ascii(r16, 16);
+    }
+    if (raz_compiler_rt_path_exists_ascii(legacy, 12) != 0) {
+        raz_compiler_rt_remove_path_ascii(legacy, 12);
+    }
+    raz_compiler_rt_arena_destroy(target_dir);
+    raz_compiler_rt_arena_destroy(r16);
+    raz_compiler_rt_arena_destroy(legacy);
+    return 16;
+}
+
 fn project_registry_bare_constraint(i64 spec, i64 length) -> bool {
     if (spec == 0 || length <= 0) {
         return false;
@@ -165,6 +235,211 @@ fn path_dirname(i64 path, i64 length, i64 output, i64 capacity) -> i64 {
     return count;
 }
 
+struct ProjectNativeBuild {
+    bool active;
+    i64 object_path;
+    i64 object_length;
+}
+
+fn project_native_build_init(ProjectNativeBuild&mut build) {
+    build.active = false;
+    build.object_path = 0;
+    build.object_length = 0;
+}
+
+fn project_prepare_default_native_build(
+    i64 manifest_path,
+    i64 manifest_path_length,
+    bool release_profile,
+    i64 backend,
+    i64&mut optimization_kind,
+    i64&mut emit_kind,
+    bool&mut forge_native,
+    i64&mut artifact_path,
+    i64&mut artifact_length,
+    ProjectNativeBuild&mut build,
+) -> bool {
+    build.object_path = raz_compiler_rt_arena_create(8192);
+    *artifact_path = raz_compiler_rt_arena_create(8192);
+    if (build.object_path == 0 || *artifact_path == 0) {
+        project_native_build_destroy(build);
+        if (*artifact_path != 0) {
+            raz_compiler_rt_arena_destroy(*artifact_path);
+            *artifact_path = 0;
+        }
+        return false;
+    }
+    if (
+        !project_default_native_paths(
+            manifest_path,
+            manifest_path_length,
+            release_profile,
+            build.object_path,
+            8192,
+            *artifact_path,
+            8192,
+            &mut build.object_length,
+            artifact_length,
+        )
+    ) {
+        project_native_build_destroy(build);
+        raz_compiler_rt_arena_destroy(*artifact_path);
+        *artifact_path = 0;
+        *artifact_length = 0;
+        return false;
+    }
+    build.active = true;
+    if (*optimization_kind < 0) {
+        *optimization_kind = 0;
+        if (release_profile) {
+            *optimization_kind = 3;
+        }
+    }
+    if (backend == 0) {
+        *forge_native = true;
+    } else if (backend == 1) {
+        *emit_kind = 2;
+    }
+    return true;
+}
+
+fn project_native_backend_output(
+    ProjectNativeBuild& build,
+    i64 backend,
+    i64&mut output_path,
+    i64&mut output_length,
+) {
+    if (build.active && backend == 0) {
+        *output_path = build.object_path;
+        *output_length = build.object_length;
+    }
+}
+
+fn project_native_build_finish(
+    ProjectNativeBuild& build,
+    i64 backend,
+    i64 artifact_path,
+    i64 artifact_length,
+) -> bool {
+    if (!build.active || backend != 0) {
+        return true;
+    }
+    // A successful project build is defined by the materialized artifact, not
+    // merely by reaching the end of backend dispatch. Never report success when
+    // the native object or final executable is absent.
+    if (
+        build.object_path == 0 ||
+        build.object_length <= 0 ||
+        artifact_path == 0 ||
+        artifact_length <= 0 ||
+        raz_compiler_rt_path_exists_ascii(build.object_path, build.object_length) == 0
+    ) {
+        return false;
+    }
+    if (
+        raz_compiler_forge_link_executable_i64(
+            build.object_path,
+            build.object_length,
+            artifact_path,
+            artifact_length,
+        ) <= 0
+    ) {
+        return false;
+    }
+    return raz_compiler_rt_path_exists_ascii(artifact_path, artifact_length) != 0;
+}
+
+fn project_native_build_destroy(ProjectNativeBuild&mut build) {
+    if (build.object_path != 0) {
+        raz_compiler_rt_arena_destroy(build.object_path);
+    }
+    build.active = false;
+    build.object_path = 0;
+    build.object_length = 0;
+}
+
+fn project_default_native_paths(
+    i64 manifest_path,
+    i64 manifest_path_length,
+    bool release_profile,
+    i64 object_path,
+    i64 object_capacity,
+    i64 artifact_path,
+    i64 artifact_capacity,
+    i64&mut object_length,
+    i64&mut artifact_length,
+) -> bool {
+    if (
+        manifest_path == 0 ||
+        manifest_path_length <= 0 ||
+        object_path == 0 ||
+        artifact_path == 0 ||
+        object_capacity <= 0 ||
+        artifact_capacity <= 0
+    ) {
+        return false;
+    }
+
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 package_name = raz_compiler_rt_arena_create(4096);
+
+    if (manifest == 0 || package_name == 0) {
+        if (manifest != 0) {
+            raz_compiler_rt_arena_destroy(manifest);
+        }
+        if (package_name != 0) {
+            raz_compiler_rt_arena_destroy(package_name);
+        }
+        return false;
+    }
+
+    i64 manifest_length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536, );
+    i64 package_name_length = -1;
+
+    if (manifest_length > 0) {
+        package_name_length = manifest_package_name(manifest, manifest_length, package_name, 4096);
+    }
+    if (manifest_length <= 0 || package_name_length <= 0) {
+        raz_compiler_rt_arena_destroy(package_name);
+        raz_compiler_rt_arena_destroy(manifest);
+        return false;
+    }
+
+    i64 profile = 0;
+
+    if (release_profile) {
+        profile = 1;
+    }
+    i64 final_artifact_length = raz_compiler_project_native_path_i64(
+        manifest_path,
+        manifest_path_length,
+        package_name,
+        package_name_length,
+        profile,
+        0,
+        artifact_path,
+        artifact_capacity,
+    );
+    i64 final_object_length = raz_compiler_project_native_path_i64(
+        manifest_path,
+        manifest_path_length,
+        package_name,
+        package_name_length,
+        profile,
+        1,
+        object_path,
+        object_capacity,
+    );
+    raz_compiler_rt_arena_destroy(package_name);
+    raz_compiler_rt_arena_destroy(manifest);
+    if (final_artifact_length <= 0 || final_object_length <= 0) {
+        return false;
+    }
+    *artifact_length = final_artifact_length;
+    *object_length = final_object_length;
+    return true;
+}
+
 fn path_vendor_active() -> bool {
     i64 marker = raz_compiler_rt_arena_create(13);
 
@@ -191,31 +466,57 @@ fn path_vendor_git(i64 right, i64 start, i64 count, i64 output, i64 capacity) ->
         return 0;
     }
 
-    i64 prefix_a[11] = [46, 47, 46, 114, 97, 122, 47, 103, 105, 116, 47];
-    i64 prefix_b[9] = [46, 114, 97, 122, 47, 103, 105, 116, 47];
+    i64 prefix_a[13] = [46, 47, 116, 97, 114, 103, 101, 116, 47, 103, 105, 116, 47];
+    i64 prefix_b[11] = [116, 97, 114, 103, 101, 116, 47, 103, 105, 116, 47];
+    i64 legacy_a[11] = [46, 47, 46, 114, 97, 122, 47, 103, 105, 116, 47];
+    i64 legacy_b[9] = [46, 114, 97, 122, 47, 103, 105, 116, 47];
     i64 prefix_length = 0;
-    bool matched = count > 11;
+    bool matched = count > 13;
     i64 i = 0;
 
-    while (matched && i < 11) {
+    while (matched && i < 13) {
         if (raz_compiler_rt_arena_get(right, start + i) != prefix_a[i]) {
             matched = false;
         }
         i += 1;
     }
     if (matched) {
-        prefix_length = 11;
+        prefix_length = 13;
     } else {
-        matched = count > 9;
+        matched = count > 11;
         i = 0;
-        while (matched && i < 9) {
+        while (matched && i < 11) {
             if (raz_compiler_rt_arena_get(right, start + i) != prefix_b[i]) {
                 matched = false;
             }
             i += 1;
         }
         if (matched) {
-            prefix_length = 9;
+            prefix_length = 11;
+        } else {
+            matched = count > 11;
+            i = 0;
+            while (matched && i < 11) {
+                if (raz_compiler_rt_arena_get(right, start + i) != legacy_a[i]) {
+                    matched = false;
+                }
+                i += 1;
+            }
+            if (matched) {
+                prefix_length = 11;
+            } else {
+                matched = count > 9;
+                i = 0;
+                while (matched && i < 9) {
+                    if (raz_compiler_rt_arena_get(right, start + i) != legacy_b[i]) {
+                        matched = false;
+                    }
+                    i += 1;
+                }
+                if (matched) {
+                    prefix_length = 9;
+                }
+            }
         }
     }
     if (prefix_length == 0) {
@@ -354,21 +655,21 @@ fn path_registry_store_root(i64 output, i64 capacity) -> i64 {
         return home_length + suffix_length;
     }
 
-    i64 fallback[12] = [46, 47, 46, 114, 97, 122, 47, 115, 116, 111, 114, 101];
+    i64 fallback[14] = [46, 47, 116, 97, 114, 103, 101, 116, 47, 115, 116, 111, 114, 101];
 
-    if (capacity < 12) {
+    if (capacity < 14) {
         raz_compiler_rt_arena_destroy(key);
         raz_compiler_rt_arena_destroy(home);
         return -1;
     }
     i = 0;
-    while (i < 12) {
+    while (i < 14) {
         raz_compiler_rt_arena_set(output, i, fallback[i]);
         i += 1;
     }
     raz_compiler_rt_arena_destroy(key);
     raz_compiler_rt_arena_destroy(home);
-    return 12;
+    return 14;
 }
 
 fn path_registry_decl(i64 right, i64 start, i64 count) -> bool {
@@ -547,22 +848,22 @@ fn path_registry_locked_checksum(i64 right, i64 start, i64 count, i64 output, i6
     // During `raz add`, the new exact resolution exists in the transient cache
     // before raz.lock is regenerated. Use it only as a bootstrap fallback.
 
-    i64 cache_path = raz_compiler_rt_arena_create(16);
+    i64 cache_path = raz_compiler_rt_arena_create(20);
     i64 cache = raz_compiler_rt_arena_create(1048576);
 
     if (cache_path == 0 || cache == 0) {
         return -1;
     }
 
-    i64 cp[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+    i64 cache_path_length = project_registry_cache_path(cache_path, 20);
 
-    i = 0;
-    while (i < 12) {
-        raz_compiler_rt_arena_set(cache_path, i, cp[i]);
-        i += 1;
+    if (cache_path_length <= 0) {
+        raz_compiler_rt_arena_destroy(cache_path);
+        raz_compiler_rt_arena_destroy(cache);
+        return -1;
     }
 
-    i64 cache_length = raz_compiler_rt_read_ascii(cache_path, 12, cache, 1048576);
+    i64 cache_length = raz_compiler_rt_read_ascii(cache_path, cache_path_length, cache, 1048576);
 
     raz_compiler_rt_arena_destroy(cache_path);
     if (cache_length > 0) {

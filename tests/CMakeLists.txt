@@ -1650,6 +1650,10 @@ add_test(NAME raz-cli-output-diagnostics
     --work ${CMAKE_CURRENT_BINARY_DIR}/cli-output-diagnostics-work)
 set_tests_properties(raz-cli-output-diagnostics PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
+add_test(NAME raz-project-native-output
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-project-native-output.py)
+set_tests_properties(raz-project-native-output PROPERTIES TIMEOUT 30)
+
 add_test(NAME raz-sync-policy-runtime
   COMMAND ${CMAKE_COMMAND}
     -DRAZ_EXE=$<TARGET_FILE:raz_host>

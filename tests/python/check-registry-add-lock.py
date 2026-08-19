@@ -28,7 +28,16 @@ checks = {
     'lockfile path join uses arena handle rather than array reference': 'i64 lock_name = raz_compiler_rt_arena_create(8);' in project and 'path_join(root, root_length, lock_name, 8, lock_path, 8192)' in project and '&lock_name' not in project,
     'project assembly records lockfile after manifest root resolution': '!project_record_lock_input(state, root, root_length)' in project,
     'lockfile input is optional for path-only projects': 'raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0' in project,
-    'incremental cache schema invalidates pre-lock-aware project caches': 'fn incremental_cache_schema() -> i64 {\n    return 4;\n}' in incremental,
+    'incremental cache schema invalidates pre-target-layout caches': 'fn incremental_cache_schema() -> i64 {\n    return 5;\n}' in incremental,
+    'project package cache lives directly under target': 'i64 bytes[16] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];' in registry,
+    'project registry tracking lives directly under target': 'i64 bytes[19] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];' in registry,
+    'legacy package-manager state is migrated on first access': 'fn registry_project_state_prepare(' in registry and 'raz_compiler_rt_copy_file_ascii(r16, r16_length, output, length)' in registry and 'raz_compiler_rt_copy_file_ascii(root_legacy, root_length, output, length)' in registry,
+    'package lock cache lookup uses canonical project-state helper': 'registry_project_state_prepare(0, path, 20)' in package,
+    'Git materializations live under target': 'i64 parent_bytes[12] = [46, 47, 116, 97, 114, 103, 101, 116, 47, 103, 105, 116];' in package,
+    'ordinary build preflight rehydrates Git cache': 'status = package_git_fetch_tracked();' in registry,
+    'locked registry packages reuse shared store before index lookup': registry.find('registry_store_path(checksum, checksum_length, locked_store, 8192)') < registry.find('registry_resolve_mode(\n        name,\n        name_length,\n        version,'),
+    'offline locked build avoids registry index when shared store is present': 'if (registry_offline()) {\n        return 64;' in registry,
+    'project assembly cache fallback uses canonical target/raz.cache path': 'fn project_registry_cache_path(' in project and 'i64 cache_path_length = project_registry_cache_path(cache_path, 20);' in project,
 }
 failed=[name for name,ok in checks.items() if not ok]
 if failed:

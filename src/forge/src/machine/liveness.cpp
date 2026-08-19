@@ -12,8 +12,24 @@ bool has_result(Opcode opcode) noexcept {
     switch (opcode) {
     case Opcode::store_stack_i8: case Opcode::store_stack_i16: case Opcode::store_stack_i32:
     case Opcode::store_stack_i64: case Opcode::store_stack_f32: case Opcode::store_stack_f64:
+    case Opcode::store_stack_v128: case Opcode::store_stack_v256: case Opcode::store_stack_v512:
     case Opcode::store_ptr_i8: case Opcode::store_ptr_i16: case Opcode::store_ptr_i32:
     case Opcode::store_ptr_i64: case Opcode::store_ptr_f32: case Opcode::store_ptr_f64:
+    case Opcode::add_i64_contiguous_inplace:
+    case Opcode::binary_i32_contiguous_inplace:
+    case Opcode::binary_i64_contiguous_inplace:
+    case Opcode::binary_i32_contiguous_map:
+    case Opcode::binary_i64_contiguous_map:
+    case Opcode::binary_i32_contiguous_map2:
+    case Opcode::binary_i64_contiguous_map2:
+    case Opcode::binary_i32_contiguous_map3:
+    case Opcode::binary_i64_contiguous_map3:
+    case Opcode::binary_i32_contiguous_chain:
+    case Opcode::binary_i64_contiguous_chain:
+    case Opcode::binary_i32_contiguous_dag:
+    case Opcode::binary_i64_contiguous_dag:
+    case Opcode::binary_i32_contiguous_dag_reuse:
+    case Opcode::binary_i64_contiguous_dag_reuse:
     case Opcode::call_void: case Opcode::call_aggregate: case Opcode::call_indirect_void:
     case Opcode::jump: case Opcode::branch_i1:
     case Opcode::return_i32: case Opcode::return_i64: case Opcode::return_f32:

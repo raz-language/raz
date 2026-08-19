@@ -367,13 +367,27 @@ int main(int argc, char** argv) {
         forge::pass::PassManager pipeline;
         forge::pass::build_standard_pipeline(pipeline, level);
         try {
-            const auto report = pipeline.run_with_report(*module);
             if (pass_stats) {
+                const auto report = pipeline.run_with_report(*module, false);
                 std::cerr << "FORGE  pipeline -" << forge::pass::optimization_level_name(level)
                           << " passes=" << pipeline.pass_names().size()
                           << " rewritten=" << report.total.operations_rewritten
                           << " removed=" << report.total.operations_removed
                           << " blocks=" << report.total.blocks_removed << '\n';
+            } else {
+                (void)pipeline.run(*module, false);
+            }
+            // Production compilation verifies once, at the optimized-IR
+            // boundary. Verifying the whole module after every pass is O(passes
+            // x module) and dominated compile time on realistic inputs; the
+            // per-pass checks remain available through `forge opt` for
+            // diagnosing which pass broke the IR.
+            const auto optimized = forge::ir::verify_module(*module);
+            for (const auto& diagnostic : optimized) {
+                if (diagnostic.severity == forge::DiagnosticSeverity::error) {
+                    print_diagnostics(optimized);
+                    return 1;
+                }
             }
         } catch (const std::exception& error) {
             std::cerr << "error: " << error.what() << '\n';

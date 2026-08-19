@@ -37,6 +37,8 @@ def main():
     else:
         root=Path(ns.root).resolve(); c=str(build_test_compiler(root, work, ns.raz, ns.linker, env))
     reg=work/'registry';reg.mkdir(parents=True);app=work/'app';(app/'src').mkdir(parents=True)
+    state=app/'target'; tracking_file=state/'raz.registry'; cache_file=state/'raz.cache'
+    legacy_tracking=app/'.raz.registry'; legacy_cache=app/'.raz.cache'
     entries=[make_pkg(reg,v) for v in ('1.2.0','1.7.3','2.0.0','1.10.0-alpha.1')]; index=reg/'index';index.write_text('\n'.join(entries)+'\n')
     (app/'raz.toml').write_text('[package]\nname = "app"\nversion = "0.1.0"\nkind = "executable"\nsource = "src"\nentry = "src/main.rz"\n\n[dependencies]\n');(app/'src/main.rz').write_text('fn main() -> i64 { return 0; }\n')
     env['RAZ_REGISTRY_INDEX']=str(index); env['RAZ_HOME']=str(work/'home')
@@ -46,7 +48,25 @@ def main():
     assert 'widget@2.0.0' in run([c,'registry','widget','>=1.2.0'],app,env).stdout
     assert 'widget@1.10.0-alpha.1' in run([c,'registry','widget','1.10.0-alpha.1'],app,env).stdout
     run([c,'add','widget','registry:widget@^1.2.0'],app,env)
-    assert 'widget@^1.2.0' in (app/'.raz.registry').read_text(); assert 'widget = "^1.2.0"' in (app/'raz.toml').read_text(); assert '1.7.3' in (app/'.raz.cache').read_text(); assert any((work/'home/store').glob('*/raz.toml'))
+    assert 'widget@^1.2.0' in tracking_file.read_text(); assert 'widget = "^1.2.0"' in (app/'raz.toml').read_text(); assert '1.7.3' in cache_file.read_text(); assert any((work/'home/store').glob('*/raz.toml'))
+    assert not legacy_tracking.exists() and not legacy_cache.exists(), 'new commands recreated legacy root-level state files'
+
+    # Both historical layouts migrate into target/. First exercise the
+    # pre-R16 project-root dotfiles.
+    shutil.copy2(tracking_file,legacy_tracking); tracking_file.unlink()
+    shutil.copy2(cache_file,legacy_cache); cache_file.unlink()
+    run([c,'update'],app,env)
+    assert tracking_file.is_file() and cache_file.is_file(), 'legacy project state was not migrated into target/'
+    assert not legacy_tracking.exists() and not legacy_cache.exists(), 'legacy project-root state survived migration'
+
+    # Then exercise the R16-R18 .raz/ layout.
+    r16=app/'.raz'; r16.mkdir(exist_ok=True)
+    shutil.copy2(tracking_file,r16/'raz.registry'); tracking_file.unlink()
+    shutil.copy2(cache_file,r16/'raz.cache'); cache_file.unlink()
+    run([c,'update'],app,env)
+    assert tracking_file.is_file() and cache_file.is_file(), 'R16 project state was not migrated into target/'
+    assert not (r16/'raz.registry').exists() and not (r16/'raz.cache').exists(), 'R16 state files survived migration'
+
     helper_entry=make_named_pkg(reg,'helper','0.3.0')
     with index.open('a') as f:f.write(helper_entry+'\n')
     run([c,'add','helper','registry:helper@^0.3.0'],app,env)
@@ -80,24 +100,29 @@ def main():
 
     with index.open('a') as f:f.write(make_named_pkg(reg,'devtool','0.1.0')+'\n')
     run([c,'add','devtool','registry:devtool@^0.1.0','--dev'],app,env)
-    tracking=(app/'.raz.registry').read_text()
+    tracking=tracking_file.read_text()
     assert 'devtool@^0.1.0|3' in tracking, tracking
     manifest=(app/'raz.toml').read_text(); assert '[dev-dependencies]' in manifest and 'devtool = ' in manifest
-    cache=(app/'.raz.cache').read_text()
+    cache=cache_file.read_text()
     assert 'widget widget 1.7.3 ' in cache and 'helper helper 0.3.0 ' in cache and 'devtool devtool 0.1.0 ' in cache, cache
     with index.open('a') as f:f.write(make_pkg(reg,'1.9.0')+'\n')
     with index.open('a') as f:f.write(make_named_pkg(reg,'devtool','0.1.5')+'\n')
     run([c,'update'],app,env); manifest=(app/'raz.toml').read_text(); assert 'widget = "^1.2.0"' in manifest; assert '[dev-dependencies]' in manifest and 'devtool = ' in manifest; lock=(app/'raz.lock').read_bytes(); assert b'version = "1.9.0"' in lock and b'version = "0.1.5"' in lock; assert b'source = "registry"' in lock and b'checksum = "' in lock; assert str(work/'home/store').encode() not in lock
     stable=hashlib.sha256(lock).hexdigest()
     with index.open('a') as f:f.write(make_pkg(reg,'1.9.5')+'\n')
-    run([c,'fetch'],app,env); assert hashlib.sha256((app/'raz.lock').read_bytes()).hexdigest()==stable; assert '1.9.0' in (app/'.raz.cache').read_text()
+    run([c,'fetch'],app,env); assert hashlib.sha256((app/'raz.lock').read_bytes()).hexdigest()==stable; assert '1.9.0' in cache_file.read_text()
     tree=run([c,'tree'],app,env).stdout; assert 'app' in tree and 'widget' in tree
     run([c,'update'],app,env); assert b'version = "1.9.5"' in (app/'raz.lock').read_bytes()
-    run([c,'remove','widget'],app,env); assert 'widget@^1.2.0' not in (app/'.raz.registry').read_text(); before=(app/'raz.toml').read_text();run([c,'update'],app,env);assert (app/'raz.toml').read_text()==before
+    run([c,'remove','widget'],app,env); assert 'widget@^1.2.0' not in tracking_file.read_text(); before=(app/'raz.toml').read_text();run([c,'update'],app,env);assert (app/'raz.toml').read_text()==before
     run([c,'add','widget@^1.2.0'],app,env)
-    assert 'widget@^1.2.0' in (app/'.raz.registry').read_text(), 'official registry shorthand was not tracked'
+    assert 'widget@^1.2.0' in tracking_file.read_text(), 'official registry shorthand was not tracked'
+    # target/ is disposable. A clean build must recreate package-manager state
+    # from raz.lock and the shared content-addressed store.
+    shutil.rmtree(app/'target', ignore_errors=True)
+    run([c,'check'],app,env)
+    assert tracking_file.is_file() and cache_file.is_file(), 'clean project state was not reconstructed under target/'
     # Stored packages remain usable offline even if the registry source disappears.
-    cache_row=next(line for line in (app/'.raz.cache').read_text().splitlines() if line.startswith('widget ')); selected_store=Path(cache_row.split()[3]).resolve()
+    cache_row=next(line for line in cache_file.read_text().splitlines() if line.startswith('widget ')); selected_store=Path(cache_row.split()[3]).resolve()
     shutil.rmtree(reg/'widget-1_9_0', ignore_errors=True)
     offline=env.copy(); offline['RAZ_OFFLINE']='1'
     run([c,'update'],app,offline)

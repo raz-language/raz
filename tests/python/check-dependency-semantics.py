@@ -142,9 +142,11 @@ def main() -> int:
     expected_kind = {"windows": 6, "linux": 7, "macos": 8}[target]
     assert spec in tracking and f"|{expected_kind}" in tracking
     git_manifest = (gapp / "raz.toml").read_text(encoding="utf-8").replace("\\", "/")
-    assert f"[target.{target}.dependencies]" in git_manifest and "./.raz/git/" in git_manifest
+    assert f"[target.{target}.dependencies]" in git_manifest and "./target/git/" in git_manifest
     run([c, "check", "raz.toml"], gapp, env)
-    shutil.rmtree(gapp / ".raz" / "git")
+    shutil.rmtree(gapp / "target" / "git")
+    run([c, "check", "raz.toml"], gapp, env)
+    assert (gapp / "target" / "git").is_dir(), "ordinary build did not rehydrate target/git"
     run([c, "fetch"], gapp, env)
     git_manifest = (gapp / "raz.toml").read_text(encoding="utf-8")
     assert f"[target.{target}.dependencies]" in git_manifest

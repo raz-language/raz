@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
   ProjectGraph graph;
   ProjectError error;
   if (!raz::compiler::discover_project(options.project, graph, error)) { cli_error(error.message); return 1; }
-  const auto workspace_state_path = graph.manifest.root / ".raz" / "cache" / "workspace-v1.state";
+  const auto workspace_state_path = graph.manifest.root / "target" / "cache" / "workspace-v1.state";
   const auto previous_workspace = WorkspaceGraph::load(workspace_state_path);
   const auto current_workspace = raz::compiler::build_workspace_graph(graph);
   const auto workspace_delta = previous_workspace.has_value()
@@ -164,9 +164,12 @@ int main(int argc, char** argv) {
     std::error_code clean_error;
     const auto target_removed = std::filesystem::remove_all(graph.manifest.root / "target", clean_error);
     if (clean_error) { cli_errorf("could not clean build artifacts: ", clean_error.message()); return 1; }
-    const auto cache_removed = std::filesystem::remove_all(graph.manifest.root / ".raz", clean_error);
-    if (clean_error) { cli_errorf("could not clean compiler cache: ", clean_error.message()); return 1; }
-    cli_status("Cleaned", graph.manifest.name + " (" + std::to_string(target_removed + cache_removed) + " entries removed)", raz::terminal::green);
+    // target/ is the complete project-local generated-state root. Also remove
+    // the legacy pre-R19 .raz/ directory so upgraded projects converge on the
+    // canonical layout after their first clean.
+    const auto legacy_removed = std::filesystem::remove_all(graph.manifest.root / ".raz", clean_error);
+    if (clean_error) { cli_errorf("could not clean legacy project state: ", clean_error.message()); return 1; }
+    cli_status("Cleaned", graph.manifest.name + " (" + std::to_string(target_removed + legacy_removed) + " entries removed)", raz::terminal::green);
     return 0;
   }
 
@@ -218,7 +221,7 @@ int main(int argc, char** argv) {
       std::vector<TestResult> test_results;
       for (const auto& test_path : discovered_tests) {
         const auto& entry_path = test_path;
-        const auto test_root = graph.manifest.root / "target" / options.target / options.profile / "tests" / entry_path.stem();
+        const auto test_root = project_output_root(graph, options) / "tests" / entry_path.stem();
         std::filesystem::create_directories(test_root);
         const auto test_ir = test_root / "test.fir";
 #if defined(_WIN32)
@@ -255,9 +258,16 @@ int main(int argc, char** argv) {
   }
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
   if (!g_quiet) {
+    // Match the production driver's completion line: the package name is
+    // already on the Compiling line, so this one reports the profile that was
+    // built and how long it took. The compiled/fresh counts stay because they
+    // say something the profile does not.
     std::ostringstream summary;
-    summary << graph.manifest.name << " [" << options.profile << ", " << options.target << "] ("
-            << compiled << " compiled, " << fresh << " fresh) in " << elapsed << " ms";
+    summary << '`' << options.profile << "` profile ["
+            << (options.profile == "release" ? "optimized" : "unoptimized + debuginfo")
+            << "] target(s) (" << compiled << " compiled, " << fresh << " fresh) in "
+            << (elapsed / 1000) << '.' << std::setfill('0') << std::setw(2) << ((elapsed % 1000) / 10)
+            << 's';
     cli_status(check_only ? "Checked" : "Finished", summary.str(), raz::terminal::green);
   }
 

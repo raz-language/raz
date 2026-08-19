@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,17 +33,27 @@ def prepare_seed_project(root: Path, project: Path) -> None:
         "public import raz_compiler_backend_rxe_codegen;",
         "public import raz_compiler_backend_llvm_codegen;",
     )
-    wasm_options = text.find("  // --backend=wasm\n")
-    if wasm_options >= 0:
-        option_end = text.find("  return -1;\n", wasm_options)
-        if option_end < 0:
-            raise RuntimeError("could not prepare compiler candidate backend option view")
-        text = text[:wasm_options] + text[option_end:]
-    for block in (
-        "  if (backend == 2) {\n    return emit_wasm_module(source, hir, mir, output_path, output_path_length);\n  }\n",
-        "  if (backend == 3) {\n    return emit_rxe_module(source, hir, mir, output_path, output_path_length);\n  }\n",
-    ):
-        text = text.replace(block, "")
+    text, option_replacements = re.subn(
+        r"(?ms)^[ \t]*// --backend=wasm\r?\n.*?(?=^[ \t]*return -1;)",
+        "",
+        text,
+        count=1,
+    )
+    if option_replacements != 1:
+        raise RuntimeError("could not prepare compiler candidate backend option view")
+
+    for backend_kind, emitter in ((2, "emit_wasm_module"), (3, "emit_rxe_module")):
+        pattern = (
+            rf"(?ms)^[ \t]*if \(backend == {backend_kind}\) \{{\r?\n"
+            rf"[ \t]*return {emitter}\([^;]*\);\r?\n"
+            rf"[ \t]*\}}\r?\n"
+        )
+        text, replacements = re.subn(pattern, "", text, count=1)
+        if replacements != 1:
+            raise RuntimeError(f"could not remove compiler candidate {emitter} dispatch")
+
+    if "emit_wasm_module(" in text or "emit_rxe_module(" in text:
+        raise RuntimeError("optional backend dispatch leaked into compiler candidate view")
     backend.write_text(text, encoding="utf-8")
 
     for source in (project / "src").rglob("*.rz"):
@@ -64,7 +75,7 @@ def build_test_compiler(root: Path, work: Path, host_compiler: str, linker: str,
     prepare_seed_project(root, project)
     env["RAZ_LINKER"] = linker
     p = subprocess.run(
-        [host_compiler, "build", str(project), "--target", "host", "--profile", "debug", "--force"],
+        [host_compiler, "build", str(project), "--profile", "debug", "--force"],
         cwd=root,
         env=env,
         text=True,

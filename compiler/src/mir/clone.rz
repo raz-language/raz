@@ -1,0 +1,265 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_mir_clone;
+
+public import raz_compiler_mir_ownership_lowering_paths;
+
+// Clone lowering for aggregates. Structure and enum cloning are mutually
+// recursive but reach nothing else in HIR->MIR lowering: they only read HIR type
+// shape and emit MIR, so they live outside the expression/statement/cleanup
+// cluster that the rest of lowering deliberately keeps together.
+fn mir_clone_structure_value(HirModule& hir, MirModule&mut mir, i64 source, i64 structure) -> i64 {
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 count = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    i64 storage = mir_emit(mir, 30, count, 0, 0, 0);
+    i64 field = 0;
+
+    while (field < count) {
+        i64 metadata = first + field;
+        i64 index = mir_emit(mir, 1, field, 0, 0, 0);
+        i64 field_type = raz_compiler_rt_arena_get(hir.struct_field_types, metadata);
+        i64 child = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+        i64 extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+        i64 value = mir_emit_typed(mir, 28, source, index, 0, 0, field_type);
+
+        if (extent >= 0) {
+            // A fixed-array field is represented by an aggregate image handle,
+            // not by element 0. Clone every element into a fresh image so
+            // derived Clone preserves fixed arrays instead of accidentally
+            // cloning only their first slot.
+
+            i64 array_storage = mir_emit(mir, 30, extent, 0, 0, 0);
+            i64 element = 0;
+
+            while (element < extent) {
+                i64 element_index = mir_emit(mir, 1, element, 0, 0, 0);
+                i64 element_value = mir_emit_typed(mir, 28, value, element_index, 0, 0, field_type);
+
+                if (
+                    child >= 0 &&
+                    raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0 &&
+                    raz_compiler_rt_arena_get(hir.struct_copy_flags, child) == 0
+                ) {
+                    i64 clone_function = raz_compiler_rt_arena_get(hir.struct_clone_functions, child);
+
+                    if (clone_function >= 0 && mir.call_argument_count < 524288) {
+                        i64 argument_start = mir.call_argument_count;
+
+                        raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, element_value);
+                        mir.call_argument_count += 1;
+                        element_value = mir_emit_typed(
+                            mir,
+                            8,
+                            clone_function,
+                            argument_start,
+                            1,
+                            0,
+                            field_type,
+                        );
+                    } else if (raz_compiler_rt_arena_get(hir.struct_derived_clone_flags, child) != 0) {
+                        element_value = mir_clone_structure_value(hir, mir, element_value, child);
+                    }
+                } else if (hir_type_is_enum(field_type)) {
+                    i64 child_enum = hir_type_enum_index(field_type);
+
+                    if (
+                        raz_compiler_rt_arena_get(hir.enum_copy_flags, child_enum) == 0 &&
+                        raz_compiler_rt_arena_get(hir.enum_derived_clone_flags, child_enum) != 0
+                    ) {
+                        element_value = mir_clone_enum_value(hir, mir, element_value, child_enum);
+                    }
+                }
+                mir_emit(mir, 29, array_storage, element_index, element_value, 0);
+                element += 1;
+            }
+            value = array_storage;
+        } else if (
+            child >= 0 &&
+            raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0 &&
+            raz_compiler_rt_arena_get(hir.struct_copy_flags, child) == 0
+        ) {
+            i64 clone_function = raz_compiler_rt_arena_get(hir.struct_clone_functions, child);
+
+            if (clone_function >= 0 && mir.call_argument_count < 524288) {
+                i64 argument_start = mir.call_argument_count;
+
+                raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, value);
+                mir.call_argument_count += 1;
+                value = mir_emit_typed(mir, 8, clone_function, argument_start, 1, 0, field_type);
+            } else if (raz_compiler_rt_arena_get(hir.struct_derived_clone_flags, child) != 0) {
+                value = mir_clone_structure_value(hir, mir, value, child);
+            }
+        } else if (hir_type_is_enum(field_type)) {
+            i64 child_enum = hir_type_enum_index(field_type);
+
+            if (
+                raz_compiler_rt_arena_get(hir.enum_copy_flags, child_enum) == 0 &&
+                raz_compiler_rt_arena_get(hir.enum_derived_clone_flags, child_enum) != 0
+            ) {
+                value = mir_clone_enum_value(hir, mir, value, child_enum);
+            }
+        }
+        mir_emit(mir, 29, storage, index, value, 0);
+        field += 1;
+    }
+    return storage;
+}
+
+fn mir_clone_enum_value(HirModule& hir, MirModule&mut mir, i64 source, i64 enumeration) -> i64 {
+    i64 member_start = raz_compiler_rt_arena_get(hir.enum_member_starts, enumeration);
+    i64 member_count = raz_compiler_rt_arena_get(hir.enum_member_counts, enumeration);
+    i64 max_payload_count = 0;
+    i64 scan_member = 0;
+
+    while (scan_member < member_count) {
+        i64 payload_count = raz_compiler_rt_arena_get(
+            hir.enum_member_payload_counts,
+            member_start + scan_member,
+        );
+        if (payload_count > max_payload_count) {
+            max_payload_count = payload_count;
+        }
+        scan_member += 1;
+    }
+
+    i64 storage = mir_emit(mir, 30, max_payload_count + 1, 0, 0, 0);
+    i64 zero = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+    i64 tag = mir_emit_typed(mir, 28, source, zero, 0, 0, 0);
+
+    mir_emit(mir, 29, storage, zero, tag, 0);
+    if (member_count <= 0) {
+        return storage;
+    }
+
+    i64 jumps = raz_compiler_rt_arena_create(member_count + 1);
+
+    if (jumps == 0) {
+        return storage;
+    }
+
+    i64 jump_count = 0;
+    i64 member_offset = 0;
+
+    while (member_offset < member_count) {
+        i64 member = member_start + member_offset;
+
+        i64 expected = mir_emit_typed(
+            mir,
+            1,
+            raz_compiler_rt_arena_get(hir.enum_member_values, member),
+            0,
+            0,
+            0,
+            0,
+        );
+
+        i64 matches = mir_emit_typed(mir, 11, tag, expected, 0, 0, 0);
+        i64 branch = mir_emit(mir, 23, matches, -1, -1, -1);
+        i64 clone_block = mir_emit(mir, 24, 0, 0, 0, 0);
+        i64 payload_start = raz_compiler_rt_arena_get(hir.enum_member_payload_starts, member);
+        i64 payload_count = raz_compiler_rt_arena_get(hir.enum_member_payload_counts, member);
+        i64 payload_offset = 0;
+
+        while (payload_offset < payload_count) {
+            i64 payload = payload_start + payload_offset;
+            i64 slot = mir_emit_typed(mir, 1, payload_offset + 1, 0, 0, 0, 0);
+            i64 payload_type = raz_compiler_rt_arena_get(hir.enum_payload_types, payload);
+            i64 child = raz_compiler_rt_arena_get(hir.enum_payload_type_structs, payload);
+            i64 extent = raz_compiler_rt_arena_get(hir.enum_payload_array_extents, payload);
+            i64 value = mir_emit_typed(mir, 28, source, slot, 0, 0, payload_type);
+
+            if (extent >= 0) {
+                i64 array_storage = mir_emit(mir, 30, extent, 0, 0, 0);
+                i64 element = 0;
+
+                while (element < extent) {
+                    i64 element_index = mir_emit_typed(mir, 1, element, 0, 0, 0, 0);
+                    i64 element_value = mir_emit_typed(mir, 28, value, element_index, 0, 0, payload_type);
+
+                    if (child >= 0 && raz_compiler_rt_arena_get(hir.struct_copy_flags, child) == 0) {
+                        i64 clone_function = raz_compiler_rt_arena_get(hir.struct_clone_functions, child);
+
+                        if (clone_function >= 0 && mir.call_argument_count < 524288) {
+                            i64 argument_start = mir.call_argument_count;
+
+                            raz_compiler_rt_arena_set(
+                                mir.call_arguments,
+                                mir.call_argument_count,
+                                element_value,
+                            );
+                            mir.call_argument_count += 1;
+                            element_value = mir_emit_typed(
+                                mir,
+                                8,
+                                clone_function,
+                                argument_start,
+                                1,
+                                0,
+                                payload_type,
+                            );
+                        } else if (raz_compiler_rt_arena_get(hir.struct_derived_clone_flags, child) != 0) {
+                            element_value = mir_clone_structure_value(hir, mir, element_value, child);
+                        }
+                    } else if (hir_type_is_enum(payload_type)) {
+                        i64 child_enum = hir_type_enum_index(payload_type);
+
+                        if (
+                            raz_compiler_rt_arena_get(hir.enum_copy_flags, child_enum) == 0 &&
+                            raz_compiler_rt_arena_get(hir.enum_derived_clone_flags, child_enum) != 0
+                        ) {
+                            element_value = mir_clone_enum_value(hir, mir, element_value, child_enum);
+                        }
+                    }
+                    mir_emit(mir, 29, array_storage, element_index, element_value, 0);
+                    element += 1;
+                }
+                value = array_storage;
+            } else if (child >= 0 && raz_compiler_rt_arena_get(hir.struct_copy_flags, child) == 0) {
+                i64 clone_function = raz_compiler_rt_arena_get(hir.struct_clone_functions, child);
+
+                if (clone_function >= 0 && mir.call_argument_count < 524288) {
+                    i64 argument_start = mir.call_argument_count;
+
+                    raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, value);
+                    mir.call_argument_count += 1;
+                    value = mir_emit_typed(mir, 8, clone_function, argument_start, 1, 0, payload_type);
+                } else if (raz_compiler_rt_arena_get(hir.struct_derived_clone_flags, child) != 0) {
+                    value = mir_clone_structure_value(hir, mir, value, child);
+                }
+            } else if (hir_type_is_enum(payload_type)) {
+                i64 child_enum = hir_type_enum_index(payload_type);
+
+                if (
+                    raz_compiler_rt_arena_get(hir.enum_copy_flags, child_enum) == 0 &&
+                    raz_compiler_rt_arena_get(hir.enum_derived_clone_flags, child_enum) != 0
+                ) {
+                    value = mir_clone_enum_value(hir, mir, value, child_enum);
+                }
+            }
+            mir_emit(mir, 29, storage, slot, value, 0);
+            payload_offset += 1;
+        }
+
+        i64 jump = mir_emit(mir, 22, 0, -1, -1, 0);
+
+        raz_compiler_rt_arena_set(jumps, jump_count, jump);
+        jump_count += 1;
+
+        i64 next_block = mir_emit(mir, 24, 0, 0, 0, 0);
+
+        mir_patch_operand(mir, branch, 1, next_block);
+        mir_patch_operand(mir, branch, 2, clone_block);
+        member_offset += 1;
+    }
+
+    i64 merge = mir_emit(mir, 24, 0, 0, 0, 0);
+    i64 jump_index = 0;
+
+    while (jump_index < jump_count) {
+        mir_patch_target(mir, raz_compiler_rt_arena_get(jumps, jump_index), merge);
+        jump_index += 1;
+    }
+    raz_compiler_rt_arena_destroy(jumps);
+    return storage;
+}

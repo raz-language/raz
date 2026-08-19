@@ -13,6 +13,143 @@ public import raz_compiler_driver_registry_transport;
 extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
 extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
 
+// All project-local generated package-manager state lives beneath target/.
+// This keeps the project root limited to durable metadata (raz.toml / raz.lock)
+// and user sources, and gives `raz clean` one complete generated-state root.
+// kind 0 = target/raz.cache, kind 1 = target/raz.registry.
+public fn registry_project_state_path(i64 kind, i64 output, i64 capacity) -> i64 {
+    if (output == 0) {
+        return -1;
+    }
+    if (kind == 0) {
+        if (capacity < 16) {
+            return -1;
+        }
+
+        i64 bytes[16] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+        i64 i = 0;
+
+        while (i < 16) {
+            raz_compiler_rt_arena_set(output, i, bytes[i]);
+            i += 1;
+        }
+        return 16;
+    }
+    if (kind == 1) {
+        if (capacity < 19) {
+            return -1;
+        }
+
+        i64 bytes[19] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+        i64 i = 0;
+
+        while (i < 19) {
+            raz_compiler_rt_arena_set(output, i, bytes[i]);
+            i += 1;
+        }
+        return 19;
+    }
+    return -1;
+}
+
+// Migrate both historical project-state layouts on first access:
+//   pre-R16: .raz.cache / .raz.registry
+//   R16-R18: .raz/raz.cache / .raz/raz.registry
+// The canonical target/ copy wins if more than one exists. Legacy files are
+// removed after migration; the remaining .raz/ directory is purely legacy and
+// is deleted by `raz clean`.
+public fn registry_project_state_prepare(i64 kind, i64 output, i64 capacity) -> i64 {
+    i64 length = registry_project_state_path(kind, output, capacity);
+
+    if (length <= 0) {
+        return -1;
+    }
+
+    i64 target_dir = raz_compiler_rt_arena_create(6);
+    i64 r16 = raz_compiler_rt_arena_create(24);
+    i64 root_legacy = raz_compiler_rt_arena_create(16);
+
+    if (target_dir == 0 || r16 == 0 || root_legacy == 0) {
+        return -1;
+    }
+
+    i64 target_bytes[6] = [116, 97, 114, 103, 101, 116];
+    i64 i = 0;
+
+    while (i < 6) {
+        raz_compiler_rt_arena_set(target_dir, i, target_bytes[i]);
+        i += 1;
+    }
+    if (raz_compiler_rt_create_dir_ascii(target_dir, 6) != 0) {
+        raz_compiler_rt_arena_destroy(target_dir);
+        raz_compiler_rt_arena_destroy(r16);
+        raz_compiler_rt_arena_destroy(root_legacy);
+        return -1;
+    }
+
+    i64 r16_length = 0;
+    i64 root_length = 0;
+
+    if (kind == 0) {
+        i64 r16_bytes[16] = [46, 47, 46, 114, 97, 122, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+
+        i = 0;
+        while (i < 16) {
+            raz_compiler_rt_arena_set(r16, i, r16_bytes[i]);
+            i += 1;
+        }
+        r16_length = 16;
+
+        i64 root_bytes[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+
+        i = 0;
+        while (i < 12) {
+            raz_compiler_rt_arena_set(root_legacy, i, root_bytes[i]);
+            i += 1;
+        }
+        root_length = 12;
+    } else if (kind == 1) {
+        i64 r16_bytes[19] = [46, 47, 46, 114, 97, 122, 47, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+
+        i = 0;
+        while (i < 19) {
+            raz_compiler_rt_arena_set(r16, i, r16_bytes[i]);
+            i += 1;
+        }
+        r16_length = 19;
+
+        i64 root_bytes[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+
+        i = 0;
+        while (i < 15) {
+            raz_compiler_rt_arena_set(root_legacy, i, root_bytes[i]);
+            i += 1;
+        }
+        root_length = 15;
+    }
+    if (raz_compiler_rt_path_exists_ascii(output, length) == 0) {
+        if (r16_length > 0 && raz_compiler_rt_path_exists_ascii(r16, r16_length) != 0) {
+            if (raz_compiler_rt_copy_file_ascii(r16, r16_length, output, length) < 0) {
+                return -1;
+            }
+        } else if (root_length > 0 && raz_compiler_rt_path_exists_ascii(root_legacy, root_length) != 0) {
+            if (raz_compiler_rt_copy_file_ascii(root_legacy, root_length, output, length) < 0) {
+                return -1;
+            }
+        }
+    }
+    if (r16_length > 0 && raz_compiler_rt_path_exists_ascii(r16, r16_length) != 0) {
+        raz_compiler_rt_remove_path_ascii(r16, r16_length);
+    }
+    if (root_length > 0 && raz_compiler_rt_path_exists_ascii(root_legacy, root_length) != 0) {
+        raz_compiler_rt_remove_path_ascii(root_legacy, root_length);
+    }
+    raz_compiler_rt_arena_destroy(target_dir);
+    raz_compiler_rt_arena_destroy(r16);
+    raz_compiler_rt_arena_destroy(root_legacy);
+    return length;
+}
+
 fn registry_report_status(i64 status) -> i64 {
     if (status == 0) {
         return 0;
@@ -1589,7 +1726,7 @@ fn registry_outdated_command() -> i64 {
         return sync_status;
     }
 
-    i64 tracking_path = raz_compiler_rt_arena_create(16);
+    i64 tracking_path = raz_compiler_rt_arena_create(20);
     i64 tracking = raz_compiler_rt_arena_create(1048576);
     i64 data = raz_compiler_rt_arena_create(2097152);
     i64 base = raz_compiler_rt_arena_create(8192);
@@ -1598,15 +1735,14 @@ fn registry_outdated_command() -> i64 {
         return 40;
     }
 
-    i64 tp[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 i = 0;
+    i64 tracking_path_length = registry_project_state_prepare(1, tracking_path, 20);
 
-    while (i < 15) {
-        raz_compiler_rt_arena_set(tracking_path, i, tp[i]);
-        i += 1;
+    if (tracking_path_length <= 0) {
+        return 56;
     }
 
-    i64 tracking_length = raz_compiler_rt_read_ascii(tracking_path, 15, tracking, 1048576);
+    i64 tracking_length = raz_compiler_rt_read_ascii(tracking_path, tracking_path_length, tracking, 1048576);
+    i64 i = 0;
 
     if (tracking_length <= 0) {
         i64 none[26] = [78, 111, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 46, 10];
@@ -2086,7 +2222,7 @@ fn registry_write_tracking(
     i64 cl,
     i64 section_kind,
 ) -> i64 {
-    i64 path = raz_compiler_rt_arena_create(16);
+    i64 path = raz_compiler_rt_arena_create(20);
     i64 old = raz_compiler_rt_arena_create(1048576);
     i64 out = raz_compiler_rt_arena_create(1048576);
 
@@ -2094,15 +2230,14 @@ fn registry_write_tracking(
         return 40;
     }
 
-    i64 pb[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 i = 0;
+    i64 path_length = registry_project_state_prepare(1, path, 20);
 
-    while (i<15) {
-        raz_compiler_rt_arena_set(path, i, pb[i]);
-        i += 1;
+    if (path_length <= 0) {
+        return 56;
     }
 
-    i64 ol = raz_compiler_rt_read_ascii(path, 15, old, 1048576);
+    i64 i = 0;
+    i64 ol = raz_compiler_rt_read_ascii(path, path_length, old, 1048576);
 
     if (ol<0) {
         ol = 0;
@@ -2166,7 +2301,7 @@ fn registry_write_tracking(
 
     package_append_literal(out, 1048576, &mut cursor, &tail, 2);
 
-    i64 w = raz_compiler_rt_write_ascii(path, 16, out, cursor);
+    i64 w = raz_compiler_rt_write_ascii(path, path_length, out, cursor);
 
     raz_compiler_rt_arena_destroy(path);
     raz_compiler_rt_arena_destroy(old);
@@ -2180,7 +2315,7 @@ fn registry_write_tracking(
 fn registry_sync_tracking_from_manifest() -> i64 {
     i64 manifest_path = raz_compiler_rt_arena_create(16);
     i64 manifest = raz_compiler_rt_arena_create(1048576);
-    i64 tracking_path = raz_compiler_rt_arena_create(16);
+    i64 tracking_path = raz_compiler_rt_arena_create(20);
     i64 empty = raz_compiler_rt_arena_create(1);
 
     if (manifest_path == 0 || manifest == 0 || tracking_path == 0 || empty == 0) {
@@ -2188,17 +2323,17 @@ fn registry_sync_tracking_from_manifest() -> i64 {
     }
 
     i64 mp[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
-    i64 tp[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
     i64 i = 0;
 
     while (i < 10) {
         raz_compiler_rt_arena_set(manifest_path, i, mp[i]);
         i += 1;
     }
-    i = 0;
-    while (i < 15) {
-        raz_compiler_rt_arena_set(tracking_path, i, tp[i]);
-        i += 1;
+
+    i64 tracking_path_length = registry_project_state_prepare(1, tracking_path, 20);
+
+    if (tracking_path_length <= 0) {
+        return 56;
     }
 
     i64 length = raz_compiler_rt_read_ascii(manifest_path, 10, manifest, 1048576);
@@ -2207,7 +2342,7 @@ fn registry_sync_tracking_from_manifest() -> i64 {
         return 57;
     }
     // Tracking is derived. Rebuild it from raz.toml on every update/outdated.
-    if (raz_compiler_rt_write_ascii(tracking_path, 15, empty, 0) != 0) {
+    if (raz_compiler_rt_write_ascii(tracking_path, tracking_path_length, empty, 0) != 0) {
         return 56;
     }
 
@@ -2353,7 +2488,7 @@ fn registry_write_cache(
     i64 checksum,
     i64 cl,
 ) -> i64 {
-    i64 fp = raz_compiler_rt_arena_create(13);
+    i64 fp = raz_compiler_rt_arena_create(20);
     i64 old = raz_compiler_rt_arena_create(1048576);
     i64 out = raz_compiler_rt_arena_create(1048576);
 
@@ -2361,15 +2496,14 @@ fn registry_write_cache(
         return 40;
     }
 
-    i64 f[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
-    i64 i = 0;
+    i64 path_length = registry_project_state_prepare(0, fp, 20);
 
-    while (i < 12) {
-        raz_compiler_rt_arena_set(fp, i, f[i]);
-        i += 1;
+    if (path_length <= 0) {
+        return 56;
     }
 
-    i64 old_length = raz_compiler_rt_read_ascii(fp, 12, old, 1048576);
+    i64 i = 0;
+    i64 old_length = raz_compiler_rt_read_ascii(fp, path_length, old, 1048576);
 
     if (old_length < 0) {
         old_length = 0;
@@ -2424,7 +2558,7 @@ fn registry_write_cache(
 
     package_append_literal(out, 1048576, &mut cur, &lf, 1);
 
-    i64 w = raz_compiler_rt_write_ascii(fp, 12, out, cur);
+    i64 w = raz_compiler_rt_write_ascii(fp, path_length, out, cur);
 
     raz_compiler_rt_arena_destroy(fp);
     raz_compiler_rt_arena_destroy(old);
@@ -2522,7 +2656,7 @@ fn registry_rebuild_lock_from_resolved_cache() -> i64 {
 
     i64 status = package_lock_command();
 
-    if (status != 0 && old_length> 0) {
+    if (status != 0 && old_length > 0) {
         if (raz_compiler_rt_write_ascii(path, 10, old, old_length) != old_length) {
             status = 56;
         }
@@ -2617,7 +2751,7 @@ fn registry_resolve_and_apply(
             }
             raz_compiler_rt_arena_destroy(manifest_spec);
         }
-        // .raz.registry is retained only as a derived acceleration file for the
+        // target/raz.registry is retained only as a derived acceleration file for the
         // existing parallel updater. raz.toml is authoritative for user intent.
         if (s == 0 && track) {
             s = registry_write_tracking(alias, al, name, nl, con, cl, section_kind);
@@ -2744,22 +2878,21 @@ fn package_registry_update_command() -> i64 {
         return sync_status;
     }
 
-    i64 fp = raz_compiler_rt_arena_create(16);
+    i64 fp = raz_compiler_rt_arena_create(20);
     i64 data = raz_compiler_rt_arena_create(1048576);
 
     if (fp == 0 || data == 0) {
         return 40;
     }
 
-    i64 f[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 i = 0;
+    i64 path_length = registry_project_state_prepare(1, fp, 20);
 
-    while (i < 15) {
-        raz_compiler_rt_arena_set(fp, i, f[i]);
-        i += 1;
+    if (path_length <= 0) {
+        return 56;
     }
 
-    i64 len = raz_compiler_rt_read_ascii(fp, 15, data, 1048576);
+    i64 i = 0;
+    i64 len = raz_compiler_rt_read_ascii(fp, path_length, data, 1048576);
 
     if (len < 0) {
         raz_compiler_rt_arena_destroy(fp);
@@ -2998,6 +3131,128 @@ fn package_registry_update_command() -> i64 {
     return status;
 }
 
+// Rebuild derived target/raz.cache rows from an exact lockfile entry and the
+// tracking map reconstructed from raz.toml. This is what makes target/ fully
+// disposable: after `raz clean`, an ordinary build can restore alias -> package
+// mappings without re-resolving constraints or changing locked versions.
+fn registry_cache_locked_package_for_tracking(
+    i64 name,
+    i64 name_length,
+    i64 version,
+    i64 version_length,
+    i64 store_path,
+    i64 store_path_length,
+    i64 checksum,
+    i64 checksum_length,
+) -> i64 {
+    i64 tracking_path = raz_compiler_rt_arena_create(20);
+    i64 tracking = raz_compiler_rt_arena_create(1048576);
+    i64 alias = raz_compiler_rt_arena_create(4096);
+    i64 spec = raz_compiler_rt_arena_create(4096);
+    i64 tracked_name = raz_compiler_rt_arena_create(4096);
+    i64 constraint = raz_compiler_rt_arena_create(256);
+
+    if (
+        tracking_path == 0 ||
+        tracking == 0 ||
+        alias == 0 ||
+        spec == 0 ||
+        tracked_name == 0 ||
+        constraint == 0
+    ) {
+        return 40;
+    }
+
+    i64 path_length = registry_project_state_prepare(1, tracking_path, 20);
+
+    if (path_length <= 0) {
+        return 56;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(tracking_path, path_length, tracking, 1048576);
+
+    if (length <= 0) {
+        raz_compiler_rt_arena_destroy(tracking_path);
+        raz_compiler_rt_arena_destroy(tracking);
+        raz_compiler_rt_arena_destroy(alias);
+        raz_compiler_rt_arena_destroy(spec);
+        raz_compiler_rt_arena_destroy(tracked_name);
+        raz_compiler_rt_arena_destroy(constraint);
+        return 0;
+    }
+
+    i64 status = 0;
+    i64 pos = 0;
+
+    while (pos < length && status == 0) {
+        i64 start = pos;
+
+        while (pos < length && raz_compiler_rt_arena_get(tracking, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos < length) {
+            pos += 1;
+        }
+
+        i64 equal = start;
+
+        while (equal < end && raz_compiler_rt_arena_get(tracking, equal) != 61) {
+            equal += 1;
+        }
+        if (equal >= end) {
+            continue;
+        }
+
+        i64 alias_length = package_copy_key(tracking, start, equal, alias, 4096);
+        i64 spec_length = copy_quoted_value(tracking, equal + 1, end, spec, 4096);
+        i64 tracked_name_length = 0;
+        i64 constraint_length = 0;
+        i64 section_kind = 2;
+
+        if (
+            alias_length <= 0 ||
+            spec_length <= 0 ||
+            !registry_tracking_spec_parse(
+                spec,
+                spec_length,
+                tracked_name,
+                4096,
+                &mut tracked_name_length,
+                constraint,
+                256,
+                &mut constraint_length,
+                &mut section_kind,
+            )
+        ) {
+            continue;
+        }
+        if (registry_bytes_equal(tracked_name, 0, tracked_name_length, name, 0, name_length)) {
+            status = registry_write_cache(
+                alias,
+                alias_length,
+                name,
+                name_length,
+                version,
+                version_length,
+                store_path,
+                store_path_length,
+                checksum,
+                checksum_length,
+            );
+        }
+    }
+    raz_compiler_rt_arena_destroy(tracking_path);
+    raz_compiler_rt_arena_destroy(tracking);
+    raz_compiler_rt_arena_destroy(alias);
+    raz_compiler_rt_arena_destroy(spec);
+    raz_compiler_rt_arena_destroy(tracked_name);
+    raz_compiler_rt_arena_destroy(constraint);
+    return status;
+}
+
 fn registry_fetch_locked_entry(
     i64 name,
     i64 name_length,
@@ -3008,6 +3263,40 @@ fn registry_fetch_locked_entry(
 ) -> i64 {
     if (name_length <= 0 || version_length <= 0 || checksum_length <= 0) {
         return 55;
+    }
+    // raz.lock already fixes the exact package identity and checksum. Reuse the
+    // shared content-addressed store before consulting the registry index. This
+    // makes target/ genuinely disposable and keeps locked builds offline-capable.
+
+    i64 locked_store = raz_compiler_rt_arena_create(8192);
+
+    if (locked_store == 0) {
+        return 40;
+    }
+
+    i64 locked_store_length = registry_store_path(checksum, checksum_length, locked_store, 8192);
+
+    if (
+        locked_store_length > 0 &&
+        raz_compiler_rt_path_exists_ascii(locked_store, locked_store_length) != 0 &&
+        registry_store_verify(locked_store, locked_store_length, checksum, checksum_length)
+    ) {
+        i64 cached_status = registry_cache_locked_package_for_tracking(
+            name,
+            name_length,
+            version,
+            version_length,
+            locked_store,
+            locked_store_length,
+            checksum,
+            checksum_length,
+        );
+        raz_compiler_rt_arena_destroy(locked_store);
+        return cached_status;
+    }
+    raz_compiler_rt_arena_destroy(locked_store);
+    if (registry_offline()) {
+        return 64;
     }
 
     i64 resolved_version = raz_compiler_rt_arena_create(256);
@@ -3051,6 +3340,26 @@ fn registry_fetch_locked_entry(
                 i += 1;
             }
         }
+    }
+    if (status == 0) {
+        i64 resolved_path_length = 0;
+
+        while (
+            resolved_path_length < 8192 &&
+            raz_compiler_rt_arena_get(resolved_path, resolved_path_length) != 0
+        ) {
+            resolved_path_length += 1;
+        }
+        status = registry_cache_locked_package_for_tracking(
+            name,
+            name_length,
+            version,
+            version_length,
+            resolved_path,
+            resolved_path_length,
+            checksum,
+            checksum_length,
+        );
     }
     raz_compiler_rt_arena_destroy(resolved_version);
     raz_compiler_rt_arena_destroy(resolved_path);
@@ -3257,22 +3566,21 @@ fn registry_validate_manifest_lock_constraints() -> i64 {
         return sync_status;
     }
 
-    i64 path = raz_compiler_rt_arena_create(16);
+    i64 path = raz_compiler_rt_arena_create(20);
     i64 tracking = raz_compiler_rt_arena_create(1048576);
 
     if (path == 0 || tracking == 0) {
         return 40;
     }
 
-    i64 tp[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 i = 0;
+    i64 path_length = registry_project_state_prepare(1, path, 20);
 
-    while (i < 15) {
-        raz_compiler_rt_arena_set(path, i, tp[i]);
-        i += 1;
+    if (path_length <= 0) {
+        return 56;
     }
 
-    i64 length = raz_compiler_rt_read_ascii(path, 15, tracking, 1048576);
+    i64 i = 0;
+    i64 length = raz_compiler_rt_read_ascii(path, path_length, tracking, 1048576);
 
     raz_compiler_rt_arena_destroy(path);
     if (length <= 0) {
@@ -3604,6 +3912,15 @@ fn package_registry_prepare_build(i64 manifest_path, i64 manifest_length) -> i64
     i64 status = 0;
 
     if (data_length >= 0) {
+        // Recreate target/raz.registry from raz.toml first. Exact lock hydration
+        // below then rebuilds target/raz.cache without changing dependency intent.
+        status = registry_sync_tracking_from_manifest();
+        if (status != 0) {
+            raz_compiler_rt_arena_destroy(root);
+            raz_compiler_rt_arena_destroy(lock_path);
+            raz_compiler_rt_arena_destroy(lock_data);
+            return status;
+        }
         if (registry_vendor_active()) {
             status = registry_vendor_verify_lock_data(lock_data, data_length);
             if (status == 0) {
@@ -3611,6 +3928,12 @@ fn package_registry_prepare_build(i64 manifest_path, i64 manifest_length) -> i64
             }
         } else {
             status = registry_fetch_lock_data(lock_data, data_length);
+            if (status == 0) {
+                // target/git is generated cache state. Rehydrate commit-pinned
+                // Git dependencies automatically after `raz clean`, just like
+                // locked registry packages are restored from the shared store.
+                status = package_git_fetch_tracked();
+            }
         }
         if (status == 0) {
             status = registry_validate_manifest_lock_constraints();
@@ -3646,8 +3969,11 @@ fn package_registry_fetch_command() -> i64 {
         return package_registry_update_command();
     }
 
-    i64 status = registry_fetch_lock_data(data, length);
+    i64 status = registry_sync_tracking_from_manifest();
 
+    if (status == 0) {
+        status = registry_fetch_lock_data(data, length);
+    }
     if (status == 0) {
         status = package_git_fetch_tracked();
     }
@@ -3660,7 +3986,7 @@ fn package_registry_fetch_command() -> i64 {
 }
 
 fn registry_remove_tracking(i64 alias, i64 al) -> i64 {
-    i64 path = raz_compiler_rt_arena_create(16);
+    i64 path = raz_compiler_rt_arena_create(20);
     i64 old = raz_compiler_rt_arena_create(1048576);
     i64 out = raz_compiler_rt_arena_create(1048576);
 
@@ -3668,15 +3994,14 @@ fn registry_remove_tracking(i64 alias, i64 al) -> i64 {
         return 40;
     }
 
-    i64 pb[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 i = 0;
+    i64 path_length = registry_project_state_prepare(1, path, 20);
 
-    while (i<15) {
-        raz_compiler_rt_arena_set(path, i, pb[i]);
-        i += 1;
+    if (path_length <= 0) {
+        return 56;
     }
 
-    i64 ol = raz_compiler_rt_read_ascii(path, 15, old, 1048576);
+    i64 i = 0;
+    i64 ol = raz_compiler_rt_read_ascii(path, path_length, old, 1048576);
 
     if (ol<0) {
         raz_compiler_rt_arena_destroy(path);
@@ -3715,7 +4040,7 @@ fn registry_remove_tracking(i64 alias, i64 al) -> i64 {
         }
     }
 
-    i64 w = raz_compiler_rt_write_ascii(path, 16, out, cursor);
+    i64 w = raz_compiler_rt_write_ascii(path, path_length, out, cursor);
 
     raz_compiler_rt_arena_destroy(path);
     raz_compiler_rt_arena_destroy(old);
@@ -3827,6 +4152,16 @@ fn registry_dependency_path_publishable(i64 path, i64 length) -> bool {
     i64 local_cache[5] = [46, 114, 97, 122, 47];
 
     if (registry_path_prefix(path, length, &local_cache, 5)) {
+        return false;
+    }
+
+    i64 target_cache[7] = [116, 97, 114, 103, 101, 116, 47];
+    i64 target_cache_dot[9] = [46, 47, 116, 97, 114, 103, 101, 116, 47];
+
+    if (
+        registry_path_prefix(path, length, &target_cache, 7) ||
+        registry_path_prefix(path, length, &target_cache_dot, 9)
+    ) {
         return false;
     }
 
@@ -4360,10 +4695,10 @@ fn package_publish_command() -> i64 {
                 token_length = registry_publish_token(publish_token, 8192, true);
                 raz_compiler_rt_arena_destroy(publish_token);
             }
-            if (token_length> 0) {
+            if (token_length > 0) {
                 github_publish = true;
             } else {
-                i64 staging[14] = [46, 47, 46, 114, 97, 122, 45, 112, 117, 98, 108, 105, 115, 104];
+                i64 staging[14] = [116, 97, 114, 103, 101, 116, 47, 112, 117, 98, 108, 105, 115, 104];
                 i64 si = 0;
 
                 while (si < 14) {
@@ -4386,7 +4721,7 @@ fn package_publish_command() -> i64 {
             // official registry. Fall back to a PR-ready tree instead of
             // turning that ordinary contributor case into a publish failure.
 
-            i64 staging[14] = [46, 47, 46, 114, 97, 122, 45, 112, 117, 98, 108, 105, 115, 104];
+            i64 staging[14] = [116, 97, 114, 103, 101, 116, 47, 112, 117, 98, 108, 105, 115, 104];
             i64 si = 0;
 
             while (si < 14) {

@@ -2,6 +2,37 @@
 
 All notable user-visible changes to Raz are documented here.
 
+## Unreleased
+
+### Native linking
+
+- ObLink is now the linker for every Raz link, including the bootstrap's
+  reproducibility generations. `tools/bootstrap.py` previously invoked the host
+  C++ compiler directly for those, and the forge bridge's ObLink branch never
+  forwarded the OpenSSL archives the runtime is built against, so `raz build`
+  failed on `EVP_*` even when the bootstrap succeeded.
+- Fixed the CMake guard that silently disabled OpenSSL forwarding in the bridge.
+  `OpenSSL::SSL` is an imported target scoped to the directory that found it, so
+  testing for it from another directory is always false and the definition was
+  never set.
+
+### CLI
+
+- `raz run` builds and launches the native executable and exits with the
+  program's status, instead of interpreting the program. A direct-source run
+  with no project manifest still uses the MIR interpreter, since there is no
+  artifact to launch.
+- Build status output follows the established convention: the completion line
+  names the profile and elapsed time rather than repeating the package name,
+  which already appears on the line above. The linker no longer prints a success
+  banner to stdout.
+
+### Correctness
+
+- Fixed the incremental artifact cache ignoring the profile. `raz build`
+  followed by `raz build --release` restored the cached debug artifact and
+  shipped a byte-identical unoptimized binary as the release build.
+
 ## 1.0.0
 
 ### Language

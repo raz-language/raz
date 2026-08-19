@@ -6,8 +6,8 @@ setlocal
 set "ROOT=%~dp0"
 python "%ROOT%tests\check-source.py"
 if errorlevel 1 exit /b %ERRORLEVEL%
-if exist "%ROOT%build\release\CTestTestfile.cmake" (
-  ctest --test-dir "%ROOT%build\release" --output-on-failure %*
+if exist "%ROOT%target\bootstrap\host\release\CTestTestfile.cmake" (
+  ctest --test-dir "%ROOT%target\bootstrap\host\release" --output-on-failure %*
   exit /b %ERRORLEVEL%
 )
 echo Static repository checks passed.

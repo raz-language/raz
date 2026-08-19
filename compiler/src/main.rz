@@ -119,6 +119,8 @@ fn main() -> i64 {
     i64 requested_features_length = 0;
     bool all_features = false;
     bool default_features = true;
+    bool release_profile = false;
+    i64 cli_started_nanos = raz_compiler_rt_monotonic_nanos();
 
     if (requested_features == 0) {
         return 40;
@@ -174,6 +176,9 @@ fn main() -> i64 {
             argument_base += 1;
         } else if (path_is_check_option(option_argument, option_length)) {
             check_only = true;
+            argument_base += 1;
+        } else if (cli_release_option(option_argument, option_length)) {
+            release_profile = true;
             argument_base += 1;
         } else if (backend_shortcut >= 0) {
             backend = backend_shortcut;
@@ -332,38 +337,23 @@ fn main() -> i64 {
         cli_print_missing_path(cli_manifest_path, cli_manifest_length);
         return 2;
     }
-    if (run_after_build && cli_output_path == 0) {
-        cli_output_path = raz_compiler_rt_arena_create(32);
-        if (cli_output_path == 0) {
-            return 40;
-        }
-        if (raz_compiler_rt_host_platform() == 1) {
-            i64 run_name[11] = [114, 97, 122, 45, 114, 117, 110, 46, 101, 120, 101];
-            i64 rn = 0;
-
-            while (rn<11) {
-                raz_compiler_rt_arena_set(cli_output_path, rn, run_name[rn]);
-                rn += 1;
-            }
-            cli_output_length = 11;
-        } else {
-            i64 run_name[7] = [114, 97, 122, 45, 114, 117, 110];
-            i64 rn = 0;
-
-            while (rn<7) {
-                raz_compiler_rt_arena_set(cli_output_path, rn, run_name[rn]);
-                rn += 1;
-            }
-            cli_output_length = 7;
-        }
-        forge_native = backend == 0;
-        if (backend == 1) {
-            llvm_options.emit_kind = 2;
-        }
-    }
-
     bool direct_source = path_has_rz_extension(cli_manifest_path, cli_manifest_length);
     bool project_manifest = path_has_toml_extension(cli_manifest_path, cli_manifest_length);
+    ProjectNativeBuild native_build;
+
+    project_native_build_init(&mut native_build);
+    if ((cli_command == 3 || cli_command == 12) && project_manifest && cli_output_path == 0) {
+        if (
+            !project_prepare_default_native_build(
+                cli_manifest_path, cli_manifest_length, release_profile, backend,
+                &mut llvm_options.optimization_kind, &mut llvm_options.emit_kind, &mut forge_native,
+                &mut cli_output_path, &mut cli_output_length, &mut native_build,
+            )
+        ) {
+            cli_print_native_path_failure();
+            return 40;
+        }
+    }
     i64 manifest_capacity = 65536;
     i64 source_capacity = 4194304;
     i64 module_capacity = 4194304;
@@ -429,6 +419,7 @@ fn main() -> i64 {
                 &mut module_count,
             )
         ) {
+            cli_print_project_source_failure();
             return 40;
         }
     }
@@ -524,6 +515,7 @@ fn main() -> i64 {
         }
     }
     if (module_count <= 0) {
+        cli_print_project_source_failure();
         return 40;
     }
     write_compiler_diagnostic(90, module_count, length);
@@ -544,6 +536,7 @@ fn main() -> i64 {
         llvm_options.emit_kind,
         forge_native,
         forge_structured_only,
+        release_profile,
         cli_output_path,
         cli_output_length,
     );
@@ -552,16 +545,16 @@ fn main() -> i64 {
         if (cache_restore_kind == 1) {
             cli_print_status(3, cli_manifest_path, cli_manifest_length);
         }
-        cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
-        raz_compiler_rt_arena_destroy(bytes);
-        raz_compiler_rt_arena_destroy(manifest);
-        if (cli_manifest_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_manifest_path);
-        }
-        if (cli_output_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_output_path);
-        }
-        return 0;
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+
+        i64 restored_status = cli_maybe_run_artifact(
+            run_after_build && cache_restore_kind == 1,
+            cli_output_path,
+            cli_output_length,
+        );
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
+        project_native_build_destroy(&mut native_build);
+        return restored_status;
     }
     cli_print_compile_status(cli_command, cli_manifest_path, cli_manifest_length);
     // bytes. Avoid a second full-file lexer pass here: on the production compiler
@@ -602,13 +595,9 @@ fn main() -> i64 {
         write_query_profile(&hir);
     }
     if (check_only) {
-        cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
         destroy_hir(&mut hir);
-        raz_compiler_rt_arena_destroy(bytes);
-        raz_compiler_rt_arena_destroy(manifest);
-        if (cli_manifest_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_manifest_path);
-        }
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
         return 0;
     }
     write_compiler_diagnostic(
@@ -646,33 +635,25 @@ fn main() -> i64 {
             execution_status = execute_mir_benches(&input, &hir, &mut mir, bench_iterations);
         }
         if (execution_status == 0) {
-            cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+            cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
         }
         destroy_mir(&mut mir);
         destroy_hir(&mut hir);
-        raz_compiler_rt_arena_destroy(bytes);
-        raz_compiler_rt_arena_destroy(manifest);
-        if (cli_manifest_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_manifest_path);
-        }
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
         return execution_status;
     }
-    if (run_after_build) {
-        cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+    // A project run links a real executable and launches it, so what `raz run`
+    // reports is what the program actually does. Only a direct-source run, which
+    // produces no artifact to launch, still goes through the MIR interpreter.
+    if (run_after_build && cli_output_path == 0) {
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
         cli_print_status(4, cli_manifest_path, cli_manifest_length);
 
         i64 run_status = execute_mir_main(&hir, &mut mir);
 
         destroy_mir(&mut mir);
         destroy_hir(&mut hir);
-        raz_compiler_rt_arena_destroy(bytes);
-        raz_compiler_rt_arena_destroy(manifest);
-        if (cli_manifest_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_manifest_path);
-        }
-        if (cli_output_path != 0) {
-            raz_compiler_rt_arena_destroy(cli_output_path);
-        }
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
         return run_status;
     }
 
@@ -680,6 +661,7 @@ fn main() -> i64 {
     i64 backend_output_length = cli_output_length;
     i64 llvm_sidecar_path = 0;
 
+    project_native_backend_output(&native_build, backend, &mut backend_output_path, &mut backend_output_length);
     if (backend == 1 && llvm_options.emit_kind != 0) {
         if (cli_output_path == 0 || cli_output_length <= 0) {
             return 46;
@@ -704,6 +686,7 @@ fn main() -> i64 {
             backend_output_length,
         )
     ) {
+        cli_print_backend_emit_failure();
         return 46;
     }
     if (backend == 1 && llvm_options.emit_kind != 0) {
@@ -719,6 +702,10 @@ fn main() -> i64 {
             return 46;
         }
     }
+    if (!project_native_build_finish(&native_build, backend, cli_output_path, cli_output_length)) {
+        cli_print_native_link_failure();
+        return 46;
+    }
     incremental_store_artifact(
         cli_manifest_path,
         cli_manifest_length,
@@ -727,23 +714,20 @@ fn main() -> i64 {
         llvm_options.emit_kind,
         forge_native,
         forge_structured_only,
+        release_profile,
         cli_output_path,
         cli_output_length,
     );
     write_compiler_diagnostic(95, 0, 0);
-    cli_print_completion_status(cli_command, cli_manifest_path, cli_manifest_length);
+    cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+
+    i64 exit_status = cli_maybe_run_artifact(run_after_build, cli_output_path, cli_output_length);
     destroy_mir(&mut mir);
     destroy_hir(&mut hir);
-    raz_compiler_rt_arena_destroy(bytes);
-    raz_compiler_rt_arena_destroy(manifest);
-    if (cli_manifest_path != 0) {
-        raz_compiler_rt_arena_destroy(cli_manifest_path);
-    }
+    cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
     if (llvm_sidecar_path != 0) {
         raz_compiler_rt_arena_destroy(llvm_sidecar_path);
     }
-    if (cli_output_path != 0) {
-        raz_compiler_rt_arena_destroy(cli_output_path);
-    }
-    return 0;
+    project_native_build_destroy(&mut native_build);
+    return exit_status;
 }

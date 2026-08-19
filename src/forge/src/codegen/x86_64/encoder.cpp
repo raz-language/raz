@@ -101,9 +101,323 @@ void emit_sse_stack_store(Buffer& out, XmmRegister source, std::int32_t displace
     out.i32(displacement);
 }
 
+// Packed spill and reload. These use the unaligned forms (MOVDQU / VMOVDQU) so
+// a spill slot only has to be non-overlapping, not aligned to its own width.
+// 128-bit uses the SSE2 encoding; 256-bit uses two-byte VEX; 512-bit uses EVEX.
+void emit_vector_stack_move(Buffer& out, XmmRegister reg, std::int32_t displacement,
+                            std::uint16_t bits, bool store) {
+    const std::uint8_t opcode = store ? 0x7F : 0x6F;
+    if (bits >= 512U) {
+        // EVEX.512.F3.0F.W0 6F/7F — 4-byte prefix, zeroing-unmasked.
+        out.byte(0x62);
+        out.byte(0xF1);              // R/X/B set, mm = 0F map
+        out.byte(0x7E);              // W0, vvvv unused, pp = F3
+        out.byte(0x48);              // L'L = 10 (512-bit), no mask
+    } else if (bits >= 256U) {
+        out.byte(0xC5);              // two-byte VEX
+        out.byte(0xFA);              // R set, vvvv unused, L = 1 (256-bit), pp = F3
+    } else {
+        out.byte(0xF3); out.byte(0x0F);
+    }
+    out.byte(opcode);
+    emit_modrm(out, 2, static_cast<std::uint8_t>(reg), static_cast<std::uint8_t>(Register::ebp));
+    out.i32(displacement);
+}
+
 void emit_ptr_modrm(Buffer& out, std::uint8_t reg, Register pointer, std::int32_t displacement) {
     emit_modrm(out, displacement == 0 ? 0 : 2, reg, static_cast<std::uint8_t>(pointer));
     if (displacement != 0) out.i32(displacement);
+}
+
+void emit_xmm128_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement = 0) {
+    const auto src = static_cast<std::uint8_t>(source);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0xF3);
+    if (src >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (src >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x7F);
+    emit_ptr_modrm(out, src, pointer, displacement);
+}
+void emit_xmm128_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0xF3);
+    if (dst >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (dst >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x6F);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+void emit_xmm64_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement = 0) {
+    const auto src = static_cast<std::uint8_t>(source);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0x66);
+    if (src >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (src >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0xD6);
+    emit_ptr_modrm(out, src, pointer, displacement);
+}
+void emit_xmm64_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0xF3);
+    if (dst >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (dst >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x7E);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+void emit_vex3(Buffer& out, std::uint8_t map, std::uint8_t pp, bool l256,
+               std::uint8_t reg, std::uint8_t vvvv, std::uint8_t rm, bool memory_rm = false) {
+    const bool r = reg >= 8U;
+    const bool b = rm >= 8U;
+    out.byte(0xC4);
+    out.byte(static_cast<std::uint8_t>((r ? 0U : 0x80U) | 0x40U | (b ? 0U : 0x20U) | (map & 0x1FU)));
+    out.byte(static_cast<std::uint8_t>(((~vvvv) & 0x0FU) << 3U | (l256 ? 0x04U : 0U) | (pp & 0x03U)));
+    (void)memory_rm;
+}
+void emit_vex_mov_gpr_to_xmm(Buffer& out, XmmRegister destination, Register source, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    const bool r = dst >= 8U;
+    const bool b = src >= 8U;
+    out.byte(0xC4);
+    out.byte(static_cast<std::uint8_t>((r ? 0U : 0x80U) | 0x40U | (b ? 0U : 0x20U) | 0x01U));
+    // VMOVD/VMOVQ xmm, r32/r64: VEX.128.66.0F.W0/W1 6E /r,
+    // with the unused vvvv field encoded as 1111b.
+    out.byte(static_cast<std::uint8_t>((wide ? 0x80U : 0U) | 0x78U | 0x01U));
+    out.byte(0x6E);
+    emit_modrm(out, 3, dst, src);
+}
+void emit_ymm256_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    emit_vex3(out, 1U, 2U, true, dst, 0U, ptr, true); // VMOVDQU ymm, m256
+    out.byte(0x6F);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+void emit_ymm256_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement = 0) {
+    const auto src = static_cast<std::uint8_t>(source);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    emit_vex3(out, 1U, 2U, true, src, 0U, ptr, true); // VMOVDQU m256, ymm
+    out.byte(0x7F);
+    emit_ptr_modrm(out, src, pointer, displacement);
+}
+void emit_avx2_integer_binary(Buffer& out, XmmRegister destination, XmmRegister lhs, XmmRegister rhs, std::uint8_t opcode) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto left = static_cast<std::uint8_t>(lhs);
+    const auto right = static_cast<std::uint8_t>(rhs);
+    emit_vex3(out, 1U, 1U, true, dst, left, right); // VPADDD/Q, VPSUBD/Q, VPAND/OR/XOR
+    out.byte(opcode);
+    emit_modrm(out, 3, dst, right);
+}
+void emit_avx2_broadcast(Buffer& out, XmmRegister destination, XmmRegister source, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    emit_vex3(out, 2U, 1U, true, dst, 0U, src); // VPBROADCASTD/Q ymm, xmm
+    out.byte(wide ? 0x59 : 0x58);
+    emit_modrm(out, 3, dst, src);
+}
+enum class MaskRegister : std::uint8_t { k0 = 0, k1 = 1, k2 = 2, k3 = 3, k4 = 4, k5 = 5, k6 = 6, k7 = 7 };
+
+void emit_evex(Buffer& out, std::uint8_t map, std::uint8_t pp, bool wide64,
+               std::uint16_t vector_bits, std::uint8_t reg, std::uint8_t vvvv,
+               std::uint8_t rm, MaskRegister mask = MaskRegister::k0, bool zeroing = false) {
+    const bool r = (reg & 0x08U) != 0U;
+    const bool b = (rm & 0x08U) != 0U;
+    // Forge's current packed scratch allocator uses vector registers 0-7, so
+    // EVEX.R'/V' remain in their non-extended state. The helper still handles
+    // high GPR memory bases through EVEX.B.
+    out.byte(0x62);
+    out.byte(static_cast<std::uint8_t>(0xC0U | (b ? 0U : 0x20U) | (r ? 0U : 0x10U) | (map & 0x07U)));
+    out.byte(static_cast<std::uint8_t>((wide64 ? 0x80U : 0U) | (((~vvvv) & 0x0FU) << 3U) | 0x04U | (pp & 0x03U)));
+    std::uint8_t length = 0U;
+    if (vector_bits >= 512U) length = 0x40U;       // EVEX.L'L = 10b
+    else if (vector_bits >= 256U) length = 0x20U;  // EVEX.L'L = 01b
+    out.byte(static_cast<std::uint8_t>((zeroing ? 0x80U : 0U) | length | 0x08U | static_cast<std::uint8_t>(mask)));
+}
+
+void emit_zmm512_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement,
+                          bool wide, MaskRegister mask = MaskRegister::k0, bool zeroing = false) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    emit_evex(out, 1U, 2U, wide, 512U, dst, 0U, ptr, mask, zeroing); // VMOVDQU32/64 zmm, m512
+    out.byte(0x6F);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+
+void emit_zmm512_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement,
+                           bool wide, MaskRegister mask = MaskRegister::k0) {
+    const auto src = static_cast<std::uint8_t>(source);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    emit_evex(out, 1U, 2U, wide, 512U, src, 0U, ptr, mask, false); // VMOVDQU32/64 m512, zmm
+    out.byte(0x7F);
+    emit_ptr_modrm(out, src, pointer, displacement);
+}
+
+void emit_avx512_integer_binary(Buffer& out, XmmRegister destination, XmmRegister lhs, XmmRegister rhs,
+                                std::uint8_t opcode, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto left = static_cast<std::uint8_t>(lhs);
+    const auto right = static_cast<std::uint8_t>(rhs);
+    emit_evex(out, 1U, 1U, wide, 512U, dst, left, right);
+    out.byte(opcode);
+    emit_modrm(out, 3, dst, right);
+}
+
+void emit_avx512_broadcast(Buffer& out, XmmRegister destination, XmmRegister source, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    emit_evex(out, 2U, 1U, wide, 512U, dst, 0U, src); // VPBROADCASTD/Q zmm, xmm
+    out.byte(wide ? 0x59 : 0x58);
+    emit_modrm(out, 3, dst, src);
+}
+
+void emit_kmovw(Buffer& out, MaskRegister destination, Register source) {
+    const auto src = static_cast<std::uint8_t>(source);
+    // KMOVW k, r32. Use VEX3 only when the GPR requires the B extension.
+    if (src >= 8U) {
+        emit_vex3(out, 1U, 0U, false, static_cast<std::uint8_t>(destination), 0U, src);
+        out.byte(0x92);
+        emit_modrm(out, 3, static_cast<std::uint8_t>(destination), src);
+    } else {
+        out.byte(0xC5); out.byte(0xF8); out.byte(0x92);
+        emit_modrm(out, 3, static_cast<std::uint8_t>(destination), src);
+    }
+}
+
+void emit_mask_lane_count(Buffer& out, MaskRegister destination, std::uint8_t lanes) {
+    const auto bits = lanes >= 16U ? 0xffffU : static_cast<std::uint16_t>((1U << lanes) - 1U);
+    // Preserve r11 even if register allocation happened to place a live pointer
+    // there. The mask setup is therefore transparent to the surrounding pack.
+    out.byte(0x41); out.byte(0x53);                 // push r11
+    out.byte(0x41); out.byte(0xBB); out.i32(bits);  // mov r11d, imm32
+    emit_kmovw(out, destination, Register::r11d);
+    out.byte(0x41); out.byte(0x5B);                 // pop r11
+}
+
+void emit_vzeroupper(Buffer& out) {
+    out.byte(0xC5); out.byte(0xF8); out.byte(0x77);
+}
+void emit_packed_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement, std::int32_t bytes) {
+    if (bytes == 64) emit_zmm512_ptr_load(out, destination, pointer, displacement, false);
+    else if (bytes == 32) emit_ymm256_ptr_load(out, destination, pointer, displacement);
+    else if (bytes == 8) emit_xmm64_ptr_load(out, destination, pointer, displacement);
+    else emit_xmm128_ptr_load(out, destination, pointer, displacement);
+}
+void emit_packed_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement, std::int32_t bytes) {
+    if (bytes == 64) emit_zmm512_ptr_store(out, pointer, source, displacement, false);
+    else if (bytes == 32) emit_ymm256_ptr_store(out, pointer, source, displacement);
+    else if (bytes == 8) emit_xmm64_ptr_store(out, pointer, source, displacement);
+    else emit_xmm128_ptr_store(out, pointer, source, displacement);
+}
+void emit_xmm128_move(Buffer& out, XmmRegister destination, XmmRegister source) {
+    out.byte(0x66); out.byte(0x0F); out.byte(0x6F);
+    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+}
+void emit_packed_move(Buffer& out, XmmRegister destination, XmmRegister source, std::int32_t bytes) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    if (bytes == 64) {
+        emit_evex(out, 1U, 1U, false, 512U, dst, 0U, src); // VMOVDQA32 zmm, zmm
+        out.byte(0x6F);
+        emit_modrm(out, 3, dst, src);
+    } else if (bytes == 32) {
+        emit_vex3(out, 1U, 1U, true, dst, 0U, src); // VMOVDQA ymm, ymm
+        out.byte(0x6F);
+        emit_modrm(out, 3, dst, src);
+    } else {
+        emit_xmm128_move(out, destination, source);
+    }
+}
+
+void emit_sse2_integer_binary(Buffer& out, XmmRegister destination, XmmRegister source, std::uint8_t opcode);
+
+void emit_packed_integer_binary(Buffer& out, XmmRegister destination, XmmRegister lhs, XmmRegister rhs,
+                                std::uint8_t opcode, bool wide, std::int32_t bytes) {
+    if (bytes == 64) emit_avx512_integer_binary(out, destination, lhs, rhs, opcode, wide);
+    else if (bytes == 32) emit_avx2_integer_binary(out, destination, lhs, rhs, opcode);
+    else {
+        if (destination != lhs) emit_xmm128_move(out, destination, lhs);
+        emit_sse2_integer_binary(out, destination, rhs, opcode);
+    }
+}
+void emit_paddd(Buffer& out, XmmRegister destination, XmmRegister source) {
+    out.byte(0x66); out.byte(0x0F); out.byte(0xFE);
+    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+}
+void emit_paddd_ptr(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0x66);
+    if (dst >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (dst >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0xFE);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+void emit_pshufd(Buffer& out, XmmRegister destination, XmmRegister source, std::uint8_t control) {
+    out.byte(0x66); out.byte(0x0F); out.byte(0x70);
+    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+    out.byte(control);
+}
+void emit_movd_xmm_to_gpr(Buffer& out, Register destination, XmmRegister source) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    out.byte(0x66);
+    if (src >= 8U || dst >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (src >= 8U ? 0x04U : 0U) | (dst >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x7E);
+    emit_modrm(out, 3, src, dst);
+}
+void emit_paddq(Buffer& out, XmmRegister destination, XmmRegister source) {
+    out.byte(0x66); out.byte(0x0F); out.byte(0xD4);
+    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+}
+void emit_paddq_ptr(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(0x66);
+    if (dst >= 8U || ptr >= 8U) out.byte(static_cast<std::uint8_t>(0x40U | (dst >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0xD4);
+    emit_ptr_modrm(out, dst, pointer, displacement);
+}
+void emit_sse2_integer_binary(Buffer& out, XmmRegister destination, XmmRegister source, std::uint8_t opcode) {
+    out.byte(0x66); out.byte(0x0F); out.byte(opcode);
+    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+}
+void emit_packed_integer_binary(Buffer& out, XmmRegister destination, XmmRegister source, std::uint8_t opcode, std::int32_t bytes) {
+    const bool wide = opcode == 0xD4U || opcode == 0xFBU;
+    if (bytes == 64) emit_avx512_integer_binary(out, destination, destination, source, opcode, wide);
+    else if (bytes == 32) emit_avx2_integer_binary(out, destination, destination, source, opcode);
+    else emit_sse2_integer_binary(out, destination, source, opcode);
+}
+void emit_movq_gpr_to_xmm(Buffer& out, XmmRegister destination, Register source) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    out.byte(0x66);
+    out.byte(static_cast<std::uint8_t>(0x48U | (dst >= 8U ? 0x04U : 0U) | (src >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x6E);
+    emit_modrm(out, 3, dst, src);
+}
+void emit_movq_xmm_to_gpr(Buffer& out, Register destination, XmmRegister source) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
+    out.byte(0x66);
+    out.byte(static_cast<std::uint8_t>(0x48U | (src >= 8U ? 0x04U : 0U) | (dst >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(0x7E);
+    emit_modrm(out, 3, src, dst);
+}
+
+void emit_sse_rip_load_placeholder(Buffer& out, XmmRegister destination, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    out.byte(wide ? 0xF2 : 0xF3);
+    if (dst >= 8U) out.byte(0x44);
+    out.byte(0x0F); out.byte(0x10);
+    emit_modrm(out, 0, dst, 5); // [rip + disp32]
+    out.i32(0);
+}
+
+void emit_sse_binary_ptr(Buffer& out, XmmRegister destination, Register pointer, bool wide,
+                         std::uint8_t opcode, std::int32_t displacement = 0) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto ptr = static_cast<std::uint8_t>(pointer);
+    out.byte(wide ? 0xF2 : 0xF3);
+    if (dst >= 8U || ptr >= 8U)
+        out.byte(static_cast<std::uint8_t>(0x40U | (dst >= 8U ? 0x04U : 0U) | (ptr >= 8U ? 0x01U : 0U)));
+    out.byte(0x0F); out.byte(opcode);
+    emit_ptr_modrm(out, dst, pointer, displacement);
 }
 
 void emit_sse_ptr_load(Buffer& out, XmmRegister destination, Register pointer, bool wide, std::int32_t displacement = 0) {
@@ -2452,6 +2766,9 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 instruction.opcode != machine::Opcode::store_stack_i64 &&
                 instruction.opcode != machine::Opcode::store_stack_f32 &&
                 instruction.opcode != machine::Opcode::store_stack_f64 &&
+                instruction.opcode != machine::Opcode::store_stack_v128 &&
+                instruction.opcode != machine::Opcode::store_stack_v256 &&
+                instruction.opcode != machine::Opcode::store_stack_v512 &&
                 instruction.opcode != machine::Opcode::store_ptr_i32 &&
                 instruction.opcode != machine::Opcode::store_ptr_i64 &&
                 instruction.opcode != machine::Opcode::store_ptr_f32 &&
@@ -2715,6 +3032,27 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 const bool wide = instruction.opcode == machine::Opcode::store_stack_f64;
                 emit_read_float_location(out, XmmRegister::xmm0, allocation.location(instruction.inputs[0]), wide);
                 emit_sse_stack_store(out, XmmRegister::xmm0, static_cast<std::int32_t>(instruction.immediate), wide);
+                break;
+            }
+            case machine::Opcode::load_stack_v128:
+            case machine::Opcode::load_stack_v256:
+            case machine::Opcode::load_stack_v512: {
+                const std::uint16_t bits = instruction.opcode == machine::Opcode::load_stack_v512 ? 512U
+                    : instruction.opcode == machine::Opcode::load_stack_v256 ? 256U : 128U;
+                emit_vector_stack_move(out, XmmRegister::xmm0,
+                                       static_cast<std::int32_t>(instruction.immediate), bits, false);
+                write_floating_cached(allocation.location(instruction.result), XmmRegister::xmm0, true);
+                break;
+            }
+            case machine::Opcode::store_stack_v128:
+            case machine::Opcode::store_stack_v256:
+            case machine::Opcode::store_stack_v512: {
+                const std::uint16_t bits = instruction.opcode == machine::Opcode::store_stack_v512 ? 512U
+                    : instruction.opcode == machine::Opcode::store_stack_v256 ? 256U : 128U;
+                emit_read_float_location(out, XmmRegister::xmm0,
+                                         allocation.location(instruction.inputs[0]), true);
+                emit_vector_stack_move(out, XmmRegister::xmm0,
+                                       static_cast<std::int32_t>(instruction.immediate), bits, true);
                 break;
             }
             case machine::Opcode::copy_f32:
@@ -3119,6 +3457,694 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 else if (instruction.opcode == machine::Opcode::or_i64) { out.byte(0x09); out.byte(0xC8); }
                 else { out.byte(0x31); out.byte(0xC8); }
                 write_integer_cached64(destination, Register::eax);
+                break;
+            }
+            case machine::Opcode::add_i64_contiguous_inplace: {
+                if (instruction.inputs.size() != 2U || instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed contiguous i64 map-add in @" + function.name);
+                    return encoded;
+                }
+                const auto& base_location = allocation.location(instruction.inputs[0]);
+                const auto& delta_location = allocation.location(instruction.inputs[1]);
+                Register base = Register::ecx;
+                Register delta = Register::eax;
+                if (base_location.kind == machine::LocationKind::physical_register) base = integer_register(base_location.physical);
+                else emit_read_location64(out, base, base_location);
+                if (delta_location.kind == machine::LocationKind::physical_register) delta = integer_register(delta_location.physical);
+                else emit_read_location64(out, delta, delta_location);
+                emit_movq_gpr_to_xmm(out, XmmRegister::xmm1, delta);
+                emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm1, 0x44);
+                for (std::int32_t offset = 0; offset < instruction.immediate * 8; offset += 16) {
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm0, base, offset);
+                    emit_paddq(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                    emit_xmm128_ptr_store(out, base, XmmRegister::xmm0, offset);
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_inplace:
+            case machine::Opcode::binary_i64_contiguous_inplace:
+            case machine::Opcode::binary_i32_contiguous_map:
+            case machine::Opcode::binary_i64_contiguous_map: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_inplace ||
+                                  instruction.opcode == machine::Opcode::binary_i64_contiguous_map;
+                const bool inplace = instruction.opcode == machine::Opcode::binary_i32_contiguous_inplace ||
+                                     instruction.opcode == machine::Opcode::binary_i64_contiguous_inplace;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.inputs.size() != (inplace ? 2U : 3U) || instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed contiguous integer expression pack in @" + function.name);
+                    return encoded;
+                }
+                const auto scalar_opcode = static_cast<machine::Opcode>(instruction.argument_index);
+                const bool supported = wide
+                    ? (scalar_opcode == machine::Opcode::add_i64 || scalar_opcode == machine::Opcode::sub_i64 ||
+                       scalar_opcode == machine::Opcode::and_i64 || scalar_opcode == machine::Opcode::or_i64 ||
+                       scalar_opcode == machine::Opcode::xor_i64)
+                    : (scalar_opcode == machine::Opcode::add_i32 || scalar_opcode == machine::Opcode::sub_i32 ||
+                       scalar_opcode == machine::Opcode::and_i32 || scalar_opcode == machine::Opcode::or_i32 ||
+                       scalar_opcode == machine::Opcode::xor_i32);
+                if (!supported) {
+                    add_error(diagnostics, "unsupported packed integer operation in @" + function.name);
+                    return encoded;
+                }
+
+                const auto source_reg = instruction.inputs[0];
+                const auto destination_reg = inplace ? instruction.inputs[0] : instruction.inputs[1];
+                const auto scalar_reg = inplace ? instruction.inputs[1] : instruction.inputs[2];
+                const auto& source_location = allocation.location(source_reg);
+                const auto& destination_location = allocation.location(destination_reg);
+                const auto& scalar_location = allocation.location(scalar_reg);
+                Register source = Register::ecx;
+                Register destination = Register::edx;
+                Register scalar = Register::eax;
+                if (source_location.kind == machine::LocationKind::physical_register)
+                    source = integer_register(source_location.physical);
+                else
+                    emit_read_location64(out, source, source_location);
+                if (destination_location.kind == machine::LocationKind::physical_register)
+                    destination = integer_register(destination_location.physical);
+                else
+                    emit_read_location64(out, destination, destination_location);
+                if (scalar_location.kind == machine::LocationKind::physical_register)
+                    scalar = integer_register(scalar_location.physical);
+                else
+                    emit_read_location64(out, scalar, scalar_location);
+
+                const bool use_avx512 = instruction.vector_bits >= 512U && instruction.immediate * lane_bytes >= 64;
+                const bool use_avx2 = !use_avx512 && instruction.vector_bits >= 256U && instruction.immediate * lane_bytes >= 32;
+                if (use_avx512 || use_avx2) {
+                    // Stay entirely in the VEX/EVEX domain.  Legacy SSE MOVQ /
+                    // PSHUFD here creates an AVX<->SSE transition on every
+                    // vector-loop iteration once vzeroupper is correctly moved
+                    // to ABI boundaries.
+                    emit_vex_mov_gpr_to_xmm(out, XmmRegister::xmm1, scalar, wide);
+                } else if (wide) {
+                    emit_movq_gpr_to_xmm(out, XmmRegister::xmm1, scalar);
+                    emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm1, 0x44);
+                } else {
+                    emit_mov_gpr_to_xmm(out, XmmRegister::xmm1, scalar, false);
+                    emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm1, 0x00);
+                }
+                MaskRegister zmm_mask = MaskRegister::k0;
+                bool masked_zmm = false;
+                if (instruction.vector_mask_lanes != 0U) {
+                    const auto zmm_lanes = static_cast<std::uint8_t>(wide ? 8U : 16U);
+                    if (!use_avx512 || instruction.vector_mask_lanes > zmm_lanes) {
+                        add_error(diagnostics, "invalid AVX-512 packed lane mask in @" + function.name);
+                        return encoded;
+                    }
+                    emit_mask_lane_count(out, MaskRegister::k1, instruction.vector_mask_lanes);
+                    zmm_mask = MaskRegister::k1;
+                    masked_zmm = true;
+                }
+                if (use_avx512) emit_avx512_broadcast(out, XmmRegister::xmm1, XmmRegister::xmm1, wide);
+                else if (use_avx2) emit_avx2_broadcast(out, XmmRegister::xmm1, XmmRegister::xmm1, wide);
+
+                std::uint8_t packed_opcode = 0;
+                if (scalar_opcode == machine::Opcode::add_i32) packed_opcode = 0xFE;       // PADDD
+                else if (scalar_opcode == machine::Opcode::add_i64) packed_opcode = 0xD4;  // PADDQ
+                else if (scalar_opcode == machine::Opcode::sub_i32) packed_opcode = 0xFA;  // PSUBD
+                else if (scalar_opcode == machine::Opcode::sub_i64) packed_opcode = 0xFB;  // PSUBQ
+                else if (scalar_opcode == machine::Opcode::and_i32 || scalar_opcode == machine::Opcode::and_i64) packed_opcode = 0xDB; // PAND
+                else if (scalar_opcode == machine::Opcode::or_i32 || scalar_opcode == machine::Opcode::or_i64) packed_opcode = 0xEB;   // POR
+                else packed_opcode = 0xEF; // PXOR
+
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                std::int32_t offset = 0;
+                // Schedule two independent vectors together when possible.
+                // This exposes load/ALU overlap instead of creating one long
+                // load -> op -> store chain, matching the shape modern x86
+                // out-of-order cores (and LLVM) prefer for four i64/eight i32
+                // lane packs.
+                if (use_avx512) {
+                    for (; offset + 64 <= total_bytes; offset += 64) {
+                        emit_zmm512_ptr_load(out, XmmRegister::xmm0, source, offset, wide, zmm_mask, masked_zmm);
+                        emit_avx512_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm0, XmmRegister::xmm1, packed_opcode, wide);
+                        emit_zmm512_ptr_store(out, destination, XmmRegister::xmm0, offset, wide, zmm_mask);
+                    }
+                } else if (use_avx2) {
+                    for (; offset + 32 <= total_bytes; offset += 32) {
+                        emit_ymm256_ptr_load(out, XmmRegister::xmm0, source, offset);
+                        emit_avx2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm0, XmmRegister::xmm1, packed_opcode);
+                        emit_ymm256_ptr_store(out, destination, XmmRegister::xmm0, offset);
+                    }
+                } else {
+                    for (; offset + 32 <= total_bytes; offset += 32) {
+                        emit_xmm128_ptr_load(out, XmmRegister::xmm0, source, offset);
+                        emit_xmm128_ptr_load(out, XmmRegister::xmm2, source, offset + 16);
+                        emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_opcode);
+                        emit_sse2_integer_binary(out, XmmRegister::xmm2, XmmRegister::xmm1, packed_opcode);
+                        emit_xmm128_ptr_store(out, destination, XmmRegister::xmm0, offset);
+                        emit_xmm128_ptr_store(out, destination, XmmRegister::xmm2, offset + 16);
+                    }
+                }
+                if (offset < total_bytes) {
+                    const auto chunk_bytes = std::min<std::int32_t>(16, total_bytes - offset);
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source, offset, chunk_bytes);
+                    emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_opcode);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, chunk_bytes);
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_map2:
+            case machine::Opcode::binary_i64_contiguous_map2: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_map2;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.inputs.size() != 3U || instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed vector-to-vector integer expression pack in @" + function.name);
+                    return encoded;
+                }
+                const auto scalar_opcode = static_cast<machine::Opcode>(instruction.argument_index);
+                const bool supported = wide
+                    ? (scalar_opcode == machine::Opcode::add_i64 || scalar_opcode == machine::Opcode::sub_i64 ||
+                       scalar_opcode == machine::Opcode::and_i64 || scalar_opcode == machine::Opcode::or_i64 ||
+                       scalar_opcode == machine::Opcode::xor_i64)
+                    : (scalar_opcode == machine::Opcode::add_i32 || scalar_opcode == machine::Opcode::sub_i32 ||
+                       scalar_opcode == machine::Opcode::and_i32 || scalar_opcode == machine::Opcode::or_i32 ||
+                       scalar_opcode == machine::Opcode::xor_i32);
+                if (!supported) {
+                    add_error(diagnostics, "unsupported vector-to-vector integer operation in @" + function.name);
+                    return encoded;
+                }
+                Register source_a = Register::ecx, source_b = Register::edx, destination = Register::eax;
+                const auto resolve_pointer = [&](machine::VirtualRegister reg, Register fallback) -> Register {
+                    const auto& location = allocation.location(reg);
+                    if (location.kind == machine::LocationKind::physical_register)
+                        return integer_register(location.physical);
+                    emit_read_location64(out, fallback, location);
+                    return fallback;
+                };
+                source_a = resolve_pointer(instruction.inputs[0], Register::ecx);
+                source_b = resolve_pointer(instruction.inputs[1], Register::edx);
+                destination = resolve_pointer(instruction.inputs[2], Register::eax);
+                std::uint8_t packed_opcode = 0;
+                if (scalar_opcode == machine::Opcode::add_i32) packed_opcode = 0xFE;
+                else if (scalar_opcode == machine::Opcode::add_i64) packed_opcode = 0xD4;
+                else if (scalar_opcode == machine::Opcode::sub_i32) packed_opcode = 0xFA;
+                else if (scalar_opcode == machine::Opcode::sub_i64) packed_opcode = 0xFB;
+                else if (scalar_opcode == machine::Opcode::and_i32 || scalar_opcode == machine::Opcode::and_i64) packed_opcode = 0xDB;
+                else if (scalar_opcode == machine::Opcode::or_i32 || scalar_opcode == machine::Opcode::or_i64) packed_opcode = 0xEB;
+                else packed_opcode = 0xEF;
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                std::int32_t offset = 0;
+                const auto vector_chunk_bytes = instruction.vector_bits >= 512U ? 64 :
+                                                instruction.vector_bits >= 256U ? 32 : 16;
+                for (; offset + vector_chunk_bytes <= total_bytes; offset += vector_chunk_bytes) {
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source_a, offset, vector_chunk_bytes);
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_b, offset, vector_chunk_bytes);
+                    emit_packed_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm0, XmmRegister::xmm1,
+                                               packed_opcode, wide, vector_chunk_bytes);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, vector_chunk_bytes);
+                }
+                if (offset < total_bytes) {
+                    const auto chunk_bytes = std::min<std::int32_t>(16, total_bytes - offset);
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source_a, offset, chunk_bytes);
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_b, offset, chunk_bytes);
+                    emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_opcode);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, chunk_bytes);
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_dag_reuse:
+            case machine::Opcode::binary_i64_contiguous_dag_reuse: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_dag_reuse;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.symbol.size() < 18U || (instruction.symbol.size() % 6U) != 0U ||
+                    instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed packed reusable integer DAG in @" + function.name);
+                    return encoded;
+                }
+                struct DagNode { std::uint16_t tag{}, lhs{}, rhs{}; };
+                const auto read16 = [&](std::size_t at) -> std::uint16_t {
+                    return static_cast<std::uint16_t>(static_cast<unsigned char>(instruction.symbol[at])) |
+                           (static_cast<std::uint16_t>(static_cast<unsigned char>(instruction.symbol[at + 1U])) << 8U);
+                };
+                std::vector<DagNode> nodes;
+                nodes.reserve(instruction.symbol.size() / 6U);
+                std::size_t max_source = 0U;
+                bool saw_source = false;
+                for (std::size_t at = 0; at < instruction.symbol.size(); at += 6U) {
+                    DagNode node{read16(at), read16(at + 2U), read16(at + 4U)};
+                    if ((node.tag & 0x8000U) != 0U) {
+                        saw_source = true;
+                        max_source = std::max(max_source, static_cast<std::size_t>(node.tag & 0x7fffU));
+                    }
+                    nodes.push_back(node);
+                }
+                const auto source_count = saw_source ? max_source + 1U : 0U;
+                if (source_count == 0U || instruction.inputs.size() != source_count + 1U) {
+                    add_error(diagnostics, "malformed packed reusable DAG source list in @" + function.name);
+                    return encoded;
+                }
+                const auto packed_byte = [&](machine::Opcode op) -> std::uint8_t {
+                    if (op == machine::Opcode::add_i32) return 0xFE;
+                    if (op == machine::Opcode::add_i64) return 0xD4;
+                    if (op == machine::Opcode::sub_i32) return 0xFA;
+                    if (op == machine::Opcode::sub_i64) return 0xFB;
+                    if (op == machine::Opcode::and_i32 || op == machine::Opcode::and_i64) return 0xDB;
+                    if (op == machine::Opcode::or_i32 || op == machine::Opcode::or_i64) return 0xEB;
+                    return 0xEF;
+                };
+                const auto resolve_pointer = [&](machine::VirtualRegister reg, Register fallback) -> Register {
+                    const auto& location = allocation.location(reg);
+                    if (location.kind == machine::LocationKind::physical_register) return integer_register(location.physical);
+                    emit_read_location64(out, fallback, location);
+                    return fallback;
+                };
+                std::vector<std::size_t> base_uses(nodes.size(), 0U);
+                for (const auto& node : nodes) {
+                    if ((node.tag & 0x8000U) == 0U) {
+                        if (node.lhs >= nodes.size() || node.rhs >= nodes.size()) {
+                            add_error(diagnostics, "packed reusable DAG node reference overflow in @" + function.name);
+                            return encoded;
+                        }
+                        ++base_uses[node.lhs];
+                        ++base_uses[node.rhs];
+                    }
+                }
+
+                // Estimate the amount of packed work required to rematerialize
+                // each node. Shared nodes with meaningful rematerialization cost
+                // are cached; cheap nodes are allowed to recompute when keeping
+                // all shared values live would create unnecessary XMM pressure.
+                // Limit persistent cache entries so the recursive evaluator keeps
+                // enough registers available for independent subtrees.
+                std::vector<std::size_t> subtree_cost(nodes.size(), 1U);
+                for (std::size_t id = 0; id < nodes.size(); ++id) {
+                    const auto& node = nodes[id];
+                    if ((node.tag & 0x8000U) == 0U) {
+                        subtree_cost[id] = 1U + subtree_cost[node.lhs] + subtree_cost[node.rhs];
+                    }
+                }
+                struct RetainCandidate { std::size_t id{}; std::size_t savings{}; std::size_t cost{}; };
+                std::vector<RetainCandidate> retain_candidates;
+                for (std::size_t id = 0; id < nodes.size(); ++id) {
+                    if ((nodes[id].tag & 0x8000U) != 0U || base_uses[id] < 2U) continue;
+                    const auto savings = (subtree_cost[id] > 1U ? subtree_cost[id] - 1U : 0U) * (base_uses[id] - 1U);
+                    if (savings != 0U) retain_candidates.push_back({id, savings, subtree_cost[id]});
+                }
+                std::sort(retain_candidates.begin(), retain_candidates.end(), [](const auto& left, const auto& right) {
+                    if (left.savings != right.savings) return left.savings > right.savings;
+                    if (left.cost != right.cost) return left.cost > right.cost;
+                    return left.id < right.id;
+                });
+                std::vector<bool> retain(nodes.size(), false);
+                std::vector<std::size_t> retention_value(nodes.size(), 0U);
+                for (const auto& candidate : retain_candidates) {
+                    retain[candidate.id] = true;
+                    retention_value[candidate.id] = candidate.savings;
+                }
+
+                const std::array<XmmRegister, 8> pool = {XmmRegister::xmm0, XmmRegister::xmm1, XmmRegister::xmm2, XmmRegister::xmm3,
+                                                         XmmRegister::xmm4, XmmRegister::xmm5, XmmRegister::xmm6, XmmRegister::xmm7};
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                for (std::int32_t offset = 0; offset < total_bytes;) {
+                    const auto remaining_bytes = total_bytes - offset;
+                    const auto chunk_bytes = instruction.vector_bits >= 512U && remaining_bytes >= 64 ? 64 :
+                                             instruction.vector_bits >= 256U && remaining_bytes >= 32 ? 32 :
+                                             std::min<std::int32_t>(16, remaining_bytes);
+                    std::vector<std::optional<XmmRegister>> cached(nodes.size());
+                    auto remaining = base_uses;
+                    std::array<bool, 8> busy{};
+                    const auto is_protected = [](XmmRegister reg, const std::vector<XmmRegister>& protected_regs) {
+                        return std::find(protected_regs.begin(), protected_regs.end(), reg) != protected_regs.end();
+                    };
+                    const auto allocate_xmm = [&](const std::vector<XmmRegister>& protected_regs) -> std::optional<XmmRegister> {
+                        for (std::size_t i = 0; i < pool.size(); ++i) {
+                            if (!busy[i]) {
+                                busy[i] = true;
+                                return pool[i];
+                            }
+                        }
+
+                        std::optional<std::size_t> victim;
+                        for (std::size_t id = 0; id < cached.size(); ++id) {
+                            if (!cached[id] || is_protected(*cached[id], protected_regs)) continue;
+                            if (!victim || retention_value[id] < retention_value[*victim] ||
+                                (retention_value[id] == retention_value[*victim] && subtree_cost[id] < subtree_cost[*victim]))
+                                victim = id;
+                        }
+                        if (!victim) return std::nullopt;
+                        const auto reg = *cached[*victim];
+                        cached[*victim].reset();
+                        return reg;
+                    };
+                    const auto release_xmm = [&](XmmRegister reg) { busy[static_cast<std::size_t>(reg)] = false; };
+                    struct Materialized { XmmRegister reg{}; bool disposable{}; };
+                    std::function<std::optional<Materialized>(std::size_t, const std::vector<XmmRegister>&)> materialize;
+                    materialize = [&](std::size_t id, const std::vector<XmmRegister>& protected_regs) -> std::optional<Materialized> {
+                        if (id >= nodes.size()) return std::nullopt;
+                        if (retain[id] && cached[id]) return Materialized{*cached[id], false};
+                        const auto& node = nodes[id];
+                        if ((node.tag & 0x8000U) != 0U) {
+                            const auto reg = allocate_xmm(protected_regs);
+                            if (!reg) return std::nullopt;
+                            const auto source_index = static_cast<std::size_t>(node.tag & 0x7fffU);
+                            const auto pointer = resolve_pointer(instruction.inputs[source_index], Register::ecx);
+                            emit_packed_ptr_load(out, *reg, pointer, offset, chunk_bytes);
+                            return Materialized{*reg, true};
+                        }
+                        auto lhs = materialize(node.lhs, protected_regs);
+                        if (!lhs) return std::nullopt;
+                        auto rhs_protected = protected_regs;
+                        rhs_protected.push_back(lhs->reg);
+                        auto rhs = materialize(node.rhs, rhs_protected);
+                        if (!rhs) {
+                            if (lhs->disposable) release_xmm(lhs->reg);
+                            return std::nullopt;
+                        }
+                        XmmRegister destination_reg = lhs->reg;
+                        if (!lhs->disposable) {
+                            auto destination_protected = rhs_protected;
+                            destination_protected.push_back(rhs->reg);
+                            const auto fresh = allocate_xmm(destination_protected);
+                            if (!fresh) {
+                                if (rhs->disposable) release_xmm(rhs->reg);
+                                return std::nullopt;
+                            }
+                            destination_reg = *fresh;
+                            emit_packed_move(out, destination_reg, lhs->reg, chunk_bytes);
+                        }
+                        emit_packed_integer_binary(out, destination_reg, rhs->reg, packed_byte(static_cast<machine::Opcode>(node.tag)), chunk_bytes);
+                        if (rhs->disposable && rhs->reg != destination_reg) release_xmm(rhs->reg);
+
+                        if (remaining[node.lhs] != 0U) --remaining[node.lhs];
+                        if (remaining[node.rhs] != 0U) --remaining[node.rhs];
+                        const std::array<std::size_t, 2> consumed = {node.lhs, node.rhs};
+                        for (std::size_t index = 0; index < consumed.size(); ++index) {
+                            const auto child = consumed[index];
+                            if (index != 0U && consumed[0] == child) continue;
+                            if (retain[child] && remaining[child] == 0U && cached[child] && *cached[child] != destination_reg) {
+                                release_xmm(*cached[child]);
+                                cached[child].reset();
+                            }
+                        }
+
+                        const bool keep = retain[id];
+                        if (keep) cached[id] = destination_reg;
+                        return Materialized{destination_reg, !keep};
+                    };
+                    const auto root = materialize(nodes.size() - 1U, {});
+                    if (!root) {
+                        add_error(diagnostics, "packed reusable DAG exceeded vector register budget in @" + function.name);
+                        return encoded;
+                    }
+                    const auto destination = resolve_pointer(instruction.inputs[source_count], Register::ecx);
+                    emit_packed_ptr_store(out, destination, root->reg, offset, chunk_bytes);
+                    if (root->disposable) release_xmm(root->reg);
+                    offset += chunk_bytes;
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_dag:
+            case machine::Opcode::binary_i64_contiguous_dag: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_dag;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.symbol.size() < 10U || (instruction.symbol.size() & 1U) != 0U ||
+                    instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed packed integer DAG in @" + function.name);
+                    return encoded;
+                }
+                const auto packed_byte = [&](machine::Opcode op) -> std::uint8_t {
+                    if (op == machine::Opcode::add_i32) return 0xFE;
+                    if (op == machine::Opcode::add_i64) return 0xD4;
+                    if (op == machine::Opcode::sub_i32) return 0xFA;
+                    if (op == machine::Opcode::sub_i64) return 0xFB;
+                    if (op == machine::Opcode::and_i32 || op == machine::Opcode::and_i64) return 0xDB;
+                    if (op == machine::Opcode::or_i32 || op == machine::Opcode::or_i64) return 0xEB;
+                    return 0xEF;
+                };
+                const auto resolve_pointer = [&](machine::VirtualRegister reg, Register fallback) -> Register {
+                    const auto& location = allocation.location(reg);
+                    if (location.kind == machine::LocationKind::physical_register) return integer_register(location.physical);
+                    emit_read_location64(out, fallback, location);
+                    return fallback;
+                };
+                std::vector<std::uint16_t> program;
+                program.reserve(instruction.symbol.size() / 2U);
+                std::size_t max_source = 0U;
+                bool saw_source = false;
+                for (std::size_t metadata_offset = 0; metadata_offset + 1U < instruction.symbol.size(); metadata_offset += 2U) {
+                    const auto token = static_cast<std::uint16_t>(
+                        static_cast<std::uint16_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset])) |
+                        (static_cast<std::uint16_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset + 1U])) << 8U));
+                    program.push_back(token);
+                    if ((token & 0x8000U) != 0U) {
+                        saw_source = true;
+                        max_source = std::max(max_source, static_cast<std::size_t>(token & 0x7fffU));
+                    }
+                }
+                const auto source_count = saw_source ? max_source + 1U : 0U;
+                if (source_count == 0U || instruction.inputs.size() != source_count + 1U) {
+                    add_error(diagnostics, "malformed packed integer DAG source list in @" + function.name);
+                    return encoded;
+                }
+                const std::array<XmmRegister, 8> xmm_stack_registers = {
+                    XmmRegister::xmm0, XmmRegister::xmm1, XmmRegister::xmm2, XmmRegister::xmm3,
+                    XmmRegister::xmm4, XmmRegister::xmm5, XmmRegister::xmm6, XmmRegister::xmm7};
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                for (std::int32_t offset = 0; offset < total_bytes;) {
+                    const auto remaining_bytes = total_bytes - offset;
+                    const auto chunk_bytes = instruction.vector_bits >= 512U && remaining_bytes >= 64 ? 64 :
+                                             instruction.vector_bits >= 256U && remaining_bytes >= 32 ? 32 :
+                                             std::min<std::int32_t>(16, remaining_bytes);
+                    std::vector<XmmRegister> stack;
+                    stack.reserve(8U);
+                    for (const auto token : program) {
+                        if ((token & 0x8000U) != 0U) {
+                            const auto source_index = static_cast<std::size_t>(token & 0x7fffU);
+                            if (source_index >= source_count || stack.size() >= xmm_stack_registers.size()) {
+                                add_error(diagnostics, "packed integer DAG stack/source overflow in @" + function.name);
+                                return encoded;
+                            }
+                            const auto target = xmm_stack_registers[stack.size()];
+                            const auto pointer = resolve_pointer(instruction.inputs[source_index], Register::ecx);
+                            emit_packed_ptr_load(out, target, pointer, offset, chunk_bytes);
+                            stack.push_back(target);
+                            continue;
+                        }
+                        if (stack.size() < 2U) {
+                            add_error(diagnostics, "packed integer DAG stack underflow in @" + function.name);
+                            return encoded;
+                        }
+                        const auto operation = static_cast<machine::Opcode>(token);
+                        const auto right = stack.back();
+                        stack.pop_back();
+                        const auto left = stack.back();
+                        emit_packed_integer_binary(out, left, right, packed_byte(operation), chunk_bytes);
+                    }
+                    if (stack.size() != 1U) {
+                        add_error(diagnostics, "packed integer DAG stack imbalance in @" + function.name);
+                        return encoded;
+                    }
+                    const auto destination = resolve_pointer(instruction.inputs[source_count], Register::ecx);
+                    emit_packed_ptr_store(out, destination, stack.front(), offset, chunk_bytes);
+                    offset += chunk_bytes;
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_chain:
+            case machine::Opcode::binary_i64_contiguous_chain: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_chain;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.symbol.size() < 6U || (instruction.symbol.size() & 1U) != 0U ||
+                    instruction.inputs.size() != instruction.symbol.size() / 2U + 2U ||
+                    instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed arbitrary-depth integer expression pack in @" + function.name);
+                    return encoded;
+                }
+                const auto packed_byte = [&](machine::Opcode op) -> std::uint8_t {
+                    if (op == machine::Opcode::add_i32) return 0xFE;
+                    if (op == machine::Opcode::add_i64) return 0xD4;
+                    if (op == machine::Opcode::sub_i32) return 0xFA;
+                    if (op == machine::Opcode::sub_i64) return 0xFB;
+                    if (op == machine::Opcode::and_i32 || op == machine::Opcode::and_i64) return 0xDB;
+                    if (op == machine::Opcode::or_i32 || op == machine::Opcode::or_i64) return 0xEB;
+                    return 0xEF;
+                };
+                const auto resolve_pointer = [&](machine::VirtualRegister reg, Register fallback) -> Register {
+                    const auto& location = allocation.location(reg);
+                    if (location.kind == machine::LocationKind::physical_register) return integer_register(location.physical);
+                    emit_read_location64(out, fallback, location);
+                    return fallback;
+                };
+                std::vector<machine::Opcode> chain_operations;
+                chain_operations.reserve(instruction.symbol.size() / 2U);
+                for (std::size_t metadata_offset = 0; metadata_offset + 1U < instruction.symbol.size(); metadata_offset += 2U) {
+                    const auto encoded = static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset])) |
+                                         (static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset + 1U])) << 8U);
+                    chain_operations.push_back(static_cast<machine::Opcode>(encoded));
+                }
+                const auto source_count = chain_operations.size() + 1U;
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                std::int32_t offset = 0;
+                const auto vector_chunk_bytes = instruction.vector_bits >= 512U ? 64 :
+                                                instruction.vector_bits >= 256U ? 32 : 16;
+                for (; offset + vector_chunk_bytes <= total_bytes; offset += vector_chunk_bytes) {
+                    auto source = resolve_pointer(instruction.inputs[0], Register::ecx);
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source, offset, vector_chunk_bytes);
+                    for (std::size_t operation_index = 0; operation_index < chain_operations.size(); ++operation_index) {
+                        source = resolve_pointer(instruction.inputs[operation_index + 1U], Register::ecx);
+                        emit_packed_ptr_load(out, XmmRegister::xmm1, source, offset, vector_chunk_bytes);
+                        emit_packed_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1,
+                                                   packed_byte(chain_operations[operation_index]), vector_chunk_bytes);
+                    }
+                    const auto destination = resolve_pointer(instruction.inputs[source_count], Register::ecx);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, vector_chunk_bytes);
+                }
+                if (offset < total_bytes) {
+                    const auto chunk_bytes = std::min<std::int32_t>(16, total_bytes - offset);
+                    auto source = resolve_pointer(instruction.inputs[0], Register::ecx);
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source, offset, chunk_bytes);
+                    for (std::size_t operation_index = 0; operation_index < chain_operations.size(); ++operation_index) {
+                        source = resolve_pointer(instruction.inputs[operation_index + 1U], Register::ecx);
+                        emit_packed_ptr_load(out, XmmRegister::xmm1, source, offset, chunk_bytes);
+                        emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1,
+                                                 packed_byte(chain_operations[operation_index]));
+                    }
+                    const auto destination = resolve_pointer(instruction.inputs[source_count], Register::ecx);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, chunk_bytes);
+                }
+                break;
+            }
+            case machine::Opcode::binary_i32_contiguous_map3:
+            case machine::Opcode::binary_i64_contiguous_map3: {
+                const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_map3;
+                const auto lane_bytes = wide ? 8 : 4;
+                if (instruction.inputs.size() != 4U || instruction.immediate < 2 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed chained integer expression pack in @" + function.name);
+                    return encoded;
+                }
+                const auto op1 = static_cast<machine::Opcode>(instruction.argument_index & 0xffffU);
+                const auto op2 = static_cast<machine::Opcode>((instruction.argument_index >> 16U) & 0xffffU);
+                const auto packed_byte = [&](machine::Opcode op) -> std::uint8_t {
+                    if (op == machine::Opcode::add_i32) return 0xFE;
+                    if (op == machine::Opcode::add_i64) return 0xD4;
+                    if (op == machine::Opcode::sub_i32) return 0xFA;
+                    if (op == machine::Opcode::sub_i64) return 0xFB;
+                    if (op == machine::Opcode::and_i32 || op == machine::Opcode::and_i64) return 0xDB;
+                    if (op == machine::Opcode::or_i32 || op == machine::Opcode::or_i64) return 0xEB;
+                    return 0xEF;
+                };
+                Register source_a = Register::ecx, source_b = Register::edx, source_c = Register::r8d, destination = Register::eax;
+                const auto resolve_pointer = [&](machine::VirtualRegister reg, Register fallback) -> Register {
+                    const auto& location = allocation.location(reg);
+                    if (location.kind == machine::LocationKind::physical_register) return integer_register(location.physical);
+                    emit_read_location64(out, fallback, location); return fallback;
+                };
+                source_a = resolve_pointer(instruction.inputs[0], Register::ecx);
+                source_b = resolve_pointer(instruction.inputs[1], Register::edx);
+                source_c = resolve_pointer(instruction.inputs[2], Register::r8d);
+                destination = resolve_pointer(instruction.inputs[3], Register::eax);
+                const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
+                std::int32_t offset = 0;
+                const auto vector_chunk_bytes = instruction.vector_bits >= 512U ? 64 :
+                                                instruction.vector_bits >= 256U ? 32 : 16;
+                for (; offset + vector_chunk_bytes <= total_bytes; offset += vector_chunk_bytes) {
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source_a, offset, vector_chunk_bytes);
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_b, offset, vector_chunk_bytes);
+                    emit_packed_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_byte(op1), vector_chunk_bytes);
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_c, offset, vector_chunk_bytes);
+                    emit_packed_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_byte(op2), vector_chunk_bytes);
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, vector_chunk_bytes);
+                }
+                if (offset < total_bytes) {
+                    const auto chunk_bytes = std::min<std::int32_t>(16, total_bytes - offset);
+                    emit_packed_ptr_load(out, XmmRegister::xmm0, source_a, offset, chunk_bytes);
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_b, offset, chunk_bytes);
+                    emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_byte(op1));
+                    emit_packed_ptr_load(out, XmmRegister::xmm1, source_c, offset, chunk_bytes);
+                    emit_sse2_integer_binary(out, XmmRegister::xmm0, XmmRegister::xmm1, packed_byte(op2));
+                    emit_packed_ptr_store(out, destination, XmmRegister::xmm0, offset, chunk_bytes);
+                }
+                break;
+            }
+            case machine::Opcode::reduce_add_i32_contiguous: {
+                if (instruction.inputs.size() != 1U || instruction.immediate < 4 || instruction.immediate > 32 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed contiguous i32 reduction in @" + function.name);
+                    return encoded;
+                }
+                const auto& pointer_location = allocation.location(instruction.inputs[0]);
+                Register pointer = Register::ecx;
+                if (pointer_location.kind == machine::LocationKind::physical_register)
+                    pointer = integer_register(pointer_location.physical);
+                else
+                    emit_read_location64(out, pointer, pointer_location);
+                emit_xmm128_ptr_load(out, XmmRegister::xmm0, pointer, 0);
+                if (instruction.immediate == 4) {
+                    // One 128-bit vector already contains all four lanes.
+                } else {
+                    const auto half_bytes = static_cast<std::int32_t>(instruction.immediate * 2);
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm1, pointer, half_bytes);
+                    for (std::int32_t offset = 16; offset < half_bytes; offset += 16) {
+                        emit_paddd_ptr(out, XmmRegister::xmm0, pointer, offset);
+                        emit_paddd_ptr(out, XmmRegister::xmm1, pointer, half_bytes + offset);
+                    }
+                    emit_paddd(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                }
+                // Horizontally reduce four packed dwords without requiring SSE3.
+                emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm0, 0x4E);
+                emit_paddd(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm0, 0xB1);
+                emit_paddd(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                const auto& destination = allocation.location(instruction.result);
+                if (destination.kind == machine::LocationKind::physical_register) {
+                    emit_movd_xmm_to_gpr(out, integer_register(destination.physical), XmmRegister::xmm0);
+                } else {
+                    emit_movd_xmm_to_gpr(out, Register::eax, XmmRegister::xmm0);
+                    write_integer_cached32(destination, Register::eax);
+                }
+                break;
+            }
+            case machine::Opcode::reduce_add_i64_contiguous: {
+                if (instruction.inputs.size() != 1U || instruction.immediate < 4 || instruction.immediate > 16 ||
+                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    add_error(diagnostics, "malformed contiguous i64 reduction in @" + function.name);
+                    return encoded;
+                }
+                const auto& pointer_location = allocation.location(instruction.inputs[0]);
+                Register pointer = Register::ecx;
+                if (pointer_location.kind == machine::LocationKind::physical_register)
+                    pointer = integer_register(pointer_location.physical);
+                else
+                    emit_read_location64(out, pointer, pointer_location);
+                emit_xmm128_ptr_load(out, XmmRegister::xmm0, pointer, 0);
+                if (instruction.immediate == 4) {
+                    emit_paddq_ptr(out, XmmRegister::xmm0, pointer, 16);
+                } else if (instruction.immediate == 8) {
+                    // Four independent 128-bit loads expose memory-level
+                    // parallelism before joining two add chains.
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm1, pointer, 16);
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm2, pointer, 32);
+                    emit_paddq(out, XmmRegister::xmm2, XmmRegister::xmm0);
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm0, pointer, 48);
+                    emit_paddq(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                    emit_paddq(out, XmmRegister::xmm0, XmmRegister::xmm2);
+                } else {
+                    const auto half_bytes = static_cast<std::int32_t>(instruction.immediate * 4);
+                    emit_xmm128_ptr_load(out, XmmRegister::xmm1, pointer, half_bytes);
+                    for (std::int32_t offset = 16; offset < half_bytes; offset += 16) {
+                        emit_paddq_ptr(out, XmmRegister::xmm0, pointer, offset);
+                        emit_paddq_ptr(out, XmmRegister::xmm1, pointer, half_bytes + offset);
+                    }
+                    emit_paddq(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                }
+                emit_pshufd(out, XmmRegister::xmm1, XmmRegister::xmm0, 0xEE);
+                emit_paddq(out, XmmRegister::xmm0, XmmRegister::xmm1);
+                const auto& destination = allocation.location(instruction.result);
+                if (destination.kind == machine::LocationKind::physical_register) {
+                    emit_movq_xmm_to_gpr(out, integer_register(destination.physical), XmmRegister::xmm0);
+                } else {
+                    emit_movq_xmm_to_gpr(out, Register::eax, XmmRegister::xmm0);
+                    write_integer_cached64(destination, Register::eax);
+                }
                 break;
             }
             case machine::Opcode::add_i32:

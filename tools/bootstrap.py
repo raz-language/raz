@@ -460,7 +460,7 @@ def prepare_reproducibility_build(build_dir: Path, order: list[str]) -> None:
         shutil.rmtree(build_dir)
     # Reproducibility stages only read the canonical compiler sources. Hard-link
     # those immutable inputs instead of copying the complete compiler tree for
-    # every generation. Generated .raz/target state remains stage-local.
+    # every generation. Generated target/ state (and legacy .raz/ state) remains stage-local.
     shutil.copytree(
         ROOT / "compiler",
         build_dir,
@@ -497,7 +497,23 @@ def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str]
     print(f"      completed in {time.monotonic() - started:.3f}s", flush=True)
 
 
-def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Path, output: Path, env: dict[str, str], runtime_deps: list[str]) -> None:
+def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Path, output: Path, env: dict[str, str], runtime_deps: list[str], linker: Path | None = None) -> None:
+    # The reproducibility generations are the only links in the bootstrap that
+    # do not go through the raz driver, so without this they would reach for the
+    # host C++ compiler even though the bundled linker is what ships. Keep the
+    # C++ driver as the fallback for hosts ObLink does not target yet.
+    if linker is not None and linker.is_file():
+        args = [str(linker), str(obj), str(runtime), str(bridge), str(forge), *runtime_deps,
+                "-l", "ws2_32", "-l", "bcrypt", "-l", "crypt32",
+                "--stack", "33554432", "-o", str(output)]
+        try:
+            run(f"Link {output.name}", args, cwd=output.parent, env=env)
+            return
+        except RuntimeError as error:
+            # The raz build driver falls back to the configured external linker
+            # when ObLink cannot complete an image; keep the same contract here
+            # so an unsupported input shape does not fail the whole bootstrap.
+            print(f"      ObLink could not complete this image ({error}); using {compiler}", flush=True)
     name = Path(compiler).name.lower()
     if IS_WINDOWS and name in {"cl", "cl.exe", "clang-cl", "clang-cl.exe"}:
         # Reproducibility executables are the Raz compiler itself.  Reserve
@@ -555,25 +571,39 @@ def main() -> int:
     cmake = require_command("cmake", env)
     require_command("ninja", env)
     ctest = require_command("ctest", env) if args.run_tests else ""
-    host_build = ROOT / "build" / args.host_preset
-    qualification = ROOT / "build" / "compiler-qualification"
+    build_root = ROOT / "build"
+    host_build = build_root / args.host_preset
+    qualification = ROOT / "target" / "bootstrap"
     if args.clean:
         shutil.rmtree(host_build, ignore_errors=True)
         shutil.rmtree(qualification, ignore_errors=True)
     qualification.mkdir(parents=True, exist_ok=True)
 
     banner(f"Configure and build host toolchain ({platform.system()})")
-    compiler, fresh = choose_compiler(host_build, env, ROOT / "build" / ".toolchain-preflight")
+    compiler, fresh = choose_compiler(host_build, env, build_root / ".toolchain-preflight")
     print(f"C++ compiler: {compiler}\nJobs        : {args.jobs}")
     configure = [cmake, "--preset", args.host_preset]
     if fresh:
         configure.append(f"-DCMAKE_CXX_COMPILER={compiler}")
     run("Configure host toolchain", configure, env=env)
-    run("Build host compiler/runtime/Forge", [cmake, "--build", "--preset", args.host_preset, "--parallel", str(args.jobs), "--target", "raz_host", "razc_host", "raz_runtime", "raz_forge_bridge", "forge"], env=env)
+    run("Build host compiler/runtime/Forge", [cmake, "--build", "--preset", args.host_preset, "--parallel", str(args.jobs), "--target", "raz_host", "razc_host", "raz_runtime", "raz_forge_bridge", "forge", "oblink"], env=env)
     compiler = read_cache(host_build, "CMAKE_CXX_COMPILER")
-    env["RAZ_LINKER"] = compiler
+    if IS_WINDOWS:
+        env["RAZ_EXTERNAL_LINKER"] = compiler
+        env.pop("RAZ_LINKER", None)  # Bundled ObLink is the Windows default.
+    else:
+        env["RAZ_LINKER"] = compiler
 
     host_driver = find_artifact(host_build, [f"raz-host{EXE}"])
+    # Built above alongside the host toolchain. ObLink emits PE32+ only, so it
+    # is the bundled linker on Windows and nowhere else yet; elsewhere, and when
+    # the bundled build is disabled, link_stage falls back to the C++ driver.
+    oblink: Path | None = None
+    if IS_WINDOWS:
+        try:
+            oblink = find_artifact(host_build, [f"oblink{EXE}"])
+        except RuntimeError:
+            oblink = None
     runtime = find_artifact(host_build, ["raz_runtime.lib", "libraz_runtime.a"])
     bridge = find_artifact(host_build, ["raz_forge_bridge.lib", "libraz_forge_bridge.a"])
     forge = find_artifact(host_build, ["forge.lib", "libforge.a"])
@@ -671,8 +701,8 @@ def main() -> int:
         lines = [line for line in lines if not line.startswith("namespace raz_compiler_") and not line.startswith("public import raz_compiler_") and not line.startswith("import raz_compiler_")]
         source.write_text("\n".join(lines) + "\n", encoding="utf-8")
     (compiler_project / "source-order.txt").write_text("\n".join(legacy_order) + "\n", encoding="ascii")
-    run("Host compiler -> production compiler", [str(host_driver), "build", str(compiler_project), "--target", "host", "--profile", args.bootstrap_profile, "--force"], env=env)
-    built = compiler_project / "target" / "host" / args.bootstrap_profile / f"raz-compiler{EXE}"
+    run("Host compiler -> production compiler", [str(host_driver), "build", str(compiler_project), "--profile", args.bootstrap_profile, "--force"], env=env)
+    built = compiler_project / "target" / args.bootstrap_profile / f"raz-compiler{EXE}"
     if not built.is_file():
         raise RuntimeError(f"Production compiler was not produced: {built}")
     candidate_dir = qualification / "candidate"
@@ -688,7 +718,16 @@ def main() -> int:
         banner(f"Reproducibility build {generation}")
         directory = qualification / f"repro-{generation}"
         prepare_reproducibility_build(directory, order)
-        obj = directory / f"compiler{OBJ}"
+
+        # A reproducibility workspace is still a Raz project.  Keep *all*
+        # generated native state below that project's target/ tree instead of
+        # dropping compiler.obj / raz-compiler beside raz.toml and src/.  This
+        # preserves the project-wide invariant that source roots stay clean and
+        # `target/` is the only project-local build-artifact root.
+        stage_target = directory / "target" / args.bootstrap_profile
+        stage_target.mkdir(parents=True, exist_ok=True)
+        obj = stage_target / f"compiler{OBJ}"
+        obj_argument = obj.relative_to(directory).as_posix()
         invoke_compiler(
             f"Compile reproducibility generation {generation}",
             previous,
@@ -700,14 +739,14 @@ def main() -> int:
                 "--forge-structured-only",
                 f"--opt={repro_opt}",
                 "raz.toml",
-                obj.name,
+                obj_argument,
             ],
             args.status_interval,
         )
         if not obj.is_file() or obj.stat().st_size < 500_000:
             raise RuntimeError(f"Reproducibility object is missing or unexpectedly small: {obj}")
-        exe = directory / f"raz-compiler{EXE}"
-        link_stage(compiler, obj, runtime, bridge, forge, exe, env, runtime_deps)
+        exe = stage_target / f"raz-compiler{EXE}"
+        link_stage(compiler, obj, runtime, bridge, forge, exe, env, runtime_deps, oblink)
         run(f"Validate reproducibility build {generation}", [str(exe), "--version"], cwd=directory, env=env)
         generated.append((generation, obj, exe, digest(obj)))
         previous = exe

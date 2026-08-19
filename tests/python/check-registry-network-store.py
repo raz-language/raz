@@ -48,7 +48,7 @@ def main():
     store=work/'home/store'/digest
     assert (store/'raz.toml').is_file() and (store/'src/widget.rz').is_file()
     assert 'widget = "^1.0.0"' in (app/'raz.toml').read_text()
-    assert (app/'.raz.registry-index').is_file()
+    assert (work/'home/registry/index.txt').is_file()
     server.shutdown();server.server_close();thread.join(timeout=5)
     offline=online.copy();offline['RAZ_OFFLINE']='1';offline.pop('RAZ_REGISTRY_URL',None);offline.pop('RAZ_REGISTRY_MIRRORS',None)
     before=(app/'raz.lock').read_bytes(); assert b'source = "registry"' in before and digest.encode() in before; run([compiler,'fetch'],app,offline);assert (app/'raz.lock').read_bytes()==before

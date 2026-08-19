@@ -67,7 +67,7 @@ other exported signature text invalidates importing modules.
 
 ## Persistent incremental state
 
-The compiler persists incremental state under the package-local `.raz/cache`
+The compiler persists incremental state under the package-local `target/cache`
 directory. Persistent state is an optimization only: deleting the directory must
 never change program semantics.
 

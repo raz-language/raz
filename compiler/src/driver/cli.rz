@@ -109,7 +109,10 @@ fn cli_print_status_detail(i64 detail, i64 detail_length) {
     raz_compiler_rt_arena_destroy(manifest);
 }
 
-fn cli_print_status(i64 kind, i64 detail, i64 detail_length) {
+// Writes the right-aligned status label and returns its length, or 0 for an
+// unknown kind. Labels are padded to a common width so the verbs line up down
+// the left edge of a build the way cargo's do.
+fn cli_print_status_label(i64 kind) -> i64 {
     i64 label_length = 0;
 
     if (kind == 1) {
@@ -185,7 +188,11 @@ fn cli_print_status(i64 kind, i64 detail, i64 detail_length) {
         cli_write_stream(1, &spaces, 6);
         cli_write_stream(1, &label, 6);
     }
-    if (label_length <= 0) {
+    return label_length;
+}
+
+fn cli_print_status(i64 kind, i64 detail, i64 detail_length) {
+    if (cli_print_status_label(kind) <= 0) {
         return;
     }
 
@@ -197,6 +204,130 @@ fn cli_print_status(i64 kind, i64 detail, i64 detail_length) {
     cli_write_stream(1, &newline, 1);
 }
 
+// `raz run` executes the linked artifact, so the status line names the file
+// that is about to run rather than the package it came from. Backticks match
+// the surrounding profile line and make the path unambiguous when it contains
+// spaces.
+fn cli_print_running_artifact(i64 path, i64 length) {
+    if (cli_print_status_label(4) <= 0) {
+        return;
+    }
+
+    i64 open_quote[2] = [32, 96];
+    i64 close_quote[2] = [96, 10];
+
+    cli_write_stream(1, &open_quote, 2);
+    cli_write_arena_stream(1, path, length);
+    cli_write_stream(1, &close_quote, 2);
+}
+
+// Runs the linked executable and reports its exit status as our own, the way a
+// build tool is expected to be transparent about the program it launched.
+fn cli_run_native_artifact(i64 path, i64 length) -> i64 {
+    if (path == 0 || length <= 0) {
+        return -1;
+    }
+    cli_print_running_artifact(path, length);
+    return raz_compiler_rt_process_run_argv_ascii(path, length, 0, 0, 0);
+}
+
+// Launches the linked artifact when the command asked for a run, and reports
+// its exit status. Returns 0 when there is nothing to run so the caller can use
+// the result as its own status unconditionally.
+fn cli_maybe_run_artifact(bool run_after_build, i64 path, i64 length) -> i64 {
+    if (!run_after_build) {
+        return 0;
+    }
+    return cli_run_native_artifact(path, length);
+}
+
+// Releases the arenas a compilation holds. Every exit path in the entrypoint
+// tears down the same set, so keeping the sequence here means a new early
+// return cannot quietly forget one of them.
+fn cli_release_compilation_arenas(i64 bytes, i64 manifest, i64 manifest_path, i64 output_path) {
+    if (bytes != 0) {
+        raz_compiler_rt_arena_destroy(bytes);
+    }
+    if (manifest != 0) {
+        raz_compiler_rt_arena_destroy(manifest);
+    }
+    if (manifest_path != 0) {
+        raz_compiler_rt_arena_destroy(manifest_path);
+    }
+    if (output_path != 0) {
+        raz_compiler_rt_arena_destroy(output_path);
+    }
+}
+
+// Elapsed seconds to two decimal places, as `1.23s`.
+fn cli_print_elapsed(i64 elapsed_nanos) {
+    i64 nanos = elapsed_nanos;
+
+    if (nanos < 0) {
+        nanos = 0;
+    }
+
+    i64 hundredths = nanos / 10000000;
+    i64 fraction = hundredths % 100;
+    i64 point[1] = [46];
+    i64 digits[2];
+
+    cli_write_number(1, hundredths / 100);
+    cli_write_stream(1, &point, 1);
+    digits[0] = 48 + fraction / 10;
+    digits[1] = 48 + fraction % 10;
+    cli_write_stream(1, &digits, 2);
+}
+
+// The completion line reports what was produced rather than restating the
+// package name already shown by Compiling above it: which profile was built,
+// what optimization and debug settings that implies, and how long it took.
+fn cli_print_completion_summary(i64 command, bool release_profile, i64 started_nanos) {
+    if (command <= 0) {
+        return;
+    }
+
+    i64 kind = 6;
+
+    if (command == 4 || command == 11 || command == 17) {
+        kind = 7;
+    } else if (command == 16) {
+        kind = 8;
+    }
+    if (cli_print_status_label(kind) <= 0) {
+        return;
+    }
+
+    i64 open_quote[2] = [32, 96];
+    i64 profile_word[10] = [96, 32, 112, 114, 111, 102, 105, 108, 101, 32];
+    i64 in_word[4] = [32, 105, 110, 32];
+    i64 suffix[2] = [115, 10];
+
+    cli_write_stream(1, &open_quote, 2);
+    if (release_profile) {
+        i64 release_name[7] = [114, 101, 108, 101, 97, 115, 101];
+
+        cli_write_stream(1, &release_name, 7);
+    } else {
+        i64 debug_name[5] = [100, 101, 98, 117, 103];
+
+        cli_write_stream(1, &debug_name, 5);
+    }
+    cli_write_stream(1, &profile_word, 10);
+    if (release_profile) {
+        i64 release_flags[21] = [91, 111, 112, 116, 105, 109, 105, 122, 101, 100, 93, 32, 116, 97, 114, 103, 101, 116, 40, 115, 41];
+
+        cli_write_stream(1, &release_flags, 21);
+    } else {
+        i64 debug_flags[35] = [91, 117, 110, 111, 112, 116, 105, 109, 105, 122, 101, 100, 32, 43, 32, 100, 101, 98, 117, 103, 105, 110, 102, 111, 93, 32, 116, 97, 114, 103, 101, 116, 40, 115, 41];
+
+        cli_write_stream(1, &debug_flags, 35);
+    }
+    cli_write_stream(1, &in_word, 4);
+    cli_print_elapsed(raz_compiler_rt_monotonic_nanos() - started_nanos);
+    cli_write_stream(1, &suffix, 2);
+}
+
 fn cli_print_compile_status(i64 command, i64 detail, i64 detail_length) {
     if (command <= 0) {
         return;
@@ -205,19 +336,6 @@ fn cli_print_compile_status(i64 command, i64 detail, i64 detail_length) {
         cli_print_status(2, detail, detail_length);
     } else {
         cli_print_status(1, detail, detail_length);
-    }
-}
-
-fn cli_print_completion_status(i64 command, i64 detail, i64 detail_length) {
-    if (command <= 0) {
-        return;
-    }
-    if (command == 4 || command == 11 || command == 17) {
-        cli_print_status(7, detail, detail_length);
-    } else if (command == 16) {
-        cli_print_status(8, detail, detail_length);
-    } else {
-        cli_print_status(6, detail, detail_length);
     }
 }
 
@@ -1749,6 +1867,10 @@ fn cli_print_build_help() {
     i64 words[111] = [9071406455288661, 29683936866754930, 32774720870966380, 16924084343304041, 9075869162172009, 32780223149076315, 29678487875029597, 9141757663012204, 9118677051207539, 27428556134969967, 9126416531861114, 32760384526971504, 28542713838575662, 28543820617705760, 30528358674949152, 28547047227531380, 27375683628852334, 31279338135841635, 16452466801996912, 27411018911064074, 28777949182651235, 9143677836817007, 28542713840676141, 28555782096166944, 2926244743038496, 27973096986976288, 30518308418512235, 12702091439009142, 9042853765082157, 9118745278554144, 9042427874004044, 13578369193946413, 34959505628082556, 9042521610681459, 9042521604759584, 34455865800290383, 30434956172424289, 9042428395091557, 29667501401976109, 32199702429394284, 9042521610216809, 9042521604759584, 9118749914453792, 29682889984402803, 34184252269600867, 30515186162102304, 32758179966709353, 29117744843197025, 31359671238336613, 12701695934624622, 12777868927919661, 9118758504522094, 9042521604759584, 9042521604759584, 9113991274655045, 9118758504522094, 9135169506796143, 29387151656511604, 2926244743038496, 32210631980294176, 33058416749274471, 12776760826754147, 9042523102932591, 33057252258619424, 32216185158595177, 28259039942304629, 9118694230672928, 9118758504522094, 31078187487686508, 21768458899950183, 31084746153946912, 12715989951724147, 30518308686622053, 35019868121886070, 9042521609304165, 21427420580028448, 12475373003298380, 28559167943962144, 32760384526118688, 33888187238522924, 30507468189950821, 32700769134185061, 16956068729418337, 17562964972892788, 9042521604759584, 21475799091650592, 29117685486865750, 31641137687065701, 12715989951735148, 27424277749133411, 9042521606743405, 9042521604759584, 21427420580028448, 32195298731054668, 24013622257935719, 28541316864417802, 17296853128541281, 9075869128158268, 9042521604759584, 24290737837318176, 28542713606709325, 33060533936988276, 31091242661274994, 30435007477735456, 29323069418731116, 31356011657849957, 21427748276871282, 32195298731054668, 31078160811713895, 31359671238336619, 170816366];
 
     cli_write_packed(&words, 111, 774);
+
+    i64 artifact_help[91] = [80, 114, 111, 106, 101, 99, 116, 32, 98, 117, 105, 108, 100, 115, 32, 119, 114, 105, 116, 101, 32, 110, 97, 116, 105, 118, 101, 32, 101, 120, 101, 99, 117, 116, 97, 98, 108, 101, 115, 32, 117, 110, 100, 101, 114, 32, 116, 97, 114, 103, 101, 116, 47, 100, 101, 98, 117, 103, 59, 32, 45, 45, 114, 101, 108, 101, 97, 115, 101, 32, 117, 115, 101, 115, 32, 116, 97, 114, 103, 101, 116, 47, 114, 101, 108, 101, 97, 115, 101, 46, 10];
+
+    cli_write(&artifact_help, 91);
 }
 
 fn cli_print_check_help() {
@@ -1872,6 +1994,12 @@ fn cli_bench_iterations_option(i64 value, i64 length) -> i64 {
         return -1;
     }
     return result;
+}
+
+fn cli_release_option(i64 value, i64 length) -> bool {
+    i64 word[9] = [45, 45, 114, 101, 108, 101, 97, 115, 101];
+
+    return cli_arg_equals(value, length, &word, 9);
 }
 
 fn cli_entry_override_option(i64 value, i64 length) -> bool {
@@ -2094,12 +2222,39 @@ fn cli_run_shell(i64[]command, i64 length) -> i64 {
     return result;
 }
 
+fn cli_print_project_source_failure() {
+    i64 text[65] = [101, 114, 114, 111, 114, 58, 32, 99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 97, 115, 115, 101, 109, 98, 108, 101, 32, 112, 114, 111, 106, 101, 99, 116, 32, 115, 111, 117, 114, 99, 101, 115, 32, 111, 114, 32, 108, 111, 99, 107, 101, 100, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 10];
+
+    cli_write_stream(2, &text, 65);
+}
+
+fn cli_print_native_path_failure() {
+    i64 text[45] = [101, 114, 114, 111, 114, 58, 32, 99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 112, 114, 101, 112, 97, 114, 101, 32, 116, 97, 114, 103, 101, 116, 32, 111, 117, 116, 112, 117, 116, 32, 112, 97, 116, 104, 115, 10];
+
+    cli_write_stream(2, &text, 45);
+}
+
+fn cli_print_backend_emit_failure() {
+    i64 text[52] = [101, 114, 114, 111, 114, 58, 32, 98, 97, 99, 107, 101, 110, 100, 32, 100, 105, 100, 32, 110, 111, 116, 32, 112, 114, 111, 100, 117, 99, 101, 32, 116, 104, 101, 32, 114, 101, 113, 117, 101, 115, 116, 101, 100, 32, 111, 117, 116, 112, 117, 116, 10];
+
+    cli_write_stream(2, &text, 52);
+}
+
+fn cli_print_native_link_failure() {
+    i64 text[50] = [101, 114, 114, 111, 114, 58, 32, 110, 97, 116, 105, 118, 101, 32, 108, 105, 110, 107, 32, 100, 105, 100, 32, 110, 111, 116, 32, 112, 114, 111, 100, 117, 99, 101, 32, 116, 104, 101, 32, 101, 120, 101, 99, 117, 116, 97, 98, 108, 101, 10];
+
+    cli_write_stream(2, &text, 50);
+}
+
 fn cli_clean_project() -> i64 {
     i64 path = raz_compiler_rt_arena_create(16);
 
     if (path == 0) {
         return 40;
     }
+    // target/ is the single canonical root for every rebuildable project-local
+    // artifact: native outputs, incremental state, registry acceleration rows,
+    // Git materializations, and publish staging. Removing it is a complete clean.
 
     i64 target[6] = [116, 97, 114, 103, 101, 116];
     i64 i = 0;
@@ -2109,12 +2264,15 @@ fn cli_clean_project() -> i64 {
         i += 1;
     }
     raz_compiler_rt_remove_path_ascii(path, 6);
+    // Remove the pre-R19 project-local generated-state directory as migration
+    // cleanup. Durable dependency intent remains in raz.toml / raz.lock (and the
+    // commit-pinned Git tracking file), so the next build can rehydrate safely.
 
-    i64 incremental[4] = [46, 114, 97, 122];
+    i64 legacy[4] = [46, 114, 97, 122];
 
     i = 0;
     while (i < 4) {
-        raz_compiler_rt_arena_set(path, i, incremental[i]);
+        raz_compiler_rt_arena_set(path, i, legacy[i]);
         i += 1;
     }
     raz_compiler_rt_remove_path_ascii(path, 4);
@@ -2129,9 +2287,9 @@ fn cli_clean_project() -> i64 {
     raz_compiler_rt_remove_path_ascii(path, 5);
     raz_compiler_rt_arena_destroy(path);
 
-    i64 msg[44] = [82, 101, 109, 111, 118, 101, 100, 32, 116, 97, 114, 103, 101, 116, 47, 44, 32, 46, 114, 97, 122, 47, 44, 32, 97, 110, 100, 32, 98, 117, 105, 108, 100, 47, 32, 97, 114, 116, 105, 102, 97, 99, 116, 115];
+    i64 msg[51] = [82, 101, 109, 111, 118, 101, 100, 32, 116, 97, 114, 103, 101, 116, 47, 44, 32, 108, 101, 103, 97, 99, 121, 32, 46, 114, 97, 122, 47, 44, 32, 97, 110, 100, 32, 98, 117, 105, 108, 100, 47, 32, 97, 114, 116, 105, 102, 97, 99, 116, 115];
 
-    cli_write_text(&msg, 44);
+    cli_write_text(&msg, 51);
 
     i64 nl[1] = [10];
 

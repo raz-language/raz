@@ -12,6 +12,21 @@ std::uint64_t hash_file(const std::filesystem::path& path, std::string_view salt
 
 std::string hex(std::uint64_t value) { std::ostringstream out; out << std::hex << value; return out.str(); }
 
+// The native host is the default build target and does not need a redundant
+// filesystem namespace.  Keep target/<profile>/ as the canonical host layout,
+// while explicit alternate targets retain target/<target>/<profile>/ isolation.
+std::filesystem::path project_output_root(const ProjectGraph& graph, const Options& options) {
+  const auto target_root = graph.manifest.root / "target";
+  if (options.target == "host") return target_root / options.profile;
+  return target_root / options.target / options.profile;
+}
+
+std::filesystem::path project_cache_root(const ProjectGraph& graph, const Options& options) {
+  const auto cache_root = graph.manifest.root / "target" / "cache";
+  if (options.target == "host") return cache_root / options.profile;
+  return cache_root / options.target / options.profile;
+}
+
 std::uint64_t hash_text(std::string_view text, std::uint64_t seed = 1469598103934665603ULL) {
   auto hash = seed;
   for (const char value : text) { hash ^= static_cast<unsigned char>(value); hash *= 1099511628211ULL; }
@@ -142,6 +157,17 @@ bool visible_on_surface(SourceVisibility visibility, SemanticSurface surface) {
   return surface == SemanticSurface::package_api || visibility == SourceVisibility::public_;
 }
 
+// Declarations are consumed by a single-pass semantic analyzer, so a type has
+// to appear before everything that mentions it -- source order is meaningful
+// and must survive deduplication. Callers that need an order-independent value,
+// such as an interface fingerprint, sort their own copy instead.
+void deduplicate_preserving_order(std::vector<std::string>& items) {
+  std::set<std::string> seen;
+  items.erase(std::remove_if(items.begin(), items.end(),
+                             [&](const std::string& item) { return !seen.insert(item).second; }),
+              items.end());
+}
+
 std::vector<std::string> semantic_declarations(const std::filesystem::path& path,
                                                SemanticSurface surface) {
   std::ifstream input(path);
@@ -255,8 +281,7 @@ std::vector<std::string> semantic_declarations(const std::filesystem::path& path
     ++line_index;
   }
 
-  std::sort(items.begin(), items.end());
-  items.erase(std::unique(items.begin(), items.end()), items.end());
+  deduplicate_preserving_order(items);
   return items;
 }
 
@@ -344,8 +369,11 @@ std::uint64_t public_interface_fingerprint(const ProjectGraph& graph) {
       hash = hash_text(imported.alias, hash);
       hash = hash_text(imported.reexport ? "public" : "package", hash);
     }
-    const auto exported = exported_semantic_declarations(module.source_path);
+    auto exported = exported_semantic_declarations(module.source_path);
     const std::set<std::string> exported_set(exported.begin(), exported.end());
+    // Reordering two declarations in a source file does not change the
+    // interface it presents, so the fingerprint hashes a canonical order.
+    std::sort(exported.begin(), exported.end());
     for (const auto& item : exported) {
       hash = hash_text(item, hash);
       const auto body = semantic_body(item);
@@ -399,7 +427,9 @@ std::uint64_t module_interface_fingerprint(const ProjectGraph& graph,
     hash = hash_text(imported.alias, hash);
   }
 
-  for (const auto& item : exported_semantic_declarations(module.source_path)) {
+  auto exported = exported_semantic_declarations(module.source_path);
+  std::sort(exported.begin(), exported.end());
+  for (const auto& item : exported) {
     hash = hash_text(item, hash);
     const auto body = semantic_body(item);
     if (body.starts_with("impl<")) exported_generic = true;
@@ -524,11 +554,39 @@ int execute_shell_command(const std::string& command) {
 
 std::string native_linker() {
   const std::string configured = environment_value("RAZ_LINKER");
+  if (!configured.empty()) return configured;
 #if defined(_WIN32)
-  return configured.empty() ? "clang++" : configured;
+  if (!g_self_executable.empty()) {
+    std::error_code ec;
+    const auto self = std::filesystem::absolute(g_self_executable, ec);
+    const auto sibling = (ec ? g_self_executable : self).parent_path() / "oblink.exe";
+    if (std::filesystem::is_regular_file(sibling)) return sibling.string();
+  }
+#ifdef RAZ_OBLINK_PATH
+  if (std::filesystem::is_regular_file(std::filesystem::path(RAZ_OBLINK_PATH))) return RAZ_OBLINK_PATH;
+#endif
+  return "oblink.exe";
+#else
+  return "c++";
+#endif
+}
+
+std::string native_external_linker() {
+  const std::string configured = environment_value("RAZ_EXTERNAL_LINKER");
+#if defined(_WIN32)
+  return configured.empty() ? "clang-cl" : configured;
 #else
   return configured.empty() ? "c++" : configured;
 #endif
+}
+
+bool oblink_driver(std::string linker) {
+  std::replace(linker.begin(), linker.end(), '\\', '/');
+  const auto slash = linker.find_last_of('/');
+  if (slash != std::string::npos) linker.erase(0, slash + 1);
+  std::transform(linker.begin(), linker.end(), linker.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return linker == "oblink" || linker == "oblink.exe";
 }
 
 bool windows_msvc_style_driver(std::string linker) {
@@ -541,6 +599,74 @@ bool windows_msvc_style_driver(std::string linker) {
   return linker == "cl" || linker == "cl.exe" || linker == "clang-cl" || linker == "clang-cl.exe";
 #else
   (void)linker;
+  return false;
+#endif
+}
+
+#if defined(_WIN32)
+std::string windows_native_library_environment(std::string value) {
+  // Strawberry/MinGW may prepend its own import libraries to LIB/LIBPATH.
+  // clang-cl then feeds those archives to lld-link ahead of the Visual Studio
+  // and Windows SDK libraries it can discover itself.  Mixing those ABI worlds
+  // is what produced /failifmismatch(_MSC_VER) failures in installed Raz builds.
+  std::string result;
+  std::size_t begin = 0;
+  while (begin <= value.size()) {
+    const auto end = value.find(';', begin);
+    const std::string part = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    std::string lower = part;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool foreign = lower.find("strawberry") != std::string::npos ||
+                         lower.find("mingw") != std::string::npos ||
+                         lower.find("msys") != std::string::npos;
+    if (!part.empty() && !foreign) {
+      if (!result.empty()) result.push_back(';');
+      result += part;
+    }
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return result;
+}
+
+int execute_windows_msvc_fallback(const std::string& command) {
+  const std::string prior_lib = environment_value("LIB");
+  const std::string prior_libpath = environment_value("LIBPATH");
+  _putenv_s("LIB", windows_native_library_environment(prior_lib).c_str());
+  _putenv_s("LIBPATH", windows_native_library_environment(prior_libpath).c_str());
+  const int status = execute_shell_command(command);
+  _putenv_s("LIB", prior_lib.c_str());
+  _putenv_s("LIBPATH", prior_libpath.c_str());
+  return status;
+}
+#endif
+
+std::string native_link_command(const std::vector<std::filesystem::path>& inputs,
+                                const std::filesystem::path& output,
+                                bool shared,
+                                const std::vector<std::string>& native_libraries,
+                                const std::vector<std::filesystem::path>& native_library_paths);
+
+bool execute_native_link_command(const std::string& primary_command,
+                                 const std::vector<std::filesystem::path>& inputs,
+                                 const std::filesystem::path& output,
+                                 bool shared = false,
+                                 const std::vector<std::string>& native_libraries = {},
+                                 const std::vector<std::filesystem::path>& native_library_paths = {}) {
+  if (execute_shell_command(primary_command) == 0) return true;
+#if defined(_WIN32)
+  if (!oblink_driver(native_linker())) return false;
+  const std::string fallback = native_external_linker();
+  if (fallback.empty()) return false;
+  const std::string prior = environment_value("RAZ_LINKER");
+  _putenv_s("RAZ_LINKER", fallback.c_str());
+  const std::string fallback_command = native_link_command(inputs, output, shared, native_libraries, native_library_paths);
+  _putenv_s("RAZ_LINKER", prior.c_str());
+  cli_status("Link", "ObLink could not complete this image; using configured bootstrap fallback " + fallback, raz::terminal::yellow);
+  if (windows_msvc_style_driver(fallback)) return execute_windows_msvc_fallback(fallback_command) == 0;
+  return execute_shell_command(fallback_command) == 0;
+#else
   return false;
 #endif
 }
@@ -610,6 +736,11 @@ int compile_module_worker(const SessionOptions& session) {
   return execute_shell_command(command.str());
 }
 
+bool compiler_link_artifact(const std::filesystem::path& output) {
+  const auto name = output.filename().string();
+  return name == "raz-compiler.exe" || name == "raz-compiler";
+}
+
 std::string native_link_command(const std::vector<std::filesystem::path>& inputs,
                                 const std::filesystem::path& output,
                                 bool shared = false,
@@ -618,8 +749,44 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
   const std::string linker = native_linker();
   std::ostringstream command;
 #if defined(_WIN32)
+  if (oblink_driver(linker)) {
+    command << shell_quote(std::filesystem::path(linker)) << ' ';
+    for (const auto& input : inputs) command << shell_quote(input) << ' ';
+    // ObLink owns COFF-library discovery now. Forward package-native search
+    // paths/libraries rather than silently dropping them as the old baseline did.
+    for (const auto& path : native_library_paths) command << "-L " << shell_quote(path) << ' ';
+    for (const auto& library : native_libraries) command << "-l " << shell_quote(std::filesystem::path(library)) << ' ';
+#ifdef RAZ_RUNTIME_LIBRARY_PATH
+    command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
+#endif
+    if (compiler_link_artifact(output)) {
+#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
+      command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
+#endif
+#ifdef RAZ_FORGE_LIBRARY_PATH
+      command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
+#endif
+    }
+    // raz_runtime.lib is compiled against OpenSSL when it is available, so any
+    // image that pulls a runtime member may need libssl/libcrypto. The MSVC and
+    // POSIX branches already pass these; omitting them here left every ObLink
+    // link of a runtime-using program failing on EVP_* symbols.
+#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
+    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
+#endif
+#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
+    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
+#endif
+    // CMake records these as transitive runtime dependencies, but a static .lib
+    // cannot carry the final PE import table. Ask ObLink to resolve the standard
+    // Windows import libraries through the VS/SDK LIB search path.
+    command << "-l ws2_32 -l bcrypt -l crypt32 ";
+    if (compiler_link_artifact(output)) command << "--stack 8388608 ";
+    command << "-o " << shell_quote(output);
+    return command.str();
+  }
   if (windows_msvc_style_driver(linker)) {
-    command << shell_quote(std::filesystem::path(linker)) << " /nologo ";
+    command << shell_quote(std::filesystem::path(linker)) << " /nologo /MD ";
     if (shared) command << "/LD ";
     for (const auto& input : inputs) command << shell_quote(input) << ' ';
     for (const auto& path : native_library_paths) command << "/LIBPATH:" << shell_quote(path) << ' ';
@@ -627,18 +794,22 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
 #ifdef RAZ_RUNTIME_LIBRARY_PATH
     command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
 #endif
+    if (compiler_link_artifact(output)) {
 #ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
+      command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
 #endif
 #ifdef RAZ_FORGE_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
+      command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
 #endif
+    }
+    if (compiler_link_artifact(output)) {
 #ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
+      command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
 #endif
 #ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
+      command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
 #endif
+    }
     command << "ws2_32.lib bcrypt.lib crypt32.lib /Fe:" << shell_quote(output);
     if (!shared) {
       // The self-hosted compiler recursively walks large syntax/HIR trees and
@@ -662,12 +833,14 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
 #ifdef RAZ_RUNTIME_LIBRARY_PATH
   command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
 #endif
+  if (compiler_link_artifact(output)) {
 #ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-  command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
+    command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
 #endif
 #ifdef RAZ_FORGE_LIBRARY_PATH
-  command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
+    command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
 #endif
+  }
 #ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
   command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
 #endif
@@ -898,7 +1071,7 @@ void append_legacy_sources(const ProjectGraph& graph, std::ofstream& output) {
 }
 
 std::filesystem::path native_artifact_path(const ProjectGraph& graph, const Options& options) {
-  const auto root = graph.manifest.root / "target" / options.target / options.profile;
+  const auto root = project_output_root(graph, options);
 #if defined(_WIN32)
   if (graph.manifest.kind == raz::compiler::PackageKind::executable) return root / (graph.manifest.name + ".exe");
   if (graph.manifest.kind == raz::compiler::PackageKind::static_library) return root / (graph.manifest.name + ".lib");
@@ -1255,7 +1428,7 @@ NativeIrOwnership prepare_native_ir_ownership(
 
 bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& options,
                                      const BuildProfile& profile) {
-  const auto output_root = graph.manifest.root / "target" / options.target / options.profile;
+  const auto output_root = project_output_root(graph, options);
   const auto native_root = output_root / "native" / "aggregate";
   std::filesystem::create_directories(native_root);
   const auto combined_source = native_root / "package.rz";
@@ -1335,8 +1508,8 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
     return true;
   }
 
-  if (execute_shell_command(aggregate_command) != 0) {
-    cli_error("native linker failed; set RAZ_LINKER to a compatible C++ driver");
+  if (!execute_native_link_command(aggregate_command, inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library)) {
+    cli_error("native link failed (ObLink and fallback linker both failed)");
     return false;
   }
 
@@ -1347,10 +1520,10 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
 
 bool build_native_artifact(const ProjectGraph& graph, const Options& options, const BuildProfile& profile) {
   if (options.target != "host" && options.target != "test-host") {
-    cli_error("native emission currently requires --target host; cross-target project layout remains available");
+    cli_error("native emission currently supports only the automatic host target; cross-target project layout remains available");
     return false;
   }
-  const auto output_root = graph.manifest.root / "target" / options.target / options.profile;
+  const auto output_root = project_output_root(graph, options);
   const auto module_root = output_root / "modules";
   const auto native_root = output_root / "native";
   const auto object_root = native_root / "modules";
@@ -1500,8 +1673,8 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
     return true;
   }
 
-  if (execute_shell_command(command) != 0) {
-    cli_error("native linker failed; set RAZ_LINKER to a compatible C++ driver");
+  if (!execute_native_link_command(command, link_inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library, graph.manifest.native_libraries, graph.manifest.native_library_paths)) {
+    cli_error("native link failed (ObLink and fallback linker both failed)");
     return false;
   }
 
@@ -1582,8 +1755,7 @@ void collect_dependency_semantics(const ProjectGraph& graph, const Options& opti
                                   std::vector<std::string>& declarations) {
   for (const auto& dependency : graph.dependencies) {
     collect_dependency_semantics(dependency, options, declarations);
-    const auto module_root = dependency.manifest.root / "target" / options.target /
-                             options.profile / "modules";
+    const auto module_root = project_output_root(dependency, options) / "modules";
     for (const auto& module : dependency.modules) {
       const auto interface_path = module_root / (sanitize(module.logical_name) + ".dmi");
       const auto imported = read_semantic_interface(interface_path);
@@ -1591,16 +1763,14 @@ void collect_dependency_semantics(const ProjectGraph& graph, const Options& opti
     }
   }
 
-  std::sort(declarations.begin(), declarations.end());
-  declarations.erase(std::unique(declarations.begin(), declarations.end()), declarations.end());
+  deduplicate_preserving_order(declarations);
 }
 
 void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Options& options,
                                            std::ofstream& output) {
   for (const auto& dependency : graph.dependencies) {
     write_namespaced_dependency_semantics(dependency, options, output);
-    const auto module_root = dependency.manifest.root / "target" / options.target /
-                             options.profile / "modules";
+    const auto module_root = project_output_root(dependency, options) / "modules";
     for (const auto& dependency_module : dependency.modules) {
       const auto interface_path = module_root / (sanitize(dependency_module.logical_name) + ".dmi");
       const auto declarations = read_semantic_interface(interface_path);
@@ -1616,7 +1786,8 @@ void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Opti
 void write_local_semantic_module(const ProjectGraph& graph,
                                  const raz::compiler::ModuleUnit& module,
                                  std::ofstream& output,
-                                 std::set<std::filesystem::path>& emitted) {
+                                 std::set<std::filesystem::path>& emitted,
+                                 const std::filesystem::path& compiled) {
   const auto canonical = std::filesystem::weakly_canonical(module.source_path);
   if (!emitted.insert(canonical).second) return;
 
@@ -1627,8 +1798,14 @@ void write_local_semantic_module(const ProjectGraph& graph,
   // explicit import edge.
   for (const auto& imported : module.imports) {
     if (const auto* local = local_module(graph, imported.path))
-      write_local_semantic_module(graph, *local, output, emitted);
+      write_local_semantic_module(graph, *local, output, emitted, compiled);
   }
+
+  // An import cycle can lead back to the module being compiled. Its real source
+  // is appended below, so emitting its interface here would make every one of
+  // its declarations a duplicate -- but its imports are still prerequisites for
+  // the modules that reached it, so the walk above has to happen either way.
+  if (canonical == compiled) return;
 
   const auto declarations = package_semantic_declarations(module.source_path);
   if (declarations.empty() && module.imports.empty()) return;
@@ -1655,9 +1832,10 @@ SemanticInputFile semantic_input_for_module(const ProjectGraph& graph,
     write_namespaced_dependency_semantics(graph, options, output);
 
     std::set<std::filesystem::path> emitted;
+    const auto compiled = std::filesystem::weakly_canonical(module.source_path);
     for (const auto& imported : module.imports) {
       if (const auto* local = local_module(graph, imported.path))
-        write_local_semantic_module(graph, *local, output, emitted);
+        write_local_semantic_module(graph, *local, output, emitted, compiled);
     }
 
     append_namespaced_module(graph, module, output);
@@ -1836,9 +2014,9 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
   }
 
   const BuildProfile& profile = profile_it->second;
-  const auto output_root = graph.manifest.root / "target" / options.target / options.profile;
+  const auto output_root = project_output_root(graph, options);
   const auto module_root = output_root / "modules";
-  const auto cache_root = graph.manifest.root / ".raz" / "cache" / options.target / options.profile;
+  const auto cache_root = project_cache_root(graph, options);
   std::filesystem::create_directories(module_root);
   std::filesystem::create_directories(cache_root);
 

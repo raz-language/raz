@@ -84,6 +84,8 @@ raz lint
 raz doc
 ```
 
+For executable packages, a normal `raz build` writes the native program under `target/debug/`. On Windows, a package named `hello` produces `target/debug/hello.exe`; on Linux and macOS it produces `target/debug/hello`. Use `raz build --release` for the optimized `target/release/` artifact. Backend IR such as `.fir` is only produced by explicit backend/emission commands.
+
 Useful project commands include:
 
 | Command | Purpose |
@@ -844,7 +846,7 @@ Most packages use deterministic source discovery. Packages such as the compiler 
 
 `raz.lock` records the resolved package graph and manifest fingerprints deterministically. Human-readable registry constraints stay in `raz.toml`; the lockfile records the exact selected version and verified package checksum/store identity used for reproducible builds.
 
-Official registry packages resolve from the GitHub-backed [`raz-language/packages`](https://github.com/raz-language/packages) repository, with local snapshots, private HTTP/HTTPS registries, and mirror fallback still supported. Registry packages are materialized into a shared content-addressed store. Set `RAZ_PACKAGE_STORE` or `RAZ_HOME` to choose the store location, or `RAZ_OFFLINE=1` to require a cached registry snapshot and an already-present, integrity-valid store entry. `raz search foo` and `raz info foo` inspect the official index without downloading packages. `raz outdated` reports newer versions for tracked dependencies. `raz add foo` and `raz add foo@^1.2.0` use the official registry and keep the manifest compact (`foo = ">=0.0.0"` or the requested constraint). `raz pack` creates deterministic `.dpk` archives; ordinary `raz publish` prepares a `.raz-publish/` submission for the GitHub registry, while explicit private registries retain filesystem or HTTP/HTTPS publishing.
+Official registry packages resolve from the GitHub-backed [`raz-language/packages`](https://github.com/raz-language/packages) repository, with local snapshots, private HTTP/HTTPS registries, and mirror fallback still supported. Registry packages are materialized into a shared content-addressed store. Set `RAZ_PACKAGE_STORE` or `RAZ_HOME` to choose the store location, or `RAZ_OFFLINE=1` to require a cached registry snapshot and an already-present, integrity-valid store entry. `raz search foo` and `raz info foo` inspect the official index without downloading packages. `raz outdated` reports newer versions for tracked dependencies. `raz add foo` and `raz add foo@^1.2.0` use the official registry and keep the manifest compact (`foo = ">=0.0.0"` or the requested constraint). `raz pack` creates deterministic `.dpk` archives; ordinary `raz publish` prepares a `target/publish/` submission for the GitHub registry, while explicit private registries retain filesystem or HTTP/HTTPS publishing.
 
 **Summary**
 

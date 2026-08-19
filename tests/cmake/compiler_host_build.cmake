@@ -36,16 +36,16 @@ endforeach()
 
 # Build the exact compiler source as the package entry point. This creates the
 # native compiler candidate artifact used by the next bootstrap pass.
-execute_process(COMMAND "${RAZ_EXE}" build "${project}" --target host --profile debug --force
+execute_process(COMMAND "${RAZ_EXE}" build "${project}" --profile debug --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Native compiler candidate build failed:\n${build_output}\n${build_error}")
 endif()
 
 if(WIN32)
-  set(executable "${project}/target/host/debug/raz-compiler.exe")
+  set(executable "${project}/target/debug/raz-compiler.exe")
 else()
-  set(executable "${project}/target/host/debug/raz-compiler")
+  set(executable "${project}/target/debug/raz-compiler")
 endif()
 if(NOT EXISTS "${executable}")
   message(FATAL_ERROR "Native compiler candidate artifact missing: ${executable}")

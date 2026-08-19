@@ -21,7 +21,7 @@ set(project "${WORK_ROOT}/compiler")
 # test guards against lived in the Raz compiler's HIR -> MIR lowering, so the
 # generated compiler must be the component compiling the fixture below.
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${project}" --target host --profile debug --force
+  COMMAND "${RAZ_EXE}" build "${project}" --profile debug --force
   RESULT_VARIABLE candidate_build_result
   OUTPUT_VARIABLE candidate_build_output
   ERROR_VARIABLE candidate_build_error)
@@ -30,11 +30,11 @@ if(NOT candidate_build_result EQUAL 0)
 endif()
 
 if(WIN32)
-  set(candidate_executable "${project}/target/host/debug/raz-compiler.exe")
+  set(candidate_executable "${project}/target/debug/raz-compiler.exe")
   set(object "${WORK_ROOT}/mutable-parameter.obj")
   set(executable "${WORK_ROOT}/mutable-parameter.exe")
 else()
-  set(candidate_executable "${project}/target/host/debug/raz-compiler")
+  set(candidate_executable "${project}/target/debug/raz-compiler")
   set(object "${WORK_ROOT}/mutable-parameter.o")
   set(executable "${WORK_ROOT}/mutable-parameter")
 endif()

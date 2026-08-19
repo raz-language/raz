@@ -6,8 +6,8 @@ from pathlib import Path
 import re
 
 root = Path(__file__).resolve().parents[1]
-isa = (root / 'compiler/src/backend/rxe/isa.rz').read_text()
-writer = (root / 'compiler/src/backend/rxe/writer.rz').read_text()
+isa = (root / 'compiler/src/backend/rxe/isa.rz').read_text(encoding='utf-8')
+writer = (root / 'compiler/src/backend/rxe/writer.rz').read_text(encoding='utf-8')
 fmt = int(re.search(r'rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa).group(1))
 isa_version = int(re.search(r'rxe_isa_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa).group(1))
 header = int(re.search(r'i64 header_bytes = (\d+);', writer).group(1))
@@ -44,5 +44,5 @@ text += ['', 'The v7 addition at offsets 96 and 100 makes the aggregate-layout s
 for value,name in ops:
     text.append(f'| {value} | `{name}` |')
 text += ['', '## Compatibility invariant', '', 'Every emitted RXE file is read back by the Raz-side independent binary decoder. Section geometry and canonical reserved fields are validated, the image is re-encoded, and the result must be byte-identical before emission succeeds.', '']
-(root / 'docs/RXE-v1-FORMAT.md').write_text('\n'.join(text))
+(root / 'docs/RXE-v1-FORMAT.md').write_text('\n'.join(text), encoding='utf-8')
 print(f'generated docs/RXE-v1-FORMAT.md (format v{fmt}, ISA v{isa_version}, {len(ops)} opcodes)')
