@@ -4,7 +4,7 @@ Thank you for helping improve Raz. The production compiler is implemented in Raz
 
 ## Design rules
 
-1. **Forge remains the sole production backend.** Do not add a C emitter, LLVM fallback, or alternate production code generator.
+1. **Forge remains the default native backend.** LLVM is the supported alternate native backend; do not add a C emitter or another production backend without an explicit architecture decision.
 2. **Language behavior belongs in Raz.** Do not move compiler semantics or standard-library functionality into native shims simply because the Raz implementation is harder.
 3. **Keep the host compiler compatibility-stable and native boundaries narrow.** C++ is appropriate for the host compiler and permanent runtime/OS/ABI boundaries that cannot reasonably live in Raz. New language semantics belong under `compiler/src/`.
 4. **Preserve determinism.** Source discovery, dependency ordering, generated identifiers, and compiler output must remain reproducible.
@@ -37,6 +37,19 @@ tests/python/check-native-boundary.py
 tests/python/check-forge-package.py
 tools/format-raz.py
 ```
+
+## Embedded Forge and ObLink
+
+Raz carries Forge and ObLink under `src/forge/` and `src/oblink/` so a compiler checkout can build a complete native toolchain. Those directories are exact mirrors of the standalone `raz-language/forge` and `raz-language/oblink` repositories, not Raz-specific forks.
+
+In the standard sibling workspace, synchronize intentional standalone changes with:
+
+```bash
+python tools/sync-embedded-components.py
+python tools/check-embedded-components.py
+```
+
+The synchronization command replaces the embedded trees, including removal of stale files. CI checks byte identity across every maintained component file. Make component changes in the standalone repository first, then synchronize the Raz copy in the same release/integration pass.
 
 ## Style and comments
 

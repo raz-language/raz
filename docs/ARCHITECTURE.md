@@ -81,9 +81,9 @@ The native boundary is audited by `tests/python/check-native-boundary.py`.
 
 ## Incremental compilation
 
-The project driver and language server share a persistent module graph. Module fingerprints incorporate source, imports, target/profile configuration, and relevant dependency interfaces. Unrelated package changes therefore do not force broad recompilation.
+The project driver owns the persistent build module graph, while the production language server keeps unsaved editor documents in memory and analyzes them through the compiler frontend. Module fingerprints incorporate source, imports, target/profile configuration, and relevant dependency interfaces. Unrelated package changes therefore do not force broad recompilation.
 
-Incremental metadata tracks semantic, HIR, MIR, backend IR, and final build fingerprints. Native builds emit cached module objects where safe, canonicalize equivalent generated specializations to deterministic owners, and content-address final link inputs so unchanged artifacts are not rewritten unnecessarily.
+Incremental build metadata tracks semantic, HIR, MIR, backend IR, and final build fingerprints. Native builds emit cached module objects where safe, canonicalize equivalent generated specializations to deterministic owners, and content-address final link inputs so unchanged artifacts are not rewritten unnecessarily.
 
 ## Determinism
 

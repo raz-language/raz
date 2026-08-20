@@ -32,7 +32,7 @@ Supported x86-64 hosts can produce native artifacts through Forge or the LLVM/Cl
 Release archives and installers use a shared redistributable layout:
 
 ```text
-bin/                 raz, razc, raz-lsp
+bin/                 raz, razc (language server is `raz lsp`)
 lib/                 native runtime components
 share/raz/library/   Raz standard library
 manifest.sha256      redistributable integrity manifest

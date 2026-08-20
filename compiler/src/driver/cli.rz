@@ -221,24 +221,163 @@ fn cli_print_running_artifact(i64 path, i64 length) {
     cli_write_stream(1, &close_quote, 2);
 }
 
-// Runs the linked executable and reports its exit status as our own, the way a
-// build tool is expected to be transparent about the program it launched.
-fn cli_run_native_artifact(i64 path, i64 length) -> i64 {
+// Returns the position of the exact `--` argument separator, or -1 when the
+// command line has no separator. The production driver parses arguments before
+// the separator as Raz options/input and preserves everything after it verbatim
+// for the program launched by `raz run`.
+fn cli_argument_separator_index(i64 argc) -> i64 {
+    i64 argument = raz_compiler_rt_arena_create(2);
+
+    if (argument == 0) {
+        return -1;
+    }
+
+    i64 index = 2;
+
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, argument, 2);
+
+        if (
+            length == 2 &&
+            raz_compiler_rt_arena_get(argument, 0) == 45 &&
+            raz_compiler_rt_arena_get(argument, 1) == 45
+        ) {
+            raz_compiler_rt_arena_destroy(argument);
+            return index;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(argument);
+    return -1;
+}
+
+// Partitions process argv into the arguments owned by Raz and the arguments
+// owned by the program launched by `raz run`. The separator itself belongs to
+// neither side. Keeping this policy in the CLI module prevents the compiler
+// entrypoint from growing command-line parsing rules of its own.
+fn cli_prepare_argument_partition(
+    i64 process_argc,
+    i64 cli_command,
+    i64&mut out_cli_argc,
+    i64&mut out_first_program_argument,
+) -> bool {
+    i64 separator = cli_argument_separator_index(process_argc);
+
+    if (separator >= 0 && cli_command != 12) {
+        return false;
+    }
+    *out_cli_argc = process_argc;
+    *out_first_program_argument = process_argc;
+    if (separator >= 0) {
+        *out_cli_argc = separator;
+        *out_first_program_argument = separator + 1;
+    }
+    // The compact driver bound protects Raz option parsing only. Forwarded
+    // program argv is deliberately outside that bound.
+    return *out_cli_argc <= 32;
+}
+
+// Returns the first argument that can be a command option/input. Commands that
+// name an explicit subcommand consume argv[1]; direct compiler invocation does
+// not. Keeping this map here makes the entrypoint independent of command IDs.
+fn cli_command_argument_base(i64 command) -> i64 {
+    if (command >= 3 && command <= 6) {
+        return 2;
+    }
+    if (command == 10 || command == 11 || command == 12 || command == 16 || command == 17 || command == 40) {
+        return 2;
+    }
+    return 1;
+}
+
+// Runs the linked executable and reports its exit status as our own. Program
+// arguments are copied into the runtime's compact NUL-separated argv buffer;
+// no shell is involved, so quoting, spaces, and option-looking values such as
+// `--help` are delivered exactly as the user supplied them after `--`.
+fn cli_run_native_artifact(i64 path, i64 length, i64 first_program_argument, i64 process_argc, ) -> i64 {
     if (path == 0 || length <= 0) {
         return -1;
     }
     cli_print_running_artifact(path, length);
-    return raz_compiler_rt_process_run_argv_ascii(path, length, 0, 0, 0);
+    if (first_program_argument >= process_argc) {
+        return raz_compiler_rt_process_run_argv_ascii(path, length, 0, 0, 0);
+    }
+
+    i64 blob_length = 0;
+    i64 argument_count = 0;
+    i64 index = first_program_argument;
+
+    // Size first so the forwarding path has no arbitrary per-argument limit.
+    while (index < process_argc) {
+        i64 argument_length = raz_compiler_rt_process_arg(index, 0, 0);
+
+        if (argument_length < 0 || blob_length > 2147483647 - argument_length - 1) {
+            return -1;
+        }
+        blob_length += argument_length + 1;
+        argument_count += 1;
+        index += 1;
+    }
+
+    i64 blob = raz_compiler_rt_arena_create(blob_length);
+
+    if (blob == 0) {
+        return -1;
+    }
+
+    i64 cursor = 0;
+
+    index = first_program_argument;
+    while (index < process_argc) {
+        i64 argument_length = raz_compiler_rt_process_arg(index, 0, 0);
+        i64 argument = raz_compiler_rt_arena_create(argument_length + 1);
+
+        if (argument == 0) {
+            raz_compiler_rt_arena_destroy(blob);
+            return -1;
+        }
+
+        i64 actual_length = raz_compiler_rt_process_arg(index, argument, argument_length);
+
+        if (actual_length != argument_length) {
+            raz_compiler_rt_arena_destroy(argument);
+            raz_compiler_rt_arena_destroy(blob);
+            return -1;
+        }
+
+        i64 byte = 0;
+
+        while (byte < argument_length) {
+            raz_compiler_rt_arena_set(blob, cursor, raz_compiler_rt_arena_get(argument, byte));
+            cursor += 1;
+            byte += 1;
+        }
+        raz_compiler_rt_arena_set(blob, cursor, 0);
+        cursor += 1;
+        raz_compiler_rt_arena_destroy(argument);
+        index += 1;
+    }
+
+    i64 status = raz_compiler_rt_process_run_argv_ascii(path, length, blob, blob_length, argument_count, );
+
+    raz_compiler_rt_arena_destroy(blob);
+    return status;
 }
 
 // Launches the linked artifact when the command asked for a run, and reports
 // its exit status. Returns 0 when there is nothing to run so the caller can use
 // the result as its own status unconditionally.
-fn cli_maybe_run_artifact(bool run_after_build, i64 path, i64 length) -> i64 {
+fn cli_maybe_run_artifact(
+    bool run_after_build,
+    i64 path,
+    i64 length,
+    i64 first_program_argument,
+    i64 process_argc,
+) -> i64 {
     if (!run_after_build) {
         return 0;
     }
-    return cli_run_native_artifact(path, length);
+    return cli_run_native_artifact(path, length, first_program_argument, process_argc);
 }
 
 // Releases the arenas a compilation holds. Every exit path in the entrypoint
@@ -553,6 +692,10 @@ fn cli_write_command_name(i64 stream, i64 kind) {
         i64 name[5] = [99, 97, 99, 104, 101];
 
         cli_write_stream(stream, &name, 5);
+    } else if (kind == 42) {
+        i64 name[3] = [108, 115, 112];
+
+        cli_write_stream(stream, &name, 3);
     }
 }
 
@@ -834,6 +977,14 @@ fn cli_print_command_suggestion(i64 value, i64 length) {
     if (distance < best_distance) {
         best_distance = distance;
         best_kind = 34;
+    }
+
+    i64 candidate_lsp[3] = [108, 115, 112];
+
+    distance = cli_edit_distance(value, length, &candidate_lsp, 3);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 42;
     }
 
     bool close = best_distance <= 1;
@@ -1609,6 +1760,24 @@ fn cli_command_kind(i64 value, i64 length) -> i64 {
     if (cli_arg_equals(value, length, &c_cache, 5)) {
         return 41;
     }
+
+    i64 c_lsp[3] = [108, 115, 112];
+
+    if (cli_arg_equals(value, length, &c_lsp, 3)) {
+        return 42;
+    }
+
+    i64 c_bindgen[7] = [98, 105, 110, 100, 103, 101, 110];
+
+    if (cli_arg_equals(value, length, &c_bindgen, 7)) {
+        return 43;
+    }
+
+    i64 c_c_header[8] = [99, 45, 104, 101, 97, 100, 101, 114];
+
+    if (cli_arg_equals(value, length, &c_c_header, 8)) {
+        return 44;
+    }
     return 0;
 }
 
@@ -1695,6 +1864,15 @@ fn cli_print_general_help() {
     i64 extra[102] = [32, 32, 112, 97, 99, 107, 32, 32, 32, 32, 32, 32, 67, 114, 101, 97, 116, 101, 32, 97, 32, 100, 101, 116, 101, 114, 109, 105, 110, 105, 115, 116, 105, 99, 32, 46, 100, 112, 107, 32, 97, 114, 99, 104, 105, 118, 101, 10, 32, 32, 112, 117, 98, 108, 105, 115, 104, 32, 32, 32, 80, 117, 98, 108, 105, 115, 104, 32, 116, 104, 101, 32, 99, 117, 114, 114, 101, 110, 116, 32, 112, 97, 99, 107, 97, 103, 101, 32, 116, 111, 32, 97, 32, 114, 101, 103, 105, 115, 116, 114, 121, 10];
 
     cli_write(&extra, 102);
+
+    i64 lsp_line[57] = [32, 32, 108, 115, 112, 32, 32, 32, 32, 32, 32, 82, 117, 110, 32, 116, 104, 101, 32, 112, 114, 111, 100, 117, 99, 116, 105, 111, 110, 32, 108, 97, 110, 103, 117, 97, 103, 101, 32, 115, 101, 114, 118, 101, 114, 32, 111, 118, 101, 114, 32, 115, 116, 100, 105, 111, 10];
+
+    cli_write(&lsp_line, 57);
+
+    i64 bindgen_line[58] = [32,32,98,105,110,100,103,101,110,32,32,32,71,101,110,101,114,97,116,101,32,82,97,122,32,70,70,73,32,100,101,99,108,97,114,97,116,105,111,110,115,32,102,114,111,109,32,97,32,67,32,104,101,97,100,101,114,10];
+    cli_write(&bindgen_line, 58);
+    i64 c_header_line[67] = [32,32,99,45,104,101,97,100,101,114,32,32,71,101,110,101,114,97,116,101,32,97,32,67,32,104,101,97,100,101,114,32,102,114,111,109,32,112,117,98,108,105,99,32,82,97,122,32,67,45,65,66,73,32,100,101,99,108,97,114,97,116,105,111,110,115,10];
+    cli_write(&c_header_line, 67);
 }
 
 fn cli_print_project_commands() {
@@ -1858,6 +2036,15 @@ fn cli_print_project_command_help(i64 command) {
         i64 t[88] = [85, 115, 97, 103, 101, 58, 32, 114, 97, 122, 32, 99, 97, 99, 104, 101, 32, 91, 115, 116, 97, 116, 117, 115, 124, 99, 108, 101, 97, 110, 93, 10, 73, 110, 115, 112, 101, 99, 116, 32, 111, 114, 32, 99, 108, 101, 97, 110, 32, 116, 104, 101, 32, 115, 104, 97, 114, 101, 100, 32, 82, 97, 122, 32, 114, 101, 103, 105, 115, 116, 114, 121, 47, 112, 97, 99, 107, 97, 103, 101, 32, 99, 97, 99, 104, 101, 46, 10];
 
         cli_write(&t, 88);
+    } else if (command == 42) {
+        i64 t[66] = [85, 115, 97, 103, 101, 58, 32, 114, 97, 122, 32, 108, 115, 112, 10, 82, 117, 110, 32, 116, 104, 101, 32, 112, 114, 111, 100, 117, 99, 116, 105, 111, 110, 32, 82, 97, 122, 32, 108, 97, 110, 103, 117, 97, 103, 101, 32, 115, 101, 114, 118, 101, 114, 32, 111, 118, 101, 114, 32, 115, 116, 100, 105, 111, 46, 10];
+        cli_write(&t, 66);
+    } else if (command == 43) {
+        i64 t[117] = [85,115,97,103,101,58,32,114,97,122,32,98,105,110,100,103,101,110,32,60,104,101,97,100,101,114,46,104,62,32,91,45,45,116,97,114,103,101,116,45,97,98,105,61,119,105,110,100,111,119,115,124,117,110,105,120,93,32,91,111,117,116,112,117,116,46,114,122,93,10,71,101,110,101,114,97,116,101,32,82,97,122,32,70,70,73,32,100,101,99,108,97,114,97,116,105,111,110,115,32,102,114,111,109,32,97,32,67,32,104,101,97,100,101,114,46,10];
+        cli_write(&t, 117);
+    } else if (command == 44) {
+        i64 t[108] = [85,115,97,103,101,58,32,114,97,122,32,99,45,104,101,97,100,101,114,32,60,115,111,117,114,99,101,46,114,122,62,32,91,111,117,116,112,117,116,46,104,93,10,71,101,110,101,114,97,116,101,32,97,32,67,32,104,101,97,100,101,114,32,102,114,111,109,32,101,120,112,108,105,99,105,116,32,112,117,98,108,105,99,32,82,97,122,32,67,45,65,66,73,32,100,101,99,108,97,114,97,116,105,111,110,115,46,10];
+        cli_write(&t, 108);
     } else {
         cli_print_general_help();
     }
@@ -1938,7 +2125,7 @@ fn cli_print_command_help(i64 command) {
         cli_print_backends();
     } else if (command == 8) {
         cli_print_targets();
-    } else if (command >= 12 && command <= 41) {
+    } else if (command >= 12 && command <= 43) {
         cli_print_project_command_help(command);
     } else {
         cli_print_general_help();

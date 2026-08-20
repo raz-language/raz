@@ -203,6 +203,69 @@ pass::PassResult ScalarStackPromotionPass::run(
     // control flow.  Slot liveness determines where block parameters are
     // required; iterative renaming then wires both forward edges and backedges.
     const auto& cfg = analyses.cfg();
+    const auto& dominators = analyses.dominators();
+
+    // Cross-block scalar promotion uses a conventional dominance-frontier
+    // mem2reg construction.  The earlier implementation inferred incoming
+    // values by iterating predecessor outputs; that works for acyclic joins but
+    // is not a valid SSA construction for backedges.  In particular, a loop
+    // header could observe a stale preheader value instead of the latch update.
+    //
+    // Build immediate dominators from the already-computed dominator sets, then
+    // use the Cytron iterated-dominance-frontier algorithm to place block
+    // parameters (our IR's phi representation).  A dominator-tree rename pass
+    // wires each predecessor edge with the value current at the end of that
+    // predecessor, including loop latches.
+    std::unordered_map<std::string, std::string> immediate_dominator;
+    std::unordered_map<std::string, std::vector<std::string>> dominator_children;
+    std::unordered_map<std::string, std::unordered_set<std::string>> dominance_frontier;
+    if (!function.blocks.empty()) {
+        const auto& entry_name = function.blocks.front().name;
+        for (const auto& block : function.blocks) {
+            if (block.name == entry_name || !cfg.reachable.contains(block.name)) continue;
+            const auto dom_it = dominators.dominators.find(block.name);
+            if (dom_it == dominators.dominators.end()) continue;
+            std::string best;
+            std::size_t best_depth = 0;
+            for (const auto& candidate : dom_it->second) {
+                if (candidate == block.name) continue;
+                const auto candidate_it = dominators.dominators.find(candidate);
+                const std::size_t depth = candidate_it == dominators.dominators.end()
+                    ? 0U : candidate_it->second.size();
+                if (best.empty() || depth > best_depth) {
+                    best = candidate;
+                    best_depth = depth;
+                }
+            }
+            if (!best.empty()) {
+                immediate_dominator.emplace(block.name, best);
+                dominator_children[best].push_back(block.name);
+            }
+        }
+
+        for (const auto& block : function.blocks) {
+            if (!cfg.reachable.contains(block.name)) continue;
+            const auto predecessors = cfg.predecessors.find(block.name);
+            if (predecessors == cfg.predecessors.end()) continue;
+            std::size_t reachable_predecessors = 0;
+            for (const auto& predecessor : predecessors->second)
+                if (cfg.reachable.contains(predecessor)) ++reachable_predecessors;
+            if (reachable_predecessors < 2U) continue;
+            const auto idom_it = immediate_dominator.find(block.name);
+            if (idom_it == immediate_dominator.end()) continue;
+            for (const auto& predecessor : predecessors->second) {
+                if (!cfg.reachable.contains(predecessor)) continue;
+                std::string runner = predecessor;
+                while (!runner.empty() && runner != idom_it->second) {
+                    dominance_frontier[runner].insert(block.name);
+                    const auto runner_idom = immediate_dominator.find(runner);
+                    if (runner_idom == immediate_dominator.end()) break;
+                    runner = runner_idom->second;
+                }
+            }
+        }
+    }
+
     std::unordered_map<std::string, std::size_t> block_index;
     for (std::size_t index = 0; index < function.blocks.size(); ++index)
         block_index.emplace(function.blocks[index].name, index);
@@ -214,21 +277,23 @@ pass::PassResult ScalarStackPromotionPass::run(
             bool has_type{};
             bool valid{true};
             std::unordered_set<std::string> access_blocks;
+            std::unordered_set<std::string> definition_blocks;
             std::string function_signature_name;
         };
         std::unordered_map<std::string, CrossCandidate> cross_candidates;
         const auto& entry = function.blocks.front();
         for (std::size_t index = 0; index < entry.operations.size(); ++index) {
             const auto& operation = entry.operations[index];
-            if (operation.opcode == "stack.alloc" && !operation.result.empty()) {
-                std::string function_signature_name;
-                const auto callback_signature = std::find_if(operation.attributes.begin(), operation.attributes.end(), [](const ir::Attribute& attribute) {
-                    return attribute.name == "callback.signature";
-                });
-                if (callback_signature != operation.attributes.end()) function_signature_name = callback_signature->value;
-                cross_candidates.emplace(operation.result,
-                    CrossCandidate{index, ir::Type(ir::TypeKind::void_), false, true, {}, std::move(function_signature_name)});
-            }
+            if (operation.opcode != "stack.alloc" || operation.result.empty()) continue;
+            std::string function_signature_name;
+            const auto callback_signature = std::find_if(
+                operation.attributes.begin(), operation.attributes.end(),
+                [](const ir::Attribute& attribute) { return attribute.name == "callback.signature"; });
+            if (callback_signature != operation.attributes.end())
+                function_signature_name = callback_signature->value;
+            cross_candidates.emplace(operation.result,
+                CrossCandidate{index, ir::Type(ir::TypeKind::void_), false, true, {}, {},
+                               std::move(function_signature_name)});
         }
 
         for (const auto& block : function.blocks) {
@@ -237,13 +302,16 @@ pass::PassResult ScalarStackPromotionPass::run(
                     const auto found = cross_candidates.find(operation.operands[operand_index]);
                     if (found == cross_candidates.end()) continue;
                     auto& candidate = found->second;
-                    const bool scalar_load = operation.opcode == "load" && operand_index == 0U && operation.operands.size() == 1U;
-                    const bool scalar_store = operation.opcode == "store" && operand_index == 1U && operation.operands.size() == 2U;
+                    const bool scalar_load = operation.opcode == "load" && operand_index == 0U &&
+                                             operation.operands.size() == 1U;
+                    const bool scalar_store = operation.opcode == "store" && operand_index == 1U &&
+                                              operation.operands.size() == 2U;
                     if (!scalar_load && !scalar_store) {
                         candidate.valid = false;
                         continue;
                     }
                     candidate.access_blocks.insert(block.name);
+                    if (scalar_store) candidate.definition_blocks.insert(block.name);
                     if (!candidate.has_type) {
                         candidate.stored_type = operation.type;
                         candidate.has_type = true;
@@ -259,8 +327,12 @@ pass::PassResult ScalarStackPromotionPass::run(
         }
 
         for (const auto& [slot, candidate] : cross_candidates) {
-            if (!candidate.valid || !candidate.has_type || candidate.access_blocks.size() < 2U) continue;
+            if (!candidate.valid || !candidate.has_type || candidate.access_blocks.size() < 2U ||
+                candidate.definition_blocks.empty())
+                continue;
 
+            // Liveness prunes phi placement.  A frontier block that never reads
+            // the incoming slot value before redefining it does not need a phi.
             std::unordered_map<std::string, bool> use_before_definition;
             std::unordered_map<std::string, bool> defines;
             for (const auto& block : function.blocks) {
@@ -268,9 +340,11 @@ pass::PassResult ScalarStackPromotionPass::run(
                 bool defined = false;
                 bool uses_incoming = false;
                 for (const auto& operation : block.operations) {
-                    if (operation.opcode == "store" && operation.operands.size() == 2U && operation.operands[1] == slot) {
+                    if (operation.opcode == "store" && operation.operands.size() == 2U &&
+                        operation.operands[1] == slot) {
                         defined = true;
-                    } else if (operation.opcode == "load" && operation.operands.size() == 1U && operation.operands[0] == slot && !defined) {
+                    } else if (operation.opcode == "load" && operation.operands.size() == 1U &&
+                               operation.operands[0] == slot && !defined) {
                         uses_incoming = true;
                     }
                 }
@@ -287,9 +361,11 @@ pass::PassResult ScalarStackPromotionPass::run(
                     const auto& block = *block_it;
                     if (!cfg.reachable.contains(block.name)) continue;
                     bool out = false;
-                    if (const auto successors = cfg.successors.find(block.name); successors != cfg.successors.end())
+                    if (const auto successors = cfg.successors.find(block.name);
+                        successors != cfg.successors.end()) {
                         for (const auto& successor : successors->second)
                             if (cfg.reachable.contains(successor) && live_in[successor]) out = true;
+                    }
                     const bool in = use_before_definition[block.name] || (out && !defines[block.name]);
                     if (live_out[block.name] != out || live_in[block.name] != in) {
                         live_out[block.name] = out;
@@ -299,90 +375,73 @@ pass::PassResult ScalarStackPromotionPass::run(
                 }
             }
 
-            std::unordered_map<std::string, std::string> parameters;
             std::string stem = slot;
             if (!stem.empty() && stem.front() == '%') stem.erase(stem.begin());
-            for (const auto& block : function.blocks) {
-                if (block.name == function.blocks.front().name || !live_in[block.name]) continue;
-                std::size_t predecessor_count = 0;
-                if (const auto predecessors = cfg.predecessors.find(block.name); predecessors != cfg.predecessors.end())
-                    for (const auto& predecessor : predecessors->second)
-                        if (cfg.reachable.contains(predecessor)) ++predecessor_count;
-                if (predecessor_count >= 2U)
-                    parameters.emplace(block.name, "%mem2reg." + stem + "." + block.name);
-            }
-
-            std::unordered_map<std::string, std::string> outgoing;
-            const std::size_t iteration_limit = std::max<std::size_t>(4U, function.blocks.size() * 4U);
-            for (std::size_t iteration = 0; iteration < iteration_limit; ++iteration) {
-                bool changed = false;
-                for (const auto& block : function.blocks) {
-                    if (!cfg.reachable.contains(block.name)) continue;
-                    std::string current;
-                    if (const auto parameter = parameters.find(block.name); parameter != parameters.end()) {
-                        current = parameter->second;
-                    } else if (block.name != function.blocks.front().name) {
-                        std::string common;
-                        bool all_known = true;
-                        bool first = true;
-                        if (const auto predecessors = cfg.predecessors.find(block.name); predecessors != cfg.predecessors.end()) {
-                            for (const auto& predecessor : predecessors->second) {
-                                if (!cfg.reachable.contains(predecessor)) continue;
-                                const auto incoming = outgoing.find(predecessor);
-                                if (incoming == outgoing.end() || incoming->second.empty()) {
-                                    all_known = false;
-                                    break;
-                                }
-                                if (first) {
-                                    common = incoming->second;
-                                    first = false;
-                                } else if (common != incoming->second) {
-                                    all_known = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if (all_known && !first) current = common;
-                    }
-
-                    for (const auto& operation : block.operations) {
-                        if (operation.opcode == "store" && operation.operands.size() == 2U && operation.operands[1] == slot)
-                            current = operation.operands[0];
-                    }
-                    if (outgoing[block.name] != current) {
-                        outgoing[block.name] = current;
-                        changed = true;
-                    }
+            std::unordered_map<std::string, std::string> parameters;
+            std::vector<std::string> worklist(candidate.definition_blocks.begin(),
+                                              candidate.definition_blocks.end());
+            std::unordered_set<std::string> queued(candidate.definition_blocks.begin(),
+                                                   candidate.definition_blocks.end());
+            for (std::size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+                const auto frontier = dominance_frontier.find(worklist[cursor]);
+                if (frontier == dominance_frontier.end()) continue;
+                for (const auto& block_name : frontier->second) {
+                    if (!live_in[block_name] || parameters.contains(block_name)) continue;
+                    parameters.emplace(block_name, "%mem2reg." + stem + "." + block_name);
+                    if (queued.insert(block_name).second) worklist.push_back(block_name);
                 }
-                if (!changed) break;
             }
 
             std::unordered_map<std::string, std::string> load_replacements;
+            std::unordered_map<std::string, std::unordered_map<std::string, std::string>> edge_values;
             bool safe = true;
-            for (const auto& block : function.blocks) {
-                if (!cfg.reachable.contains(block.name)) continue;
-                std::string current;
-                if (const auto parameter = parameters.find(block.name); parameter != parameters.end()) {
+            const auto rename = [&](const auto& self, const std::string& block_name,
+                                    std::string current) -> void {
+                if (!safe) return;
+                if (const auto parameter = parameters.find(block_name); parameter != parameters.end())
                     current = parameter->second;
-                } else if (block.name != function.blocks.front().name) {
-                    bool first = true;
-                    if (const auto predecessors = cfg.predecessors.find(block.name); predecessors != cfg.predecessors.end()) {
-                        for (const auto& predecessor : predecessors->second) {
-                            if (!cfg.reachable.contains(predecessor)) continue;
-                            const auto incoming = outgoing.find(predecessor);
-                            if (incoming == outgoing.end() || incoming->second.empty()) { safe = false; break; }
-                            if (first) { current = incoming->second; first = false; }
-                            else if (current != incoming->second) { safe = false; break; }
-                        }
-                    }
-                    if (!safe) break;
-                }
+                const auto index = block_index.find(block_name);
+                if (index == block_index.end()) { safe = false; return; }
+                const auto& block = function.blocks[index->second];
                 for (const auto& operation : block.operations) {
-                    if (operation.opcode == "store" && operation.operands.size() == 2U && operation.operands[1] == slot) {
+                    if (operation.opcode == "store" && operation.operands.size() == 2U &&
+                        operation.operands[1] == slot) {
                         current = operation.operands[0];
-                    } else if (operation.opcode == "load" && operation.operands.size() == 1U && operation.operands[0] == slot) {
-                        if (current.empty()) { safe = false; break; }
-                        load_replacements.emplace(operation.result, current);
+                    } else if (operation.opcode == "load" && operation.operands.size() == 1U &&
+                               operation.operands[0] == slot) {
+                        if (current.empty()) { safe = false; return; }
+                        load_replacements[operation.result] = current;
+                    }
+                }
+                if (const auto successors = cfg.successors.find(block_name);
+                    successors != cfg.successors.end()) {
+                    for (const auto& successor : successors->second) {
+                        if (!parameters.contains(successor)) continue;
+                        if (current.empty()) { safe = false; return; }
+                        edge_values[block_name][successor] = current;
+                    }
+                }
+                if (const auto children = dominator_children.find(block_name);
+                    children != dominator_children.end()) {
+                    for (const auto& child : children->second) self(self, child, current);
+                }
+            };
+            rename(rename, function.blocks.front().name, {});
+            if (!safe) continue;
+
+            // Every reachable predecessor of a phi block must supply an edge
+            // value.  Verify this before mutating the IR so a malformed or
+            // uninitialized slot cannot leave a half-promoted function behind.
+            for (const auto& [block_name, parameter] : parameters) {
+                (void)parameter;
+                const auto predecessors = cfg.predecessors.find(block_name);
+                if (predecessors == cfg.predecessors.end()) { safe = false; break; }
+                for (const auto& predecessor : predecessors->second) {
+                    if (!cfg.reachable.contains(predecessor)) continue;
+                    const auto source = edge_values.find(predecessor);
+                    if (source == edge_values.end() || !source->second.contains(block_name)) {
+                        safe = false;
+                        break;
                     }
                 }
                 if (!safe) break;
@@ -394,27 +453,23 @@ pass::PassResult ScalarStackPromotionPass::run(
                 ir::ValueDecl promoted_parameter(parameter, candidate.stored_type);
                 promoted_parameter.function_signature_name = candidate.function_signature_name;
                 block.parameters.push_back(std::move(promoted_parameter));
-                const auto predecessors = cfg.predecessors.find(block_name);
-                if (predecessors == cfg.predecessors.end()) { safe = false; break; }
-                for (const auto& predecessor : predecessors->second) {
+                const auto& predecessors = cfg.predecessors.at(block_name);
+                for (const auto& predecessor : predecessors) {
                     if (!cfg.reachable.contains(predecessor)) continue;
-                    const auto incoming = outgoing.find(predecessor);
-                    if (incoming == outgoing.end() || incoming->second.empty()) { safe = false; break; }
                     auto& terminator = function.blocks[block_index.at(predecessor)].operations.back();
                     for (std::size_t edge = 0; edge < terminator.successors.size(); ++edge) {
                         if (terminator.successors[edge] != block_name) continue;
                         if (terminator.successor_arguments.size() < terminator.successors.size())
                             terminator.successor_arguments.resize(terminator.successors.size());
-                        terminator.successor_arguments[edge].push_back(incoming->second);
+                        terminator.successor_arguments[edge].push_back(edge_values.at(predecessor).at(block_name));
                     }
                 }
-                if (!safe) break;
             }
-            if (!safe) continue;
 
             for (auto& block : function.blocks) {
                 for (auto& operation : block.operations) {
-                    if (operation.opcode == "store" && operation.operands.size() == 2U && operation.operands[1] == slot) {
+                    if (operation.opcode == "store" && operation.operands.size() == 2U &&
+                        operation.operands[1] == slot) {
                         operation.opcode.clear();
                         operation.result.clear();
                         operation.operands.clear();
@@ -423,7 +478,9 @@ pass::PassResult ScalarStackPromotionPass::run(
                         operation.type = ir::Type(ir::TypeKind::void_);
                         ++result.operations_removed;
                         result.changed = true;
-                    } else if (operation.opcode == "load" && operation.operands.size() == 1U && operation.operands[0] == slot) {
+                        result.touch_block(block.name);
+                    } else if (operation.opcode == "load" && operation.operands.size() == 1U &&
+                               operation.operands[0] == slot) {
                         const auto replacement = load_replacements.find(operation.result);
                         if (replacement == load_replacements.end()) continue;
                         operation.opcode = "copy";
@@ -431,6 +488,7 @@ pass::PassResult ScalarStackPromotionPass::run(
                         operation.alignment = 0;
                         ++result.operations_rewritten;
                         result.changed = true;
+                        result.touch_block(block.name);
                     }
                 }
             }
@@ -442,6 +500,15 @@ pass::PassResult ScalarStackPromotionPass::run(
             allocation.successor_arguments.clear();
             allocation.type = ir::Type(ir::TypeKind::void_);
             ++result.operations_removed;
+            result.changed = true;
+            result.touch_block(function.blocks.front().name);
+            for (const auto& [block_name, parameter] : parameters) {
+                (void)parameter;
+                result.touch_block(block_name);
+                const auto& predecessors = cfg.predecessors.at(block_name);
+                for (const auto& predecessor : predecessors)
+                    if (cfg.reachable.contains(predecessor)) result.touch_block(predecessor);
+            }
         }
         for (auto& block : function.blocks)
             block.operations.erase(std::remove_if(block.operations.begin(), block.operations.end(),
@@ -961,6 +1028,147 @@ pass::PassResult LoopInvariantCodeMotionPass::run(ir::Function& function,
     return result;
 }
 
+pass::PassResult LoopInvariantGuardHoistingPass::run(
+    ir::Function& function, analysis::FunctionAnalysisManager& analyses) {
+    pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
+    if (function.blocks.size() < 3U) return result;
+
+    // This is a deliberately non-duplicating form of loop unswitching.  When a
+    // natural-loop header consists only of an invariant branch, hoist that
+    // decision to the unique preheader and turn the loop-header branch into an
+    // unconditional jump along the in-loop arm.  The rejected arm is taken
+    // directly from the preheader, so the invariant predicate is evaluated
+    // once instead of once per iteration.
+    //
+    // The legality rules are intentionally strict:
+    //   * the loop must have a unique preheader;
+    //   * the header may contain only the branch terminator;
+    //   * exactly one branch successor stays inside the loop;
+    //   * the condition must be defined outside the loop and dominate the
+    //     preheader (or be a literal);
+    //   * values sent to the exit must already be available in the preheader,
+    //     after substituting the header's initial block-parameter arguments.
+    // No operations or loop blocks are cloned.
+    bool changed_round = true;
+    while (changed_round) {
+        changed_round = false;
+        const auto loop_info = analyses.loops();
+        const auto& dominators = analyses.dominators();
+
+        std::unordered_map<std::string, std::string> definition_block;
+        const std::string entry = function.blocks.front().name;
+        for (const auto& parameter : function.parameters)
+            definition_block[parameter.name] = entry;
+        for (const auto& block : function.blocks) {
+            for (const auto& parameter : block.parameters)
+                definition_block[parameter.name] = block.name;
+            for (const auto& operation : block.operations)
+                if (!operation.result.empty()) definition_block[operation.result] = block.name;
+        }
+
+        for (const auto& loop : loop_info.loops) {
+            if (loop.preheader.empty()) continue;
+            const auto header_it = std::find_if(function.blocks.begin(), function.blocks.end(),
+                [&](const ir::Block& block) { return block.name == loop.header; });
+            const auto preheader_it = std::find_if(function.blocks.begin(), function.blocks.end(),
+                [&](const ir::Block& block) { return block.name == loop.preheader; });
+            if (header_it == function.blocks.end() || preheader_it == function.blocks.end()) continue;
+            auto& header = *header_it;
+            auto& preheader = *preheader_it;
+            if (header.operations.size() != 1U || preheader.operations.empty()) continue;
+
+            auto& header_branch = header.operations.back();
+            auto& preheader_jump = preheader.operations.back();
+            if (header_branch.opcode != "branch" || header_branch.operands.size() != 1U ||
+                header_branch.successors.size() != 2U ||
+                header_branch.successor_arguments.size() != 2U ||
+                preheader_jump.opcode != "jump" || preheader_jump.successors.size() != 1U ||
+                preheader_jump.successors.front() != header.name ||
+                preheader_jump.successor_arguments.size() != 1U ||
+                preheader_jump.successor_arguments.front().size() != header.parameters.size())
+                continue;
+
+            const bool first_inside = loop.blocks.contains(header_branch.successors[0]);
+            const bool second_inside = loop.blocks.contains(header_branch.successors[1]);
+            if (first_inside == second_inside) continue;
+            const std::size_t inside_index = first_inside ? 0U : 1U;
+            const std::size_t exit_index = first_inside ? 1U : 0U;
+            if (header_branch.successors[inside_index] == header.name) continue;
+
+            const std::string condition = header_branch.operands.front();
+            if (condition.starts_with('%')) {
+                const auto definition = definition_block.find(condition);
+                if (definition == definition_block.end() || loop.blocks.contains(definition->second) ||
+                    !dominators.dominates(definition->second, preheader.name))
+                    continue;
+            } else if (!number(condition)) {
+                continue;
+            }
+
+            std::unordered_map<std::string, std::string> initial_parameter_value;
+            const auto& initial_arguments = preheader_jump.successor_arguments.front();
+            for (std::size_t index = 0; index < header.parameters.size(); ++index)
+                initial_parameter_value[header.parameters[index].name] = initial_arguments[index];
+
+            const auto available_in_preheader = [&](const std::string& value) {
+                if (!value.starts_with('%')) return number(value).has_value();
+                const auto definition = definition_block.find(value);
+                return definition != definition_block.end() &&
+                       !loop.blocks.contains(definition->second) &&
+                       dominators.dominates(definition->second, preheader.name);
+            };
+
+            std::vector<std::string> exit_arguments = header_branch.successor_arguments[exit_index];
+            bool exit_available = true;
+            for (auto& argument : exit_arguments) {
+                const auto initial = initial_parameter_value.find(argument);
+                if (initial != initial_parameter_value.end()) argument = initial->second;
+                if (!available_in_preheader(argument)) {
+                    exit_available = false;
+                    break;
+                }
+            }
+            if (!exit_available) continue;
+
+            // Preserve the original in-loop edge before rewriting the header.
+            const std::string inside_successor = header_branch.successors[inside_index];
+            const std::vector<std::string> inside_arguments =
+                header_branch.successor_arguments[inside_index];
+            const std::string exit_successor = header_branch.successors[exit_index];
+
+            // Header: the preheader has already selected the invariant loop arm,
+            // so every backedge can take it unconditionally.
+            header_branch.opcode = "jump";
+            header_branch.operands.clear();
+            header_branch.successors = {inside_successor};
+            header_branch.successor_arguments = {inside_arguments};
+
+            // Preheader: evaluate the invariant condition once.  The loop arm
+            // still enters through the header so its initial block parameters
+            // remain exactly the values supplied by the old preheader jump.
+            preheader_jump.opcode = "branch";
+            preheader_jump.operands = {condition};
+            if (inside_index == 0U) {
+                preheader_jump.successors = {header.name, exit_successor};
+                preheader_jump.successor_arguments = {initial_arguments, exit_arguments};
+            } else {
+                preheader_jump.successors = {exit_successor, header.name};
+                preheader_jump.successor_arguments = {exit_arguments, initial_arguments};
+            }
+
+            result.changed = true;
+            result.operations_rewritten += 2U;
+            result.touch_block(preheader.name);
+            result.touch_block(header.name);
+            analyses.invalidate_control_flow();
+            changed_round = true;
+            break;
+        }
+    }
+    return result;
+}
+
 pass::PassResult DeadCodeEliminationPass::run(ir::Function& function,
                                               analysis::FunctionAnalysisManager&) {
     pass::PassResult result;
@@ -1125,64 +1333,390 @@ pass::PassResult MergeParameterSimplificationPass::run(
     result.invalidation = analysis::InvalidationScope::operations;
     if (function.blocks.empty()) return result;
 
+    // Block parameters are Forge IR's phi nodes.  Mem2reg deliberately creates
+    // them before later scalar passes have had a chance to discover that some
+    // incoming values are equivalent.  Keep this simplifier small and
+    // correctness-first, but iterate it to a fixed point so one eliminated phi
+    // can expose another one immediately.
+    //
+    // A parameter is trivial when all of its *non-self* incoming values reduce
+    // to one canonical SSA value.  Ignoring the self edge is what makes the
+    // standard loop case
+    //
+    //     header(%x) <- preheader(%initial), latch(%x)
+    //
+    // collapse safely to %initial.  A phi containing only self references has
+    // no defining value and is therefore left alone.  Unresolved parameters in
+    // the same block are also left in place; this prevents mutually recursive
+    // phi cycles from being collapsed without an external defining value.
     const auto& dominators = analyses.dominators();
-    for (auto& block : function.blocks) {
-        if (block.parameters.empty()) continue;
+    std::unordered_map<std::string, std::string> replacements;
 
-        struct IncomingEdge {
-            ir::Operation* terminator{};
-            std::size_t successor_index{};
+    const auto canonical = [&](const std::string& value) {
+        std::string current = value;
+        std::unordered_set<std::string> seen;
+        while (true) {
+            const auto found = replacements.find(current);
+            if (found == replacements.end() || found->second == current) break;
+            if (!seen.insert(current).second) break;
+            current = found->second;
+        }
+        return current;
+    };
+
+    bool changed_round = true;
+    while (changed_round) {
+        changed_round = false;
+        for (auto& block : function.blocks) {
+            if (block.parameters.empty()) continue;
+
+            struct IncomingEdge {
+                ir::Operation* terminator{};
+                std::size_t successor_index{};
+                std::string predecessor;
+            };
+            std::vector<IncomingEdge> incoming;
+            for (auto& predecessor : function.blocks) {
+                if (predecessor.operations.empty()) continue;
+                auto& terminator = predecessor.operations.back();
+                for (std::size_t edge = 0; edge < terminator.successors.size(); ++edge) {
+                    if (terminator.successors[edge] == block.name &&
+                        edge < terminator.successor_arguments.size()) {
+                        incoming.push_back({&terminator, edge, predecessor.name});
+                    }
+                }
+            }
+            if (incoming.empty()) continue;
+
+            std::unordered_set<std::string> block_parameter_names;
+            for (const auto& parameter : block.parameters)
+                block_parameter_names.insert(parameter.name);
+
+            // Walk backwards so removing a parameter cannot invalidate the
+            // indices of parameters that are still waiting to be inspected.
+            for (std::size_t parameter_index = block.parameters.size(); parameter_index-- > 0;) {
+                const std::string parameter_name = block.parameters[parameter_index].name;
+                std::optional<std::string> candidate;
+                bool trivial = true;
+                bool has_external_value = false;
+
+                for (const auto& edge : incoming) {
+                    auto& arguments = edge.terminator->successor_arguments[edge.successor_index];
+                    if (parameter_index >= arguments.size()) {
+                        trivial = false;
+                        break;
+                    }
+                    const std::string incoming_value = canonical(arguments[parameter_index]);
+                    if (incoming_value == parameter_name) continue;
+
+                    // Do not collapse unresolved mutually-recursive block
+                    // parameters.  If that peer phi becomes trivial first, the
+                    // replacement map will canonicalize it on the next round.
+                    if (block_parameter_names.contains(incoming_value) &&
+                        !replacements.contains(incoming_value)) {
+                        trivial = false;
+                        break;
+                    }
+
+                    has_external_value = true;
+                    if (!candidate) candidate = incoming_value;
+                    else if (*candidate != incoming_value) {
+                        trivial = false;
+                        break;
+                    }
+                }
+
+                if (!trivial || !has_external_value || !candidate ||
+                    *candidate == parameter_name) {
+                    continue;
+                }
+
+                const std::string replacement = canonical(*candidate);
+                if (replacement == parameter_name) continue;
+
+                // The parameter is defined at block entry and dominates the
+                // block plus all dominated descendants.  Rewrite precisely
+                // that region, including successor edge arguments in loop
+                // latches, so later phi tests see the canonical value too.
+                for (auto& dominated : function.blocks) {
+                    if (dominated.name != block.name &&
+                        !dominators.dominates(block.name, dominated.name)) {
+                        continue;
+                    }
+                    for (auto& operation : dominated.operations) {
+                        for (auto& operand : operation.operands) {
+                            if (operand == parameter_name) operand = replacement;
+                            else operand = canonical(operand);
+                        }
+                        for (auto& arguments : operation.successor_arguments) {
+                            for (auto& argument : arguments) {
+                                if (argument == parameter_name) argument = replacement;
+                                else argument = canonical(argument);
+                            }
+                        }
+                    }
+                    result.touch_block(dominated.name);
+                }
+
+                for (const auto& edge : incoming) {
+                    auto& arguments = edge.terminator->successor_arguments[edge.successor_index];
+                    arguments.erase(arguments.begin() + static_cast<std::ptrdiff_t>(parameter_index));
+                    result.touch_block(edge.predecessor);
+                }
+                replacements[parameter_name] = replacement;
+                block_parameter_names.erase(parameter_name);
+                block.parameters.erase(block.parameters.begin() +
+                                       static_cast<std::ptrdiff_t>(parameter_index));
+                result.changed = true;
+                changed_round = true;
+                ++result.operations_rewritten;
+            }
+        }
+    }
+
+    // A final canonicalization pass flattens phi-of-phi replacement chains in
+    // operands that were not in the dominated region of the phi eliminated in
+    // the same round (for example an already-existing edge argument).  This is
+    // cheap and makes subsequent CSE/SCCP/DCE see a single SSA spelling.
+    if (!replacements.empty()) {
+        for (auto& block : function.blocks) {
+            for (auto& operation : block.operations) {
+                for (auto& operand : operation.operands) operand = canonical(operand);
+                for (auto& arguments : operation.successor_arguments)
+                    for (auto& argument : arguments) argument = canonical(argument);
+            }
+        }
+    }
+    return result;
+}
+
+
+pass::PassResult BranchThreadingPass::run(ir::Function& function,
+                                          analysis::FunctionAnalysisManager& analyses) {
+    pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
+    if (function.blocks.size() < 3U) return result;
+
+    // Jump threading is deliberately non-duplicating.  A predecessor edge may
+    // bypass a shared predicate block only when the condition can be evaluated
+    // from constants already available on that edge and every outgoing edge
+    // argument can be expressed using values already available at the
+    // predecessor.  This captures the profitable control-flow case without
+    // manufacturing new SSA definitions or creating dominance hazards.
+    const auto evaluable_opcode = [](std::string_view opcode) {
+        return opcode == "const" || opcode == "copy" || opcode == "select" ||
+               opcode == "neg" || opcode == "not" || opcode == "add" ||
+               opcode == "sub" || opcode == "mul" || opcode == "and" ||
+               opcode == "or" || opcode == "xor" || opcode == "shl" ||
+               opcode == "shr.signed" || opcode == "shr.unsigned" ||
+               opcode == "cmp.eq" || opcode == "cmp.ne" || opcode == "cmp.lt" ||
+               opcode == "cmp.le" || opcode == "cmp.gt" || opcode == "cmp.ge" ||
+               opcode == "cmp.ult" || opcode == "cmp.ule" || opcode == "cmp.ugt" ||
+               opcode == "cmp.uge";
+    };
+
+    const auto eval_scalar = [](const ir::Operation& operation,
+                                const std::unordered_map<std::string, long long>& constants)
+        -> std::optional<long long> {
+        const auto value = [&](const std::string& operand) -> std::optional<long long> {
+            if (const auto literal = number(operand)) return *literal;
+            const auto found = constants.find(operand);
+            return found == constants.end() ? std::optional<long long>{}
+                                            : std::optional<long long>{found->second};
         };
-        std::vector<IncomingEdge> incoming;
-        for (auto& predecessor : function.blocks) {
+        if (operation.opcode == "const" && operation.operands.size() == 1U)
+            return number(operation.operands[0]);
+        if (operation.opcode == "copy" && operation.operands.size() == 1U)
+            return value(operation.operands[0]);
+        if ((operation.opcode == "neg" || operation.opcode == "not") &&
+            operation.operands.size() == 1U) {
+            const auto input = value(operation.operands[0]);
+            if (!input) return {};
+            return operation.opcode == "neg" ? -*input : ~*input;
+        }
+        if (operation.opcode == "select" && operation.operands.size() == 3U) {
+            const auto condition = value(operation.operands[0]);
+            if (!condition) return {};
+            return value(operation.operands[*condition != 0 ? 1U : 2U]);
+        }
+        if (operation.operands.size() != 2U) return {};
+        const auto left = value(operation.operands[0]);
+        const auto right = value(operation.operands[1]);
+        if (!left || !right) return {};
+        const long long a = *left, b = *right;
+        if (operation.opcode == "add") return a + b;
+        if (operation.opcode == "sub") return a - b;
+        if (operation.opcode == "mul") return a * b;
+        if (operation.opcode == "and") return a & b;
+        if (operation.opcode == "or") return a | b;
+        if (operation.opcode == "xor") return a ^ b;
+        if (operation.opcode == "shl") return a << b;
+        if (operation.opcode == "shr.signed") return a >> b;
+        if (operation.opcode == "shr.unsigned")
+            return static_cast<long long>(static_cast<unsigned long long>(a) >> b);
+        if (operation.opcode == "cmp.eq") return a == b;
+        if (operation.opcode == "cmp.ne") return a != b;
+        if (operation.opcode == "cmp.lt") return a < b;
+        if (operation.opcode == "cmp.le") return a <= b;
+        if (operation.opcode == "cmp.gt") return a > b;
+        if (operation.opcode == "cmp.ge") return a >= b;
+        if (operation.opcode == "cmp.ult")
+            return static_cast<unsigned long long>(a) < static_cast<unsigned long long>(b);
+        if (operation.opcode == "cmp.ule")
+            return static_cast<unsigned long long>(a) <= static_cast<unsigned long long>(b);
+        if (operation.opcode == "cmp.ugt")
+            return static_cast<unsigned long long>(a) > static_cast<unsigned long long>(b);
+        if (operation.opcode == "cmp.uge")
+            return static_cast<unsigned long long>(a) >= static_cast<unsigned long long>(b);
+        return {};
+    };
+
+    std::unordered_map<std::string, std::string> definition_block;
+    const std::string entry_name = function.blocks.front().name;
+    for (const auto& parameter : function.parameters) definition_block[parameter.name] = entry_name;
+    for (const auto& block : function.blocks) {
+        for (const auto& parameter : block.parameters) definition_block[parameter.name] = block.name;
+        for (const auto& operation : block.operations)
+            if (!operation.result.empty()) definition_block[operation.result] = block.name;
+    }
+
+    bool changed_round = true;
+    while (changed_round) {
+        changed_round = false;
+        const auto& dominators = analyses.dominators();
+        std::unordered_map<std::string, std::size_t> block_index;
+        for (std::size_t index = 0; index < function.blocks.size(); ++index)
+            block_index[function.blocks[index].name] = index;
+
+        for (std::size_t predecessor_index = 0;
+             predecessor_index < function.blocks.size() && !changed_round;
+             ++predecessor_index) {
+            auto& predecessor = function.blocks[predecessor_index];
             if (predecessor.operations.empty()) continue;
             auto& terminator = predecessor.operations.back();
-            for (std::size_t edge = 0; edge < terminator.successors.size(); ++edge) {
-                if (terminator.successors[edge] == block.name &&
-                    edge < terminator.successor_arguments.size()) {
-                    incoming.push_back({&terminator, edge});
+
+            std::unordered_map<std::string, long long> predecessor_constants;
+            for (const auto& operation : predecessor.operations) {
+                if (operation.result.empty()) continue;
+                if (const auto constant = eval_scalar(operation, predecessor_constants))
+                    predecessor_constants[operation.result] = *constant;
+            }
+
+            for (std::size_t edge_index = 0;
+                 edge_index < terminator.successors.size() && !changed_round;
+                 ++edge_index) {
+                const auto target_it = block_index.find(terminator.successors[edge_index]);
+                if (target_it == block_index.end() || target_it->second == 0U ||
+                    target_it->second == predecessor_index) continue;
+                const auto& target = function.blocks[target_it->second];
+                if (target.operations.empty()) continue;
+                const auto& branch = target.operations.back();
+                if (branch.opcode != "branch" || branch.operands.size() != 1U ||
+                    branch.successors.size() != 2U || branch.successor_arguments.size() != 2U)
+                    continue;
+                const std::size_t body_size = target.operations.size() - 1U;
+                if (body_size > 3U || edge_index >= terminator.successor_arguments.size() ||
+                    terminator.successor_arguments[edge_index].size() != target.parameters.size())
+                    continue;
+
+                // A bypassed block must not own SSA values that are consumed
+                // directly by another block.  Forge permits dominated direct
+                // SSA uses across blocks, so merely rewriting successor edge
+                // arguments is not enough: a successor could otherwise become
+                // reachable along a threaded path on which the defining block
+                // never executed.  Require all outward dataflow from this
+                // predicate block to travel through its explicit terminator
+                // edge arguments, which are remapped below.
+                std::unordered_set<std::string> target_values;
+                for (const auto& parameter : target.parameters) target_values.insert(parameter.name);
+                for (std::size_t operation_index = 0; operation_index < body_size; ++operation_index)
+                    if (!target.operations[operation_index].result.empty())
+                        target_values.insert(target.operations[operation_index].result);
+                bool escapes_target = false;
+                for (const auto& candidate : function.blocks) {
+                    if (candidate.name == target.name) continue;
+                    for (const auto& operation : candidate.operations) {
+                        for (const auto& operand : operation.operands)
+                            if (target_values.contains(operand)) escapes_target = true;
+                        for (const auto& arguments : operation.successor_arguments)
+                            for (const auto& argument : arguments)
+                                if (target_values.contains(argument)) escapes_target = true;
+                    }
                 }
+                if (escapes_target) continue;
+
+                std::unordered_map<std::string, std::string> substitutions;
+                std::unordered_map<std::string, long long> constants = predecessor_constants;
+                for (std::size_t parameter_index = 0; parameter_index < target.parameters.size(); ++parameter_index) {
+                    const auto& argument = terminator.successor_arguments[edge_index][parameter_index];
+                    substitutions[target.parameters[parameter_index].name] = argument;
+                    if (const auto literal = number(argument)) constants[target.parameters[parameter_index].name] = *literal;
+                    else if (const auto found = predecessor_constants.find(argument); found != predecessor_constants.end())
+                        constants[target.parameters[parameter_index].name] = found->second;
+                }
+
+                bool safe = true;
+                for (std::size_t operation_index = 0; operation_index < body_size; ++operation_index) {
+                    const auto& operation = target.operations[operation_index];
+                    if (operation.has_side_effects() || !evaluable_opcode(operation.opcode)) {
+                        safe = false;
+                        break;
+                    }
+                    // Evaluation may use target-local results because no code is
+                    // cloned; they are only symbolic facts for deciding which
+                    // successor this incoming edge takes.
+                    std::unordered_map<std::string, long long> eval_constants = constants;
+                    for (const auto& [parameter, argument] : substitutions) {
+                        const auto found = constants.find(parameter);
+                        if (found != constants.end()) eval_constants[argument] = found->second;
+                    }
+                    if (const auto constant = eval_scalar(operation, eval_constants))
+                        constants[operation.result] = *constant;
+                }
+                if (!safe) continue;
+
+                std::string condition = branch.operands.front();
+                std::optional<long long> condition_value;
+                if (const auto found = constants.find(condition); found != constants.end())
+                    condition_value = found->second;
+                else if (const auto substitution = substitutions.find(condition); substitution != substitutions.end()) {
+                    if (const auto found = predecessor_constants.find(substitution->second); found != predecessor_constants.end())
+                        condition_value = found->second;
+                    else condition_value = number(substitution->second);
+                }
+                if (!condition_value) continue;
+                const std::size_t selected = *condition_value != 0 ? 0U : 1U;
+
+                auto outgoing_arguments = branch.successor_arguments[selected];
+                for (auto& argument : outgoing_arguments) {
+                    if (const auto substitution = substitutions.find(argument); substitution != substitutions.end())
+                        argument = substitution->second;
+                    // A target-local computed value cannot be referenced after
+                    // bypassing the block because this pass never clones code.
+                    const auto definition = definition_block.find(argument);
+                    if (definition != definition_block.end() && definition->second == target.name) {
+                        safe = false;
+                        break;
+                    }
+                    if (number(argument)) continue;
+                    if (definition == definition_block.end() ||
+                        !dominators.dominates(definition->second, predecessor.name)) {
+                        safe = false;
+                        break;
+                    }
+                }
+                if (!safe) continue;
+
+                terminator.successors[edge_index] = branch.successors[selected];
+                terminator.successor_arguments[edge_index] = std::move(outgoing_arguments);
+                result.changed = true;
+                ++result.operations_rewritten;
+                result.touch_block(predecessor.name);
+                result.touch_block(target.name);
+                changed_round = true;
             }
         }
-        if (incoming.size() < 2U) continue;
-
-        for (std::size_t parameter_index = block.parameters.size(); parameter_index-- > 0;) {
-            const auto& parameter = block.parameters[parameter_index];
-            std::optional<std::string> common;
-            bool identical = true;
-            for (const auto& edge : incoming) {
-                auto& arguments = edge.terminator->successor_arguments[edge.successor_index];
-                if (parameter_index >= arguments.size()) {
-                    identical = false;
-                    break;
-                }
-                if (!common) common = arguments[parameter_index];
-                else if (*common != arguments[parameter_index]) {
-                    identical = false;
-                    break;
-                }
-            }
-            if (!identical || !common || *common == parameter.name) continue;
-
-            for (auto& dominated : function.blocks) {
-                if (dominated.name != block.name &&
-                    !dominators.dominates(block.name, dominated.name)) continue;
-                for (auto& operation : dominated.operations) {
-                    for (auto& operand : operation.operands)
-                        if (operand == parameter.name) operand = *common;
-                    for (auto& arguments : operation.successor_arguments)
-                        for (auto& argument : arguments)
-                            if (argument == parameter.name) argument = *common;
-                }
-            }
-            for (const auto& edge : incoming) {
-                auto& arguments = edge.terminator->successor_arguments[edge.successor_index];
-                arguments.erase(arguments.begin() + static_cast<std::ptrdiff_t>(parameter_index));
-            }
-            block.parameters.erase(block.parameters.begin() + static_cast<std::ptrdiff_t>(parameter_index));
-            result.changed = true;
-            ++result.operations_rewritten;
-        }
+        if (changed_round) analyses.invalidate_control_flow(result.touched_blocks);
     }
     return result;
 }
@@ -1192,6 +1726,11 @@ pass::PassResult SimplifyCFGPass::run(ir::Function& function,
     pass::PassResult result;
     result.invalidation = analysis::InvalidationScope::control_flow;
     if (function.blocks.empty()) return result;
+
+    // First discard blocks that cannot be reached from the entry.  SCCP often
+    // creates these by folding a conditional branch to an unconditional jump.
+    // Do this before straight-line merging so dead predecessors cannot make an
+    // otherwise single-predecessor continuation look shared.
     const auto reachable = analyses.cfg().reachable;
     const auto before = function.blocks.size();
     function.blocks.erase(std::remove_if(function.blocks.begin(), function.blocks.end(),
@@ -1199,6 +1738,92 @@ pass::PassResult SimplifyCFGPass::run(ir::Function& function,
         function.blocks.end());
     result.blocks_removed = before - function.blocks.size();
     result.changed = result.blocks_removed != 0;
+    if (result.changed) analyses.invalidate_control_flow();
+
+    // Collapse maximal straight-line regions.  A block parameter is Forge's
+    // phi representation, so when a continuation has exactly one predecessor
+    // its parameters are no longer merges at all: the predecessor edge
+    // arguments are their unique SSA values.  Substitute those values globally
+    // (the parameter name is unique), remove the predecessor jump, and splice
+    // the continuation into the predecessor.  Restrict this to unconditional
+    // one-successor edges; conditional-edge threading and multi-predecessor
+    // joins need edge duplication rather than simple block concatenation.
+    bool merged = true;
+    while (merged) {
+        merged = false;
+
+        std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> incoming;
+        for (std::size_t predecessor_index = 0; predecessor_index < function.blocks.size(); ++predecessor_index) {
+            const auto& predecessor = function.blocks[predecessor_index];
+            if (predecessor.operations.empty()) continue;
+            const auto& terminator = predecessor.operations.back();
+            for (std::size_t successor_index = 0; successor_index < terminator.successors.size(); ++successor_index)
+                incoming[terminator.successors[successor_index]].push_back({predecessor_index, successor_index});
+        }
+
+        for (std::size_t block_index = 1; block_index < function.blocks.size(); ++block_index) {
+            auto& block = function.blocks[block_index];
+            const auto incoming_it = incoming.find(block.name);
+            if (incoming_it == incoming.end() || incoming_it->second.size() != 1U) continue;
+
+            const auto [predecessor_index, successor_index] = incoming_it->second.front();
+            if (predecessor_index == block_index || predecessor_index >= function.blocks.size()) continue;
+            auto& predecessor = function.blocks[predecessor_index];
+            if (predecessor.operations.empty()) continue;
+            auto& jump = predecessor.operations.back();
+            if (jump.opcode != "jump" || jump.successors.size() != 1U || successor_index != 0U ||
+                jump.successors.front() != block.name) continue;
+
+            const std::vector<std::string> arguments =
+                jump.successor_arguments.empty() ? std::vector<std::string>{}
+                                                 : jump.successor_arguments.front();
+            if (arguments.size() != block.parameters.size()) continue;
+
+            std::unordered_map<std::string, std::string> replacements;
+            for (std::size_t parameter_index = 0; parameter_index < block.parameters.size(); ++parameter_index)
+                replacements.emplace(block.parameters[parameter_index].name, arguments[parameter_index]);
+
+            const auto canonical = [&](std::string value) {
+                std::unordered_set<std::string> seen;
+                while (true) {
+                    const auto found = replacements.find(value);
+                    if (found == replacements.end() || found->second == value || !seen.insert(value).second) break;
+                    value = found->second;
+                }
+                return value;
+            };
+            if (!replacements.empty()) {
+                for (auto& rewrite_block : function.blocks) {
+                    for (auto& operation : rewrite_block.operations) {
+                        for (auto& operand : operation.operands) {
+                            const auto found = replacements.find(operand);
+                            if (found != replacements.end()) operand = canonical(found->second);
+                        }
+                        for (auto& edge_arguments : operation.successor_arguments) {
+                            for (auto& argument : edge_arguments) {
+                                const auto found = replacements.find(argument);
+                                if (found != replacements.end()) argument = canonical(found->second);
+                            }
+                        }
+                    }
+                }
+            }
+
+            predecessor.operations.pop_back();
+            predecessor.operations.insert(predecessor.operations.end(),
+                                          std::make_move_iterator(block.operations.begin()),
+                                          std::make_move_iterator(block.operations.end()));
+            result.touch_block(predecessor.name);
+            result.touch_block(block.name);
+            function.blocks.erase(function.blocks.begin() + static_cast<std::ptrdiff_t>(block_index));
+            ++result.blocks_removed;
+            ++result.operations_rewritten;
+            result.changed = true;
+            merged = true;
+            analyses.invalidate_control_flow();
+            break;
+        }
+    }
     return result;
 }
 
@@ -1442,36 +2067,200 @@ pass::PassResult CommonSubexpressionEliminationPass::run(ir::Function& function,
 
 pass::PassResult SparseConditionalConstantPropagationPass::run(
     ir::Function& function, analysis::FunctionAnalysisManager& analyses) {
-    pass::PassResult total;
+    enum class LatticeKind : std::uint8_t { unknown, constant, overdefined };
+    struct LatticeValue { LatticeKind kind{LatticeKind::unknown}; long long constant{}; };
+
+    pass::PassResult result;
+    result.invalidation = analysis::InvalidationScope::control_flow;
+    if (function.blocks.empty()) return result;
+
+    std::unordered_map<std::string, LatticeValue> values;
+    std::unordered_set<std::string> executable_blocks;
+    std::unordered_set<std::string> executable_edges;
+
+    const auto edge_key = [](const std::string& predecessor, std::size_t successor_index) {
+        return predecessor + "#" + std::to_string(successor_index);
+    };
+    const auto value_of = [&](const std::string& name) -> LatticeValue {
+        if (auto literal = number(name)) return {LatticeKind::constant, *literal};
+        const auto found = values.find(name);
+        return found == values.end() ? LatticeValue{} : found->second;
+    };
+    const auto meet = [](LatticeValue left, LatticeValue right) {
+        if (left.kind == LatticeKind::unknown) return right;
+        if (right.kind == LatticeKind::unknown) return left;
+        if (left.kind == LatticeKind::overdefined || right.kind == LatticeKind::overdefined)
+            return LatticeValue{LatticeKind::overdefined, 0};
+        return left.constant == right.constant ? left : LatticeValue{LatticeKind::overdefined, 0};
+    };
+    const auto update = [&](const std::string& name, LatticeValue incoming) {
+        if (name.empty()) return false;
+        auto& current = values[name];
+        const auto merged = meet(current, incoming);
+        if (merged.kind == current.kind &&
+            (merged.kind != LatticeKind::constant || merged.constant == current.constant)) return false;
+        current = merged;
+        return true;
+    };
+
+    for (const auto& parameter : function.parameters)
+        values[parameter.name] = {LatticeKind::overdefined, 0};
+    executable_blocks.insert(function.blocks.front().name);
+
+    const auto evaluate = [&](const ir::Operation& operation) -> LatticeValue {
+        if (operation.opcode == "const" && operation.operands.size() == 1) {
+            if (auto literal = number(operation.operands.front())) return {LatticeKind::constant, *literal};
+            return {LatticeKind::overdefined, 0};
+        }
+        if (operation.opcode == "copy" && operation.operands.size() == 1)
+            return value_of(operation.operands.front());
+        if (operation.opcode == "select" && operation.operands.size() == 3) {
+            const auto condition = value_of(operation.operands[0]);
+            if (condition.kind == LatticeKind::constant)
+                return value_of(operation.operands[condition.constant != 0 ? 1 : 2]);
+            const auto left = value_of(operation.operands[1]);
+            const auto right = value_of(operation.operands[2]);
+            return condition.kind == LatticeKind::overdefined ? meet(left, right) : LatticeValue{};
+        }
+        if (operation.operands.size() == 1 &&
+            (operation.opcode == "neg" || operation.opcode == "not")) {
+            const auto operand = value_of(operation.operands[0]);
+            if (operand.kind != LatticeKind::constant) return operand;
+            return {LatticeKind::constant, operation.opcode == "neg" ? -operand.constant : ~operand.constant};
+        }
+        if (operation.operands.size() != 2) return {LatticeKind::overdefined, 0};
+        const auto left = value_of(operation.operands[0]);
+        const auto right = value_of(operation.operands[1]);
+        if (left.kind == LatticeKind::overdefined || right.kind == LatticeKind::overdefined)
+            return {LatticeKind::overdefined, 0};
+        if (left.kind != LatticeKind::constant || right.kind != LatticeKind::constant) return {};
+        const auto a = left.constant, b = right.constant;
+        if ((operation.opcode == "div" || operation.opcode == "div.signed" || operation.opcode == "div.unsigned" ||
+             operation.opcode == "rem.signed" || operation.opcode == "rem.unsigned") && b == 0)
+            return {LatticeKind::overdefined, 0};
+        if (operation.opcode == "add") return {LatticeKind::constant, a + b};
+        if (operation.opcode == "sub") return {LatticeKind::constant, a - b};
+        if (operation.opcode == "mul") return {LatticeKind::constant, a * b};
+        if (operation.opcode == "div" || operation.opcode == "div.signed") return {LatticeKind::constant, a / b};
+        if (operation.opcode == "div.unsigned") return {LatticeKind::constant, static_cast<long long>(static_cast<unsigned long long>(a) / static_cast<unsigned long long>(b))};
+        if (operation.opcode == "rem.signed") return {LatticeKind::constant, a % b};
+        if (operation.opcode == "rem.unsigned") return {LatticeKind::constant, static_cast<long long>(static_cast<unsigned long long>(a) % static_cast<unsigned long long>(b))};
+        if (operation.opcode == "and") return {LatticeKind::constant, a & b};
+        if (operation.opcode == "or") return {LatticeKind::constant, a | b};
+        if (operation.opcode == "xor") return {LatticeKind::constant, a ^ b};
+        if (operation.opcode == "shl") return {LatticeKind::constant, a << b};
+        if (operation.opcode == "shr.signed") return {LatticeKind::constant, a >> b};
+        if (operation.opcode == "shr.unsigned") return {LatticeKind::constant, static_cast<long long>(static_cast<unsigned long long>(a) >> b)};
+        if (operation.opcode == "cmp.eq") return {LatticeKind::constant, a == b};
+        if (operation.opcode == "cmp.ne") return {LatticeKind::constant, a != b};
+        if (operation.opcode == "cmp.lt") return {LatticeKind::constant, a < b};
+        if (operation.opcode == "cmp.le") return {LatticeKind::constant, a <= b};
+        if (operation.opcode == "cmp.gt") return {LatticeKind::constant, a > b};
+        if (operation.opcode == "cmp.ge") return {LatticeKind::constant, a >= b};
+        if (operation.opcode == "cmp.ult") return {LatticeKind::constant, static_cast<unsigned long long>(a) < static_cast<unsigned long long>(b)};
+        if (operation.opcode == "cmp.ule") return {LatticeKind::constant, static_cast<unsigned long long>(a) <= static_cast<unsigned long long>(b)};
+        if (operation.opcode == "cmp.ugt") return {LatticeKind::constant, static_cast<unsigned long long>(a) > static_cast<unsigned long long>(b)};
+        if (operation.opcode == "cmp.uge") return {LatticeKind::constant, static_cast<unsigned long long>(a) >= static_cast<unsigned long long>(b)};
+        return {LatticeKind::overdefined, 0};
+    };
+
     bool changed = true;
     unsigned iterations = 0;
-    while (changed && iterations++ < 16) {
+    while (changed && iterations++ < 128) {
         changed = false;
-        ConstantFoldPass fold;
-        auto folded = fold.run(function, analyses);
-        total += folded;
-        changed = changed || folded.changed;
-        if (folded.changed) analyses.invalidate(
-            analysis::InvalidationScope::operations, folded.touched_blocks);
-        BranchFoldPass branch;
-        auto branched = branch.run(function, analyses);
-        total += branched;
-        changed = changed || branched.changed;
-        if (branched.changed) analyses.invalidate_control_flow(branched.touched_blocks);
-        SimplifyCFGPass cfg;
-        auto simplified = cfg.run(function, analyses);
-        total += simplified;
-        changed = changed || simplified.changed;
-        if (simplified.changed) analyses.invalidate_control_flow();
-        CopyPropagationPass copies;
-        auto propagated = copies.run(function, analyses);
-        total += propagated;
-        changed = changed || propagated.changed;
-        if (propagated.changed) analyses.invalidate(
-            analysis::InvalidationScope::operations, propagated.touched_blocks);
+        for (auto& block : function.blocks) {
+            if (!executable_blocks.contains(block.name)) continue;
+
+            for (std::size_t parameter_index = 0; parameter_index < block.parameters.size(); ++parameter_index) {
+                LatticeValue incoming;
+                bool saw_incoming = false;
+                for (const auto& predecessor : function.blocks) {
+                    if (predecessor.operations.empty()) continue;
+                    const auto& terminator = predecessor.operations.back();
+                    for (std::size_t successor_index = 0; successor_index < terminator.successors.size(); ++successor_index) {
+                        if (terminator.successors[successor_index] != block.name ||
+                            !executable_edges.contains(edge_key(predecessor.name, successor_index)) ||
+                            successor_index >= terminator.successor_arguments.size() ||
+                            parameter_index >= terminator.successor_arguments[successor_index].size()) continue;
+                        const auto edge_value = value_of(terminator.successor_arguments[successor_index][parameter_index]);
+                        incoming = saw_incoming ? meet(incoming, edge_value) : edge_value;
+                        saw_incoming = true;
+                    }
+                }
+                if (saw_incoming && update(block.parameters[parameter_index].name, incoming)) changed = true;
+            }
+
+            for (const auto& operation : block.operations)
+                if (!operation.result.empty() && update(operation.result, evaluate(operation))) changed = true;
+            if (block.operations.empty()) continue;
+            const auto& terminator = block.operations.back();
+            const auto mark_edge = [&](std::size_t successor_index) {
+                if (successor_index >= terminator.successors.size()) return;
+                if (executable_edges.insert(edge_key(block.name, successor_index)).second) changed = true;
+                if (executable_blocks.insert(terminator.successors[successor_index]).second) changed = true;
+            };
+            if (terminator.opcode == "jump") mark_edge(0);
+            else if (terminator.opcode == "branch" && terminator.operands.size() == 1 && terminator.successors.size() == 2) {
+                const auto condition = value_of(terminator.operands.front());
+                if (condition.kind == LatticeKind::constant) mark_edge(condition.constant != 0 ? 0 : 1);
+                else if (condition.kind == LatticeKind::overdefined) { mark_edge(0); mark_edge(1); }
+            }
+        }
     }
-    total.changed = total.changed || changed;
-    return total;
+
+    for (auto& block : function.blocks) {
+        for (std::size_t parameter_index = block.parameters.size(); parameter_index-- > 0;) {
+            const auto fact = value_of(block.parameters[parameter_index].name);
+            if (fact.kind != LatticeKind::constant) continue;
+            ir::Operation constant;
+            constant.result = block.parameters[parameter_index].name;
+            constant.opcode = "const";
+            constant.type = block.parameters[parameter_index].type;
+            constant.operands = {std::to_string(fact.constant)};
+            block.operations.insert(block.operations.begin(), std::move(constant));
+            for (auto& predecessor : function.blocks) {
+                if (predecessor.operations.empty()) continue;
+                auto& terminator = predecessor.operations.back();
+                for (std::size_t successor_index = 0; successor_index < terminator.successors.size(); ++successor_index) {
+                    if (terminator.successors[successor_index] != block.name || successor_index >= terminator.successor_arguments.size() ||
+                        parameter_index >= terminator.successor_arguments[successor_index].size()) continue;
+                    terminator.successor_arguments[successor_index].erase(terminator.successor_arguments[successor_index].begin() + static_cast<std::ptrdiff_t>(parameter_index));
+                    result.touch_block(predecessor.name);
+                }
+            }
+            block.parameters.erase(block.parameters.begin() + static_cast<std::ptrdiff_t>(parameter_index));
+            result.changed = true; ++result.operations_rewritten; result.touch_block(block.name);
+        }
+    }
+
+    for (auto& block : function.blocks) {
+        if (!executable_blocks.contains(block.name)) continue;
+        for (auto& operation : block.operations) {
+            if (operation.result.empty() || operation.opcode == "const") continue;
+            const auto fact = value_of(operation.result);
+            if (fact.kind != LatticeKind::constant) continue;
+            operation.opcode = "const"; operation.operands = {std::to_string(fact.constant)};
+            result.changed = true; ++result.operations_rewritten; result.touch_block(block.name);
+        }
+        if (block.operations.empty()) continue;
+        auto& terminator = block.operations.back();
+        if (terminator.opcode != "branch" || terminator.operands.size() != 1 || terminator.successors.size() != 2 || terminator.successor_arguments.size() != 2) continue;
+        const auto condition = value_of(terminator.operands.front());
+        if (condition.kind != LatticeKind::constant) continue;
+        const std::size_t selected = condition.constant != 0 ? 0 : 1;
+        terminator.opcode = "jump"; terminator.operands.clear();
+        terminator.successors = {terminator.successors[selected]};
+        terminator.successor_arguments = {terminator.successor_arguments[selected]};
+        result.changed = true; ++result.operations_rewritten; result.touch_block(block.name);
+    }
+
+    if (result.changed) analyses.invalidate_control_flow(result.touched_blocks);
+    SimplifyCFGPass cfg;
+    auto simplified = cfg.run(function, analyses); result += simplified;
+    if (simplified.changed) analyses.invalidate_control_flow();
+    MergeParameterSimplificationPass merge_parameters;
+    result += merge_parameters.run(function, analyses);
+    return result;
 }
 
 pass::PassResult ScalarCleanupFixpointPass::run(
@@ -1482,6 +2271,7 @@ pass::PassResult ScalarCleanupFixpointPass::run(
     SparseConditionalConstantPropagationPass sccp;
     AlgebraicSimplificationPass algebraic;
     CommonSubexpressionEliminationPass cse;
+    MergeParameterSimplificationPass merge_parameters;
     CopyPropagationPass copies;
     DeadCodeEliminationPass dce;
     SimplifyCFGPass cfg;
@@ -1502,6 +2292,7 @@ pass::PassResult ScalarCleanupFixpointPass::run(
         run_pass(sccp);
         run_pass(algebraic);
         run_pass(cse);
+        run_pass(merge_parameters);
         run_pass(copies);
         run_pass(dce);
         run_pass(cfg);

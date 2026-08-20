@@ -712,6 +712,40 @@ def main() -> int:
     if not IS_WINDOWS:
         candidate_compiler.chmod(candidate_compiler.stat().st_mode | 0o111)
 
+    # Qualify the language server in the compiler users actually receive. The
+    # C++ host remains a bootstrap boundary; editor protocol behavior belongs to
+    # the Raz-written candidate and is checked before recursive generations.
+    run(
+        "Production language server protocol",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-production-lsp.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
+        "Production semantic language server protocol",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-lsp-semantic-index.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
+        "Production project language server index",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-lsp-project-index.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
+        "Production registry language server index",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-lsp-registry-index.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
+        "Production C bindgen",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-bindgen.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
+        "Production C header export",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-c-header.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+
     generated: list[tuple[int, Path, Path, str]] = []
     previous = candidate_compiler
     for generation in range(1, 4):

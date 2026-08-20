@@ -1,0 +1,251 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_c_header;
+
+public import raz_compiler_driver_bindgen;
+
+// Raz -> C header generator for the explicit C ABI surface.  This is purposely
+// conservative: declarations are emitted only when source annotations make the
+// ABI contract unambiguous.  Normal public Raz APIs are not exported by
+// accident, and unsupported type spellings fail the generation rather than
+// guessing a C representation.
+
+fn c_header_space(i64 ch) -> bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+fn c_header_ident(i64 ch) -> bool {
+    return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+}
+
+fn c_header_skip(i64 data, i64 cursor, i64 end) -> i64 {
+    while (cursor < end && c_header_space(raz_compiler_rt_arena_get(data, cursor))) { cursor += 1; }
+    return cursor;
+}
+
+fn c_header_trim(i64 data, i64 start, i64 end) -> i64 {
+    while (end > start && c_header_space(raz_compiler_rt_arena_get(data, end - 1))) { end -= 1; }
+    return end;
+}
+
+fn c_header_append_byte(i64 out, i64 capacity, i64 cursor, i64 ch) -> i64 {
+    if (cursor < 0 || cursor >= capacity) { return -1; }
+    raz_compiler_rt_arena_set(out, cursor, ch);
+    return cursor + 1;
+}
+
+fn c_header_append_range(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
+    i64 i = start;
+    while (i < end) {
+        cursor = c_header_append_byte(out, capacity, cursor, raz_compiler_rt_arena_get(data, i));
+        if (cursor < 0) { return -1; }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn c_header_append_literal(i64 out, i64 capacity, i64 cursor, i64[] text, i64 length) -> i64 {
+    i64 i = 0;
+    while (i < length) {
+        cursor = c_header_append_byte(out, capacity, cursor, text[i]);
+        if (cursor < 0) { return -1; }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn c_header_equal(i64 data, i64 start, i64 end, i64[] text, i64 length) -> bool {
+    start = c_header_skip(data, start, end);
+    end = c_header_trim(data, start, end);
+    if (end - start != length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != text[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn c_header_starts(i64 data, i64 start, i64 end, i64[] text, i64 length) -> bool {
+    start = c_header_skip(data, start, end);
+    if (end - start < length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != text[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn c_header_find(i64 data, i64 start, i64 end, i64 ch) -> i64 {
+    i64 i = start;
+    while (i < end) {
+        if (raz_compiler_rt_arena_get(data, i) == ch) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn c_header_find_matching(i64 data, i64 open, i64 end, i64 left, i64 right) -> i64 {
+    i64 depth = 0;
+    i64 i = open;
+    while (i < end) {
+        i64 ch = raz_compiler_rt_arena_get(data, i);
+        if (ch == left) { depth += 1; }
+        else if (ch == right) {
+            depth -= 1;
+            if (depth == 0) { return i; }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn c_header_find_token(i64 data, i64 start, i64 end, i64[] token, i64 length) -> i64 {
+    i64 i = start;
+    while (i + length <= end) {
+        bool boundary_left = i == start || !c_header_ident(raz_compiler_rt_arena_get(data, i - 1));
+        bool same = boundary_left;
+        i64 j = 0;
+        while (same && j < length) {
+            same = raz_compiler_rt_arena_get(data, i + j) == token[j];
+            j += 1;
+        }
+        if (same) {
+            bool boundary_right = i + length == end || !c_header_ident(raz_compiler_rt_arena_get(data, i + length));
+            if (boundary_right) { return i; }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn c_header_emit_base_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
+    start = c_header_skip(data, start, end);
+    end = c_header_trim(data, start, end);
+    i64 i8t[2]=[105,56]; i64 u8t[2]=[117,56]; i64 i16t[3]=[105,49,54]; i64 u16t[3]=[117,49,54];
+    i64 i32t[3]=[105,51,50]; i64 u32t[3]=[117,51,50]; i64 i64t[3]=[105,54,52]; i64 u64t[3]=[117,54,52];
+    i64 isizet[5]=[105,115,105,122,101]; i64 usizet[5]=[117,115,105,122,101]; i64 f32t[3]=[102,51,50]; i64 f64t[3]=[102,54,52];
+    i64 boolt[4]=[98,111,111,108]; i64 voidt[4]=[118,111,105,100];
+    i64 ci8[6]=[105,110,116,56,95,116]; i64 cu8[7]=[117,105,110,116,56,95,116];
+    i64 ci16[7]=[105,110,116,49,54,95,116]; i64 cu16[8]=[117,105,110,116,49,54,95,116];
+    i64 ci32[7]=[105,110,116,51,50,95,116]; i64 cu32[8]=[117,105,110,116,51,50,95,116];
+    i64 ci64[7]=[105,110,116,54,52,95,116]; i64 cu64[8]=[117,105,110,116,54,52,95,116];
+    i64 cintptr[8]=[105,110,116,112,116,114,95,116]; i64 cuintptr[9]=[117,105,110,116,112,116,114,95,116];
+    i64 cfloat[5]=[102,108,111,97,116]; i64 cdouble[6]=[100,111,117,98,108,101]; i64 cbool[4]=[98,111,111,108]; i64 cvoid[4]=[118,111,105,100];
+    if(c_header_equal(data,start,end,&i8t,2)){return c_header_append_literal(out,capacity,cursor,&ci8,6);} if(c_header_equal(data,start,end,&u8t,2)){return c_header_append_literal(out,capacity,cursor,&cu8,7);}
+    if(c_header_equal(data,start,end,&i16t,3)){return c_header_append_literal(out,capacity,cursor,&ci16,7);} if(c_header_equal(data,start,end,&u16t,3)){return c_header_append_literal(out,capacity,cursor,&cu16,8);}
+    if(c_header_equal(data,start,end,&i32t,3)){return c_header_append_literal(out,capacity,cursor,&ci32,7);} if(c_header_equal(data,start,end,&u32t,3)){return c_header_append_literal(out,capacity,cursor,&cu32,8);}
+    if(c_header_equal(data,start,end,&i64t,3)){return c_header_append_literal(out,capacity,cursor,&ci64,7);} if(c_header_equal(data,start,end,&u64t,3)){return c_header_append_literal(out,capacity,cursor,&cu64,8);}
+    if(c_header_equal(data,start,end,&isizet,5)){return c_header_append_literal(out,capacity,cursor,&cintptr,8);} if(c_header_equal(data,start,end,&usizet,5)){return c_header_append_literal(out,capacity,cursor,&cuintptr,9);}
+    if(c_header_equal(data,start,end,&f32t,3)){return c_header_append_literal(out,capacity,cursor,&cfloat,5);} if(c_header_equal(data,start,end,&f64t,3)){return c_header_append_literal(out,capacity,cursor,&cdouble,6);}
+    if(c_header_equal(data,start,end,&boolt,4)){return c_header_append_literal(out,capacity,cursor,&cbool,4);} if(c_header_equal(data,start,end,&voidt,4)){return c_header_append_literal(out,capacity,cursor,&cvoid,4);}
+    // Named @repr(C) aggregates are emitted with their Raz spelling.  The
+    // generated header defines those names as typedefs before function use.
+    if (end > start) { return c_header_append_range(out, capacity, cursor, data, start, end); }
+    return -1;
+}
+
+fn c_header_emit_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
+    start=c_header_skip(data,start,end); end=c_header_trim(data,start,end);
+    i64 ptr_const[6]=[42,99,111,110,115,116]; i64 ptr_mut[4]=[42,109,117,116];
+    if(end-start>=6 && c_header_equal(data,end-6,end,&ptr_const,6)){
+        i64 base_end=c_header_trim(data,start,end-6); i64 cconst[7]=[99,111,110,115,116,32,0];
+        cursor=c_header_append_literal(out,capacity,cursor,&cconst,6); cursor=c_header_emit_type(out,capacity,cursor,data,start,base_end); return c_header_append_byte(out,capacity,cursor,42);
+    }
+    if(end-start>=4 && c_header_equal(data,end-4,end,&ptr_mut,4)){
+        i64 base_end=c_header_trim(data,start,end-4); cursor=c_header_emit_type(out,capacity,cursor,data,start,base_end); return c_header_append_byte(out,capacity,cursor,42);
+    }
+    return c_header_emit_base_type(out,capacity,cursor,data,start,end);
+}
+
+fn c_header_emit_callback_decl(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end,i64 name_start,i64 name_end)->i64{
+    start=c_header_skip(data,start,end); end=c_header_trim(data,start,end);
+    i64 fn_word[2]=[102,110]; if(!c_header_starts(data,start,end,&fn_word,2)){return -1;}
+    i64 open=c_header_find(data,start,end,40); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,end,40,41); if(close<0){return -1;}
+    i64 arrow=-1; i64 q=close+1; while(q+1<end){if(raz_compiler_rt_arena_get(data,q)==45&&raz_compiler_rt_arena_get(data,q+1)==62){arrow=q;break;}q+=1;}
+    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);cursor=c_header_emit_type(out,capacity,cursor,data,rs,end);}else{i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);} if(cursor<0){return -1;}
+    i64 ptr[3]=[32,40,42];cursor=c_header_append_literal(out,capacity,cursor,&ptr,3);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);i64 cp[2]=[41,40];cursor=c_header_append_literal(out,capacity,cursor,&cp,2);
+    i64 p=open+1; i64 item=p; i64 count=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(p==close||ch==44){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){i64 comma[2]=[44,32];cursor=c_header_append_literal(out,capacity,cursor,&comma,2);}cursor=c_header_emit_type(out,capacity,cursor,data,a,b);if(cursor<0){return -1;}count+=1;}item=p+1;}p+=1;}
+    if(count==0){i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);}return c_header_append_byte(out,capacity,cursor,41);
+}
+
+fn c_header_emit_field(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end)->i64{
+    start=c_header_skip(data,start,end); end=c_header_trim(data,start,end); if(end<=start){return cursor;}
+    i64 semi=end; if(raz_compiler_rt_arena_get(data,semi-1)==59){semi-=1;} semi=c_header_trim(data,start,semi);
+    i64 array_open=c_header_find(data,start,semi,91); i64 array_close=-1; if(array_open>=0){array_close=c_header_find(data,array_open+1,semi,93);}
+    i64 name_end=semi; if(array_open>=0){name_end=c_header_trim(data,start,array_open);} i64 name_start=name_end;
+    while(name_start>start && c_header_ident(raz_compiler_rt_arena_get(data,name_start-1))){name_start-=1;}
+    if(name_start==name_end){return -1;} i64 type_end=c_header_trim(data,start,name_start);
+    i64 indent[4]=[32,32,32,32]; cursor=c_header_append_literal(out,capacity,cursor,&indent,4); i64 fn_word[2]=[102,110]; if(c_header_starts(data,start,type_end,&fn_word,2)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,start,type_end,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,start,type_end); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}
+    if(array_open>=0 && array_close>array_open){cursor=c_header_append_range(out,capacity,cursor,data,array_open,array_close+1);} cursor=c_header_append_byte(out,capacity,cursor,59); cursor=c_header_append_byte(out,capacity,cursor,10); return cursor;
+}
+
+fn c_header_emit_struct(i64 out,i64 capacity,i64 cursor,i64 data,i64 decl_start,i64 decl_end)->i64{
+    i64 struct_word[6]=[115,116,114,117,99,116]; i64 s=c_header_find_token(data,decl_start,decl_end,&struct_word,6); if(s<0){return -1;}
+    i64 ns=c_header_skip(data,s+6,decl_end); i64 ne=ns; while(ne<decl_end && c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;} if(ne==ns){return -1;}
+    i64 open=c_header_find(data,ne,decl_end,123); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,decl_end,123,125); if(close<0){return -1;}
+    i64 td[15]=[116,121,112,101,100,101,102,32,115,116,114,117,99,116,32]; cursor=c_header_append_literal(out,capacity,cursor,&td,15); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ob[3]=[32,123,10]; cursor=c_header_append_literal(out,capacity,cursor,&ob,3);
+    i64 line=open+1; while(line<close){i64 e=c_header_find(data,line,close,10); if(e<0){e=close;} cursor=c_header_emit_field(out,capacity,cursor,data,line,e); if(cursor<0){return -1;} line=e+1;}
+    i64 tail[3]=[125,32,0]; cursor=c_header_append_literal(out,capacity,cursor,&tail,2); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ender[3]=[59,10,10]; return c_header_append_literal(out,capacity,cursor,&ender,3);
+}
+
+fn c_header_emit_enum(i64 out,i64 capacity,i64 cursor,i64 data,i64 decl_start,i64 decl_end)->i64{
+    i64 enum_word[4]=[101,110,117,109]; i64 s=c_header_find_token(data,decl_start,decl_end,&enum_word,4); if(s<0){return -1;} i64 ns=c_header_skip(data,s+4,decl_end); i64 ne=ns; while(ne<decl_end && c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;} if(ne==ns){return -1;}
+    i64 open=c_header_find(data,ne,decl_end,123); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,decl_end,123,125); if(close<0){return -1;}
+    i64 td[12]=[116,121,112,101,100,101,102,32,101,110,117,109]; cursor=c_header_append_literal(out,capacity,cursor,&td,12); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ob[3]=[32,123,10]; cursor=c_header_append_literal(out,capacity,cursor,&ob,3);
+    i64 p=open+1; i64 item=p; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);} if(p==close||ch==44||ch==10){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){i64 ind[4]=[32,32,32,32];cursor=c_header_append_literal(out,capacity,cursor,&ind,4);cursor=c_header_append_range(out,capacity,cursor,data,a,b);cursor=c_header_append_byte(out,capacity,cursor,44);cursor=c_header_append_byte(out,capacity,cursor,10);}item=p+1;}p+=1;}
+    i64 tail[3]=[125,32,0];cursor=c_header_append_literal(out,capacity,cursor,&tail,2);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);i64 ender[3]=[59,10,10];return c_header_append_literal(out,capacity,cursor,&ender,3);
+}
+
+fn c_header_emit_function(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end)->i64{
+    i64 fn_word[2]=[102,110]; i64 f=c_header_find_token(data,start,end,&fn_word,2); if(f<0){return -1;} i64 ns=c_header_skip(data,f+2,end); i64 ne=ns;while(ne<end&&c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;}if(ne==ns){return -1;}
+    i64 open=c_header_find(data,ne,end,40);if(open<0){return -1;}i64 close=c_header_find_matching(data,open,end,40,41);if(close<0){return -1;}
+    i64 arrow=-1;i64 i=close+1;while(i+1<end){if(raz_compiler_rt_arena_get(data,i)==45&&raz_compiler_rt_arena_get(data,i+1)==62){arrow=i;break;}i+=1;}
+    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);i64 re=rs;while(re<end&&raz_compiler_rt_arena_get(data,re)!=123&&raz_compiler_rt_arena_get(data,re)!=59&&raz_compiler_rt_arena_get(data,re)!=10){re+=1;}re=c_header_trim(data,rs,re);cursor=c_header_emit_type(out,capacity,cursor,data,rs,re);}else{i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);} cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);cursor=c_header_append_byte(out,capacity,cursor,40);
+    i64 p=open+1; i64 item=p; i64 count=0; i64 depth=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(ch==40){depth+=1;}else if(ch==41&&depth>0){depth-=1;}bool boundary=p==close||(ch==44&&depth==0);if(boundary){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){i64 comma[2]=[44,32];cursor=c_header_append_literal(out,capacity,cursor,&comma,2);}i64 name_end=b; i64 name_start=name_end;while(name_start>a&&c_header_ident(raz_compiler_rt_arena_get(data,name_start-1))){name_start-=1;}if(name_start==name_end){return -1;}i64 te=c_header_trim(data,a,name_start);i64 fn_type[2]=[102,110];if(c_header_starts(data,a,te,&fn_type,2)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,a,te,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,a,te);cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}count+=1;}item=p+1;}p+=1;}
+    if(count==0){i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);}i64 tail[4]=[41,59,10,10];return c_header_append_literal(out,capacity,cursor,&tail,4);
+}
+
+fn c_header_generate(i64 input,i64 length,i64 output,i64 capacity)->i64{
+    i64 header[99]=[47,42,32,71,101,110,101,114,97,116,101,100,32,98,121,32,114,97,122,32,99,45,104,101,97,100,101,114,46,32,68,111,32,110,111,116,32,101,100,105,116,46,32,42,47,10,35,112,114,97,103,109,97,32,111,110,99,101,10,35,105,110,99,108,117,100,101,32,60,115,116,100,105,110,116,46,104,62,10,35,105,110,99,108,117,100,101,32,60,115,116,100,100,101,102,46,104,62,10];
+    i64 cursor=c_header_append_literal(output,capacity,0,&header,99);if(cursor<0){return -1;}
+    i64 repr[8]=[64,114,101,112,114,40,67,41]; i64 abi[7]=[64,97,98,105,40,67,41]; i64 public_word[6]=[112,117,98,108,105,99]; i64 structw[6]=[115,116,114,117,99,116]; i64 enumw[4]=[101,110,117,109]; i64 externw[6]=[101,120,116,101,114,110];
+    i64 pos=0; bool pending_repr=false; bool pending_abi=false;
+    while(pos<length){i64 line_end=c_header_find(input,pos,length,10);if(line_end<0){line_end=length;}i64 a=c_header_skip(input,pos,line_end);i64 b=c_header_trim(input,a,line_end);
+        if(a<b&&c_header_starts(input,a,b,&repr,8)){pending_repr=true;}
+        if(a<b&&c_header_starts(input,a,b,&abi,7)){pending_abi=true;}
+        bool has_public=c_header_find_token(input,a,b,&public_word,6)>=0;
+        if(pending_repr&&has_public&&(c_header_find_token(input,a,b,&structw,6)>=0||c_header_find_token(input,a,b,&enumw,4)>=0)){
+            i64 open=c_header_find(input,a,length,123);if(open<0){return -1;}i64 close=c_header_find_matching(input,open,length,123,125);if(close<0){return -1;}i64 decl_end=close+1;
+            if(c_header_find_token(input,a,open,&structw,6)>=0){cursor=c_header_emit_struct(output,capacity,cursor,input,a,decl_end);}else{cursor=c_header_emit_enum(output,capacity,cursor,input,a,decl_end);}if(cursor<0){return -1;}pos=decl_end;pending_repr=false;continue;
+        }
+        if(pending_abi&&has_public&&c_header_find_token(input,a,b,&externw,6)<0){
+            i64 open=c_header_find(input,a,length,40);if(open>=0){i64 close=c_header_find_matching(input,open,length,40,41);if(close>=0){i64 decl_end=close+1;while(decl_end<length&&raz_compiler_rt_arena_get(input,decl_end)!=10){decl_end+=1;}cursor=c_header_emit_function(output,capacity,cursor,input,a,decl_end);if(cursor<0){return -1;}pending_abi=false;}}
+        }
+        if(a<b&&!c_header_starts(input,a,b,&repr,8)&&!c_header_starts(input,a,b,&abi,7)){pending_repr=false;pending_abi=false;}
+        pos=line_end+1;
+    }
+    return cursor;
+}
+
+fn c_header_path_has_rz(i64 data,i64 start,i64 length)->bool{
+    return length>=3&&raz_compiler_rt_arena_get(data,start+length-3)==46&&raz_compiler_rt_arena_get(data,start+length-2)==114&&raz_compiler_rt_arena_get(data,start+length-1)==122;
+}
+
+fn c_header_path_generated(i64 data,i64 start,i64 length)->bool{
+    i64 i=start; while(i<start+length){bool left=i==start||raz_compiler_rt_arena_get(data,i-1)==47||raz_compiler_rt_arena_get(data,i-1)==92;if(left){i64 remain=start+length-i;if(remain>=7&&raz_compiler_rt_arena_get(data,i)==116&&raz_compiler_rt_arena_get(data,i+1)==97&&raz_compiler_rt_arena_get(data,i+2)==114&&raz_compiler_rt_arena_get(data,i+3)==103&&raz_compiler_rt_arena_get(data,i+4)==101&&raz_compiler_rt_arena_get(data,i+5)==116&&(raz_compiler_rt_arena_get(data,i+6)==47||raz_compiler_rt_arena_get(data,i+6)==92)){return true;}if(remain>=6&&raz_compiler_rt_arena_get(data,i)==98&&raz_compiler_rt_arena_get(data,i+1)==117&&raz_compiler_rt_arena_get(data,i+2)==105&&raz_compiler_rt_arena_get(data,i+3)==108&&raz_compiler_rt_arena_get(data,i+4)==100&&(raz_compiler_rt_arena_get(data,i+5)==47||raz_compiler_rt_arena_get(data,i+5)==92)){return true;}}i+=1;}return false;
+}
+
+fn c_header_generate_directory(i64 path,i64 path_length,i64 output,i64 capacity)->i64{
+    i64 listing=raz_compiler_rt_arena_create(16777216);i64 input=raz_compiler_rt_arena_create(16777216);i64 temp=raz_compiler_rt_arena_create(16777216);if(listing==0||input==0||temp==0){return -1;}
+    i64 empty=raz_compiler_rt_arena_create(1);i64 cursor=c_header_generate(empty,0,output,capacity);raz_compiler_rt_arena_destroy(empty);if(cursor<0){return -1;}
+    i64 ll=raz_compiler_rt_list_files_recursive(path,path_length,listing,16777216);if(ll<0){return -1;}i64 start=0;while(start<ll){i64 end=start;while(end<ll&&raz_compiler_rt_arena_get(listing,end)!=10){end+=1;}i64 len=end-start;if(len>0&&raz_compiler_rt_arena_get(listing,start+len-1)==13){len-=1;}if(c_header_path_has_rz(listing,start,len)&&!c_header_path_generated(listing,start,len)){i64 child=raz_compiler_rt_arena_create(len+1);if(child==0){return -1;}raz_compiler_rt_arena_copy(child,0,listing,start,len);i64 il=raz_compiler_rt_read_ascii(child,len,input,16777216);raz_compiler_rt_arena_destroy(child);if(il<0){return -1;}i64 generated=c_header_generate(input,il,temp,16777216);if(generated<99){return -1;}cursor=c_header_append_range(output,capacity,cursor,temp,99,generated);if(cursor<0){return -1;}}start=end+1;}
+    raz_compiler_rt_arena_destroy(listing);raz_compiler_rt_arena_destroy(input);raz_compiler_rt_arena_destroy(temp);return cursor;
+}
+
+fn c_header_command(i64 argc)->i64{
+    if(argc<3||argc>4){cli_print_invalid_arguments();return 2;}i64 path=raz_compiler_rt_arena_create(4096);i64 out_path=raz_compiler_rt_arena_create(4096);i64 input=raz_compiler_rt_arena_create(16777216);i64 output=raz_compiler_rt_arena_create(16777216);if(path==0||out_path==0||input==0||output==0){return 40;}
+    i64 pl=cli_load_arg(2,path,4096);if(pl<=0){return 2;}i64 generated=-1;i64 il=raz_compiler_rt_read_ascii(path,pl,input,16777216);if(il>=0){generated=c_header_generate(input,il,output,16777216);}else{generated=c_header_generate_directory(path,pl,output,16777216);}if(generated<0){cli_print_invalid_arguments();return 2;}i64 status=0;if(argc==4){i64 ol=cli_load_arg(3,out_path,4096);if(ol<=0||raz_compiler_rt_write_ascii(out_path,ol,output,generated)!=generated){status=2;}}else{cli_write_arena_stream(1,output,generated);}raz_compiler_rt_arena_destroy(path);raz_compiler_rt_arena_destroy(out_path);raz_compiler_rt_arena_destroy(input);raz_compiler_rt_arena_destroy(output);return status;
+}

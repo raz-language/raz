@@ -48,6 +48,7 @@ std::int64_t raz_rt_process_run_argv(const char* program, std::int64_t program_l
 std::int64_t raz_rt_process_argc();
 std::int64_t raz_rt_process_arg(std::int64_t index, char* output, std::int64_t capacity);
 std::int64_t raz_rt_stdio_is_terminal(std::int64_t stream);
+std::int64_t raz_rt_stdio_set_binary(std::int64_t stream);
 std::int64_t raz_rt_udp_bind(std::int64_t port);
 std::int64_t raz_rt_socket_local_port(std::int64_t socket_value);
 std::int64_t raz_rt_socket_set_timeout_millis(std::int64_t socket_value, std::int64_t receive_millis, std::int64_t send_millis);
@@ -181,6 +182,8 @@ int main() {
     char arg0[1024]{};
     ok &= expect(raz_rt_process_arg(0, arg0, sizeof(arg0)) > 0, "process_arg");
     ok &= expect(raz_rt_stdio_is_terminal(0) == 0 || raz_rt_stdio_is_terminal(0) == 1, "stdio_is_terminal");
+    ok &= expect(raz_rt_stdio_set_binary(0) == 1, "stdio_set_binary_stdin");
+    ok &= expect(raz_rt_stdio_set_binary(1) == 1, "stdio_set_binary_stdout");
 
     const std::int64_t receiver = raz_rt_udp_bind(0);
     const std::int64_t sender = raz_rt_udp_bind(0);

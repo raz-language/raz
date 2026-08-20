@@ -618,7 +618,7 @@ set_tests_properties(raz-project-check PROPERTIES PASS_REGULAR_EXPRESSION "Check
 
 add_test(NAME raz-project-build
   COMMAND raz_host build ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package --target test-host --force)
-set_tests_properties(raz-project-build PROPERTIES PASS_REGULAR_EXPRESSION "Finished hello-package")
+set_tests_properties(raz-project-build PROPERTIES PASS_REGULAR_EXPRESSION "Finished `debug` profile")
 
 add_test(NAME raz-project-incremental
   COMMAND raz_host build ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package --target test-host)
@@ -626,11 +626,11 @@ set_tests_properties(raz-project-incremental PROPERTIES PASS_REGULAR_EXPRESSION 
 
 add_test(NAME raz-project-test
   COMMAND raz_host test ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package --target test-host)
-set_tests_properties(raz-project-test PROPERTIES PASS_REGULAR_EXPRESSION "Finished hello-package")
+set_tests_properties(raz-project-test PROPERTIES PASS_REGULAR_EXPRESSION "Finished `debug` profile")
 
 add_test(NAME raz-project-native-run
   COMMAND raz_host run ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package --target test-host --force)
-set_tests_properties(raz-project-native-run PROPERTIES PASS_REGULAR_EXPRESSION "Finished hello-package")
+set_tests_properties(raz-project-native-run PROPERTIES PASS_REGULAR_EXPRESSION "Running .*/hello-package")
 set_tests_properties(raz-project-check raz-project-build raz-project-incremental raz-project-test raz-project-native-run PROPERTIES RUN_SERIAL TRUE)
 set_tests_properties(raz-project-incremental PROPERTIES DEPENDS raz-project-build)
 

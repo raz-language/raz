@@ -27,6 +27,28 @@ const auto right = analyses.aliases().location("%right", 8);
 const auto relation = analyses.aliases().alias(left, right);
 ```
 
+## Scalar stack promotion
+
+`ScalarStackPromotionPass` removes non-escaping scalar stack slots within a basic block and across arbitrary reachable control flow, including loops. Cross-block promotion computes immediate dominators and iterated dominance frontiers, prunes block-parameter placement with slot liveness, and performs a dominator-tree SSA rename. Loop latches therefore pass the value current at the end of the latch into explicit loop-header block parameters instead of relying on iterative predecessor-value guessing.
+
+The construction is regression-tested with acyclic joins, counted loops, conditional loop updates, and nested loops; every promoted fixture is compared through the interpreter to preserve pre-optimization semantics.
+
+## SSA merge simplification
+
+`MergeParameterSimplificationPass` treats Forge block parameters as SSA phi nodes and removes trivial merges to a fixed point. Incoming values are canonicalized through earlier simplifications, self-referential loop edges are ignored when a single external defining value exists, and predecessor edge-argument lists are shortened in lockstep with removed parameters. This collapses identical incoming-value joins, phi-of-phi forwarding chains, and loop forms such as `header(%x) <- preheader(%initial), latch(%x)` without disturbing non-trivial cyclic phis.
+
+The pass runs immediately after scalar stack promotion and again inside the scalar cleanup fixpoint, allowing SCCP, CSE, copy propagation, DCE, and CFG simplification to consume the reduced SSA graph in the same optimization level. Interpreter regressions cover both branch-path forwarding and self-referential loop-phi elimination.
+
+## SSA-aware sparse conditional constant propagation
+
+`SparseConditionalConstantPropagationPass` tracks both an SSA value lattice (`unknown`, `constant`, `overdefined`) and executable CFG edges. Block parameters meet values only from executable predecessor edges, so constants created before a branch can remain constant through mem2reg phi/block parameters even when multiple runtime paths reach the join. A constant block parameter is materialized as a local `const` after its incoming edge arguments are removed, preserving SSA dominance while exposing the fact to later passes.
+
+Constant branch conditions mark only the taken edge executable. After the sparse fixed point, SCCP rewrites proven constant operations, folds proven branches, removes unreachable blocks, and immediately runs merge-parameter simplification. This lets dead predecessor removal turn multi-input phis into single-input/trivial phis in the same cleanup wave. Regression coverage includes both a dynamic first branch whose two executable paths carry the same constant through distinct block parameters and an edge-sensitive case where one potential predecessor is killed by an inner constant branch before the join fact is computed.
+
+`SimplifyCFGPass` then collapses straight-line continuations when a block has exactly one predecessor and that predecessor reaches it with an unconditional jump. The continuation's block parameters are substituted with the unique predecessor edge arguments, the jump is removed, and the continuation operations are spliced into the predecessor. Entry blocks, self-loops, conditional edges, and multi-predecessor joins are deliberately excluded. This turns SCCP-created single-predecessor joins into ordinary straight-line SSA immediately, exposing further CSE/DCE opportunities without duplicating blocks.
+
+`BranchThreadingPass` performs edge-specialized jump threading without cloning operations. For a tiny pure predicate block (at most three scalar operations), each incoming edge is evaluated independently using constants already available on that edge. When the condition is provably true or false, and every value required by the selected successor is already available at the predecessor, the predecessor edge bypasses the predicate block directly. The pass refuses blocks with side effects or unsupported/trapping operations, and it also refuses any block whose parameters or local SSA results are used directly outside that block; outward dataflow must travel through explicit successor arguments. This keeps threading dominance-safe and prevents code growth while still eliminating branch diamonds that global SCCP cannot fold.
+
 ## Memory forwarding
 
 `MemoryForwardingPass` tracks known values within a basic block. It:

@@ -12,9 +12,9 @@ fn rxe_dataflow_cell(i64 local_block, i64 slot, i64 slot_count) -> i64 {
     return local_block * slot_count + slot;
 }
 
-fn rxe_dataflow_predecessor_count(RxeModule& module, i64 function, i64 target) -> i64 {
-    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
-    i64 count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+fn rxe_dataflow_predecessor_count(RxeModule& module, i64 function_index, i64 target) -> i64 {
+    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+    i64 count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
     i64 block = first;
     i64 result = 0;
 
@@ -32,15 +32,15 @@ fn rxe_dataflow_predecessor_count(RxeModule& module, i64 function, i64 target) -
 
 fn rxe_dataflow_build_slot_sets(
     RxeModule& module,
-    i64 function,
+    i64 function_index,
     i64 slot_count,
     i64 uses,
     i64 defs,
     i64 live_in,
     i64 live_out
 ) -> bool {
-    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
-    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
     i64 cells = block_count * slot_count;
     i64 i = 0;
 
@@ -156,14 +156,14 @@ fn rxe_dataflow_build_slot_sets(
 // architectural register, so the register itself is the machine-level phi.
 fn rxe_dataflow_extend_slot_intervals(
     RxeModule& module,
-    i64 function,
+    i64 function_index,
     i64 slot_count,
     i64 slot_first,
     i64 slot_last,
     i64 slot_blocked
 ) -> bool {
-    i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function);
-    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+    i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
 
     if (slot_count <= 0 || block_count <= 0) {
         return true;
@@ -191,7 +191,7 @@ fn rxe_dataflow_extend_slot_intervals(
         return false;
     }
 
-    bool ok = rxe_dataflow_build_slot_sets(module, function, slot_count, uses, defs, live_in, live_out);
+    bool ok = rxe_dataflow_build_slot_sets(module, function_index, slot_count, uses, defs, live_in, live_out);
 
     if (ok) {
         i64 local = 0;
@@ -227,7 +227,7 @@ fn rxe_dataflow_extend_slot_intervals(
                 // stores are then rewritten to the same stable register.
                 if (
                     raz_compiler_rt_arena_get(live_in, cell) != 0 &&
-                    rxe_dataflow_predecessor_count(module, function, block) > 1 &&
+                    rxe_dataflow_predecessor_count(module, function_index, block) > 1 &&
                     raz_compiler_rt_arena_get(slot_first, slot) < 0
                 ) {
                     raz_compiler_rt_arena_set(slot_blocked, slot, 1);
@@ -247,12 +247,12 @@ fn rxe_dataflow_extend_slot_intervals(
 // Remove canonical frame stores whose value is dead on every path leaving the
 // instruction. This never touches addressable locals/globals or heap memory.
 fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
-    i64 function = 0;
+    i64 function_index = 0;
 
-    while (function < module.function_count) {
-        i64 slot_count = raz_compiler_rt_arena_get(module.function_frame_slots, function);
-        i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function);
-        i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+    while (function_index < module.function_count) {
+        i64 slot_count = raz_compiler_rt_arena_get(module.function_frame_slots, function_index);
+        i64 first_block = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+        i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
 
         if (slot_count > 0 && block_count > 0) {
             i64 cells = block_count * slot_count + 1;
@@ -280,7 +280,7 @@ fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
                 }
                 return false;
             }
-            if (!rxe_dataflow_build_slot_sets(module, function, slot_count, uses, defs, live_in, live_out)) {
+            if (!rxe_dataflow_build_slot_sets(module, function_index, slot_count, uses, defs, live_in, live_out)) {
                 raz_compiler_rt_arena_destroy(uses);
                 raz_compiler_rt_arena_destroy(defs);
                 raz_compiler_rt_arena_destroy(live_in);
@@ -338,7 +338,7 @@ fn rxe_dataflow_eliminate_dead_slot_stores(RxeModule&mut module) -> bool {
             raz_compiler_rt_arena_destroy(live_out);
             raz_compiler_rt_arena_destroy(live);
         }
-        function += 1;
+        function_index += 1;
     }
     return true;
 }
@@ -469,14 +469,14 @@ fn rxe_instruction_reads_register(RxeModule& module, i64 ip, i64 reg) -> bool {
 
 fn rxe_dataflow_build_register_sets(
     RxeModule& module,
-    i64 function,
+    i64 function_index,
     i64 uses,
     i64 defs,
     i64 live_in,
     i64 live_out
 ) -> bool {
-    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
-    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+    i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+    i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
     i64 cells = block_count * rxe_register_count();
     i64 i = 0;
 
@@ -628,11 +628,11 @@ fn rxe_opcode_dead_result_safe(i64 op) -> bool {
 // Eliminate register-producing instructions only when the result is dead and
 // the opcode has no observable side effect or trap behavior.
 fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
-    i64 function = 0;
+    i64 function_index = 0;
 
-    while (function < module.function_count) {
-        i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function);
-        i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function);
+    while (function_index < module.function_count) {
+        i64 first = raz_compiler_rt_arena_get(module.function_block_starts, function_index);
+        i64 block_count = raz_compiler_rt_arena_get(module.function_block_counts, function_index);
 
         if (block_count > 0) {
             i64 cells = block_count * rxe_register_count() + 1;
@@ -660,7 +660,7 @@ fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
                 }
                 return false;
             }
-            if (!rxe_dataflow_build_register_sets(module, function, uses, defs, live_in, live_out)) {
+            if (!rxe_dataflow_build_register_sets(module, function_index, uses, defs, live_in, live_out)) {
                 raz_compiler_rt_arena_destroy(uses);
                 raz_compiler_rt_arena_destroy(defs);
                 raz_compiler_rt_arena_destroy(live_in);
@@ -719,7 +719,7 @@ fn rxe_dataflow_eliminate_dead_register_results(RxeModule&mut module) -> bool {
             raz_compiler_rt_arena_destroy(live_out);
             raz_compiler_rt_arena_destroy(live);
         }
-        function += 1;
+        function_index += 1;
     }
     return true;
 }

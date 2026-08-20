@@ -1,0 +1,1023 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_bindgen;
+
+public import raz_compiler_driver_tooling;
+
+// C header -> Raz FFI source generator.  This deliberately implements the
+// stable declaration subset directly in Raz so bindgen does not depend on a C
+// compiler frontend.  The parser is line-oriented for declarations and uses a
+// small declarator normalizer for pointers/arrays/function prototypes.  Unknown
+// named C types are preserved by spelling; bindgen never invents their layout.
+
+fn bindgen_is_space(i64 ch) -> bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+fn bindgen_is_ident(i64 ch) -> bool {
+    return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+}
+
+fn bindgen_skip_space(i64 data, i64 cursor, i64 end) -> i64 {
+    while (cursor < end && bindgen_is_space(raz_compiler_rt_arena_get(data, cursor))) {
+        cursor += 1;
+    }
+    return cursor;
+}
+
+fn bindgen_trim_end(i64 data, i64 start, i64 end) -> i64 {
+    while (end > start && bindgen_is_space(raz_compiler_rt_arena_get(data, end - 1))) {
+        end -= 1;
+    }
+    return end;
+}
+
+fn bindgen_append_byte(i64 out, i64 cap, i64 cursor, i64 ch) -> i64 {
+    if (cursor < 0 || cursor >= cap) {
+        return -1;
+    }
+    raz_compiler_rt_arena_set(out, cursor, ch);
+    return cursor + 1;
+}
+
+fn bindgen_append_range(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
+    i64 i = start;
+    while (i < end) {
+        cursor = bindgen_append_byte(out, cap, cursor, raz_compiler_rt_arena_get(data, i));
+        if (cursor < 0) {
+            return -1;
+        }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn bindgen_append_literal(i64 out, i64 cap, i64 cursor, i64[] text, i64 length) -> i64 {
+    i64 i = 0;
+    while (i < length) {
+        cursor = bindgen_append_byte(out, cap, cursor, text[i]);
+        if (cursor < 0) {
+            return -1;
+        }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn bindgen_equal_ascii(i64 data, i64 start, i64 end, i64[] text, i64 length) -> bool {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (end - start != length) {
+        return false;
+    }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != text[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn bindgen_find_byte(i64 data, i64 start, i64 end, i64 ch) -> i64 {
+    i64 i = start;
+    while (i < end) {
+        if (raz_compiler_rt_arena_get(data, i) == ch) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn bindgen_find_last_byte(i64 data, i64 start, i64 end, i64 ch) -> i64 {
+    i64 i = end;
+    while (i > start) {
+        i -= 1;
+        if (raz_compiler_rt_arena_get(data, i) == ch) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn bindgen_type_word(i64 data, i64 start, i64 end, i64[] word, i64 length) -> bool {
+    return bindgen_equal_ascii(data, start, end, word, length);
+}
+
+
+public struct BindgenAliasTable {
+    i64 records;
+    i64 count;
+}
+
+fn bindgen_alias_table_init(BindgenAliasTable&mut aliases) -> bool {
+    aliases.records = raz_compiler_rt_arena_create(4096);
+    aliases.count = 0;
+    return aliases.records != 0;
+}
+
+fn bindgen_alias_table_destroy(BindgenAliasTable&mut aliases) {
+    if (aliases.records != 0) {
+        raz_compiler_rt_arena_destroy(aliases.records);
+    }
+    aliases.records = 0;
+    aliases.count = 0;
+}
+
+fn bindgen_alias_add(BindgenAliasTable&mut aliases, i64 name_start, i64 name_end, i64 type_start, i64 type_end) -> bool {
+    if (aliases.records == 0 || aliases.count >= 128 || name_end <= name_start || type_end <= type_start) {
+        return false;
+    }
+    i64 base = aliases.count * 4;
+    raz_compiler_rt_arena_set(aliases.records, base, name_start);
+    raz_compiler_rt_arena_set(aliases.records, base + 1, name_end);
+    raz_compiler_rt_arena_set(aliases.records, base + 2, type_start);
+    raz_compiler_rt_arena_set(aliases.records, base + 3, type_end);
+    aliases.count += 1;
+    return true;
+}
+
+fn bindgen_ranges_equal(i64 data, i64 left_start, i64 left_end, i64 right_start, i64 right_end) -> bool {
+    left_start = bindgen_skip_space(data, left_start, left_end);
+    left_end = bindgen_trim_end(data, left_start, left_end);
+    right_start = bindgen_skip_space(data, right_start, right_end);
+    right_end = bindgen_trim_end(data, right_start, right_end);
+    if (left_end - left_start != right_end - right_start) {
+        return false;
+    }
+    i64 i = 0;
+    while (left_start + i < left_end) {
+        if (raz_compiler_rt_arena_get(data, left_start + i) != raz_compiler_rt_arena_get(data, right_start + i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn bindgen_alias_find(BindgenAliasTable& aliases, i64 data, i64 start, i64 end) -> i64 {
+    i64 index = aliases.count;
+    while (index > 0) {
+        index -= 1;
+        i64 base = index * 4;
+        i64 name_start = raz_compiler_rt_arena_get(aliases.records, base);
+        i64 name_end = raz_compiler_rt_arena_get(aliases.records, base + 1);
+        if (bindgen_ranges_equal(data, start, end, name_start, name_end)) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+
+
+public struct BindgenMacroTable {
+    i64 records;
+    i64 count;
+}
+
+fn bindgen_macro_table_init(BindgenMacroTable&mut macros) -> bool {
+    macros.records = raz_compiler_rt_arena_create(2048);
+    macros.count = 0;
+    return macros.records != 0;
+}
+
+fn bindgen_macro_table_destroy(BindgenMacroTable&mut macros) {
+    if (macros.records != 0) { raz_compiler_rt_arena_destroy(macros.records); }
+    macros.records = 0;
+    macros.count = 0;
+}
+
+fn bindgen_macro_defined(BindgenMacroTable& macros, i64 data, i64 start, i64 end) -> bool {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    i64 index = macros.count;
+    while (index > 0) {
+        index -= 1;
+        i64 base = index * 2;
+        if (bindgen_ranges_equal(data, start, end, raz_compiler_rt_arena_get(macros.records, base), raz_compiler_rt_arena_get(macros.records, base + 1))) { return true; }
+    }
+    return false;
+}
+
+fn bindgen_macro_add(BindgenMacroTable&mut macros, i64 data, i64 start, i64 end) -> bool {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (start >= end || macros.records == 0) { return false; }
+    if (bindgen_macro_defined(macros, data, start, end)) { return true; }
+    if (macros.count >= 128) { return false; }
+    i64 base = macros.count * 2;
+    raz_compiler_rt_arena_set(macros.records, base, start);
+    raz_compiler_rt_arena_set(macros.records, base + 1, end);
+    macros.count += 1;
+    return true;
+}
+
+fn bindgen_pp_eval(i64 data, i64 start, i64 end, BindgenMacroTable& macros) -> i64 {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (start >= end) { return -1; }
+    if (end - start == 1 && raz_compiler_rt_arena_get(data, start) == 48) { return 0; }
+    if (end - start == 1 && raz_compiler_rt_arena_get(data, start) == 49) { return 1; }
+    bool negate = false;
+    if (raz_compiler_rt_arena_get(data, start) == 33) { negate = true; start = bindgen_skip_space(data, start + 1, end); }
+    i64 defined_word[7] = [100,101,102,105,110,101,100];
+    if (end - start >= 7 && bindgen_equal_ascii(data, start, start + 7, &defined_word, 7)) {
+        i64 n = bindgen_skip_space(data, start + 7, end);
+        if (n < end && raz_compiler_rt_arena_get(data, n) == 40) {
+            n = bindgen_skip_space(data, n + 1, end);
+            i64 close = bindgen_find_byte(data, n, end, 41);
+            if (close < 0) { return -1; }
+            bool present = bindgen_macro_defined(macros, data, n, close);
+            if (negate) { if (present) { return 0; } return 1; }
+            if (present) { return 1; }
+            return 0;
+        }
+        i64 ne = n; while (ne < end && bindgen_is_ident(raz_compiler_rt_arena_get(data, ne))) { ne += 1; }
+        if (ne == n) { return -1; }
+        bool present = bindgen_macro_defined(macros, data, n, ne);
+        if (negate) { if (present) { return 0; } return 1; }
+        if (present) { return 1; }
+        return 0;
+    }
+    return -1;
+}
+fn bindgen_emit_function_pointer_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    i64 first_open = bindgen_find_byte(data, start, end, 40);
+    if (first_open < 0) { return -1; }
+    i64 star = bindgen_find_byte(data, first_open + 1, end, 42);
+    if (star < 0) { return -1; }
+    i64 first_close = bindgen_find_byte(data, star + 1, end, 41);
+    if (first_close < 0) { return -1; }
+    i64 params_open = bindgen_find_byte(data, first_close + 1, end, 40);
+    i64 params_close = bindgen_find_last_byte(data, params_open + 1, end, 41);
+    if (params_open < 0 || params_close < params_open) { return -1; }
+
+    i64 fn_text[3] = [102,110,40];
+    cursor = bindgen_append_literal(out, cap, cursor, &fn_text, 3);
+    i64 item_start = params_open + 1;
+    i64 p = item_start;
+    i64 index = 0;
+    i64 depth = 0;
+    while (p <= params_close) {
+        i64 ch = 0;
+        if (p < params_close) { ch = raz_compiler_rt_arena_get(data, p); }
+        if (ch == 40) { depth += 1; }
+        else if (ch == 41 && depth > 0) { depth -= 1; }
+        bool boundary = p == params_close || (ch == 44 && depth == 0);
+        if (boundary) {
+            i64 a = bindgen_skip_space(data, item_start, p);
+            i64 b = bindgen_trim_end(data, a, p);
+            i64 void_word[4] = [118,111,105,100];
+            if (b > a && !bindgen_equal_ascii(data, a, b, &void_word, 4)) {
+                if (index > 0) {
+                    i64 comma[2] = [44,32];
+                    cursor = bindgen_append_literal(out, cap, cursor, &comma, 2);
+                }
+                i64 name_end = b;
+                i64 name_start = name_end;
+                while (name_start > a && bindgen_is_ident(raz_compiler_rt_arena_get(data, name_start - 1))) {
+                    name_start -= 1;
+                }
+                if (name_start > a && name_start < name_end) {
+                    cursor = bindgen_emit_decl_type(out, cap, cursor, data, a, b, name_start, windows_abi, aliases);
+                } else {
+                    // Callback parameters generated by `raz c-header` are unnamed
+                    // C declarators.  Use the end of the declarator as the
+                    // synthetic name boundary so pointer stars remain part of
+                    // the type instead of being mistaken for a missing name.
+                    cursor = bindgen_emit_decl_type(out, cap, cursor, data, a, b, b, windows_abi, aliases);
+                }
+                index += 1;
+            }
+            item_start = p + 1;
+        }
+        p += 1;
+    }
+    cursor = bindgen_append_byte(out, cap, cursor, 41);
+    i64 void_word[4] = [118,111,105,100];
+    if (!bindgen_equal_ascii(data, start, first_open, &void_word, 4)) {
+        i64 arrow[4] = [32,45,62,32];
+        cursor = bindgen_append_literal(out, cap, cursor, &arrow, 4);
+        cursor = bindgen_emit_base_type(out, cap, cursor, data, start, first_open, windows_abi, aliases);
+    }
+    return cursor;
+}
+
+// Emit a Raz type for the simple C type spelling in [start,end).  pointer_depth
+// is handled separately by the declarator parser.  Windows ABI uses 32-bit
+// long; Unix x86-64 uses 64-bit long.  size_t/ptrdiff_t follow pointer width.
+fn bindgen_emit_base_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+
+    // Strip common declaration qualifiers from the base spelling.
+    i64 const_word[6] = [99, 111, 110, 115, 116, 32];
+    if (end - start >= 6) {
+        bool pref = true;
+        i64 q = 0;
+        while (q < 6) {
+            if (raz_compiler_rt_arena_get(data, start + q) != const_word[q]) { pref = false; }
+            q += 1;
+        }
+        if (pref) { start = bindgen_skip_space(data, start + 6, end); }
+    }
+
+    i64 alias_index = bindgen_alias_find(aliases, data, start, end);
+    if (alias_index >= 0) {
+        i64 alias_base = alias_index * 4;
+        i64 alias_type_start = raz_compiler_rt_arena_get(aliases.records, alias_base + 2);
+        i64 alias_type_end = raz_compiler_rt_arena_get(aliases.records, alias_base + 3);
+        i64 alias_open = bindgen_find_byte(data, alias_type_start, alias_type_end, 40);
+        i64 alias_star = bindgen_find_byte(data, alias_type_start, alias_type_end, 42);
+        if (alias_open >= 0 && alias_star > alias_open) {
+            return bindgen_emit_function_pointer_type(out, cap, cursor, data, alias_type_start, alias_type_end, windows_abi, aliases);
+        }
+
+        // A pointer typedef is a type in its own right: later declarations such
+        // as `typedef const char *cstr; cstr name(void);` do not contain a `*`
+        // for the declarator parser to see.  Lower the pointer suffix while the
+        // alias spelling is still available instead of emitting an unsupported
+        // top-level Raz alias or silently losing pointer indirection.
+        if (alias_star >= 0) {
+            i64 alias_base_start = bindgen_skip_space(data, alias_type_start, alias_star);
+            i64 alias_base_end = bindgen_trim_end(data, alias_base_start, alias_star);
+            bool alias_pointee_const = false;
+            i64 const_prefix[5] = [99,111,110,115,116];
+            i64 alias_space = bindgen_find_byte(data, alias_base_start, alias_base_end, 32);
+            if (alias_space >= 0 && bindgen_equal_ascii(data, alias_base_start, alias_space, &const_prefix, 5)) {
+                alias_pointee_const = true;
+            }
+            cursor = bindgen_emit_base_type(out, cap, cursor, data, alias_base_start, alias_base_end, windows_abi, aliases);
+            i64 pointer = alias_star;
+            while (cursor >= 0 && pointer >= 0 && pointer < alias_type_end) {
+                if (alias_pointee_const) {
+                    i64 const_pointer[6] = [42,99,111,110,115,116];
+                    cursor = bindgen_append_literal(out, cap, cursor, &const_pointer, 6);
+                    alias_pointee_const = false;
+                } else {
+                    i64 mut_pointer[4] = [42,109,117,116];
+                    cursor = bindgen_append_literal(out, cap, cursor, &mut_pointer, 4);
+                }
+                pointer = bindgen_find_byte(data, pointer + 1, alias_type_end, 42);
+            }
+            return cursor;
+        }
+        return bindgen_emit_base_type(out, cap, cursor, data, alias_type_start, alias_type_end, windows_abi, aliases);
+    }
+
+    i64 w_void[4] = [118,111,105,100];
+    i64 w_char[4] = [99,104,97,114];
+    i64 w_schar[11] = [115,105,103,110,101,100,32,99,104,97,114];
+    i64 w_uchar[13] = [117,110,115,105,103,110,101,100,32,99,104,97,114];
+    i64 w_short[5] = [115,104,111,114,116];
+    i64 w_ushort[14] = [117,110,115,105,103,110,101,100,32,115,104,111,114,116];
+    i64 w_int[3] = [105,110,116];
+    i64 w_uint[12] = [117,110,115,105,103,110,101,100,32,105,110,116];
+    i64 w_long[4] = [108,111,110,103];
+    i64 w_ulong[13] = [117,110,115,105,103,110,101,100,32,108,111,110,103];
+    i64 w_ll[9] = [108,111,110,103,32,108,111,110,103];
+    i64 w_ull[18] = [117,110,115,105,103,110,101,100,32,108,111,110,103,32,108,111,110,103];
+    i64 w_float[5] = [102,108,111,97,116];
+    i64 w_double[6] = [100,111,117,98,108,101];
+    i64 w_bool[5] = [95,66,111,111,108];
+    i64 w_size[6] = [115,105,122,101,95,116];
+    i64 w_ssize[7] = [115,115,105,122,101,95,116];
+    i64 w_ptrdiff[9] = [112,116,114,100,105,102,102,95,116];
+    i64 w_int8[6] = [105,110,116,56,95,116]; i64 w_uint8[7] = [117,105,110,116,56,95,116];
+    i64 w_int16[7] = [105,110,116,49,54,95,116]; i64 w_uint16[8] = [117,105,110,116,49,54,95,116];
+    i64 w_int32[7] = [105,110,116,51,50,95,116]; i64 w_uint32[8] = [117,105,110,116,51,50,95,116];
+    i64 w_int64[7] = [105,110,116,54,52,95,116]; i64 w_uint64[8] = [117,105,110,116,54,52,95,116];
+    i64 w_intptr[8] = [105,110,116,112,116,114,95,116]; i64 w_uintptr[9] = [117,105,110,116,112,116,114,95,116];
+    i64 t_void[4] = [118,111,105,100];
+    i64 t_i8[2] = [105,56]; i64 t_u8[2] = [117,56];
+    i64 t_i16[3] = [105,49,54]; i64 t_u16[3] = [117,49,54];
+    i64 t_i32[3] = [105,51,50]; i64 t_u32[3] = [117,51,50];
+    i64 t_i64[3] = [105,54,52]; i64 t_u64[3] = [117,54,52];
+    i64 t_f32[3] = [102,51,50]; i64 t_f64[3] = [102,54,52];
+    i64 t_bool[4] = [98,111,111,108]; i64 t_usize[5] = [117,115,105,122,101]; i64 t_isize[5] = [105,115,105,122,101];
+
+    if (bindgen_type_word(data, start, end, &w_void, 4)) { return bindgen_append_literal(out, cap, cursor, &t_void, 4); }
+    if (bindgen_type_word(data, start, end, &w_int8, 6)) { return bindgen_append_literal(out, cap, cursor, &t_i8, 2); }
+    if (bindgen_type_word(data, start, end, &w_uint8, 7)) { return bindgen_append_literal(out, cap, cursor, &t_u8, 2); }
+    if (bindgen_type_word(data, start, end, &w_int16, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i16, 3); }
+    if (bindgen_type_word(data, start, end, &w_uint16, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u16, 3); }
+    if (bindgen_type_word(data, start, end, &w_int32, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
+    if (bindgen_type_word(data, start, end, &w_uint32, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
+    if (bindgen_type_word(data, start, end, &w_int64, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i64, 3); }
+    if (bindgen_type_word(data, start, end, &w_uint64, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u64, 3); }
+    if (bindgen_type_word(data, start, end, &w_intptr, 8)) { return bindgen_append_literal(out, cap, cursor, &t_isize, 5); }
+    if (bindgen_type_word(data, start, end, &w_uintptr, 9)) { return bindgen_append_literal(out, cap, cursor, &t_usize, 5); }
+    if (bindgen_type_word(data, start, end, &w_char, 4) || bindgen_type_word(data, start, end, &w_schar, 11)) { return bindgen_append_literal(out, cap, cursor, &t_i8, 2); }
+    if (bindgen_type_word(data, start, end, &w_uchar, 13)) { return bindgen_append_literal(out, cap, cursor, &t_u8, 2); }
+    if (bindgen_type_word(data, start, end, &w_short, 5)) { return bindgen_append_literal(out, cap, cursor, &t_i16, 3); }
+    if (bindgen_type_word(data, start, end, &w_ushort, 14)) { return bindgen_append_literal(out, cap, cursor, &t_u16, 3); }
+    if (bindgen_type_word(data, start, end, &w_int, 3)) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
+    if (bindgen_type_word(data, start, end, &w_uint, 12)) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
+    if (bindgen_type_word(data, start, end, &w_long, 4)) {
+        if (windows_abi) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
+        return bindgen_append_literal(out, cap, cursor, &t_i64, 3);
+    }
+    if (bindgen_type_word(data, start, end, &w_ulong, 13)) {
+        if (windows_abi) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
+        return bindgen_append_literal(out, cap, cursor, &t_u64, 3);
+    }
+    if (bindgen_type_word(data, start, end, &w_ll, 9)) { return bindgen_append_literal(out, cap, cursor, &t_i64, 3); }
+    if (bindgen_type_word(data, start, end, &w_ull, 18)) { return bindgen_append_literal(out, cap, cursor, &t_u64, 3); }
+    if (bindgen_type_word(data, start, end, &w_float, 5)) { return bindgen_append_literal(out, cap, cursor, &t_f32, 3); }
+    if (bindgen_type_word(data, start, end, &w_double, 6)) { return bindgen_append_literal(out, cap, cursor, &t_f64, 3); }
+    if (bindgen_type_word(data, start, end, &w_bool, 5)) { return bindgen_append_literal(out, cap, cursor, &t_bool, 4); }
+    if (bindgen_type_word(data, start, end, &w_size, 6)) { return bindgen_append_literal(out, cap, cursor, &t_usize, 5); }
+    if (bindgen_type_word(data, start, end, &w_ssize, 7) || bindgen_type_word(data, start, end, &w_ptrdiff, 9)) { return bindgen_append_literal(out, cap, cursor, &t_isize, 5); }
+
+    // Preserve a named type, but remove leading struct/union/enum keywords.
+    i64 k = start;
+    i64 kw_end = bindgen_find_byte(data,k,end,32);
+    if (kw_end > k) {
+        i64 ws[6] = [115,116,114,117,99,116];
+        i64 wu[5] = [117,110,105,111,110];
+        i64 we[4] = [101,110,117,109];
+        if (bindgen_equal_ascii(data,k,kw_end,&ws,6) || bindgen_equal_ascii(data,k,kw_end,&wu,5) || bindgen_equal_ascii(data,k,kw_end,&we,4)) {
+            k = bindgen_skip_space(data,kw_end,end);
+        }
+    }
+    return bindgen_append_range(out,cap,cursor,data,k,end);
+}
+
+
+fn bindgen_parse_positive_integer(i64 data, i64 start, i64 end) -> i64 {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (start >= end) {
+        return -1;
+    }
+    i64 value = 0;
+    i64 i = start;
+    while (i < end) {
+        i64 ch = raz_compiler_rt_arena_get(data, i);
+        if (ch < 48 || ch > 57) {
+            return -1;
+        }
+        value = value * 10 + ch - 48;
+        if (value > 1048576) {
+            return -1;
+        }
+        i += 1;
+    }
+    return value;
+}
+
+fn bindgen_base_size_align(i64 data, i64 start, i64 end, bool windows_abi, i64&mut size, i64&mut alignment) -> bool {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    i64 const_prefix[5] = [99,111,110,115,116];
+    if (end - start >= 5 && bindgen_equal_ascii(data, start, start + 5, &const_prefix, 5)) {
+        start = bindgen_skip_space(data, start + 5, end);
+    }
+    i64 w_char[4] = [99,104,97,114];
+    i64 w_schar[11] = [115,105,103,110,101,100,32,99,104,97,114];
+    i64 w_uchar[13] = [117,110,115,105,103,110,101,100,32,99,104,97,114];
+    i64 w_short[5] = [115,104,111,114,116];
+    i64 w_ushort[14] = [117,110,115,105,103,110,101,100,32,115,104,111,114,116];
+    i64 w_int[3] = [105,110,116];
+    i64 w_uint[12] = [117,110,115,105,103,110,101,100,32,105,110,116];
+    i64 w_long[4] = [108,111,110,103];
+    i64 w_ulong[13] = [117,110,115,105,103,110,101,100,32,108,111,110,103];
+    i64 w_ll[9] = [108,111,110,103,32,108,111,110,103];
+    i64 w_ull[18] = [117,110,115,105,103,110,101,100,32,108,111,110,103,32,108,111,110,103];
+    i64 w_float[5] = [102,108,111,97,116];
+    i64 w_double[6] = [100,111,117,98,108,101];
+    i64 w_bool[5] = [95,66,111,111,108];
+    i64 w_size[6] = [115,105,122,101,95,116];
+    i64 w_ptrdiff[9] = [112,116,114,100,105,102,102,95,116];
+    if (bindgen_equal_ascii(data,start,end,&w_char,4) || bindgen_equal_ascii(data,start,end,&w_schar,11) || bindgen_equal_ascii(data,start,end,&w_uchar,13) || bindgen_equal_ascii(data,start,end,&w_bool,5)) {
+        *size = 1; *alignment = 1; return true;
+    }
+    if (bindgen_equal_ascii(data,start,end,&w_short,5) || bindgen_equal_ascii(data,start,end,&w_ushort,14)) {
+        *size = 2; *alignment = 2; return true;
+    }
+    if (bindgen_equal_ascii(data,start,end,&w_int,3) || bindgen_equal_ascii(data,start,end,&w_uint,12) || bindgen_equal_ascii(data,start,end,&w_float,5)) {
+        *size = 4; *alignment = 4; return true;
+    }
+    if (bindgen_equal_ascii(data,start,end,&w_long,4) || bindgen_equal_ascii(data,start,end,&w_ulong,13)) {
+        if (windows_abi) { *size = 4; *alignment = 4; } else { *size = 8; *alignment = 8; }
+        return true;
+    }
+    if (bindgen_equal_ascii(data,start,end,&w_ll,9) || bindgen_equal_ascii(data,start,end,&w_ull,18) || bindgen_equal_ascii(data,start,end,&w_double,6) || bindgen_equal_ascii(data,start,end,&w_size,6) || bindgen_equal_ascii(data,start,end,&w_ptrdiff,9)) {
+        *size = 8; *alignment = 8; return true;
+    }
+    return false;
+}
+
+fn bindgen_field_size_align(i64 data, i64 start, i64 end, bool windows_abi, i64&mut size, i64&mut alignment) -> bool {
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (end > start && raz_compiler_rt_arena_get(data, end - 1) == 59) {
+        end -= 1;
+    }
+    i64 bracket = bindgen_find_last_byte(data, start, end, 91);
+    i64 logical_end = end;
+    i64 count = 1;
+    if (bracket >= 0) {
+        i64 close = bindgen_find_byte(data, bracket + 1, end, 93);
+        if (close > bracket) {
+            count = bindgen_parse_positive_integer(data, bracket + 1, close);
+            if (count <= 0) { return false; }
+            logical_end = bracket;
+        }
+    }
+    i64 name_end = bindgen_trim_end(data, start, logical_end);
+    i64 name_start = name_end;
+    while (name_start > start && bindgen_is_ident(raz_compiler_rt_arena_get(data, name_start - 1))) {
+        name_start -= 1;
+    }
+    if (name_start == name_end) { return false; }
+    i64 star = bindgen_find_byte(data, start, name_start, 42);
+    i64 element_size = 0;
+    i64 element_align = 0;
+    if (star >= 0) {
+        element_size = 8; element_align = 8;
+    } else if (!bindgen_base_size_align(data, start, name_start, windows_abi, &mut element_size, &mut element_align)) {
+        return false;
+    }
+    *size = element_size * count;
+    *alignment = element_align;
+    return true;
+}
+
+fn bindgen_append_decimal(i64 out, i64 cap, i64 cursor, i64 value) -> i64 {
+    i64 digits[24];
+    i64 count = 0;
+    if (value == 0) {
+        return bindgen_append_byte(out, cap, cursor, 48);
+    }
+    while (value > 0 && count < 24) {
+        digits[count] = 48 + value % 10;
+        count += 1;
+        value /= 10;
+    }
+    while (count > 0) {
+        count -= 1;
+        cursor = bindgen_append_byte(out, cap, cursor, digits[count]);
+        if (cursor < 0) { return -1; }
+    }
+    return cursor;
+}
+
+fn bindgen_parse_decimal(i64 data,i64 start,i64 end)->i64{
+    start=bindgen_skip_space(data,start,end);end=bindgen_trim_end(data,start,end);if(start>=end){return -1;}i64 value=0;i64 i=start;while(i<end){i64 ch=raz_compiler_rt_arena_get(data,i);if(ch<48||ch>57){return -1;}value=value*10+(ch-48);i+=1;}return value;
+}
+
+fn bindgen_bitfield_capacity(i64 data,i64 start,i64 end,bool windows_abi)->i64{
+    start=bindgen_skip_space(data,start,end);end=bindgen_trim_end(data,start,end);
+    i64 uc[13]=[117,110,115,105,103,110,101,100,32,99,104,97,114];i64 us[14]=[117,110,115,105,103,110,101,100,32,115,104,111,114,116];i64 ui[12]=[117,110,115,105,103,110,101,100,32,105,110,116];i64 ul[13]=[117,110,115,105,103,110,101,100,32,108,111,110,103];i64 u8t[7]=[117,105,110,116,56,95,116];i64 u16t[8]=[117,105,110,116,49,54,95,116];i64 u32t[8]=[117,105,110,116,51,50,95,116];i64 u64t[8]=[117,105,110,116,54,52,95,116];
+    if(bindgen_equal_ascii(data,start,end,&uc,13)||bindgen_equal_ascii(data,start,end,&u8t,7)){return 8;}if(bindgen_equal_ascii(data,start,end,&us,14)||bindgen_equal_ascii(data,start,end,&u16t,8)){return 16;}if(bindgen_equal_ascii(data,start,end,&ui,12)||bindgen_equal_ascii(data,start,end,&u32t,8)){return 32;}if(bindgen_equal_ascii(data,start,end,&ul,13)){if(windows_abi){return 32;}return 64;}if(bindgen_equal_ascii(data,start,end,&u64t,8)){return 64;}return 0;
+}
+
+fn bindgen_emit_bitfield_storage(i64 out,i64 cap,i64 cursor,i64 data,i64 type_start,i64 type_end,bool windows_abi,BindgenAliasTable& aliases,i64 index)->i64{
+    cursor=bindgen_emit_base_type(out,cap,cursor,data,type_start,type_end,windows_abi,aliases);if(cursor<0){return -1;}i64 name[24]=[32,95,95,114,97,122,95,98,105,116,102,105,101,108,100,95,115,116,111,114,97,103,101,95];cursor=bindgen_append_literal(out,cap,cursor,&name,24);cursor=bindgen_append_decimal(out,cap,cursor,index);cursor=bindgen_append_byte(out,cap,cursor,59);cursor=bindgen_append_byte(out,cap,cursor,10);return cursor;
+}
+
+fn bindgen_emit_union_storage(i64 out, i64 cap, i64 cursor, i64 input, i64 name_start, i64 name_end, i64 size, i64 alignment) -> i64 {
+    if (size <= 0) { size = 1; }
+    if (alignment <= 0) { alignment = 1; }
+    // @repr(C)@align(N)public struct Name { u8[N] storage; }
+    i64 repr[15] = [64,114,101,112,114,40,67,41,64,97,108,105,103,110,40];
+    cursor = bindgen_append_literal(out, cap, cursor, &repr, 15);
+    cursor = bindgen_append_decimal(out, cap, cursor, alignment);
+    i64 middle[15] = [41,112,117,98,108,105,99,32,115,116,114,117,99,116,32];
+    cursor = bindgen_append_literal(out, cap, cursor, &middle, 15);
+    cursor = bindgen_append_range(out, cap, cursor, input, name_start, name_end);
+    cursor = bindgen_append_byte(out, cap, cursor, 32);
+    cursor = bindgen_append_byte(out, cap, cursor, 123);
+    cursor = bindgen_append_byte(out, cap, cursor, 10);
+    cursor = bindgen_append_byte(out, cap, cursor, 117);
+    cursor = bindgen_append_byte(out, cap, cursor, 56);
+    cursor = bindgen_append_byte(out, cap, cursor, 91);
+    cursor = bindgen_append_decimal(out, cap, cursor, size);
+    i64 tail[15] = [93,32,115,116,111,114,97,103,101,59,10,125,10,10,10];
+    cursor = bindgen_append_literal(out, cap, cursor, &tail, 15);
+    return cursor;
+}
+
+fn bindgen_emit_decl_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, i64 name_start, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    i64 star = bindgen_find_byte(data,start,name_start,42);
+    i64 base_end = name_start;
+    if (star >= 0) { base_end = star; }
+    cursor = bindgen_emit_base_type(out, cap, cursor, data, start, base_end, windows_abi, aliases);
+    if (cursor < 0) { return -1; }
+    bool pointee_const = false;
+    i64 const_word[5] = [99,111,110,115,116];
+    i64 first_space = bindgen_find_byte(data, start, base_end, 32);
+    if (first_space >= 0 && bindgen_equal_ascii(data, start, first_space, &const_word, 5)) { pointee_const = true; }
+    i64 scan = star;
+    while (scan >= 0 && scan < name_start) {
+        if (raz_compiler_rt_arena_get(data, scan) == 42) {
+            if (pointee_const) {
+                i64 ptr[6] = [42,99,111,110,115,116];
+                cursor = bindgen_append_literal(out, cap, cursor, &ptr, 6);
+            } else {
+                i64 ptr[4] = [42,109,117,116];
+                cursor = bindgen_append_literal(out, cap, cursor, &ptr, 4);
+            }
+            if (cursor < 0) { return -1; }
+            pointee_const = false;
+        }
+        scan += 1;
+    }
+    return cursor;
+}
+
+
+fn bindgen_align_up(i64 value, i64 alignment) -> i64 {
+    if (alignment <= 1) { return value; }
+    i64 remainder = value % alignment;
+    if (remainder == 0) { return value; }
+    return value + alignment - remainder;
+}
+
+fn bindgen_inline_aggregate_size_align(i64 data, i64 start, i64 end, bool is_union, bool windows_abi, i64&mut size, i64&mut alignment) -> bool {
+    i64 open = bindgen_find_byte(data, start, end, 123);
+    i64 close = bindgen_find_last_byte(data, start, end, 125);
+    if (open < 0 || close <= open) { return false; }
+    i64 offset = 0;
+    i64 max_size = 0;
+    i64 max_align = 1;
+    i64 field_start = open + 1;
+    i64 cursor = field_start;
+    while (cursor <= close) {
+        bool boundary = cursor == close || raz_compiler_rt_arena_get(data, cursor) == 59;
+        if (boundary) {
+            i64 a = bindgen_skip_space(data, field_start, cursor);
+            i64 b = bindgen_trim_end(data, a, cursor);
+            if (b > a) {
+                i64 field_size = 0;
+                i64 field_align = 0;
+                if (!bindgen_field_size_align(data, a, b, windows_abi, &mut field_size, &mut field_align)) { return false; }
+                if (field_align > max_align) { max_align = field_align; }
+                if (is_union) {
+                    if (field_size > max_size) { max_size = field_size; }
+                } else {
+                    offset = bindgen_align_up(offset, field_align);
+                    offset += field_size;
+                }
+            }
+            field_start = cursor + 1;
+        }
+        cursor += 1;
+    }
+    if (is_union) { offset = max_size; }
+    *alignment = max_align;
+    *size = bindgen_align_up(offset, max_align);
+    return *size > 0;
+}
+
+fn bindgen_emit_opaque_field(i64 out, i64 cap, i64 cursor, i64 data, i64 name_start, i64 name_end, i64 size, i64 alignment, i64 synthetic_index) -> i64 {
+    i64 unit_size = 1;
+    if (alignment == 8) { i64 t[3] = [117,54,52]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 8; }
+    else if (alignment == 4) { i64 t[3] = [117,51,50]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 4; }
+    else if (alignment == 2) { i64 t[3] = [117,49,54]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 2; }
+    else if (alignment == 1) { i64 t[2] = [117,56]; cursor = bindgen_append_literal(out, cap, cursor, &t, 2); unit_size = 1; }
+    else { return -1; }
+    cursor = bindgen_append_byte(out, cap, cursor, 91);
+    cursor = bindgen_append_decimal(out, cap, cursor, size / unit_size);
+    cursor = bindgen_append_byte(out, cap, cursor, 93);
+    cursor = bindgen_append_byte(out, cap, cursor, 32);
+    if (name_end > name_start) {
+        cursor = bindgen_append_range(out, cap, cursor, data, name_start, name_end);
+    } else {
+        i64 prefix[18] = [95,95,114,97,122,95,97,110,111,110,95,115,116,111,114,97,103,101];
+        cursor = bindgen_append_literal(out, cap, cursor, &prefix, 18);
+        cursor = bindgen_append_decimal(out, cap, cursor, synthetic_index);
+    }
+    cursor = bindgen_append_byte(out, cap, cursor, 59);
+    cursor = bindgen_append_byte(out, cap, cursor, 10);
+    return cursor;
+}
+
+fn bindgen_emit_inline_anonymous_aggregate(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, i64 synthetic_index) -> i64 {
+    i64 open = bindgen_find_byte(data, start, end, 123);
+    i64 close = bindgen_find_last_byte(data, start, end, 125);
+    if (open < 0 || close <= open) { return -1; }
+    i64 union_word[5] = [117,110,105,111,110];
+    i64 kind_end = bindgen_find_byte(data, start, open, 32);
+    if (kind_end < 0) { kind_end = open; }
+    bool is_union = bindgen_equal_ascii(data, start, kind_end, &union_word, 5);
+    i64 size = 0;
+    i64 alignment = 0;
+    if (!bindgen_inline_aggregate_size_align(data, start, end, is_union, windows_abi, &mut size, &mut alignment)) { return -1; }
+    i64 name_start = bindgen_skip_space(data, close + 1, end);
+    i64 name_end = name_start;
+    while (name_end < end && bindgen_is_ident(raz_compiler_rt_arena_get(data, name_end))) { name_end += 1; }
+    return bindgen_emit_opaque_field(out, cap, cursor, data, name_start, name_end, size, alignment, synthetic_index);
+}
+
+fn bindgen_emit_field(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    start = bindgen_skip_space(data,start,end);
+    end = bindgen_trim_end(data,start,end);
+    if (end <= start) { return cursor; }
+    if (raz_compiler_rt_arena_get(data, end - 1) == 59) { end -= 1; }
+    end = bindgen_trim_end(data,start,end);
+    i64 bracket = bindgen_find_last_byte(data,start,end,91);
+    i64 logical_end = end;
+    i64 array_end = -1;
+    if (bracket >= 0 && bindgen_find_byte(data,bracket,end,93) >= 0) {
+        array_end = bindgen_find_byte(data,bracket,end,93);
+        logical_end = bracket;
+    }
+    i64 name_end = bindgen_trim_end(data,start,logical_end);
+    i64 name_start = name_end;
+    while (name_start > start && bindgen_is_ident(raz_compiler_rt_arena_get(data, name_start - 1))) { name_start -= 1; }
+    if (name_start == name_end) { return cursor; }
+
+    cursor = bindgen_emit_decl_type(out, cap, cursor, data, start, logical_end, name_start, windows_abi, aliases);
+    if (cursor < 0) { return -1; }
+    if (bracket >= 0 && array_end > bracket) {
+        cursor = bindgen_append_byte(out,cap,cursor,91);
+        cursor = bindgen_append_range(out,cap,cursor,data,bracket+1,array_end);
+        cursor = bindgen_append_byte(out,cap,cursor,93);
+    }
+    cursor = bindgen_append_byte(out,cap,cursor,32);
+    cursor = bindgen_append_range(out,cap,cursor,data,name_start,name_end);
+    cursor = bindgen_append_byte(out,cap,cursor,59);
+    cursor = bindgen_append_byte(out,cap,cursor,10);
+    return cursor;
+}
+
+fn bindgen_emit_params(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    start = bindgen_skip_space(data,start,end);
+    end = bindgen_trim_end(data,start,end);
+    i64 w_void[4]=[118,111,105,100];
+    if (start >= end || bindgen_equal_ascii(data, start, end, &w_void, 4)) { return cursor; }
+    i64 item_start=start; i64 depth=0; i64 index=0; i64 p=start;
+    while (p<=end) {
+        i64 ch = 0;
+        if (p < end) { ch = raz_compiler_rt_arena_get(data, p); }
+        if (ch == 40) { depth += 1; } else if (ch == 41 && depth > 0) { depth -= 1; }
+        bool boundary=(p==end)||(ch==44 && depth==0);
+        if (boundary) {
+            i64 a=bindgen_skip_space(data,item_start,p); i64 b=bindgen_trim_end(data,a,p);
+            if (b>a) {
+                if (index>0) { i64 comma[2]=[44,32]; cursor=bindgen_append_literal(out,cap,cursor,&comma,2); }
+                i64 callback_open=bindgen_find_byte(data,a,b,40); i64 callback_star=-1; i64 callback_close=-1;
+                if(callback_open>=0){callback_star=bindgen_find_byte(data,callback_open+1,b,42);} if(callback_star>=0){callback_close=bindgen_find_byte(data,callback_star+1,b,41);}
+                if(callback_open>=0&&callback_star>callback_open&&callback_close>callback_star){
+                    i64 callback_name_start=bindgen_skip_space(data,callback_star+1,callback_close);i64 callback_name_end=callback_name_start;while(callback_name_end<callback_close&&bindgen_is_ident(raz_compiler_rt_arena_get(data,callback_name_end))){callback_name_end+=1;}
+                    cursor=bindgen_emit_function_pointer_type(out,cap,cursor,data,a,b,windows_abi,aliases);cursor=bindgen_append_byte(out,cap,cursor,32);if(callback_name_end>callback_name_start){cursor=bindgen_append_range(out,cap,cursor,data,callback_name_start,callback_name_end);}else{i64 sep[3]=[97,114,103];cursor=bindgen_append_literal(out,cap,cursor,&sep,3);cursor=bindgen_append_byte(out,cap,cursor,48+(index%10));}
+                } else {
+                    i64 name_end=b; i64 name_start=name_end;
+                    while (name_start>a && bindgen_is_ident(raz_compiler_rt_arena_get(data,name_start-1))) { name_start-=1; }
+                    if(name_start==name_end || bindgen_find_byte(data,a,b,42)==name_start-1) {
+                        // unnamed parameter: synthesize argN
+                        cursor = bindgen_emit_base_type(out, cap, cursor, data, a, b, windows_abi, aliases);
+                        i64 sep[4]=[32,97,114,103]; cursor=bindgen_append_literal(out,cap,cursor,&sep,4);
+                        cursor=bindgen_append_byte(out,cap,cursor,48+(index%10));
+                    } else {
+                        cursor = bindgen_emit_decl_type(out, cap, cursor, data, a, b, name_start, windows_abi, aliases);
+                        cursor=bindgen_append_byte(out,cap,cursor,32);
+                        cursor=bindgen_append_range(out,cap,cursor,data,name_start,name_end);
+                    }
+                }
+                index+=1;
+            }
+            item_start=p+1;
+        }
+        p+=1;
+    }
+    return cursor;
+}
+
+fn bindgen_emit_function(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
+    i64 open=bindgen_find_byte(data,start,end,40); i64 close=bindgen_find_last_byte(data,start,end,41);
+    if (open < 0 || close < open) { return cursor; }
+    i64 name_end=bindgen_trim_end(data,start,open); i64 name_start=name_end;
+    while (name_start>start && bindgen_is_ident(raz_compiler_rt_arena_get(data,name_start-1))) { name_start-=1; }
+    if (name_start == name_end) { return cursor; }
+    i64 extern_fn[17] = [64,97,98,105,40,67,41,101,120,116,101,114,110,32,102,110,32];
+    cursor = bindgen_append_literal(out, cap, cursor, &extern_fn, 17);
+    cursor=bindgen_append_range(out,cap,cursor,data,name_start,name_end);
+    cursor=bindgen_append_byte(out,cap,cursor,40);
+    cursor = bindgen_emit_params(out, cap, cursor, data, open + 1, close, windows_abi, aliases);
+    cursor=bindgen_append_byte(out,cap,cursor,41);
+    i64 arrow[4]=[32,45,62,32]; cursor=bindgen_append_literal(out,cap,cursor,&arrow,4);
+    cursor = bindgen_emit_decl_type(out, cap, cursor, data, start, name_start, name_start, windows_abi, aliases);
+    cursor=bindgen_append_byte(out,cap,cursor,59); cursor=bindgen_append_byte(out,cap,cursor,10); cursor=bindgen_append_byte(out,cap,cursor,10);
+    return cursor;
+}
+
+fn bindgen_emit_macro_expr(i64 out,i64 cap,i64 cursor,i64 data,i64 start,i64 end)->i64{
+    i64 i=start;while(i<end){i64 ch=raz_compiler_rt_arena_get(data,i);if(ch>=48&&ch<=57){i64 begin=i;bool hex=false;if(ch==48&&i+1<end&&(raz_compiler_rt_arena_get(data,i+1)==120||raz_compiler_rt_arena_get(data,i+1)==88)){hex=true;i+=2;while(i<end){i64 d=raz_compiler_rt_arena_get(data,i);bool hd=(d>=48&&d<=57)||(d>=65&&d<=70)||(d>=97&&d<=102);if(!hd){break;}i+=1;}}else{while(i<end){i64 d=raz_compiler_rt_arena_get(data,i);if(d<48||d>57){break;}i+=1;}}cursor=bindgen_append_range(out,cap,cursor,data,begin,i);while(i<end){i64 suffix=raz_compiler_rt_arena_get(data,i);if(suffix==117||suffix==85||suffix==108||suffix==76){i+=1;}else{break;}}if(cursor<0){return -1;}continue;}cursor=bindgen_append_byte(out,cap,cursor,ch);if(cursor<0){return -1;}i+=1;}return cursor;
+}
+
+fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -> i64 {
+    i64 cursor = 0;
+    BindgenAliasTable aliases;
+    BindgenMacroTable macros;
+    if (!bindgen_alias_table_init(&mut aliases)) { return -1; }
+    if (!bindgen_macro_table_init(&mut macros)) { bindgen_alias_table_destroy(&mut aliases); return -1; }
+    i64 header[138]=[47,47,32,71,101,110,101,114,97,116,101,100,32,98,121,32,96,114,97,122,32,98,105,110,100,103,101,110,96,46,32,68,111,32,110,111,116,32,101,100,105,116,32,98,121,32,104,97,110,100,46,10,47,47,32,67,32,65,66,73,32,100,101,99,108,97,114,97,116,105,111,110,115,32,97,114,101,32,112,114,101,115,101,114,118,101,100,32,119,105,116,104,111,117,116,32,114,117,110,116,105,109,101,32,119,114,97,112,112,101,114,115,46,10,10,110,97,109,101,115,112,97,99,101,32,99,95,98,105,110,100,105,110,103,115,59,10,10];
+    cursor=bindgen_append_literal(out,cap,cursor,&header,138);
+    i64 line = 0;
+    i64 block_kind = 0;
+    i64 block_name_start = 0;
+    i64 block_name_end = 0;
+    i64 block_union_size = 0;
+    i64 block_union_alignment = 1;
+    i64 block_bitfield_used = 0;
+    i64 block_bitfield_capacity = 0;
+    i64 block_bitfield_index = 0;
+    i64 block_bitfield_type_start = 0;
+    i64 block_bitfield_type_end = 0;
+    i64 block_anonymous_index = 0;
+    bool pp_active = true;
+    bool pp_parent[32];
+    bool pp_taken[32];
+    i64 pp_depth = 0;
+    while(line<length) {
+        i64 end=line; while (end<length && raz_compiler_rt_arena_get(input,end)!=10) { end+=1; }
+        i64 a=bindgen_skip_space(input,line,end); i64 b=bindgen_trim_end(input,a,end);
+        bool handled_pp = false;
+        if (a < b && raz_compiler_rt_arena_get(input, a) == 35) {
+            i64 hash_body = bindgen_skip_space(input, a + 1, b);
+            i64 word_end = hash_body; while (word_end < b && bindgen_is_ident(raz_compiler_rt_arena_get(input, word_end))) { word_end += 1; }
+            i64 if_word[2] = [105,102]; i64 ifdef_word[5] = [105,102,100,101,102]; i64 ifndef_word[6] = [105,102,110,100,101,102]; i64 else_word[4] = [101,108,115,101]; i64 endif_word[5] = [101,110,100,105,102];
+            if (bindgen_equal_ascii(input, hash_body, word_end, &if_word, 2) || bindgen_equal_ascii(input, hash_body, word_end, &ifdef_word, 5) || bindgen_equal_ascii(input, hash_body, word_end, &ifndef_word, 6)) {
+                if (pp_depth >= 32) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
+                bool parent = pp_active;
+                i64 cond = -1;
+                if (bindgen_equal_ascii(input, hash_body, word_end, &ifdef_word, 5)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 1; } else { cond = 0; } }
+                else if (bindgen_equal_ascii(input, hash_body, word_end, &ifndef_word, 6)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 0; } else { cond = 1; } }
+                else { cond = bindgen_pp_eval(input, word_end, b, &macros); }
+                if (cond < 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
+                pp_parent[pp_depth] = parent; pp_taken[pp_depth] = cond != 0; pp_depth += 1; pp_active = parent && cond != 0; handled_pp = true;
+            } else if (bindgen_equal_ascii(input, hash_body, word_end, &else_word, 4)) {
+                if (pp_depth <= 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
+                i64 level = pp_depth - 1; pp_active = pp_parent[level] && !pp_taken[level]; pp_taken[level] = true; handled_pp = true;
+            } else if (bindgen_equal_ascii(input, hash_body, word_end, &endif_word, 5)) {
+                if (pp_depth <= 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
+                pp_depth -= 1; pp_active = pp_parent[pp_depth]; handled_pp = true;
+            }
+        }
+        if(a<b && !handled_pp && pp_active) {
+            if (block_kind != 0) {
+                if (raz_compiler_rt_arena_get(input, a) == 125) {
+                    if (block_kind == 2) {
+                        cursor = bindgen_emit_union_storage(out, cap, cursor, input, block_name_start, block_name_end, block_union_size, block_union_alignment);
+                    } else {
+                        cursor = bindgen_append_byte(out, cap, cursor, 125);
+                        cursor = bindgen_append_byte(out, cap, cursor, 10);
+                        cursor = bindgen_append_byte(out, cap, cursor, 10);
+                    }
+                    block_kind = 0;
+                    block_union_size = 0;
+                    block_union_alignment = 1;
+                    block_bitfield_used = 0;
+                    block_bitfield_capacity = 0;
+                    block_bitfield_index = 0;
+                    block_bitfield_type_start = 0;
+                    block_bitfield_type_end = 0;
+                    block_anonymous_index = 0;
+                } else if (block_kind == 3) {
+                    i64 enum_end = b;
+                    if (raz_compiler_rt_arena_get(input, enum_end - 1) == 44) { enum_end -= 1; }
+                    cursor = bindgen_append_range(out, cap, cursor, input, a, enum_end);
+                    cursor = bindgen_append_byte(out, cap, cursor, 44);
+                    cursor = bindgen_append_byte(out, cap, cursor, 10);
+                } else if (block_kind == 2) {
+                    i64 field_size = 0;
+                    i64 field_align = 0;
+                    if (bindgen_field_size_align(input, a, b, windows_abi, &mut field_size, &mut field_align)) {
+                        if (field_size > block_union_size) { block_union_size = field_size; }
+                        if (field_align > block_union_alignment) { block_union_alignment = field_align; }
+                    }
+                } else {
+                    i64 colon=bindgen_find_byte(input,a,b,58);
+                    if(colon>=0){
+                        i64 width_end=b;if(width_end>a&&raz_compiler_rt_arena_get(input,width_end-1)==59){width_end-=1;}i64 width=bindgen_parse_decimal(input,colon+1,width_end);if(width<0){bindgen_alias_table_destroy(&mut aliases);return -1;}
+                        i64 before=bindgen_trim_end(input,a,colon);i64 field_name_start=before;while(field_name_start>a&&bindgen_is_ident(raz_compiler_rt_arena_get(input,field_name_start-1))){field_name_start-=1;}if(field_name_start==before){bindgen_alias_table_destroy(&mut aliases);return -1;}i64 type_end=bindgen_trim_end(input,a,field_name_start);i64 unit=bindgen_bitfield_capacity(input,a,type_end,windows_abi);if(unit<=0||width>unit){bindgen_alias_table_destroy(&mut aliases);return -1;}
+                        if(width==0){block_bitfield_used=0;block_bitfield_capacity=0;block_bitfield_type_start=0;block_bitfield_type_end=0;}else{bool same_type=block_bitfield_type_end>block_bitfield_type_start&&bindgen_ranges_equal(input,a,type_end,block_bitfield_type_start,block_bitfield_type_end);if(block_bitfield_capacity!=unit||!same_type||block_bitfield_used+width>unit){cursor=bindgen_emit_bitfield_storage(out,cap,cursor,input,a,type_end,windows_abi,&aliases,block_bitfield_index);if(cursor<0){bindgen_alias_table_destroy(&mut aliases);return -1;}block_bitfield_index+=1;block_bitfield_used=0;block_bitfield_capacity=unit;block_bitfield_type_start=a;block_bitfield_type_end=type_end;}block_bitfield_used+=width;}
+                    }else{
+                        block_bitfield_used=0;block_bitfield_capacity=0;block_bitfield_type_start=0;block_bitfield_type_end=0;
+                        i64 inline_open = bindgen_find_byte(input, a, b, 123);
+                        i64 inline_close = bindgen_find_last_byte(input, a, b, 125);
+                        if (inline_open >= 0 && inline_close > inline_open) {
+                            cursor = bindgen_emit_inline_anonymous_aggregate(out, cap, cursor, input, a, b, windows_abi, block_anonymous_index);
+                            block_anonymous_index += 1;
+                        } else {
+                            cursor = bindgen_emit_field(out, cap, cursor, input, a, b, windows_abi, &aliases);
+                        }
+                    }
+                }
+            } else if(raz_compiler_rt_arena_get(input,a)==35) {
+                // #define NAME integer-expression: preserve the expression verbatim.
+                i64 def[7]=[35,100,101,102,105,110,101];
+                if(b-a>7 && bindgen_equal_ascii(input,a,a+7,&def,7)) {
+                    i64 n=bindgen_skip_space(input,a+7,b); i64 ne=n; while (ne<b && bindgen_is_ident(raz_compiler_rt_arena_get(input,ne))) { ne+=1; }
+                    i64 v = bindgen_skip_space(input, ne, b);
+                    bool function_macro = ne < b && raz_compiler_rt_arena_get(input, ne) == 40;
+                    bool string_macro = v < b && (raz_compiler_rt_arena_get(input, v) == 34 || raz_compiler_rt_arena_get(input, v) == 39);
+                    if (ne > n && !function_macro) { bindgen_macro_add(&mut macros, input, n, ne); }
+                    if (ne > n && v < b && raz_compiler_rt_arena_get(input, n) != 95 && !function_macro && !string_macro) {
+                        i64 pc[17]=[112,117,98,108,105,99,32,99,111,110,115,116,32,105,54,52,32];
+                        cursor=bindgen_append_literal(out,cap,cursor,&pc,17); cursor=bindgen_append_range(out,cap,cursor,input,n,ne); i64 eq[3]=[32,61,32]; cursor=bindgen_append_literal(out,cap,cursor,&eq,3); cursor=bindgen_emit_macro_expr(out,cap,cursor,input,v,b); cursor=bindgen_append_byte(out,cap,cursor,59); cursor=bindgen_append_byte(out,cap,cursor,10); cursor=bindgen_append_byte(out,cap,cursor,10);
+                    }
+                }
+            } else {
+                i64 brace=bindgen_find_byte(input,a,b,123);
+                if(brace>=0) {
+                    i64 struct_word[6]=[115,116,114,117,99,116]; i64 union_word[5]=[117,110,105,111,110]; i64 enum_word[4]=[101,110,117,109];
+                    i64 k=a; i64 typedef_word[7]=[116,121,112,101,100,101,102];
+                    if (b - a >= 7 && bindgen_equal_ascii(input, a, a + 7, &typedef_word, 7)) { k = bindgen_skip_space(input, a + 7, b); }
+                    i64 kw_end = bindgen_find_byte(input, k, brace, 32);
+                    if (kw_end < 0) { kw_end = brace; }
+                    i64 kind = 0;
+                    if (bindgen_equal_ascii(input, k, kw_end, &struct_word, 6)) { kind = 1; } else if (bindgen_equal_ascii(input, k, kw_end, &union_word, 5)) { kind = 2; } else if (bindgen_equal_ascii(input, k, kw_end, &enum_word, 4)) { kind = 3; }
+                    if(kind>0) {
+                        i64 ns=bindgen_skip_space(input,kw_end,brace); i64 ne=ns; while (ne<brace && bindgen_is_ident(raz_compiler_rt_arena_get(input,ne))) { ne+=1; }
+                        if (ne > ns) {
+                            if (kind != 2) {
+                                if (kind == 1) {
+                                    i64 prefix[22] = [64,114,101,112,114,40,67,41,112,117,98,108,105,99,32,115,116,114,117,99,116,32];
+                                    cursor = bindgen_append_literal(out, cap, cursor, &prefix, 22);
+                                } else {
+                                    i64 prefix[12] = [112,117,98,108,105,99,32,101,110,117,109,32];
+                                    cursor = bindgen_append_literal(out, cap, cursor, &prefix, 12);
+                                }
+                                cursor = bindgen_append_range(out, cap, cursor, input, ns, ne);
+                                i64 op[3] = [32,123,10];
+                                cursor = bindgen_append_literal(out, cap, cursor, &op, 3);
+                            }
+                            block_kind = kind;
+                            block_name_start = ns;
+                            block_name_end = ne;
+                            block_bitfield_used = 0;
+                            block_bitfield_capacity = 0;
+                            block_bitfield_index = 0;
+                            block_bitfield_type_start = 0;
+                            block_bitfield_type_end = 0;
+                            block_anonymous_index = 0;
+                        }
+                    }
+                } else if (bindgen_find_byte(input, a, b, 40) >= 0 && raz_compiler_rt_arena_get(input, b - 1) == 59) {
+                    i64 td[7] = [116,121,112,101,100,101,102];
+                    if (b - a >= 7 && bindgen_equal_ascii(input, a, a + 7, &td, 7)) {
+                        i64 body = bindgen_skip_space(input, a + 7, b - 1);
+                        i64 open = bindgen_find_byte(input, body, b - 1, 40);
+                        i64 star = -1;
+                        if (open >= 0) { star = bindgen_find_byte(input, open + 1, b - 1, 42); }
+                        i64 close = -1;
+                        if (star >= 0) { close = bindgen_find_byte(input, star + 1, b - 1, 41); }
+                        if (star >= 0 && close > star) {
+                            i64 ns = bindgen_skip_space(input, star + 1, close);
+                            i64 ne = ns;
+                            while (ne < close && bindgen_is_ident(raz_compiler_rt_arena_get(input, ne))) { ne += 1; }
+                            if (ne > ns) { bindgen_alias_add(&mut aliases, ns, ne, body, b - 1); }
+                        }
+                    } else {
+                        cursor = bindgen_emit_function(out, cap, cursor, input, a, b - 1, windows_abi, &aliases);
+                    }
+                } else {
+                    // Simple typedef: typedef <type> Name;
+                    i64 td[7]=[116,121,112,101,100,101,102];
+                    if(b-a>=7 && bindgen_equal_ascii(input,a,a+7,&td,7) && raz_compiler_rt_arena_get(input,b-1)==59) {
+                        i64 body=bindgen_skip_space(input,a+7,b-1); i64 ne=bindgen_trim_end(input,body,b-1); i64 ns=ne; while (ns>body && bindgen_is_ident(raz_compiler_rt_arena_get(input,ns-1))) { ns-=1; }
+                        if (ns < ne) {
+                            bindgen_alias_add(&mut aliases, ns, ne, body, ns);
+                        }
+                    }
+                }
+            }
+        }
+        line=end+1;
+    }
+    if (pp_depth != 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
+    bindgen_macro_table_destroy(&mut macros);
+    bindgen_alias_table_destroy(&mut aliases);
+    return cursor;
+}
+
+fn bindgen_command(i64 argc) -> i64 {
+    if(argc<3 || argc>5){ cli_print_invalid_arguments(); return 2; }
+    i64 path=raz_compiler_rt_arena_create(4096); i64 out_path=raz_compiler_rt_arena_create(4096); i64 input=raz_compiler_rt_arena_create(8388608); i64 output=raz_compiler_rt_arena_create(16777216);
+    if (path == 0 || out_path == 0 || input == 0 || output == 0) { return 40; }
+    i64 pl = cli_load_arg(2, path, 4096);
+    if (pl <= 0) { return 2; }
+    bool windows_abi=raz_compiler_rt_host_platform()==1; i64 output_index=3;
+    if(argc>3){ i64 option=raz_compiler_rt_arena_create(128); i64 ol=cli_load_arg(3,option,128); i64 win[20]=[45,45,116,97,114,103,101,116,45,97,98,105,61,119,105,110,100,111,119,115]; i64 unix[17]=[45,45,116,97,114,103,101,116,45,97,98,105,61,117,110,105,120]; if(cli_arg_equals(option,ol,&win,20)){windows_abi=true;output_index=4;} else if(cli_arg_equals(option,ol,&unix,17)){windows_abi=false;output_index=4;} raz_compiler_rt_arena_destroy(option); }
+    i64 il = raz_compiler_rt_read_ascii(path, pl, input, 8388608);
+    if (il < 0) { cli_print_invalid_arguments(); return 2; }
+    i64 generated = bindgen_generate(input, il, output, 16777216, windows_abi);
+    if (generated < 0) { return 40; }
+    i64 status=0;
+    if (output_index < argc) {
+        i64 opl = cli_load_arg(output_index, out_path, 4096);
+        if (opl <= 0 || raz_compiler_rt_write_ascii(out_path, opl, output, generated) != generated) { status = 2; }
+    }
+    else {
+        cli_write_arena_stream(1, output, generated);
+    }
+    raz_compiler_rt_arena_destroy(path); raz_compiler_rt_arena_destroy(out_path); raz_compiler_rt_arena_destroy(input); raz_compiler_rt_arena_destroy(output); return status;
+}

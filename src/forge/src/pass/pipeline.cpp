@@ -46,8 +46,10 @@ void build_standard_pipeline(PassManager& pipeline, OptimizationLevel level) {
             .add<transforms::CopyPropagationPass>()
             .add<transforms::DeadCodeEliminationPass>();
     pipeline.add<transforms::LoopReductionPass>()
+            .add<transforms::LoopInvariantGuardHoistingPass>()
             .add<transforms::CommonSubexpressionEliminationPass>()
             .add<transforms::ScalarStackPromotionPass>()
+            .add<transforms::MergeParameterSimplificationPass>()
             .add<transforms::MemoryForwardingPass>()
             .add<transforms::DeadStoreEliminationPass>()
             .add<transforms::IfConversionPass>()
@@ -57,6 +59,7 @@ void build_standard_pipeline(PassManager& pipeline, OptimizationLevel level) {
             .add<transforms::CommonSubexpressionEliminationPass>()
             .add<transforms::CopyPropagationPass>()
             .add<transforms::DeadCodeEliminationPass>()
+            .add<transforms::BranchThreadingPass>()
             .add<transforms::SimplifyCFGPass>()
             .add<transforms::ScalarCleanupFixpointPass>();
     if (level == OptimizationLevel::oz) {
@@ -76,10 +79,12 @@ void build_standard_pipeline(PassManager& pipeline, OptimizationLevel level) {
     if (level == OptimizationLevel::o3) {
         pipeline.add<transforms::SparseConditionalConstantPropagationPass>()
                 .add<transforms::LoopReductionPass>()
+                .add<transforms::LoopInvariantGuardHoistingPass>()
                 .add<transforms::ConstantTripLoopUnrollPass>()
                 .add<transforms::LoopInvariantCodeMotionPass>()
                 .add<transforms::CommonSubexpressionEliminationPass>()
                 .add<transforms::ScalarStackPromotionPass>()
+                .add<transforms::MergeParameterSimplificationPass>()
                 .add<transforms::MemoryForwardingPass>()
                 .add<transforms::DeadStoreEliminationPass>()
                 .add<transforms::IfConversionPass>()
@@ -89,6 +94,7 @@ void build_standard_pipeline(PassManager& pipeline, OptimizationLevel level) {
                 .add<transforms::CommonSubexpressionEliminationPass>()
                 .add<transforms::CopyPropagationPass>()
                 .add<transforms::DeadCodeEliminationPass>()
+                .add<transforms::BranchThreadingPass>()
                 .add<transforms::SimplifyCFGPass>()
                 .add<transforms::ScalarCleanupFixpointPass>();
     }

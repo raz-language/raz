@@ -73,6 +73,8 @@ See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough
 | `raz search` · `raz info` · `raz outdated` | Inspect the official registry and tracked versions |
 | `raz pack` · `raz publish` | Produce and submit deterministic package archives |
 | `raz doctor` · `raz backends` · `raz targets` | Inspect the toolchain, backends, and targets |
+| `raz bindgen` | Generate Raz C-ABI declarations from supported C headers |
+| `raz c-header` | Generate C declarations for explicit Raz C-ABI exports |
 
 Normal executable package builds are native by default: `raz build` writes `target/debug/<package>` (`.exe` on Windows), and `raz build --release` writes `target/release/<package>`. Forge `.fir` output is reserved for explicit backend/emission workflows.
 
@@ -92,7 +94,7 @@ error: no such command: 'biuld'
   help: view all commands with 'raz --help'
 ```
 
-Diagnostics are stable and machine-readable, and the same semantic engine drives the language server: completion, navigation, references, rename, symbols, formatting, and code actions. See the [CLI reference](docs/CLI.md) and [Language server](docs/LANGUAGE-SERVER.md).
+Diagnostics are stable and machine-readable, and the production compiler also owns `raz lsp`. The server provides compiler-backed diagnostics, project/dependency indexing, semantic navigation and rename, hover/signatures, semantic tokens, inlay hints, completion, formatting, code actions, folding, and selection ranges. `raz bindgen` generates supported C ABI declarations without a libclang runtime dependency, while `raz c-header` exports explicit `@abi(C)`/`@repr(C)` Raz APIs as C headers. See the [CLI reference](docs/CLI.md), [Language server](docs/LANGUAGE-SERVER.md), and [C interoperability](docs/C-INTEROPERABILITY.md).
 
 ## Standard library
 

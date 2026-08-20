@@ -86,10 +86,10 @@ fn rxe_function_has_backedge(RxeModule& module, i64 start, i64 end) -> bool {
 // registers are never recycled while a stale slot->register mapping survives.
 // Loop-carried values whose first loop access is a load remain in frame slots
 // until a future SSA/phi-aware allocator can prove their incoming value.
-fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
-    i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function);
-    i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function);
-    i64 slot_count = raz_compiler_rt_arena_get(module.function_frame_slots, function);
+fn rxe_linear_scan_function(RxeModule&mut module, i64 function_index) -> bool {
+    i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function_index);
+    i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function_index);
+    i64 slot_count = raz_compiler_rt_arena_get(module.function_frame_slots, function_index);
     i64 slot_first = raz_compiler_rt_arena_create(slot_count + 1);
     i64 slot_last = raz_compiler_rt_arena_create(slot_count + 1);
     i64 slot_reg = raz_compiler_rt_arena_create(slot_count + 1);
@@ -231,7 +231,7 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
     // backward-edge heuristics. The earlier loop analysis remains a cheap
     // conservative guard for values with no materializable incoming definition.
     if (
-        !rxe_dataflow_extend_slot_intervals(module, function, slot_count, slot_first, slot_last, slot_blocked)
+        !rxe_dataflow_extend_slot_intervals(module, function_index, slot_count, slot_first, slot_last, slot_blocked)
     ) {
         raz_compiler_rt_arena_destroy(slot_first);
         raz_compiler_rt_arena_destroy(slot_last);
@@ -307,11 +307,11 @@ fn rxe_linear_scan_function(RxeModule&mut module, i64 function) -> bool {
 
 // Secondary cache promotion handles looped functions and any values that spill
 // from linear scan. Slot stores remain the canonical fallback at merge points.
-fn rxe_promote_slot_reloads(RxeModule&mut module, i64 function, i64 resident) -> bool {
+fn rxe_promote_slot_reloads(RxeModule&mut module, i64 function_index, i64 resident) -> bool {
     rxe_register_cache_clear(resident);
 
-    i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function);
-    i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function);
+    i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function_index);
+    i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function_index);
     i64 ip = start;
 
     while (ip < end) {
@@ -360,20 +360,20 @@ fn rxe_allocate_registers(RxeModule&mut module) -> bool {
         return false;
     }
 
-    i64 function = 0;
+    i64 function_index = 0;
 
-    while (function < module.function_count) {
-        if (!rxe_linear_scan_function(module, function)) {
+    while (function_index < module.function_count) {
+        if (!rxe_linear_scan_function(module, function_index)) {
             raz_compiler_rt_arena_destroy(resident);
             return false;
         }
-        if (!rxe_promote_slot_reloads(module, function, resident)) {
+        if (!rxe_promote_slot_reloads(module, function_index, resident)) {
             raz_compiler_rt_arena_destroy(resident);
             return false;
         }
 
-        i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function);
-        i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function);
+        i64 start = raz_compiler_rt_arena_get(module.function_code_starts, function_index);
+        i64 end = start + raz_compiler_rt_arena_get(module.function_code_counts, function_index);
         i64 maximum_register = 0;
         i64 ip = start;
 
@@ -402,8 +402,8 @@ fn rxe_allocate_registers(RxeModule&mut module) -> bool {
             }
             ip += 1;
         }
-        raz_compiler_rt_arena_set(module.function_register_counts, function, maximum_register + 1);
-        function += 1;
+        raz_compiler_rt_arena_set(module.function_register_counts, function_index, maximum_register + 1);
+        function_index += 1;
     }
     raz_compiler_rt_arena_destroy(resident);
     return !module.failed;

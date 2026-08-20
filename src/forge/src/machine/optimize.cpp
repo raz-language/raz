@@ -5,8 +5,10 @@
 #include "forge/machine/liveness.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1067,6 +1069,1007 @@ OptimizationStats optimize_function(Function& function, const SlpCostModel& slp_
             optimized.push_back(std::move(instruction));
         }
         block.instructions = std::move(optimized);
+    }
+
+    // Recognize straight-line in-place integer expression packs over
+    // contiguous lanes. The scalar operation must be one of the SSE2-safe
+    // lane-wise operations whose scalar source is shared by every lane:
+    // add/sub/and/or/xor for i32 or i64. Each scalar result must feed only its
+    // matching store, and the arithmetic/store groups must be adjacent so no
+    // intervening memory side effect can change aliasing semantics.
+    //
+    // This generalizes the original i64 map-add recognizer into a small SLP
+    // packer while deliberately avoiding multiplication, shifts, or floating
+    // point where target support or reassociation semantics are different.
+    {
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct ScalarLoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<ScalarLoadInfo> scalar_loads(function.register_count);
+        for (const auto& block : function.blocks) {
+            for (const auto& ins : block.instructions) {
+                for (const auto input : ins.inputs) if (input < uses.size()) ++uses[input];
+                if ((ins.opcode == Opcode::load_ptr_i32 || ins.opcode == Opcode::load_ptr_i64) &&
+                    ins.result < scalar_loads.size() && ins.inputs.size() == 1U)
+                    scalar_loads[ins.result] = {true, ins.inputs[0], ins.immediate, ins.opcode};
+            }
+        }
+        std::unordered_set<VirtualRegister> packed_scalar_loads;
+
+        const auto lane_width = [](Opcode opcode) -> std::size_t {
+            switch (opcode) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return 4U;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return 8U;
+            default: return 0U;
+            }
+        };
+        const auto matching_store = [](Opcode arithmetic) -> Opcode {
+            switch (arithmetic) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32:
+                return Opcode::store_ptr_i32;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64:
+                return Opcode::store_ptr_i64;
+            default: return Opcode::jump; // impossible sentinel for unsupported arithmetic
+            }
+        };
+
+        for (auto& block : function.blocks) {
+            auto& ins = block.instructions;
+            for (std::size_t start = 0; start < ins.size(); ++start) {
+                bool matched = false;
+                for (const std::size_t lanes : {16U, 8U, 4U, 2U}) {
+                    if (start + lanes * 2U > ins.size()) continue;
+                    const auto arithmetic_opcode = ins[start].opcode;
+                    const auto bytes = lane_width(arithmetic_opcode);
+                    if (bytes == 0U) continue;
+                    const auto store_opcode = matching_store(arithmetic_opcode);
+                    VirtualRegister base = function.register_count;
+                    VirtualRegister store_base = function.register_count;
+                    VirtualRegister scalar = function.register_count;
+                    bool legal = true;
+                    std::vector<VirtualRegister> candidate_scalar_loads;
+                    for (std::size_t lane = 0; lane < lanes; ++lane) {
+                        const auto& arithmetic = ins[start + lane];
+                        const auto& store = ins[start + lanes + lane];
+                        if (arithmetic.opcode != arithmetic_opcode || arithmetic.inputs.size() != 2U ||
+                            store.opcode != store_opcode || store.inputs.size() != 2U ||
+                            store.inputs[0] != arithmetic.result || arithmetic.result >= uses.size() ||
+                            uses[arithmetic.result] != 1U ||
+                            store.immediate != static_cast<std::int64_t>(lane * bytes)) {
+                            legal = false; break;
+                        }
+                        VirtualRegister lane_scalar = function.register_count;
+                        VirtualRegister lane_base = function.register_count;
+                        std::int64_t lane_offset = 0;
+                        VirtualRegister scalar_load_result = function.register_count;
+                        if (arithmetic.symbol == "$memptr") {
+                            lane_scalar = arithmetic.inputs[0];
+                            lane_base = arithmetic.inputs[1];
+                            lane_offset = arithmetic.immediate;
+                        } else if (arithmetic.symbol.empty() &&
+                                   (arithmetic_opcode == Opcode::sub_i32 || arithmetic_opcode == Opcode::sub_i64)) {
+                            scalar_load_result = arithmetic.inputs[0];
+                            if (scalar_load_result >= scalar_loads.size() || !scalar_loads[scalar_load_result].valid ||
+                                uses[scalar_load_result] != 1U ||
+                                scalar_loads[scalar_load_result].opcode !=
+                                    (bytes == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64)) {
+                                legal = false; break;
+                            }
+                            lane_scalar = arithmetic.inputs[1];
+                            lane_base = scalar_loads[scalar_load_result].base;
+                            lane_offset = scalar_loads[scalar_load_result].offset;
+                        } else {
+                            legal = false; break;
+                        }
+                        if (lane_offset != static_cast<std::int64_t>(lane * bytes)) { legal = false; break; }
+                        const auto lane_store_base = store.inputs[1];
+                        if (lane == 0U) {
+                            base = lane_base;
+                            store_base = lane_store_base;
+                            scalar = lane_scalar;
+                        } else if (base != lane_base || store_base != lane_store_base || scalar != lane_scalar) {
+                            legal = false; break;
+                        }
+                        if (scalar_load_result < function.register_count)
+                            candidate_scalar_loads.push_back(scalar_load_result);
+                    }
+                    if (!legal) continue;
+                    if (!slp_profitable({bytes, lanes, 1U, 1U, 1U, 2U, arithmetic_opcode,
+                                         SlpMemoryPattern::contiguous_unaligned, 1U, 0U, 1.0}, slp_cost_model, stats)) continue;
+                    packed_scalar_loads.insert(candidate_scalar_loads.begin(), candidate_scalar_loads.end());
+
+                    Instruction packed;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    const bool inplace = base == store_base;
+                    packed.opcode = bytes == 4U
+                        ? (inplace ? Opcode::binary_i32_contiguous_inplace : Opcode::binary_i32_contiguous_map)
+                        : (inplace ? Opcode::binary_i64_contiguous_inplace : Opcode::binary_i64_contiguous_map);
+                    packed.inputs = inplace ? std::vector<VirtualRegister>{base, scalar}
+                                            : std::vector<VirtualRegister>{base, store_base, scalar};
+                    packed.immediate = static_cast<std::int64_t>(lanes);
+                    packed.argument_index = static_cast<std::uint32_t>(arithmetic_opcode);
+                    ins[start] = std::move(packed);
+                    ins.erase(ins.begin() + static_cast<std::ptrdiff_t>(start + 1U),
+                              ins.begin() + static_cast<std::ptrdiff_t>(start + lanes * 2U));
+                    matched = true;
+                    break;
+                }
+                (void)matched;
+            }
+        }
+        if (!packed_scalar_loads.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& ins) {
+                    return has_result(ins.opcode) && packed_scalar_loads.contains(ins.result);
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize packed integer DAGs with shared scalar subexpressions. Unlike
+    // the postfix tree form below, this node table gives every packed value an
+    // identity so one computed vector can feed multiple parents without being
+    // recomputed. Node records are {tag,lhs,rhs} uint16 triples; source tags
+    // have bit 15 set and binary nodes reference earlier node IDs.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct LoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<LoadInfo> loads(function.register_count);
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (has_result(instruction.opcode) && instruction.result < defs.size()) defs[instruction.result] = &instruction;
+                for (const auto input : instruction.inputs) if (input < uses.size()) ++uses[input];
+                if ((instruction.opcode == Opcode::load_ptr_i32 || instruction.opcode == Opcode::load_ptr_i64) &&
+                    instruction.result < loads.size() && instruction.inputs.size() == 1U)
+                    loads[instruction.result] = {true, instruction.inputs[0], instruction.immediate, instruction.opcode};
+            }
+        }
+        const auto lane_width = [](Opcode opcode) -> std::size_t {
+            switch (opcode) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return 4U;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return 8U;
+            default: return 0U;
+            }
+        };
+        struct Node { std::uint16_t tag{}; std::uint16_t lhs{0xffffU}; std::uint16_t rhs{0xffffU}; };
+        std::unordered_set<Instruction*> erase_instructions;
+        std::unordered_set<VirtualRegister> erase_results;
+        for (auto& block : function.blocks) {
+            auto& instructions = block.instructions;
+            for (std::size_t start = 0; start < instructions.size(); ++start) {
+                for (const std::size_t lanes : {16U, 8U, 4U, 2U}) {
+                    if (start + lanes > instructions.size()) continue;
+                    const auto store_opcode = instructions[start].opcode;
+                    if (store_opcode != Opcode::store_ptr_i32 && store_opcode != Opcode::store_ptr_i64) continue;
+                    const std::size_t bytes = store_opcode == Opcode::store_ptr_i32 ? 4U : 8U;
+                    const auto load_opcode = bytes == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64;
+                    VirtualRegister destination = function.register_count;
+                    std::vector<Node> expected_nodes;
+                    std::vector<VirtualRegister> expected_sources;
+                    std::vector<Instruction*> local_erase;
+                    std::vector<VirtualRegister> local_results;
+                    bool legal = true;
+                    bool expected_shared = false;
+                    for (std::size_t lane = 0; lane < lanes && legal; ++lane) {
+                        auto& store = instructions[start + lane];
+                        const auto offset = static_cast<std::int64_t>(lane * bytes);
+                        if (store.opcode != store_opcode || store.inputs.size() != 2U || store.immediate != offset) { legal = false; break; }
+                        if (destination == function.register_count) destination = store.inputs[1];
+                        else if (destination != store.inputs[1]) { legal = false; break; }
+
+                        std::vector<Node> nodes;
+                        std::vector<VirtualRegister> sources;
+                        std::unordered_map<VirtualRegister, std::uint16_t> memo;
+                        std::unordered_map<VirtualRegister, std::uint32_t> occurrences;
+                        std::unordered_map<VirtualRegister, std::uint16_t> source_nodes;
+                        std::unordered_map<VirtualRegister, std::uint16_t> source_indices;
+                        std::vector<Instruction*> lane_erase;
+                        std::vector<VirtualRegister> lane_results;
+                        bool shared = false;
+                        std::function<std::optional<std::uint16_t>(VirtualRegister)> visit = [&](VirtualRegister value) -> std::optional<std::uint16_t> {
+                            ++occurrences[value];
+                            if (const auto it = memo.find(value); it != memo.end()) {
+                                if (value < defs.size() && defs[value] != nullptr && lane_width(defs[value]->opcode) == bytes) shared = true;
+                                return it->second;
+                            }
+                            if (value < defs.size() && defs[value] != nullptr && lane_width(defs[value]->opcode) == bytes && defs[value]->inputs.size() == 2U) {
+                                auto* operation = defs[value];
+                                const auto left = visit(operation->inputs[0]);
+                                if (!left) return std::nullopt;
+                                std::optional<std::uint16_t> right;
+                                if (operation->symbol == "$memptr") {
+                                    if (operation->immediate != offset) return std::nullopt;
+                                    const auto base = operation->inputs[1];
+                                    auto [si, inserted] = source_indices.emplace(base, static_cast<std::uint16_t>(sources.size()));
+                                    if (inserted) sources.push_back(base);
+                                    auto [sn, new_node] = source_nodes.emplace(base, static_cast<std::uint16_t>(nodes.size()));
+                                    if (new_node) nodes.push_back(Node{static_cast<std::uint16_t>(0x8000U | si->second), 0xffffU, 0xffffU});
+                                    right = sn->second;
+                                } else {
+                                    right = visit(operation->inputs[1]);
+                                    if (!right) return std::nullopt;
+                                }
+                                if (nodes.size() >= 0x7fffU) return std::nullopt;
+                                const auto id = static_cast<std::uint16_t>(nodes.size());
+                                nodes.push_back(Node{static_cast<std::uint16_t>(operation->opcode), *left, *right});
+                                memo.emplace(value, id);
+                                lane_erase.push_back(operation);
+                                lane_results.push_back(value);
+                                return id;
+                            }
+                            if (value >= loads.size() || !loads[value].valid || loads[value].opcode != load_opcode || loads[value].offset != offset)
+                                return std::nullopt;
+                            const auto base = loads[value].base;
+                            auto [si, inserted] = source_indices.emplace(base, static_cast<std::uint16_t>(sources.size()));
+                            if (inserted) sources.push_back(base);
+                            const auto id = static_cast<std::uint16_t>(nodes.size());
+                            nodes.push_back(Node{static_cast<std::uint16_t>(0x8000U | si->second), 0xffffU, 0xffffU});
+                            memo.emplace(value, id);
+                            if (defs[value] != nullptr) lane_erase.push_back(defs[value]);
+                            lane_results.push_back(value);
+                            return id;
+                        };
+                        const auto root = visit(store.inputs[0]);
+                        if (!root || *root + 1U != nodes.size() || !shared || nodes.size() < 5U) { legal = false; break; }
+                        for (const auto& [value, count] : occurrences) {
+                            if (value < uses.size() && uses[value] != count) { legal = false; break; }
+                        }
+                        if (!legal) break;
+                        if (lane == 0U) {
+                            expected_nodes = nodes;
+                            expected_sources = sources;
+                            expected_shared = shared;
+                        } else if (expected_nodes.size() != nodes.size() || expected_sources != sources || expected_shared != shared) {
+                            legal = false; break;
+                        } else {
+                            for (std::size_t n = 0; n < nodes.size(); ++n) {
+                                if (expected_nodes[n].tag != nodes[n].tag || expected_nodes[n].lhs != nodes[n].lhs || expected_nodes[n].rhs != nodes[n].rhs) {
+                                    legal = false; break;
+                                }
+                            }
+                            if (!legal) break;
+                        }
+                        local_erase.insert(local_erase.end(), lane_erase.begin(), lane_erase.end());
+                        local_results.insert(local_results.end(), lane_results.begin(), lane_results.end());
+                    }
+                    if (!legal || expected_sources.empty()) continue;
+                    if (!slp_profitable({bytes, lanes, expected_nodes.size(), expected_sources.size(), 1U, 4U, Opcode::add_i64,
+                                         SlpMemoryPattern::contiguous_unaligned, 0U, 0U,
+                                         [&] {
+                                             double sum = 0.0; std::size_t count = 0U;
+                                             for (const auto& node : expected_nodes) if ((node.tag & 0x8000U) == 0U) {
+                                                 sum += slp_operation_multiplier(static_cast<Opcode>(node.tag), slp_cost_model); ++count;
+                                             }
+                                             return count == 0U ? 1.0 : sum / static_cast<double>(count);
+                                         }()}, slp_cost_model, stats)) continue;
+                    Instruction packed;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    packed.opcode = bytes == 4U ? Opcode::binary_i32_contiguous_dag_reuse : Opcode::binary_i64_contiguous_dag_reuse;
+                    packed.inputs = expected_sources;
+                    packed.inputs.push_back(destination);
+                    packed.immediate = static_cast<std::int64_t>(lanes);
+                    packed.symbol.reserve(expected_nodes.size() * 6U);
+                    const auto append16 = [&](std::uint16_t value) {
+                        packed.symbol.push_back(static_cast<char>(value & 0xffU));
+                        packed.symbol.push_back(static_cast<char>((value >> 8U) & 0xffU));
+                    };
+                    for (const auto& node : expected_nodes) { append16(node.tag); append16(node.lhs); append16(node.rhs); }
+                    instructions[start] = std::move(packed);
+                    instructions.erase(instructions.begin() + static_cast<std::ptrdiff_t>(start + 1U),
+                                       instructions.begin() + static_cast<std::ptrdiff_t>(start + lanes));
+                    for (auto* instruction : local_erase) erase_instructions.insert(instruction);
+                    for (const auto value : local_results) erase_results.insert(value);
+                    break;
+                }
+            }
+        }
+        if (!erase_instructions.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& instruction) {
+                    return erase_instructions.contains(const_cast<Instruction*>(&instruction)) ||
+                           (has_result(instruction.opcode) && erase_results.contains(instruction.result));
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize true branching packed expression DAGs over contiguous source
+    // arrays. The scalar tree is serialized as a compact postfix program in
+    // Instruction::symbol; source leaves reference Instruction::inputs by
+    // index. This supports arbitrary binary tree shapes without a fixed depth
+    // of map2/map3/mapN pseudo-ops.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct LoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<LoadInfo> loads(function.register_count);
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (has_result(instruction.opcode) && instruction.result < defs.size()) defs[instruction.result] = &instruction;
+                for (const auto input : instruction.inputs) if (input < uses.size()) ++uses[input];
+                if ((instruction.opcode == Opcode::load_ptr_i32 || instruction.opcode == Opcode::load_ptr_i64) &&
+                    instruction.result < loads.size() && instruction.inputs.size() == 1U)
+                    loads[instruction.result] = {true, instruction.inputs[0], instruction.immediate, instruction.opcode};
+            }
+        }
+        const auto lane_width = [](Opcode opcode) -> std::size_t {
+            switch (opcode) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return 4U;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return 8U;
+            default: return 0U;
+            }
+        };
+        struct DagBuild {
+            bool legal{true};
+            bool contains_operation{};
+            bool branching{};
+            std::vector<std::uint16_t> tokens;
+            std::vector<VirtualRegister> sources;
+            std::vector<Instruction*> erase;
+            std::vector<VirtualRegister> erase_results;
+            std::size_t operation_count{};
+            std::size_t max_stack_depth{};
+        };
+        std::unordered_set<Instruction*> erase_instructions;
+        std::unordered_set<VirtualRegister> erase_results;
+        for (auto& block : function.blocks) {
+            auto& instructions = block.instructions;
+            for (std::size_t start = 0; start < instructions.size(); ++start) {
+                for (const std::size_t lanes : {16U, 8U, 4U, 2U}) {
+                    if (start + lanes > instructions.size()) continue;
+                    const auto store_opcode = instructions[start].opcode;
+                    if (store_opcode != Opcode::store_ptr_i32 && store_opcode != Opcode::store_ptr_i64) continue;
+                    const std::size_t bytes = store_opcode == Opcode::store_ptr_i32 ? 4U : 8U;
+                    const auto load_opcode = bytes == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64;
+                    VirtualRegister destination = function.register_count;
+                    std::vector<std::uint16_t> expected_tokens;
+                    std::vector<VirtualRegister> expected_sources;
+                    std::vector<Instruction*> local_erase;
+                    std::vector<VirtualRegister> local_results;
+                    bool legal = true;
+                    bool expected_branching = false;
+                    std::size_t expected_ops = 0U;
+                    std::size_t expected_max_depth = 0U;
+                    for (std::size_t lane = 0; lane < lanes && legal; ++lane) {
+                        auto& store = instructions[start + lane];
+                        const auto offset = static_cast<std::int64_t>(lane * bytes);
+                        if (store.opcode != store_opcode || store.inputs.size() != 2U || store.immediate != offset) { legal = false; break; }
+                        if (destination == function.register_count) destination = store.inputs[1];
+                        else if (destination != store.inputs[1]) { legal = false; break; }
+
+                        DagBuild build;
+                        std::unordered_map<VirtualRegister, std::uint16_t> source_indices;
+                        std::function<bool(VirtualRegister)> visit = [&](VirtualRegister value) -> bool {
+                            if (value < defs.size() && defs[value] != nullptr && uses[value] == 1U &&
+                                lane_width(defs[value]->opcode) == bytes && defs[value]->inputs.size() == 2U) {
+                                auto* operation = defs[value];
+                                const auto left = operation->inputs[0];
+                                const bool left_is_op = left < defs.size() && defs[left] != nullptr && uses[left] == 1U && lane_width(defs[left]->opcode) == bytes;
+                                if (!visit(left)) return false;
+                                bool right_is_op = false;
+                                if (operation->symbol == "$memptr") {
+                                    if (operation->immediate != offset) return false;
+                                    const auto base = operation->inputs[1];
+                                    auto [it, inserted] = source_indices.emplace(base, static_cast<std::uint16_t>(build.sources.size()));
+                                    if (inserted) build.sources.push_back(base);
+                                    build.tokens.push_back(static_cast<std::uint16_t>(0x8000U | it->second));
+                                } else {
+                                    const auto right = operation->inputs[1];
+                                    right_is_op = right < defs.size() && defs[right] != nullptr && uses[right] == 1U && lane_width(defs[right]->opcode) == bytes;
+                                    if (!visit(right)) return false;
+                                }
+                                build.tokens.push_back(static_cast<std::uint16_t>(operation->opcode));
+                                build.erase.push_back(operation);
+                                build.erase_results.push_back(operation->result);
+                                ++build.operation_count;
+                                build.contains_operation = true;
+                                if (left_is_op && right_is_op) build.branching = true;
+                                return true;
+                            }
+                            if (value >= loads.size() || !loads[value].valid || loads[value].opcode != load_opcode ||
+                                loads[value].offset != offset || uses[value] != 1U) return false;
+                            const auto base = loads[value].base;
+                            auto [it, inserted] = source_indices.emplace(base, static_cast<std::uint16_t>(build.sources.size()));
+                            if (inserted) build.sources.push_back(base);
+                            build.tokens.push_back(static_cast<std::uint16_t>(0x8000U | it->second));
+                            if (defs[value] != nullptr) build.erase.push_back(defs[value]);
+                            build.erase_results.push_back(value);
+                            return true;
+                        };
+                        const auto result = store.inputs[0];
+                        if (!visit(result) || !build.branching || build.operation_count < 3U) { legal = false; break; }
+                        std::size_t depth = 0U;
+                        for (const auto token : build.tokens) {
+                            if ((token & 0x8000U) != 0U) { ++depth; build.max_stack_depth = std::max(build.max_stack_depth, depth); }
+                            else { if (depth < 2U) { legal = false; break; } --depth; }
+                        }
+                        if (!legal || depth != 1U || build.max_stack_depth > 8U) { legal = false; break; }
+                        if (lane == 0U) {
+                            expected_tokens = build.tokens;
+                            expected_sources = build.sources;
+                            expected_branching = build.branching;
+                            expected_ops = build.operation_count;
+                            expected_max_depth = build.max_stack_depth;
+                        } else if (expected_tokens != build.tokens || expected_sources != build.sources ||
+                                   expected_branching != build.branching || expected_ops != build.operation_count ||
+                                   expected_max_depth != build.max_stack_depth) { legal = false; break; }
+                        local_erase.insert(local_erase.end(), build.erase.begin(), build.erase.end());
+                        local_results.insert(local_results.end(), build.erase_results.begin(), build.erase_results.end());
+                    }
+                    if (!legal || expected_sources.empty()) continue;
+                    if (!slp_profitable({bytes, lanes, expected_ops, expected_sources.size(), 1U, expected_max_depth, Opcode::add_i64,
+                                         SlpMemoryPattern::contiguous_unaligned, 0U, 0U,
+                                         [&] {
+                                             double sum = 0.0; std::size_t count = 0U;
+                                             for (const auto token : expected_tokens) if ((token & 0x8000U) == 0U) {
+                                                 sum += slp_operation_multiplier(static_cast<Opcode>(token), slp_cost_model); ++count;
+                                             }
+                                             return count == 0U ? 1.0 : sum / static_cast<double>(count);
+                                         }()}, slp_cost_model, stats)) continue;
+                    Instruction packed;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    packed.opcode = bytes == 4U ? Opcode::binary_i32_contiguous_dag : Opcode::binary_i64_contiguous_dag;
+                    packed.inputs = expected_sources;
+                    packed.inputs.push_back(destination);
+                    packed.immediate = static_cast<std::int64_t>(lanes);
+                    packed.symbol.reserve(expected_tokens.size() * 2U);
+                    for (const auto token : expected_tokens) {
+                        packed.symbol.push_back(static_cast<char>(token & 0xffU));
+                        packed.symbol.push_back(static_cast<char>((token >> 8U) & 0xffU));
+                    }
+                    instructions[start] = std::move(packed);
+                    instructions.erase(instructions.begin() + static_cast<std::ptrdiff_t>(start + 1U),
+                                       instructions.begin() + static_cast<std::ptrdiff_t>(start + lanes));
+                    for (auto* instruction : local_erase) erase_instructions.insert(instruction);
+                    for (const auto value : local_results) erase_results.insert(value);
+                    break;
+                }
+            }
+        }
+        if (!erase_instructions.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& instruction) {
+                    return erase_instructions.contains(const_cast<Instruction*>(&instruction)) ||
+                           (has_result(instruction.opcode) && erase_results.contains(instruction.result));
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize arbitrary-depth left-deep vector expression chains over
+    // contiguous source arrays and one contiguous destination array:
+    //
+    //     dst[i] = (((a[i] op0 b[i]) op1 c[i]) op2 d[i]) ...
+    //
+    // This deliberately requires every scalar load and intermediate to be
+    // single-use and every source to use the exact same contiguous lane
+    // offsets. The chain length is carried explicitly on the machine
+    // instruction, so this optimization has no fixed operation-count ceiling.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct LoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<LoadInfo> loads(function.register_count);
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (has_result(instruction.opcode) && instruction.result < defs.size()) defs[instruction.result] = &instruction;
+                for (const auto input : instruction.inputs) if (input < uses.size()) ++uses[input];
+                if ((instruction.opcode == Opcode::load_ptr_i32 || instruction.opcode == Opcode::load_ptr_i64) &&
+                    instruction.result < loads.size() && instruction.inputs.size() == 1U)
+                    loads[instruction.result] = {true, instruction.inputs[0], instruction.immediate, instruction.opcode};
+            }
+        }
+        const auto lane_width = [](Opcode opcode) -> std::size_t {
+            switch (opcode) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return 4U;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return 8U;
+            default: return 0U;
+            }
+        };
+        std::unordered_set<Instruction*> erase_instructions;
+        std::unordered_set<VirtualRegister> erase_results;
+        for (auto& block : function.blocks) {
+            auto& instructions = block.instructions;
+            for (std::size_t start = 0; start < instructions.size(); ++start) {
+                for (const std::size_t lanes : {16U, 8U, 4U, 2U}) {
+                    if (start + lanes > instructions.size()) continue;
+                    const auto store_opcode = instructions[start].opcode;
+                    if (store_opcode != Opcode::store_ptr_i32 && store_opcode != Opcode::store_ptr_i64) continue;
+                    const std::size_t bytes = store_opcode == Opcode::store_ptr_i32 ? 4U : 8U;
+                    const auto load_opcode = bytes == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64;
+                    VirtualRegister destination = function.register_count;
+                    std::vector<VirtualRegister> expected_sources;
+                    std::vector<Opcode> expected_operations;
+                    std::vector<Instruction*> local_erase;
+                    std::vector<VirtualRegister> local_results;
+                    bool legal = true;
+                    for (std::size_t lane = 0; lane < lanes && legal; ++lane) {
+                        auto& store = instructions[start + lane];
+                        const auto offset = static_cast<std::int64_t>(lane * bytes);
+                        if (store.opcode != store_opcode || store.inputs.size() != 2U || store.immediate != offset) { legal = false; break; }
+                        if (destination == function.register_count) destination = store.inputs[1];
+                        else if (destination != store.inputs[1]) { legal = false; break; }
+                        auto result = store.inputs[0];
+                        if (result >= defs.size() || defs[result] == nullptr || uses[result] != 1U) { legal = false; break; }
+
+                        std::vector<Opcode> reversed_operations;
+                        std::vector<VirtualRegister> reversed_right_sources;
+                        std::vector<Instruction*> lane_erase;
+                        std::vector<VirtualRegister> lane_results;
+                        VirtualRegister first_source = function.register_count;
+                        auto* operation = defs[result];
+                        while (operation != nullptr && lane_width(operation->opcode) == bytes && operation->inputs.size() == 2U) {
+                            reversed_operations.push_back(operation->opcode);
+                            lane_erase.push_back(operation);
+                            lane_results.push_back(operation->result);
+
+                            VirtualRegister right_base = function.register_count;
+                            if (operation->symbol == "$memptr") {
+                                if (operation->immediate != offset) { legal = false; break; }
+                                right_base = operation->inputs[1];
+                            } else {
+                                const auto right = operation->inputs[1];
+                                if (right >= loads.size() || !loads[right].valid || loads[right].opcode != load_opcode ||
+                                    loads[right].offset != offset || uses[right] != 1U) { legal = false; break; }
+                                right_base = loads[right].base;
+                                if (defs[right] != nullptr) lane_erase.push_back(defs[right]);
+                                lane_results.push_back(right);
+                            }
+                            reversed_right_sources.push_back(right_base);
+
+                            const auto left = operation->inputs[0];
+                            if (left < defs.size() && defs[left] != nullptr && lane_width(defs[left]->opcode) == bytes && uses[left] == 1U) {
+                                operation = defs[left];
+                                continue;
+                            }
+                            if (left >= loads.size() || !loads[left].valid || loads[left].opcode != load_opcode ||
+                                loads[left].offset != offset || uses[left] != 1U) { legal = false; break; }
+                            first_source = loads[left].base;
+                            if (defs[left] != nullptr) lane_erase.push_back(defs[left]);
+                            lane_results.push_back(left);
+                            operation = nullptr;
+                        }
+                        if (!legal || first_source == function.register_count || reversed_operations.size() < 3U) { legal = false; break; }
+
+                        std::reverse(reversed_operations.begin(), reversed_operations.end());
+                        std::reverse(reversed_right_sources.begin(), reversed_right_sources.end());
+                        std::vector<VirtualRegister> lane_sources;
+                        lane_sources.reserve(reversed_right_sources.size() + 1U);
+                        lane_sources.push_back(first_source);
+                        lane_sources.insert(lane_sources.end(), reversed_right_sources.begin(), reversed_right_sources.end());
+                        if (lane == 0U) {
+                            expected_operations = reversed_operations;
+                            expected_sources = lane_sources;
+                        } else if (expected_operations != reversed_operations || expected_sources != lane_sources) {
+                            legal = false; break;
+                        }
+                        local_erase.insert(local_erase.end(), lane_erase.begin(), lane_erase.end());
+                        local_results.insert(local_results.end(), lane_results.begin(), lane_results.end());
+                    }
+                    if (!legal || expected_operations.size() < 3U || destination == function.register_count) continue;
+                    if (!slp_profitable({bytes, lanes, expected_operations.size(), expected_sources.size(), 1U, 3U,
+                                         expected_operations.empty() ? Opcode::add_i64 : expected_operations.front(),
+                                         SlpMemoryPattern::contiguous_unaligned, 0U, 0U,
+                                         [&] {
+                                             if (expected_operations.empty()) return 1.0;
+                                             const auto base = slp_operation_multiplier(expected_operations.front(), slp_cost_model);
+                                             double sum = 0.0;
+                                             for (const auto op : expected_operations) sum += slp_operation_multiplier(op, slp_cost_model);
+                                             return sum / (static_cast<double>(expected_operations.size()) * base);
+                                         }()}, slp_cost_model, stats)) continue;
+
+                    Instruction packed;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    packed.opcode = bytes == 4U ? Opcode::binary_i32_contiguous_chain : Opcode::binary_i64_contiguous_chain;
+                    packed.inputs = expected_sources;
+                    packed.inputs.push_back(destination);
+                    packed.immediate = static_cast<std::int64_t>(lanes);
+                    packed.symbol.clear();
+                    packed.symbol.reserve(expected_operations.size() * 2U);
+                    for (const auto operation : expected_operations) {
+                        const auto encoded = static_cast<std::uint32_t>(operation);
+                        packed.symbol.push_back(static_cast<char>(encoded & 0xffU));
+                        packed.symbol.push_back(static_cast<char>((encoded >> 8U) & 0xffU));
+                    }
+                    instructions[start] = std::move(packed);
+                    for (std::size_t lane = 1U; lane < lanes; ++lane) erase_instructions.insert(&instructions[start + lane]);
+                    for (auto* instruction : local_erase) erase_instructions.insert(instruction);
+                    for (const auto value : local_results) erase_results.insert(value);
+                    break;
+                }
+            }
+        }
+        if (!erase_instructions.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& instruction) {
+                    return erase_instructions.contains(const_cast<Instruction*>(&instruction)) ||
+                           (has_result(instruction.opcode) && erase_results.contains(instruction.result));
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize two-stage vector expression chains over three contiguous
+    // source arrays and one destination array:
+    //
+    //     dst[i] = (a[i] op1 b[i]) op2 c[i]
+    //
+    // The intermediate is kept entirely in the packed register domain. Both
+    // operations are ordered lane-wise ADD/SUB/AND/OR/XOR for i32/i64.
+    // Every scalar load/intermediate/final result must be single-use and the
+    // destination stores must form one exact contiguous group.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct LoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<LoadInfo> loads(function.register_count);
+        for (auto& b : function.blocks) for (auto& x : b.instructions) {
+            if (has_result(x.opcode) && x.result < defs.size()) defs[x.result] = &x;
+            for (auto r : x.inputs) if (r < uses.size()) ++uses[r];
+            if ((x.opcode == Opcode::load_ptr_i32 || x.opcode == Opcode::load_ptr_i64) && x.result < loads.size() && x.inputs.size()==1U)
+                loads[x.result] = {true, x.inputs[0], x.immediate, x.opcode};
+        }
+        const auto lane_width=[](Opcode op)->std::size_t {
+            switch(op){case Opcode::add_i32:case Opcode::sub_i32:case Opcode::and_i32:case Opcode::or_i32:case Opcode::xor_i32:return 4U;
+            case Opcode::add_i64:case Opcode::sub_i64:case Opcode::and_i64:case Opcode::or_i64:case Opcode::xor_i64:return 8U;default:return 0U;}
+        };
+        std::unordered_set<Instruction*> erase_ins;
+        std::unordered_set<VirtualRegister> erase_results;
+        for (auto& b : function.blocks) {
+            auto& v=b.instructions;
+            for(std::size_t start=0; start<v.size(); ++start){
+                for(std::size_t lanes: {16U,8U,4U,2U}){
+                    if(start+lanes>v.size()) continue;
+                    Opcode storeop=v[start].opcode;
+                    if(storeop!=Opcode::store_ptr_i32 && storeop!=Opcode::store_ptr_i64) continue;
+                    const std::size_t bytes=storeop==Opcode::store_ptr_i32?4U:8U;
+                    const Opcode loadop=bytes==4U?Opcode::load_ptr_i32:Opcode::load_ptr_i64;
+                    VirtualRegister abase=function.register_count,bbase=function.register_count,cbase=function.register_count,dst=function.register_count;
+                    Opcode op1=Opcode::jump,op2=Opcode::jump; bool legal=true;
+                    std::vector<Instruction*> local_erase;
+                    std::vector<VirtualRegister> local_results;
+                    auto decode_load=[&](Instruction* op, std::size_t input_index, std::int64_t off, VirtualRegister& base, std::vector<Instruction*>& ei, std::vector<VirtualRegister>& er)->bool{
+                        if(input_index>=op->inputs.size()) return false;
+                        auto r=op->inputs[input_index];
+                        if(r>=loads.size()||!loads[r].valid||loads[r].opcode!=loadop||loads[r].offset!=off||uses[r]!=1U) return false;
+                        if(base==function.register_count) base=loads[r].base; else if(base!=loads[r].base) return false;
+                        if (defs[r]) ei.push_back(defs[r]);
+                        er.push_back(r);
+                        return true;
+                    };
+                    for(std::size_t lane=0; lane<lanes && legal; ++lane){
+                        auto& st=v[start+lane]; const auto off=static_cast<std::int64_t>(lane*bytes);
+                        if(st.opcode!=storeop||st.inputs.size()!=2U||st.immediate!=off){legal=false;break;}
+                        if(dst==function.register_count) dst=st.inputs[1]; else if(dst!=st.inputs[1]){legal=false;break;}
+                        auto finalr=st.inputs[0]; if(finalr>=defs.size()||!defs[finalr]||uses[finalr]!=1U){legal=false;break;}
+                        auto* second=defs[finalr]; auto w2=lane_width(second->opcode); if(w2!=bytes||second->inputs.size()!=2U){legal=false;break;}
+                        if(lane==0)op2=second->opcode; else if(op2!=second->opcode){legal=false;break;}
+                        Instruction* first=nullptr;
+                        // Prefer the non-memory first operand as the intermediate.
+                        auto mid=second->inputs[0];
+                        if(mid<defs.size()) first=defs[mid];
+                        if(!first||lane_width(first->opcode)!=bytes||uses[mid]!=1U){legal=false;break;}
+                        if(lane==0)op1=first->opcode; else if(op1!=first->opcode){legal=false;break;}
+                        if(first->inputs.size()!=2U){legal=false;break;}
+                        // op1: A plus B, allowing B to have been folded as $memptr.
+                        if(!decode_load(first,0,off,abase,local_erase,local_results)){legal=false;break;}
+                        if(first->symbol=="$memptr") { if(first->immediate!=off){legal=false;break;} auto bb=first->inputs[1]; if(bbase==function.register_count)bbase=bb; else if(bbase!=bb){legal=false;break;} }
+                        else if(!decode_load(first,1,off,bbase,local_erase,local_results)){legal=false;break;}
+                        // op2: intermediate plus C, allowing C as $memptr.
+                        if(second->symbol=="$memptr") { if(second->immediate!=off){legal=false;break;} auto cb=second->inputs[1]; if(cbase==function.register_count)cbase=cb; else if(cbase!=cb){legal=false;break;} }
+                        else if(!decode_load(second,1,off,cbase,local_erase,local_results)){legal=false;break;}
+                        local_erase.push_back(first); local_erase.push_back(second); local_results.push_back(mid); local_results.push_back(finalr);
+                    }
+                    if(!legal||abase==function.register_count||bbase==function.register_count||cbase==function.register_count||dst==function.register_count) continue;
+                    if (!slp_profitable({bytes, lanes, 2U, 3U, 1U, 4U, op1,
+                                         SlpMemoryPattern::contiguous_unaligned, 0U, 0U,
+                                         (slp_operation_multiplier(op1, slp_cost_model) + slp_operation_multiplier(op2, slp_cost_model)) /
+                                             (2.0 * slp_operation_multiplier(op1, slp_cost_model))}, slp_cost_model, stats)) continue;
+                    Instruction packed; packed.opcode=bytes==4U?Opcode::binary_i32_contiguous_map3:Opcode::binary_i64_contiguous_map3;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    packed.inputs={abase,bbase,cbase,dst}; packed.immediate=static_cast<std::int64_t>(lanes);
+                    packed.argument_index=(static_cast<std::uint32_t>(op1)&0xffffU)|((static_cast<std::uint32_t>(op2)&0xffffU)<<16U);
+                    v[start]=std::move(packed);
+                    for(std::size_t lane=1;lane<lanes;++lane) erase_ins.insert(&v[start+lane]);
+                    for (auto* x : local_erase) erase_ins.insert(x);
+                    for (auto r : local_results) erase_results.insert(r);
+                    break;
+                }
+            }
+        }
+        if(!erase_ins.empty()) for(auto& b:function.blocks){ auto& v=b.instructions; v.erase(std::remove_if(v.begin(),v.end(),[&](Instruction const& x){return erase_ins.contains(const_cast<Instruction*>(&x)) || (has_result(x.opcode)&&erase_results.contains(x.result));}),v.end()); }
+    }
+
+    // Recognize vector-to-vector integer SLP maps over two contiguous
+    // source arrays and one contiguous destination array:
+    //
+    //     dst[i] = lhs[i] op rhs[i]
+    //
+    // The operation is lane-wise ADD/SUB/AND/OR/XOR for i32/i64. Every
+    // scalar load and arithmetic result must be single-use, offsets must be
+    // exact and contiguous, and arithmetic/store groups must be adjacent.
+    // This preserves scalar alias/ordering semantics while allowing the x86
+    // backend to issue true vector-to-vector SSE2 operations.
+    {
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        struct ScalarLoadInfo { bool valid{}; VirtualRegister base{}; std::int64_t offset{}; Opcode opcode{}; };
+        std::vector<ScalarLoadInfo> scalar_loads(function.register_count);
+        for (const auto& block : function.blocks) {
+            for (const auto& ins : block.instructions) {
+                for (const auto input : ins.inputs) if (input < uses.size()) ++uses[input];
+                if ((ins.opcode == Opcode::load_ptr_i32 || ins.opcode == Opcode::load_ptr_i64) &&
+                    ins.result < scalar_loads.size() && ins.inputs.size() == 1U)
+                    scalar_loads[ins.result] = {true, ins.inputs[0], ins.immediate, ins.opcode};
+            }
+        }
+        std::unordered_set<VirtualRegister> erased_loads;
+        const auto lane_width = [](Opcode opcode) -> std::size_t {
+            switch (opcode) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return 4U;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return 8U;
+            default: return 0U;
+            }
+        };
+        const auto matching_store = [](Opcode arithmetic) -> Opcode {
+            switch (arithmetic) {
+            case Opcode::add_i32: case Opcode::sub_i32: case Opcode::and_i32: case Opcode::or_i32: case Opcode::xor_i32: return Opcode::store_ptr_i32;
+            case Opcode::add_i64: case Opcode::sub_i64: case Opcode::and_i64: case Opcode::or_i64: case Opcode::xor_i64: return Opcode::store_ptr_i64;
+            default: return Opcode::jump;
+            }
+        };
+        for (auto& block : function.blocks) {
+            auto& ins = block.instructions;
+            for (std::size_t start = 0; start < ins.size(); ++start) {
+                for (const std::size_t lanes : {16U, 8U, 4U, 2U}) {
+                    if (start + lanes * 2U > ins.size()) continue;
+                    const auto arithmetic_opcode = ins[start].opcode;
+                    const auto bytes = lane_width(arithmetic_opcode);
+                    if (bytes == 0U) continue;
+                    const auto load_opcode = bytes == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64;
+                    const auto store_opcode = matching_store(arithmetic_opcode);
+                    VirtualRegister lhs_base = function.register_count;
+                    VirtualRegister rhs_base = function.register_count;
+                    VirtualRegister dst_base = function.register_count;
+                    bool legal = true;
+                    std::vector<VirtualRegister> candidate_loads;
+                    for (std::size_t lane = 0; lane < lanes; ++lane) {
+                        const auto& arithmetic = ins[start + lane];
+                        const auto& store = ins[start + lanes + lane];
+                        if (arithmetic.opcode != arithmetic_opcode || arithmetic.inputs.size() != 2U ||
+                            store.opcode != store_opcode || store.inputs.size() != 2U ||
+                            store.inputs[0] != arithmetic.result || arithmetic.result >= uses.size() ||
+                            uses[arithmetic.result] != 1U ||
+                            store.immediate != static_cast<std::int64_t>(lane * bytes)) {
+                            legal = false; break;
+                        }
+                        VirtualRegister lane_lhs_base = function.register_count;
+                        VirtualRegister lane_rhs_base = function.register_count;
+                        VirtualRegister lhs_load = function.register_count;
+                        VirtualRegister rhs_load = function.register_count;
+                        const auto expected_offset = static_cast<std::int64_t>(lane * bytes);
+                        if (arithmetic.symbol == "$memptr") {
+                            // Existing scalar memory folding leaves the first
+                            // array as a scalar load and encodes the second
+                            // directly as [base+offset].
+                            lhs_load = arithmetic.inputs[0];
+                            if (lhs_load >= scalar_loads.size() || !scalar_loads[lhs_load].valid ||
+                                scalar_loads[lhs_load].opcode != load_opcode || uses[lhs_load] != 1U ||
+                                scalar_loads[lhs_load].offset != expected_offset || arithmetic.immediate != expected_offset) {
+                                legal = false; break;
+                            }
+                            lane_lhs_base = scalar_loads[lhs_load].base;
+                            lane_rhs_base = arithmetic.inputs[1];
+                        } else if (arithmetic.symbol.empty()) {
+                            lhs_load = arithmetic.inputs[0];
+                            rhs_load = arithmetic.inputs[1];
+                            if (lhs_load >= scalar_loads.size() || rhs_load >= scalar_loads.size() ||
+                                !scalar_loads[lhs_load].valid || !scalar_loads[rhs_load].valid ||
+                                scalar_loads[lhs_load].opcode != load_opcode || scalar_loads[rhs_load].opcode != load_opcode ||
+                                uses[lhs_load] != 1U || uses[rhs_load] != 1U ||
+                                scalar_loads[lhs_load].offset != expected_offset || scalar_loads[rhs_load].offset != expected_offset) {
+                                legal = false; break;
+                            }
+                            lane_lhs_base = scalar_loads[lhs_load].base;
+                            lane_rhs_base = scalar_loads[rhs_load].base;
+                        } else {
+                            legal = false; break;
+                        }
+                        if (lane == 0U) {
+                            lhs_base = lane_lhs_base;
+                            rhs_base = lane_rhs_base;
+                            dst_base = store.inputs[1];
+                        } else if (lhs_base != lane_lhs_base || rhs_base != lane_rhs_base || dst_base != store.inputs[1]) {
+                            legal = false; break;
+                        }
+                        candidate_loads.push_back(lhs_load);
+                        if (rhs_load < function.register_count) candidate_loads.push_back(rhs_load);
+                    }
+                    if (!legal || lhs_base == function.register_count || rhs_base == function.register_count || dst_base == function.register_count)
+                        continue;
+                    if (!slp_profitable({bytes, lanes, 1U, 2U, 1U, 3U, arithmetic_opcode,
+                                         SlpMemoryPattern::contiguous_unaligned, 0U, 0U, 1.0}, slp_cost_model, stats)) continue;
+                    erased_loads.insert(candidate_loads.begin(), candidate_loads.end());
+                    Instruction packed;
+                    packed.vector_bits = slp_selected_vector_bits(bytes, lanes, slp_cost_model);
+                    packed.opcode = bytes == 4U ? Opcode::binary_i32_contiguous_map2 : Opcode::binary_i64_contiguous_map2;
+                    packed.inputs = {lhs_base, rhs_base, dst_base};
+                    packed.immediate = static_cast<std::int64_t>(lanes);
+                    packed.argument_index = static_cast<std::uint32_t>(arithmetic_opcode);
+                    ins[start] = std::move(packed);
+                    ins.erase(ins.begin() + static_cast<std::ptrdiff_t>(start + 1U),
+                              ins.begin() + static_cast<std::ptrdiff_t>(start + lanes * 2U));
+                    break;
+                }
+            }
+        }
+        if (!erased_loads.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& ins) {
+                    return has_result(ins.opcode) && erased_loads.contains(ins.result);
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize straight-line i32 addition reductions over contiguous
+    // 4-byte loads. Like the i64 SLP path below, this is legality-first and
+    // only fires for exact single-use reduction trees with one common base.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        for (auto& block : function.blocks) {
+            for (auto& ins : block.instructions) {
+                if (has_result(ins.opcode) && ins.result < defs.size()) defs[ins.result] = &ins;
+                for (auto input : ins.inputs) if (input < uses.size()) ++uses[input];
+            }
+        }
+
+        struct ReductionLeaf { VirtualRegister base{}; std::int64_t offset{}; };
+        std::unordered_set<VirtualRegister> slp_erased_results;
+        for (auto& block : function.blocks) {
+            for (auto& ret : block.instructions) {
+                if (ret.opcode != Opcode::return_i32 || ret.inputs.size() != 1U) continue;
+                const auto root = ret.inputs.front();
+                std::vector<ReductionLeaf> leaves;
+                std::vector<VirtualRegister> visited;
+                const auto collect = [&](auto&& self, VirtualRegister reg) -> bool {
+                    if (reg >= defs.size() || defs[reg] == nullptr) return false;
+                    auto* def = defs[reg];
+                    if (def->opcode == Opcode::load_ptr_i32 && def->inputs.size() == 1U) {
+                        leaves.push_back({def->inputs[0], def->immediate});
+                        visited.push_back(reg);
+                        return true;
+                    }
+                    if (def->opcode != Opcode::add_i32 || uses[reg] != 1U) return false;
+                    if (def->symbol == "$memptr") {
+                        if (def->inputs.size() != 2U) return false;
+                        if (!self(self, def->inputs[0])) return false;
+                        leaves.push_back({def->inputs[1], def->immediate});
+                        visited.push_back(reg);
+                        return true;
+                    }
+                    if (!def->symbol.empty() || def->inputs.size() != 2U) return false;
+                    if (!self(self, def->inputs[0]) || !self(self, def->inputs[1])) return false;
+                    visited.push_back(reg);
+                    return true;
+                };
+                if (!collect(collect, root)) continue;
+                if (leaves.size() < 4U || leaves.size() > 32U || (leaves.size() & (leaves.size() - 1U)) != 0U) continue;
+                const auto base = leaves.front().base;
+                bool legal = true;
+                std::vector<std::int64_t> offsets; offsets.reserve(leaves.size());
+                for (const auto& leaf : leaves) {
+                    if (leaf.base != base) { legal = false; break; }
+                    offsets.push_back(leaf.offset);
+                }
+                if (!legal) continue;
+                std::sort(offsets.begin(), offsets.end());
+                for (std::size_t i = 0; i < offsets.size(); ++i)
+                    if (offsets[i] != static_cast<std::int64_t>(i * 4U)) { legal = false; break; }
+                if (!legal) continue;
+
+                auto* root_def = defs[root];
+                root_def->opcode = Opcode::reduce_add_i32_contiguous;
+                root_def->inputs = {base};
+                root_def->immediate = static_cast<std::int64_t>(leaves.size());
+                root_def->symbol.clear();
+                for (const auto reg : visited) if (reg != root) slp_erased_results.insert(reg);
+                break;
+            }
+        }
+        if (!slp_erased_results.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& ins) {
+                    return has_result(ins.opcode) && slp_erased_results.contains(ins.result);
+                }), instructions.end());
+            }
+        }
+    }
+
+    // Recognize a straight-line i64 addition reduction whose leaves are
+    // contiguous 8-byte loads from the same base pointer. Represent it as a
+    // single machine pseudo-op so the target encoder can use packed SSE2
+    // loads/adds without introducing vector types into the public Forge IR.
+    // This is deliberately legality-first: all reduction nodes must be
+    // single-use, every leaf must be a plain pointer load, and offsets must
+    // form an exact 0,8,... sequence.
+    {
+        std::vector<Instruction*> defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> uses(function.register_count, 0U);
+        for (auto& block : function.blocks) {
+            for (auto& ins : block.instructions) {
+                if (has_result(ins.opcode) && ins.result < defs.size()) defs[ins.result] = &ins;
+                for (auto input : ins.inputs) if (input < uses.size()) ++uses[input];
+            }
+        }
+
+        struct ReductionLeaf { VirtualRegister base{}; std::int64_t offset{}; };
+        std::unordered_set<VirtualRegister> slp_erased_results;
+        for (auto& block : function.blocks) {
+            for (auto& ret : block.instructions) {
+                if (ret.opcode != Opcode::return_i64 || ret.inputs.size() != 1U) continue;
+                const auto root = ret.inputs.front();
+                std::vector<ReductionLeaf> leaves;
+                std::vector<VirtualRegister> visited;
+                const auto collect = [&](auto&& self, VirtualRegister reg) -> bool {
+                    if (reg >= defs.size() || defs[reg] == nullptr) return false;
+                    auto* def = defs[reg];
+                    if (def->opcode == Opcode::load_ptr_i64 && def->inputs.size() == 1U) {
+                        leaves.push_back({def->inputs[0], def->immediate});
+                        visited.push_back(reg);
+                        return true;
+                    }
+                    if (def->opcode != Opcode::add_i64 || uses[reg] != 1U) return false;
+                    if (def->symbol == "$memptr") {
+                        if (def->inputs.size() != 2U) return false;
+                        if (!self(self, def->inputs[0])) return false;
+                        leaves.push_back({def->inputs[1], def->immediate});
+                        visited.push_back(reg);
+                        return true;
+                    }
+                    if (!def->symbol.empty() || def->inputs.size() != 2U) return false;
+                    if (!self(self, def->inputs[0]) || !self(self, def->inputs[1])) return false;
+                    visited.push_back(reg);
+                    return true;
+                };
+                if (!collect(collect, root)) continue;
+                if (leaves.size() < 4U || leaves.size() > 16U || (leaves.size() & (leaves.size() - 1U)) != 0U) continue;
+                const auto base = leaves.front().base;
+                bool legal = true;
+                std::vector<std::int64_t> offsets; offsets.reserve(leaves.size());
+                for (const auto& leaf : leaves) {
+                    if (leaf.base != base) { legal = false; break; }
+                    offsets.push_back(leaf.offset);
+                }
+                if (!legal) continue;
+                std::sort(offsets.begin(), offsets.end());
+                for (std::size_t i = 0; i < offsets.size(); ++i)
+                    if (offsets[i] != static_cast<std::int64_t>(i * 8U)) { legal = false; break; }
+                if (!legal) continue;
+
+                auto* root_def = defs[root];
+                root_def->opcode = Opcode::reduce_add_i64_contiguous;
+                root_def->inputs = {base};
+                root_def->immediate = static_cast<std::int64_t>(leaves.size());
+                root_def->symbol.clear();
+                for (const auto reg : visited) if (reg != root) slp_erased_results.insert(reg);
+                break;
+            }
+        }
+        if (!slp_erased_results.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& ins) {
+                    return has_result(ins.opcode) && slp_erased_results.contains(ins.result);
+                }), instructions.end());
+            }
+        }
     }
 
     // Global machine dead-code elimination. Machine IR is SSA here, so a

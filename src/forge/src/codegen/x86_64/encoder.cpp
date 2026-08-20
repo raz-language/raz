@@ -290,7 +290,7 @@ void emit_mask_lane_count(Buffer& out, MaskRegister destination, std::uint8_t la
     out.byte(0x41); out.byte(0x5B);                 // pop r11
 }
 
-void emit_vzeroupper(Buffer& out) {
+[[maybe_unused]] void emit_vzeroupper(Buffer& out) {
     out.byte(0xC5); out.byte(0xF8); out.byte(0x77);
 }
 void emit_packed_ptr_load(Buffer& out, XmmRegister destination, Register pointer, std::int32_t displacement, std::int32_t bytes) {
@@ -400,7 +400,7 @@ void emit_movq_xmm_to_gpr(Buffer& out, Register destination, XmmRegister source)
     emit_modrm(out, 3, src, dst);
 }
 
-void emit_sse_rip_load_placeholder(Buffer& out, XmmRegister destination, bool wide) {
+[[maybe_unused]] void emit_sse_rip_load_placeholder(Buffer& out, XmmRegister destination, bool wide) {
     const auto dst = static_cast<std::uint8_t>(destination);
     out.byte(wide ? 0xF2 : 0xF3);
     if (dst >= 8U) out.byte(0x44);
@@ -409,7 +409,7 @@ void emit_sse_rip_load_placeholder(Buffer& out, XmmRegister destination, bool wi
     out.i32(0);
 }
 
-void emit_sse_binary_ptr(Buffer& out, XmmRegister destination, Register pointer, bool wide,
+[[maybe_unused]] void emit_sse_binary_ptr(Buffer& out, XmmRegister destination, Register pointer, bool wide,
                          std::uint8_t opcode, std::int32_t displacement = 0) {
     const auto dst = static_cast<std::uint8_t>(destination);
     const auto ptr = static_cast<std::uint8_t>(pointer);

@@ -67,6 +67,11 @@ public:
     std::string name() const override { return "licm"; }
     pass::PassResult run(ir::Function&, analysis::FunctionAnalysisManager&) override;
 };
+class LoopInvariantGuardHoistingPass final : public pass::FunctionPass {
+public:
+    std::string name() const override { return "loop-invariant-guard-hoisting"; }
+    pass::PassResult run(ir::Function&, analysis::FunctionAnalysisManager&) override;
+};
 class DeadCodeEliminationPass final : public pass::FunctionPass {
 public:
     std::string name() const override { return "dce"; }
@@ -80,6 +85,11 @@ public:
 class MergeParameterSimplificationPass final : public pass::FunctionPass {
 public:
     std::string name() const override { return "merge-parameter-simplification"; }
+    pass::PassResult run(ir::Function&, analysis::FunctionAnalysisManager&) override;
+};
+class BranchThreadingPass final : public pass::FunctionPass {
+public:
+    std::string name() const override { return "branch-threading"; }
     pass::PassResult run(ir::Function&, analysis::FunctionAnalysisManager&) override;
 };
 class SimplifyCFGPass final : public pass::FunctionPass {

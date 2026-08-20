@@ -12,6 +12,8 @@ raz doctor
 raz backends
 raz targets
 raz diagnostics
+raz bindgen <header.h> [--target-abi=windows|unix] [output.rz]
+raz c-header <source.rz|directory> [output.h]
 ```
 
 `raz doctor` can run outside a project. It checks the host architecture, native linker driver, and Raz driver location. When a project path is supplied (or a project is discovered), it also validates the package entry/modules and writes `target/doctor/doctor.json`.
@@ -53,12 +55,30 @@ These apply to `build`, `run`, `check`, `test`, and `lint` unless noted.
 `raz run` builds the package, links a native executable, runs it, and exits with
 the program's status.
 
-> **Known limitation.** Forwarding program arguments with `raz run -- <args>` is
-> implemented in the bootstrap driver but not yet in the shipped compiler, which
-> rejects `--`. Until that lands, a program that needs arguments should be run
-> directly from `target/<profile>/`.
+`raz run` forwards every argument after an exact `--` separator directly to the
+linked program without invoking a shell:
+
+```text
+raz run -- config.toml --port 8080
+raz run --release -- --help
+```
+
+The separator and following values are not parsed as Raz options, so program
+arguments that begin with `-` are preserved exactly. Direct-source interpreter
+runs (`raz run file.rz`) do not create a child process and therefore reject a
+post-separator argv; use a package/native run when the program needs arguments.
 
 For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug artifacts go to `target/debug/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/<package>`. The Forge object used for native linking is kept under `target/<profile>/native/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
+
+
+## C interoperability
+
+```text
+raz bindgen <header.h> [--target-abi=windows|unix] [output.rz]
+raz c-header <source.rz|directory> [output.h]
+```
+
+`raz bindgen` translates the supported C ABI declaration subset directly into Raz without requiring libclang. Windows mode uses the x64 LLP64 data model; Unix mode uses the x86-64 LP64 model. If no output path is supplied, generated Raz source is written to stdout. `raz c-header` performs the reverse direction for explicit `@repr(C) public` aggregates and `@abi(C) public fn` exports; it accepts one source file or recursively combines a package/directory tree, excluding generated build state. Callback parameters are emitted as native C function-pointer declarators. Normal Raz public APIs are deliberately omitted. If no header path is supplied, it writes to stdout. See [C interoperability](C-INTEROPERABILITY.md) for the supported declaration surface and ABI limitations.
 
 ## Backend commands
 
@@ -316,6 +336,7 @@ backend    D4000-D4999
 
 ```text
 raz diagnostics
+raz bindgen <header.h> [--target-abi=windows|unix] [output.rz]
 raz diagnostics --diagnostic-format json
 ```
 

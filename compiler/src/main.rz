@@ -45,33 +45,37 @@ fn main() -> i64 {
     if (razup_invoked()) {
         return razup_command(process_argc);
     }
-    if (process_argc > 32) {
+
+    i64 cli_command = cli_detect_command(process_argc);
+    i64 cli_argc = 0;
+    i64 first_program_argument = 0;
+
+    if (
+        !cli_prepare_argument_partition(process_argc, cli_command, &mut cli_argc, &mut first_program_argument)
+    ) {
         cli_print_invalid_arguments();
         return 2;
     }
-
-    i64 cli_command = cli_detect_command(process_argc);
-
     if (
         cli_command == 0 &&
-        !cli_argument_starts_with_dash_at(process_argc, 1) &&
-        !cli_argument_looks_like_path(process_argc, 1)
+        !cli_argument_starts_with_dash_at(cli_argc, 1) &&
+        !cli_argument_looks_like_path(cli_argc, 1)
     ) {
-        cli_print_unknown_command_at(process_argc, 1);
+        cli_print_unknown_command_at(cli_argc, 1);
         return 2;
     }
     if (cli_command == 1) {
-        if (process_argc > 3) {
+        if (cli_argc > 3) {
             cli_print_invalid_arguments();
             return 2;
         }
 
-        i64 topic = cli_help_topic(process_argc);
+        i64 topic = cli_help_topic(cli_argc);
 
         if (topic > 0) {
             cli_print_command_help(topic);
-        } else if (process_argc > 2) {
-            cli_print_unknown_command_at(process_argc, 2);
+        } else if (cli_argc > 2) {
+            cli_print_unknown_command_at(cli_argc, 2);
             return 2;
         } else {
             cli_print_general_help();
@@ -79,20 +83,20 @@ fn main() -> i64 {
         return 0;
     }
     if (cli_command == 2) {
-        if (process_argc != 2) {
+        if (cli_argc != 2) {
             cli_print_invalid_arguments();
             return 2;
         }
         cli_print_version();
         return 0;
     }
-    if (cli_command_help_requested(process_argc, cli_command)) {
+    if (cli_command_help_requested(cli_argc, cli_command)) {
         cli_print_command_help(cli_command);
         return 0;
     }
 
     bool auxiliary_handled = false;
-    i64 auxiliary_status = driver_command_dispatch(process_argc, cli_command, &mut auxiliary_handled);
+    i64 auxiliary_status = driver_command_dispatch(cli_argc, cli_command, &mut auxiliary_handled);
 
     if (auxiliary_handled) {
         return auxiliary_status;
@@ -130,25 +134,10 @@ fn main() -> i64 {
 
     llvm_target_options_init(&mut llvm_options);
 
-    i64 argument_base = 1;
-
-    if (cli_command >= 3 && cli_command <= 6) {
-        argument_base = 2;
-    }
-    if (
-        cli_command == 10 ||
-        cli_command == 11 ||
-        cli_command == 12 ||
-        cli_command == 16 ||
-        cli_command == 17 ||
-        cli_command == 40
-    ) {
-        argument_base = 2;
-    }
-
+    i64 argument_base = cli_command_argument_base(cli_command);
     bool scanning_options = true;
 
-    while (scanning_options && argument_base < process_argc) {
+    while (scanning_options && argument_base < cli_argc) {
         i64 option_argument = raz_compiler_rt_arena_create(4096);
 
         if (option_argument == 0) {
@@ -252,7 +241,7 @@ fn main() -> i64 {
         return 2;
     }
 
-    i64 remaining_argc = process_argc - argument_base;
+    i64 remaining_argc = cli_argc - argument_base;
 
     if (remaining_argc > 2) {
         cli_print_invalid_arguments();
@@ -275,7 +264,7 @@ fn main() -> i64 {
     i64 cli_output_path = 0;
     i64 cli_output_length = 0;
 
-    if (process_argc > argument_base) {
+    if (cli_argc > argument_base) {
         cli_manifest_path = raz_compiler_rt_arena_create(4096);
         if (cli_manifest_path == 0) {
             return 55;
@@ -286,7 +275,7 @@ fn main() -> i64 {
         }
     }
     if (path_is_check_option(cli_manifest_path, cli_manifest_length)) {
-        if (process_argc != argument_base + 2) {
+        if (cli_argc != argument_base + 2) {
             return 55;
         }
         check_only = true;
@@ -294,7 +283,7 @@ fn main() -> i64 {
         if (cli_manifest_length <= 0) {
             return 55;
         }
-    } else if (process_argc >= argument_base + 2) {
+    } else if (cli_argc >= argument_base + 2) {
         cli_output_path = raz_compiler_rt_arena_create(4096);
         if (cli_output_path == 0) {
             return 55;
@@ -337,23 +326,38 @@ fn main() -> i64 {
         cli_print_missing_path(cli_manifest_path, cli_manifest_length);
         return 2;
     }
+
     bool direct_source = path_has_rz_extension(cli_manifest_path, cli_manifest_length);
     bool project_manifest = path_has_toml_extension(cli_manifest_path, cli_manifest_length);
+
+    if (run_after_build && direct_source && first_program_argument < process_argc) {
+        cli_print_invalid_arguments();
+        return 2;
+    }
+
     ProjectNativeBuild native_build;
 
     project_native_build_init(&mut native_build);
     if ((cli_command == 3 || cli_command == 12) && project_manifest && cli_output_path == 0) {
         if (
             !project_prepare_default_native_build(
-                cli_manifest_path, cli_manifest_length, release_profile, backend,
-                &mut llvm_options.optimization_kind, &mut llvm_options.emit_kind, &mut forge_native,
-                &mut cli_output_path, &mut cli_output_length, &mut native_build,
+                cli_manifest_path,
+                cli_manifest_length,
+                release_profile,
+                backend,
+                &mut llvm_options.optimization_kind,
+                &mut llvm_options.emit_kind,
+                &mut forge_native,
+                &mut cli_output_path,
+                &mut cli_output_length,
+                &mut native_build,
             )
         ) {
             cli_print_native_path_failure();
             return 40;
         }
     }
+
     i64 manifest_capacity = 65536;
     i64 source_capacity = 4194304;
     i64 module_capacity = 4194304;
@@ -478,10 +482,10 @@ fn main() -> i64 {
                 path_length += 1;
                 cursor += 1;
             }
-            while (path_length> 0 && (path[path_length - 1] == 32 || path[path_length - 1] == 9)) {
+            while (path_length > 0 && (path[path_length - 1] == 32 || path[path_length - 1] == 9)) {
                 path_length -= 1;
             }
-            if (path_length> 0) {
+            if (path_length > 0) {
                 i64 module_bytes = raz_compiler_rt_arena_create(module_capacity);
 
                 if (module_bytes == 0) {
@@ -546,11 +550,12 @@ fn main() -> i64 {
             cli_print_status(3, cli_manifest_path, cli_manifest_length);
         }
         cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
-
         i64 restored_status = cli_maybe_run_artifact(
             run_after_build && cache_restore_kind == 1,
             cli_output_path,
             cli_output_length,
+            first_program_argument,
+            process_argc,
         );
         cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
         project_native_build_destroy(&mut native_build);
@@ -661,7 +666,12 @@ fn main() -> i64 {
     i64 backend_output_length = cli_output_length;
     i64 llvm_sidecar_path = 0;
 
-    project_native_backend_output(&native_build, backend, &mut backend_output_path, &mut backend_output_length);
+    project_native_backend_output(
+        &native_build,
+        backend,
+        &mut backend_output_path,
+        &mut backend_output_length
+    );
     if (backend == 1 && llvm_options.emit_kind != 0) {
         if (cli_output_path == 0 || cli_output_length <= 0) {
             return 46;
@@ -720,8 +730,13 @@ fn main() -> i64 {
     );
     write_compiler_diagnostic(95, 0, 0);
     cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
-
-    i64 exit_status = cli_maybe_run_artifact(run_after_build, cli_output_path, cli_output_length);
+    i64 exit_status = cli_maybe_run_artifact(
+        run_after_build,
+        cli_output_path,
+        cli_output_length,
+        first_program_argument,
+        process_argc,
+    );
     destroy_mir(&mut mir);
     destroy_hir(&mut hir);
     cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);

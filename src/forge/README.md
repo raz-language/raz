@@ -262,7 +262,7 @@ The release matrix installs Forge into an isolated prefix and builds independent
 
 ## Optimizer and analysis
 
-Forge ships reusable function analyses and a deterministic scalar optimization pipeline. At `-O2` and `-O3`, late scalar cleanup now runs to a bounded fixpoint so opportunities exposed by memory, loop, and CFG transforms are consumed without unbounded compile-time growth. Forge 2.0 includes conservative alias analysis, global memory dataflow, loop-capable mem2reg, and natural-loop discovery, allowing the optimizer to promote scalar locals, forward values across CFG edges, eliminate overwritten stores, and hoist safe loop-invariant expressions.
+Forge ships reusable function analyses and a deterministic scalar optimization pipeline. At `-O2` and `-O3`, late scalar cleanup now runs to a bounded fixpoint so opportunities exposed by memory, loop, and CFG transforms are consumed without unbounded compile-time growth. Forge includes conservative alias analysis, global memory dataflow, scalar stack promotion, and natural-loop discovery. Stack promotion handles same-block locals, acyclic joins, and loop-carried scalar state through liveness-pruned dominance-frontier block-parameter placement and dominator-tree SSA renaming. The optimizer still forwards values across CFG edges, eliminates overwritten stores, and hoists safe loop-invariant expressions.
 
 ```text
 CFG + dominators + use/def
@@ -271,7 +271,7 @@ CFG + dominators + use/def
           +-- natural-loop discovery
           |
           v
-SCCP -> algebraic simplification -> CSE -> memory forwarding -> LICM -> DCE -> CFG cleanup
+SCCP -> algebraic simplification -> CSE -> memory forwarding -> LICM -> DCE -> jump threading -> CFG cleanup
 ```
 
 The alias analysis intentionally returns `may_alias` when provenance or offsets are uncertain. This keeps the transformations correct for arbitrary frontend-generated pointer code while still recognizing stack allocations and distinct globals as non-aliasing. See [Optimizer and analysis](docs/optimizer.md).

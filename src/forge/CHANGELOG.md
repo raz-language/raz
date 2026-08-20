@@ -1,5 +1,16 @@
 ## Unreleased
 
+- Added non-duplicating edge-specialized branch threading for tiny pure predicate blocks. The pass evaluates conditions per predecessor edge, bypasses the shared control block only when successor dataflow is dominance-safe, and rejects side effects, trapping/unsupported operations, escaping block-local SSA values, and any case that would require code cloning.
+- Extended SCCP/CFG cleanup with edge-sensitive predecessor elimination and safe straight-line block merging. `SimplifyCFGPass` now substitutes single-predecessor block parameters from unconditional jump arguments and splices the continuation into its predecessor, with interpreter regression coverage proving a phi becomes constant only after an impossible predecessor edge is removed.
+- Upgraded SCCP to an SSA-aware executable-edge/value-lattice solver: constants now propagate through block parameters, impossible branch edges are pruned, constant phis are materialized locally, dead blocks are removed, and newly trivial merges are simplified immediately. Added an interpreter-backed regression where a runtime branch feeds the same constant through distinct phi inputs and a downstream branch folds away.
+- Marked three dormant x86-64 encoder helpers `[[maybe_unused]]`, keeping the strict `-Werror` standalone build and Windows host build warning-free without changing code generation.
+- Replaced the temporary backedge restriction in `ScalarStackPromotionPass` with liveness-pruned dominance-frontier mem2reg: loop-carried scalar slots now receive real block parameters and dominator-tree SSA renaming, with predecessor edge arguments wired from the value current at each latch. Added counted-loop, conditional-loop, nested-loop, and acyclic-join interpreter regressions before re-enabling loop promotion at `-O2`.
+- Strengthened `MergeParameterSimplificationPass` into a fixed-point SSA cleanup: identical incoming block parameters, self-plus-single-external loop phis, and phi-of-phi chains are canonicalized and removed while predecessor edge arguments stay structurally aligned. The pass now runs directly after mem2reg and inside scalar cleanup so SCCP/CSE/DCE immediately see the simplified SSA graph.
+### Optimizer correctness
+
+- Temporarily restricted cross-block stack promotion around CFG backedges after the previous iterative predecessor-value construction was shown to create stale loop state and make the optimized production Raz LSP spin indefinitely at `-O2`; the dominance-frontier implementation above now supersedes that temporary restriction.
+- Restored the target ABI/data-layout tests to source packages and extended the workspace packager so Forge's legitimate `tests/target/` directory is preserved alongside `src/target/` and `include/forge/target/`.
+
 ### Compile throughput
 
 - `PassManager::run` no longer delegates to `run_with_report`. Production

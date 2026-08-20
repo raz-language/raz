@@ -253,7 +253,7 @@ fn rxe_reference_slice_element(RxeReferenceState& state, i64 slice, i64 index, i
     if (extent < 0 || index >= extent) {
         return false;
     }
-    return rxe_reference_heap_index(state, data, index, &mut element);
+    return rxe_reference_heap_index(state, data, index, element);
 }
 
 fn rxe_reference_mem_copy(RxeReferenceState&mut state, i64 destination, i64 source, i64 count) -> bool {
@@ -363,13 +363,13 @@ fn rxe_reference_store_ref(RxeModule&mut module, RxeReferenceState&mut state, i6
 
 fn rxe_reference_make_closure(
     RxeReferenceState&mut state,
-    i64 function,
+    i64 function_index,
     i64 staged,
     i64 capture_count,
     i64&mut handle,
 ) -> bool {
     if (
-        function < 0 ||
+        function_index < 0 ||
         capture_count < 0 ||
         state.closure_count >= rxe_reference_closure_capacity() ||
         state.closure_value_count + capture_count > rxe_reference_capture_capacity()
@@ -380,7 +380,7 @@ fn rxe_reference_make_closure(
     i64 closure = state.closure_count;
     i64 first = state.closure_value_count;
 
-    raz_compiler_rt_arena_set(state.closure_functions, closure, function);
+    raz_compiler_rt_arena_set(state.closure_functions, closure, function_index);
     raz_compiler_rt_arena_set(state.closure_capture_starts, closure, first);
     raz_compiler_rt_arena_set(state.closure_capture_counts, closure, capture_count);
 
@@ -399,21 +399,21 @@ fn rxe_reference_make_closure(
 fn rxe_reference_execute_function_state(
     RxeModule&mut module,
     RxeReferenceState&mut state,
-    i64 function,
+    i64 function_index,
     i64 arguments,
     i64 argument_count,
     i64 depth,
     i64&mut result,
 ) -> bool {
-    if (function < 0 || function >= module.function_count || depth > 64) {
+    if (function_index < 0 || function_index >= module.function_count || depth > 64) {
         return false;
     }
-    if (argument_count != raz_compiler_rt_arena_get(module.function_argument_counts, function)) {
+    if (argument_count != raz_compiler_rt_arena_get(module.function_argument_counts, function_index)) {
         return false;
     }
 
     i64 registers = raz_compiler_rt_arena_create(rxe_register_count());
-    i64 slots = raz_compiler_rt_arena_create(raz_compiler_rt_arena_get(module.function_frame_slots, function) + 1);
+    i64 slots = raz_compiler_rt_arena_create(raz_compiler_rt_arena_get(module.function_frame_slots, function_index) + 1);
     i64 locals = raz_compiler_rt_arena_create(65536);
     i64 staged = raz_compiler_rt_arena_create(256);
 
@@ -433,8 +433,8 @@ fn rxe_reference_execute_function_state(
         return false;
     }
 
-    i64 ip = raz_compiler_rt_arena_get(module.function_code_starts, function);
-    i64 end = ip + raz_compiler_rt_arena_get(module.function_code_counts, function);
+    i64 ip = raz_compiler_rt_arena_get(module.function_code_starts, function_index);
+    i64 end = ip + raz_compiler_rt_arena_get(module.function_code_counts, function_index);
     i64 steps = 0;
     bool ok = true;
     bool done = false;
@@ -845,7 +845,7 @@ fn rxe_reference_execute_function_state(
 
 fn rxe_reference_execute_function(
     RxeModule&mut module,
-    i64 function,
+    i64 function_index,
     i64 arguments,
     i64 argument_count,
     i64 depth,
@@ -868,7 +868,7 @@ fn rxe_reference_execute_function(
     bool ok = rxe_reference_execute_function_state(
         module,
         &mut state,
-        function,
+        function_index,
         arguments,
         argument_count,
         depth,
@@ -883,31 +883,31 @@ fn rxe_reference_execute_function(
 fn rxe_reference_matches_mir(
     MirModule&mut mir,
     RxeModule&mut module,
-    i64 function,
+    i64 function_index,
     i64 arguments,
     i64 argument_count,
 ) -> bool {
-    if (function < 0 || function >= module.function_count) {
+    if (function_index < 0 || function_index >= module.function_count) {
         return false;
     }
-    if (argument_count != raz_compiler_rt_arena_get(module.function_argument_counts, function)) {
+    if (argument_count != raz_compiler_rt_arena_get(module.function_argument_counts, function_index)) {
         return false;
     }
     if (argument_count > 0 && arguments == 0) {
         return false;
     }
 
-    i64 mir_result = execute_mir_function(mir, function, arguments, 0, argument_count);
+    i64 mir_result = execute_mir_function(mir, function_index, arguments, 0, argument_count);
     i64 rxe_result = 0;
 
-    if (!rxe_reference_execute_function(module, function, arguments, argument_count, 0, &mut rxe_result)) {
+    if (!rxe_reference_execute_function(module, function_index, arguments, argument_count, 0, &mut rxe_result)) {
         return false;
     }
     return mir_result == rxe_result;
 }
 
-fn rxe_reference_matches_mir_zero_arg(MirModule&mut mir, RxeModule&mut module, i64 function, ) -> bool {
-    return rxe_reference_matches_mir(mir, module, function, 0, 0);
+fn rxe_reference_matches_mir_zero_arg(MirModule&mut mir, RxeModule&mut module, i64 function_index, ) -> bool {
+    return rxe_reference_matches_mir(mir, module, function_index, 0, 0);
 }
 
 // Deterministic argument-corpus differential runner used by the RXE compatibility contract
@@ -923,15 +923,15 @@ fn rxe_reference_conformance_next(i64 value) -> i64 {
 fn rxe_reference_matches_mir_seeded(
     MirModule&mut mir,
     RxeModule&mut module,
-    i64 function,
+    i64 function_index,
     i64 seed,
     i64 case_count,
 ) -> bool {
-    if (function < 0 || function >= module.function_count || case_count < 0) {
+    if (function_index < 0 || function_index >= module.function_count || case_count < 0) {
         return false;
     }
 
-    i64 argument_count = raz_compiler_rt_arena_get(module.function_argument_counts, function);
+    i64 argument_count = raz_compiler_rt_arena_get(module.function_argument_counts, function_index);
     i64 capacity = argument_count;
 
     if (capacity <= 0) {
@@ -956,7 +956,7 @@ fn rxe_reference_matches_mir_seeded(
             raz_compiler_rt_arena_set(arguments, argument, state);
             argument += 1;
         }
-        ok = rxe_reference_matches_mir(mir, module, function, arguments, argument_count);
+        ok = rxe_reference_matches_mir(mir, module, function_index, arguments, argument_count);
         case_index += 1;
     }
     raz_compiler_rt_arena_destroy(arguments);

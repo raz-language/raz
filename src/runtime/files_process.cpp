@@ -709,6 +709,26 @@ std::int64_t raz_rt_stdio_flush(std::int64_t stream) {
   return file != nullptr && std::fflush(file) == 0 ? 1 : 0;
 }
 
+std::int64_t raz_rt_stdio_set_binary(std::int64_t stream) {
+  auto* file = raz_stdio_stream(stream);
+  if (file == nullptr) return 0;
+#if defined(_WIN32)
+  // The Microsoft CRT opens the standard streams in text mode by default.
+  // Text mode rewrites every '\n' written through fwrite() to "\r\n".
+  // Protocols such as LSP already serialize their required CRLF framing, so
+  // leaving stdout in text mode turns "\r\n" into "\r\r\n" and corrupts
+  // the Content-Length header.  Binary mode is process-local and exactly
+  // preserves the byte stream supplied by the Raz protocol implementation.
+  const int descriptor = _fileno(file);
+  if (descriptor < 0) return 0;
+  return _setmode(descriptor, _O_BINARY) == -1 ? 0 : 1;
+#else
+  // POSIX stdio has no text-mode newline translation.
+  (void)file;
+  return 1;
+#endif
+}
+
 std::int64_t raz_rt_stdio_is_terminal(std::int64_t stream) {
   auto* file = raz_stdio_stream(stream);
   if (file == nullptr) return 0;

@@ -51,7 +51,7 @@ std::string_view token_kind_name(TokenKind kind) noexcept {
 
 TokenKind keyword_kind(std::string_view text) noexcept {
   using Pair = std::pair<std::string_view, TokenKind>;
-  static constexpr std::array<Pair, 40> keywords{{
+  static constexpr std::array<Pair, 41> keywords{{
       {"as", TokenKind::kw_as}, {"async", TokenKind::kw_async},
       {"await", TokenKind::kw_await}, {"break", TokenKind::kw_break},
       {"case", TokenKind::kw_case}, {"comptime", TokenKind::kw_comptime},
@@ -72,6 +72,7 @@ TokenKind keyword_kind(std::string_view text) noexcept {
       {"type", TokenKind::kw_type}, {"union", TokenKind::kw_union},
       {"unsafe", TokenKind::kw_unsafe}, {"while", TokenKind::kw_while},
       {"pub", TokenKind::kw_public}, {"priv", TokenKind::kw_private},
+      {"function", TokenKind::kw_fn},
   }};
   for (const auto& [spelling, kind] : keywords) {
     if (text == spelling) return kind;

@@ -53,7 +53,7 @@ def main() -> int:
             fail(f"{command} is not dispatched by the production CLI")
         if command not in cli:
             fail(f"{command} command is not discoverable in CLI source")
-    if "driver_command_dispatch(process_argc, cli_command" not in main_source:
+    if "driver_command_dispatch(cli_argc, cli_command" not in main_source:
         fail("production CLI does not invoke the auxiliary command dispatcher")
     if "fn package_registry_prepare_build(" not in registry:
         fail("ordinary project builds do not have an exact-lock dependency hydration preflight")

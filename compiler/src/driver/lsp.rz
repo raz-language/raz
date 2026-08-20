@@ -1,0 +1,2689 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_compiler_driver_lsp;
+
+public import raz_compiler_driver_c_header;
+import raz_compiler_driver_registry_transport;
+
+// The production language server lives in Raz.  The native runtime provides
+// byte-oriented stdio only; protocol framing, JSON handling, source analysis,
+// formatting, and editor policy stay in the compiler so Stage 0 never becomes
+// a second evolving tooling implementation.
+extern fn raz_rt_stdio_read(i64 stream, usize output, i64 capacity) -> i64;
+extern fn raz_rt_stdio_flush(i64 stream) -> i64;
+extern fn raz_rt_stdio_set_binary(i64 stream) -> i64;
+
+struct LspInput {
+    usize buffer;
+    i64 start;
+    i64 end;
+    bool eof;
+}
+
+struct LspWriter {
+    i64 data;
+    i64 length;
+    i64 capacity;
+}
+
+struct LspDocuments {
+    i64 count;
+    i64 uris;
+    i64 uri_lengths;
+    i64 texts;
+    i64 text_lengths;
+
+    // Persistent HIR-derived declaration summaries.  We intentionally cache
+    // compact semantic facts rather than retaining a live HirModule: HIR owns
+    // many arenas, so keeping those graphs across editor invalidations would
+    // complicate lifetime management.  Each document cache is rebuilt exactly
+    // when its text changes and is reused by workspace/global queries.
+    i64 semantic_counts;
+    i64 semantic_kinds;
+    i64 semantic_name_offsets;
+    i64 semantic_name_lengths;
+    i64 semantic_types;
+}
+
+fn lsp_writer_init(LspWriter&mut writer, i64 capacity) -> bool {
+    writer.data = 0;
+    writer.length = 0;
+    writer.capacity = 0;
+    if (capacity < 256) {
+        capacity = 256;
+    }
+    writer.data = raz_compiler_rt_arena_create(capacity);
+    if (writer.data == 0) {
+        return false;
+    }
+    writer.capacity = capacity;
+    return true;
+}
+
+fn lsp_writer_destroy(LspWriter&mut writer) {
+    if (writer.data != 0) {
+        raz_compiler_rt_arena_destroy(writer.data);
+    }
+    writer.data = 0;
+    writer.length = 0;
+    writer.capacity = 0;
+}
+
+fn lsp_writer_reserve(LspWriter&mut writer, i64 additional) -> bool {
+    if (additional < 0) {
+        return false;
+    }
+    if (writer.length + additional <= writer.capacity) {
+        return true;
+    }
+
+    i64 next_capacity = writer.capacity;
+
+    while (next_capacity < writer.length + additional) {
+        if (next_capacity > 33554432) {
+            return false;
+        }
+        next_capacity *= 2;
+    }
+
+    i64 next = raz_compiler_rt_arena_create(next_capacity);
+
+    if (next == 0) {
+        return false;
+    }
+    if (
+    writer.length > 0 &&
+    raz_compiler_rt_arena_copy(next, 0, writer.data, 0, writer.length) != writer.length
+    ) {
+        raz_compiler_rt_arena_destroy(next);
+        return false;
+    }
+    raz_compiler_rt_arena_destroy(writer.data);
+    writer.data = next;
+    writer.capacity = next_capacity;
+    return true;
+}
+
+fn lsp_writer_byte(LspWriter&mut writer, i64 byte) -> bool {
+    if (!lsp_writer_reserve(writer, 1)) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(writer.data, writer.length, byte);
+    writer.length += 1;
+    return true;
+}
+
+fn lsp_writer_literal(LspWriter&mut writer, i64[]value, i64 length) -> bool {
+    if (!lsp_writer_reserve(writer, length)) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(writer.data, writer.length + i, value[i]);
+        i += 1;
+    }
+    writer.length += length;
+    return true;
+}
+
+fn lsp_writer_arena(LspWriter&mut writer, i64 value, i64 start, i64 length) -> bool {
+    if (!lsp_writer_reserve(writer, length)) {
+        return false;
+    }
+    if (
+    length > 0 &&
+    raz_compiler_rt_arena_copy(writer.data, writer.length, value, start, length) != length
+    ) {
+        return false;
+    }
+    writer.length += length;
+    return true;
+}
+
+fn lsp_writer_decimal(LspWriter&mut writer, i64 value) -> bool {
+    i64 digits[24];
+    i64 count = 0;
+
+    if (value < 0) {
+        if (!lsp_writer_byte(writer, 45)) {
+            return false;
+        }
+        value = -value;
+    }
+    if (value == 0) {
+        return lsp_writer_byte(writer, 48);
+    }
+    while (value > 0 && count < 24) {
+        digits[count] = 48 + (value % 10);
+        value /= 10;
+        count += 1;
+    }
+    while (count > 0) {
+        count -= 1;
+        if (!lsp_writer_byte(writer, digits[count])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn lsp_json_hex_digit(i64 value) -> i64 {
+    if (value < 10) {
+        return 48 + value;
+    }
+    return 97 + value - 10;
+}
+
+fn lsp_writer_json_string(LspWriter&mut writer, i64 value, i64 start, i64 length) -> bool {
+    if (!lsp_writer_byte(writer, 34)) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        i64 byte = raz_compiler_rt_arena_get(value, start + i);
+
+        if (byte == 34 || byte == 92) {
+            if (!lsp_writer_byte(writer, 92) || !lsp_writer_byte(writer, byte)) {
+                return false;
+            }
+        } else if (byte == 10) {
+            i64 escaped[2] = [92, 110];
+
+            if (!lsp_writer_literal(writer, &escaped, 2)) {
+                return false;
+            }
+        } else if (byte == 13) {
+            i64 escaped[2] = [92, 114];
+
+            if (!lsp_writer_literal(writer, &escaped, 2)) {
+                return false;
+            }
+        } else if (byte == 9) {
+            i64 escaped[2] = [92, 116];
+
+            if (!lsp_writer_literal(writer, &escaped, 2)) {
+                return false;
+            }
+        } else if (byte >= 0 && byte < 32) {
+            i64 prefix[4] = [92, 117, 48, 48];
+
+            if (
+            !lsp_writer_literal(writer, &prefix, 4) ||
+            !lsp_writer_byte(writer, lsp_json_hex_digit((byte / 16) % 16)) ||
+            !lsp_writer_byte(writer, lsp_json_hex_digit(byte % 16))
+            ) {
+                return false;
+            }
+        } else if (!lsp_writer_byte(writer, byte)) {
+            return false;
+        }
+        i += 1;
+    }
+    return lsp_writer_byte(writer, 34);
+}
+
+fn lsp_input_init(LspInput&mut input) -> bool {
+    input.buffer = raz_rt_alloc_aligned(8192, 8);
+    input.start = 0;
+    input.end = 0;
+    input.eof = false;
+    return input.buffer != 0;
+}
+
+fn lsp_input_destroy(LspInput&mut input) {
+    if (input.buffer != 0) {
+        raz_rt_dealloc_aligned(input.buffer, 8);
+    }
+    input.buffer = 0;
+    input.start = 0;
+    input.end = 0;
+    input.eof = true;
+}
+
+fn lsp_input_byte(LspInput&mut input) -> i64 {
+    if (input.start >= input.end) {
+        i64 read = raz_rt_stdio_read(0, input.buffer, 8192);
+
+        if (read <= 0) {
+            input.eof = true;
+            return -1;
+        }
+        input.start = 0;
+        input.end = read;
+    }
+
+    i64 byte = raz_rt_load_u8(input.buffer + input.start);
+
+    input.start += 1;
+    return byte;
+}
+
+fn lsp_read_line(LspInput&mut input, i64 output, i64 capacity) -> i64 {
+    i64 length = 0;
+
+    while (length < capacity) {
+        i64 byte = lsp_input_byte(input);
+
+        if (byte < 0) {
+            if (length == 0) {
+                return -1;
+            }
+            return length;
+        }
+        if (byte == 10) {
+            if (length > 0 && raz_compiler_rt_arena_get(output, length - 1) == 13) {
+                length -= 1;
+            }
+            return length;
+        }
+        raz_compiler_rt_arena_set(output, length, byte);
+        length += 1;
+    }
+    return -2;
+}
+
+fn lsp_ascii_equal(i64 arena, i64 start, i64 length, i64[]text, i64 text_length) -> bool {
+    if (length != text_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(arena, start + i) != text[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn lsp_content_length(i64 line, i64 length) -> i64 {
+    i64 prefix[15] = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58];
+
+    if (length < 16) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < 15) {
+        if (raz_compiler_rt_arena_get(line, i) != prefix[i]) {
+            return -1;
+        }
+        i += 1;
+    }
+    while (
+    i < length &&
+    (raz_compiler_rt_arena_get(line, i) == 32 || raz_compiler_rt_arena_get(line, i) == 9)
+    ) {
+        i += 1;
+    }
+
+    i64 value = 0;
+    bool found = false;
+
+    while (i < length) {
+        i64 byte = raz_compiler_rt_arena_get(line, i);
+
+        if (byte < 48 || byte > 57) {
+            return -1;
+        }
+        found = true;
+        value = value * 10 + byte - 48;
+        if (value > 16777216) {
+            return -1;
+        }
+        i += 1;
+    }
+    if (!found) {
+        return -1;
+    }
+    return value;
+}
+
+fn lsp_read_message(LspInput&mut input, i64&mut out_body, i64&mut out_length) -> bool {
+    i64 line = raz_compiler_rt_arena_create(4096);
+
+    if (line == 0) {
+        return false;
+    }
+
+    i64 content_length = -1;
+    bool headers = true;
+
+    while (headers) {
+        i64 length = lsp_read_line(input, line, 4096);
+
+        if (length < 0) {
+            raz_compiler_rt_arena_destroy(line);
+            return false;
+        }
+        if (length == 0) {
+            headers = false;
+        } else {
+            i64 candidate = lsp_content_length(line, length);
+
+            if (candidate >= 0) {
+                content_length = candidate;
+            }
+        }
+    }
+    raz_compiler_rt_arena_destroy(line);
+    if (content_length < 0) {
+        return false;
+    }
+
+    i64 body = raz_compiler_rt_arena_create(content_length + 1);
+
+    if (body == 0) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < content_length) {
+        i64 byte = lsp_input_byte(input);
+
+        if (byte < 0) {
+            raz_compiler_rt_arena_destroy(body);
+            return false;
+        }
+        raz_compiler_rt_arena_set(body, i, byte);
+        i += 1;
+    }
+    *out_body = body;
+    *out_length = content_length;
+    return true;
+}
+
+fn lsp_json_skip_space(i64 body, i64 length, i64 index) -> i64 {
+    while (index < length) {
+        i64 byte = raz_compiler_rt_arena_get(body, index);
+
+        if (byte != 32 && byte != 9 && byte != 10 && byte != 13) {
+            break;
+        }
+        index += 1;
+    }
+    return index;
+}
+
+fn lsp_json_find_key(i64 body, i64 length, i64[]field, i64 field_length, i64 start) -> i64 {
+    i64 i = start;
+
+    while (i + field_length + 2 <= length) {
+        if (raz_compiler_rt_arena_get(body, i) == 34) {
+            bool matches = true;
+            i64 k = 0;
+
+            while (matches && k < field_length) {
+                if (raz_compiler_rt_arena_get(body, i + 1 + k) != field[k]) {
+                    matches = false;
+                }
+                k += 1;
+            }
+            if (matches && raz_compiler_rt_arena_get(body, i + 1 + field_length) == 34) {
+                i64 colon = lsp_json_skip_space(body, length, i + field_length + 2);
+
+                if (colon < length && raz_compiler_rt_arena_get(body, colon) == 58) {
+                    return lsp_json_skip_space(body, length, colon + 1);
+                }
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn lsp_hex_value(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 70) {
+        return byte - 65 + 10;
+    }
+    if (byte >= 97 && byte <= 102) {
+        return byte - 97 + 10;
+    }
+    return -1;
+}
+
+fn lsp_utf8_append(i64 output, i64 capacity, i64&mut cursor, i64 codepoint) -> bool {
+    if (codepoint < 0 || codepoint > 1114111) {
+        return false;
+    }
+    if (codepoint <= 127) {
+        if (*cursor + 1 > capacity) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(output, *cursor, codepoint);
+        *cursor += 1;
+        return true;
+    }
+    if (codepoint <= 2047) {
+        if (*cursor + 2 > capacity) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(output, *cursor, 192 + codepoint / 64);
+        raz_compiler_rt_arena_set(output, *cursor + 1, 128 + codepoint % 64);
+        *cursor += 2;
+        return true;
+    }
+    if (codepoint <= 65535) {
+        if (*cursor + 3 > capacity) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(output, *cursor, 224 + codepoint / 4096);
+        raz_compiler_rt_arena_set(output, *cursor + 1, 128 + (codepoint / 64) % 64);
+        raz_compiler_rt_arena_set(output, *cursor + 2, 128 + codepoint % 64);
+        *cursor += 3;
+        return true;
+    }
+    if (*cursor + 4 > capacity) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(output, *cursor, 240 + codepoint / 262144);
+    raz_compiler_rt_arena_set(output, *cursor + 1, 128 + (codepoint / 4096) % 64);
+    raz_compiler_rt_arena_set(output, *cursor + 2, 128 + (codepoint / 64) % 64);
+    raz_compiler_rt_arena_set(output, *cursor + 3, 128 + codepoint % 64);
+    *cursor += 4;
+    return true;
+}
+
+fn lsp_json_string_field(
+i64 body,
+i64 length,
+i64[]field,
+i64 field_length,
+i64 output,
+i64 capacity,
+i64 start,
+) -> i64 {
+    i64 value = lsp_json_find_key(body, length, field, field_length, start);
+
+    if (value < 0 || value >= length || raz_compiler_rt_arena_get(body, value) != 34) {
+        return -1;
+    }
+    value += 1;
+
+    i64 cursor = 0;
+
+    while (value < length) {
+        i64 byte = raz_compiler_rt_arena_get(body, value);
+
+        value += 1;
+        if (byte == 34) {
+            return cursor;
+        }
+        if (byte != 92) {
+            if (cursor >= capacity) {
+                return -1;
+            }
+            raz_compiler_rt_arena_set(output, cursor, byte);
+            cursor += 1;
+            continue;
+        }
+        if (value >= length) {
+            return -1;
+        }
+
+        i64 escaped = raz_compiler_rt_arena_get(body, value);
+
+        value += 1;
+
+        i64 decoded = escaped;
+
+        if (escaped == 110) {
+            decoded = 10;
+        } else if (escaped == 114) {
+            decoded = 13;
+        } else if (escaped == 116) {
+            decoded = 9;
+        } else if (escaped == 98) {
+            decoded = 8;
+        } else if (escaped == 102) {
+            decoded = 12;
+        } else if (escaped == 117) {
+            if (value + 4 > length) {
+                return -1;
+            }
+
+            i64 codepoint = 0;
+            i64 h = 0;
+
+            while (h < 4) {
+                i64 digit = lsp_hex_value(raz_compiler_rt_arena_get(body, value + h));
+
+                if (digit < 0) {
+                    return -1;
+                }
+                codepoint = codepoint * 16 + digit;
+                h += 1;
+            }
+            value += 4;
+            if (!lsp_utf8_append(output, capacity, &mut cursor, codepoint)) {
+                return -1;
+            }
+            continue;
+        }
+        if (cursor >= capacity) {
+            return -1;
+        }
+        raz_compiler_rt_arena_set(output, cursor, decoded);
+        cursor += 1;
+    }
+    return -1;
+}
+
+fn lsp_json_integer_field(i64 body, i64 length, i64[]field, i64 field_length, i64 start) -> i64 {
+    i64 value = lsp_json_find_key(body, length, field, field_length, start);
+
+    if (value < 0) {
+        return -1;
+    }
+
+    bool negative = false;
+
+    if (value < length && raz_compiler_rt_arena_get(body, value) == 45) {
+        negative = true;
+        value += 1;
+    }
+
+    i64 result = 0;
+    bool found = false;
+
+    while (value < length) {
+        i64 byte = raz_compiler_rt_arena_get(body, value);
+
+        if (byte < 48 || byte > 57) {
+            break;
+        }
+        found = true;
+        result = result * 10 + byte - 48;
+        value += 1;
+    }
+    if (!found) {
+        return -1;
+    }
+    if (negative) {
+        return -result;
+    }
+    return result;
+}
+
+fn lsp_json_id(LspWriter&mut writer, i64 body, i64 length) -> bool {
+    i64 field[2] = [105, 100];
+    i64 value = lsp_json_find_key(body, length, &field, 2, 0);
+
+    if (value < 0) {
+        i64 null_value[4] = [110, 117, 108, 108];
+
+        return lsp_writer_literal(writer, &null_value, 4);
+    }
+    if (raz_compiler_rt_arena_get(body, value) == 34) {
+        i64 end = value + 1;
+        bool escaped = false;
+
+        while (end < length) {
+            i64 byte = raz_compiler_rt_arena_get(body, end);
+
+            if (!escaped && byte == 34) {
+                end += 1;
+                break;
+            }
+            if (!escaped && byte == 92) {
+                escaped = true;
+            } else {
+                escaped = false;
+            }
+            end += 1;
+        }
+        return lsp_writer_arena(writer, body, value, end - value);
+    }
+
+    i64 end = value;
+
+    while (end < length) {
+        i64 byte = raz_compiler_rt_arena_get(body, end);
+
+        if (byte == 44 || byte == 125 || byte == 32 || byte == 9 || byte == 10 || byte == 13) {
+            break;
+        }
+        end += 1;
+    }
+    return lsp_writer_arena(writer, body, value, end - value);
+}
+
+fn lsp_send(LspWriter&mut body) -> bool {
+    LspWriter header;
+
+    if (!lsp_writer_init(&mut header, 96)) {
+        return false;
+    }
+
+    i64 prefix[16] = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32];
+    i64 suffix[4] = [13, 10, 13, 10];
+    bool ok = lsp_writer_literal(&mut header, &prefix, 16);
+
+    ok = ok && lsp_writer_decimal(&mut header, body.length);
+    ok = ok && lsp_writer_literal(&mut header, &suffix, 4);
+    if (ok) {
+        cli_write_arena_stream(1, header.data, header.length);
+        cli_write_arena_stream(1, body.data, body.length);
+        raz_rt_stdio_flush(1);
+    }
+    lsp_writer_destroy(&mut header);
+    return ok;
+}
+
+fn lsp_response_begin(LspWriter&mut out, i64 body, i64 length) -> bool {
+    i64 prefix[22] = [123, 34, 106, 115, 111, 110, 114, 112, 99, 34, 58, 34, 50, 46, 48, 34, 44, 34, 105, 100, 34, 58];
+
+    return lsp_writer_literal(out, &prefix, 22) && lsp_json_id(out, body, length);
+}
+
+fn lsp_response_result_prefix(LspWriter&mut out, i64 body, i64 length) -> bool {
+    i64 middle[10] = [44, 34, 114, 101, 115, 117, 108, 116, 34, 58];
+
+    return lsp_response_begin(out, body, length) && lsp_writer_literal(out, &middle, 10);
+}
+
+fn lsp_send_null_result(i64 body, i64 length) -> bool {
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 256)) {
+        return false;
+    }
+
+    i64 null_end[5] = [110, 117, 108, 108, 125];
+
+    bool ok =
+    lsp_response_result_prefix(&mut out, body, length) &&
+    lsp_writer_literal(&mut out, &null_end, 5);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_documents_init(LspDocuments&mut documents) -> bool {
+    documents.count = 0;
+    // Keep enough room for a normal multi-module package without allocating
+    // per-query workspace state.  Disk-backed modules and editor overlays share
+    // this table; didOpen replaces bytes in place and didClose restores disk.
+    documents.uris = raz_compiler_rt_arena_create(256);
+    documents.uri_lengths = raz_compiler_rt_arena_create(256);
+    documents.texts = raz_compiler_rt_arena_create(256);
+    documents.text_lengths = raz_compiler_rt_arena_create(256);
+    documents.semantic_counts = raz_compiler_rt_arena_create(256);
+    documents.semantic_kinds = raz_compiler_rt_arena_create(256);
+    documents.semantic_name_offsets = raz_compiler_rt_arena_create(256);
+    documents.semantic_name_lengths = raz_compiler_rt_arena_create(256);
+    documents.semantic_types = raz_compiler_rt_arena_create(256);
+    return documents.uris != 0 &&
+    documents.uri_lengths != 0 &&
+    documents.texts != 0 &&
+    documents.text_lengths != 0 &&
+    documents.semantic_counts != 0 &&
+    documents.semantic_kinds != 0 &&
+    documents.semantic_name_offsets != 0 &&
+    documents.semantic_name_lengths != 0 &&
+    documents.semantic_types != 0;
+}
+
+fn lsp_documents_destroy(LspDocuments&mut documents) {
+    i64 i = 0;
+
+    while (i < documents.count) {
+        i64 uri = raz_compiler_rt_arena_get(documents.uris, i);
+        i64 text = raz_compiler_rt_arena_get(documents.texts, i);
+        i64 kinds = raz_compiler_rt_arena_get(documents.semantic_kinds, i);
+        i64 offsets = raz_compiler_rt_arena_get(documents.semantic_name_offsets, i);
+        i64 lengths = raz_compiler_rt_arena_get(documents.semantic_name_lengths, i);
+        i64 types = raz_compiler_rt_arena_get(documents.semantic_types, i);
+
+        if (uri != 0) {
+            raz_compiler_rt_arena_destroy(uri);
+        }
+        if (text != 0) {
+            raz_compiler_rt_arena_destroy(text);
+        }
+        if (kinds != 0) { raz_compiler_rt_arena_destroy(kinds); }
+        if (offsets != 0) { raz_compiler_rt_arena_destroy(offsets); }
+        if (lengths != 0) { raz_compiler_rt_arena_destroy(lengths); }
+        if (types != 0) { raz_compiler_rt_arena_destroy(types); }
+        i += 1;
+    }
+    if (documents.uris != 0) {
+        raz_compiler_rt_arena_destroy(documents.uris);
+    }
+    if (documents.uri_lengths != 0) {
+        raz_compiler_rt_arena_destroy(documents.uri_lengths);
+    }
+    if (documents.texts != 0) {
+        raz_compiler_rt_arena_destroy(documents.texts);
+    }
+    if (documents.text_lengths != 0) {
+        raz_compiler_rt_arena_destroy(documents.text_lengths);
+    }
+    if (documents.semantic_counts != 0) { raz_compiler_rt_arena_destroy(documents.semantic_counts); }
+    if (documents.semantic_kinds != 0) { raz_compiler_rt_arena_destroy(documents.semantic_kinds); }
+    if (documents.semantic_name_offsets != 0) { raz_compiler_rt_arena_destroy(documents.semantic_name_offsets); }
+    if (documents.semantic_name_lengths != 0) { raz_compiler_rt_arena_destroy(documents.semantic_name_lengths); }
+    if (documents.semantic_types != 0) { raz_compiler_rt_arena_destroy(documents.semantic_types); }
+}
+
+fn lsp_arena_equal(i64 left, i64 left_length, i64 right, i64 right_length) -> bool {
+    if (left_length != right_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < left_length) {
+        if (raz_compiler_rt_arena_get(left, i) != raz_compiler_rt_arena_get(right, i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn lsp_document_find(LspDocuments& documents, i64 uri, i64 uri_length) -> i64 {
+    i64 i = 0;
+
+    while (i < documents.count) {
+        if (
+        lsp_arena_equal(
+        raz_compiler_rt_arena_get(documents.uris, i),
+        raz_compiler_rt_arena_get(documents.uri_lengths, i),
+        uri,
+        uri_length,
+        )
+        ) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn lsp_semantic_cache_destroy(LspDocuments&mut documents, i64 index) {
+    i64 kinds = raz_compiler_rt_arena_get(documents.semantic_kinds, index);
+    i64 offsets = raz_compiler_rt_arena_get(documents.semantic_name_offsets, index);
+    i64 lengths = raz_compiler_rt_arena_get(documents.semantic_name_lengths, index);
+    i64 types = raz_compiler_rt_arena_get(documents.semantic_types, index);
+    if (kinds != 0) { raz_compiler_rt_arena_destroy(kinds); }
+    if (offsets != 0) { raz_compiler_rt_arena_destroy(offsets); }
+    if (lengths != 0) { raz_compiler_rt_arena_destroy(lengths); }
+    if (types != 0) { raz_compiler_rt_arena_destroy(types); }
+    raz_compiler_rt_arena_set(documents.semantic_counts, index, 0);
+    raz_compiler_rt_arena_set(documents.semantic_kinds, index, 0);
+    raz_compiler_rt_arena_set(documents.semantic_name_offsets, index, 0);
+    raz_compiler_rt_arena_set(documents.semantic_name_lengths, index, 0);
+    raz_compiler_rt_arena_set(documents.semantic_types, index, 0);
+}
+
+fn lsp_semantic_cache_rebuild(LspDocuments&mut documents, i64 index) {
+    lsp_semantic_cache_destroy(documents, index);
+    i64 text = raz_compiler_rt_arena_get(documents.texts, index);
+    i64 text_length = raz_compiler_rt_arena_get(documents.text_lengths, index);
+    Source source; source.bytes = text; source.length = text_length;
+    HirModule hir;
+    if (!build_hir(source, &mut hir)) {
+        if (hir.diagnostic_code != DiagnosticCode::None) { destroy_hir(&mut hir); }
+        return;
+    }
+    i64 count = hir.function_count + hir.struct_count + hir.enum_count + hir.trait_count + hir.global_count + hir.constant_count;
+    if (count <= 0) { destroy_hir(&mut hir); return; }
+    i64 kinds = raz_compiler_rt_arena_create(count);
+    i64 offsets = raz_compiler_rt_arena_create(count);
+    i64 lengths = raz_compiler_rt_arena_create(count);
+    i64 types = raz_compiler_rt_arena_create(count);
+    if (kinds == 0 || offsets == 0 || lengths == 0 || types == 0) {
+        if (kinds != 0) { raz_compiler_rt_arena_destroy(kinds); }
+        if (offsets != 0) { raz_compiler_rt_arena_destroy(offsets); }
+        if (lengths != 0) { raz_compiler_rt_arena_destroy(lengths); }
+        if (types != 0) { raz_compiler_rt_arena_destroy(types); }
+        destroy_hir(&mut hir); return;
+    }
+    i64 cursor = 0; i64 i = 0;
+    while (i < hir.function_count) {
+        raz_compiler_rt_arena_set(kinds,cursor,1); raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.function_name_offsets,i)); raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.function_name_lengths,i)); raz_compiler_rt_arena_set(types,cursor,raz_compiler_rt_arena_get(hir.function_return_types,i)); cursor+=1; i+=1;
+    }
+    i=0; while(i<hir.struct_count){raz_compiler_rt_arena_set(kinds,cursor,2);raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.struct_name_offsets,i));raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.struct_name_lengths,i));raz_compiler_rt_arena_set(types,cursor,-1);cursor+=1;i+=1;}
+    i=0; while(i<hir.enum_count){raz_compiler_rt_arena_set(kinds,cursor,3);raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.enum_name_offsets,i));raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.enum_name_lengths,i));raz_compiler_rt_arena_set(types,cursor,-1);cursor+=1;i+=1;}
+    i=0; while(i<hir.trait_count){raz_compiler_rt_arena_set(kinds,cursor,4);raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.trait_name_offsets,i));raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.trait_name_lengths,i));raz_compiler_rt_arena_set(types,cursor,-1);cursor+=1;i+=1;}
+    i=0; while(i<hir.global_count){raz_compiler_rt_arena_set(kinds,cursor,5);raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.global_name_offsets,i));raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.global_name_lengths,i));raz_compiler_rt_arena_set(types,cursor,raz_compiler_rt_arena_get(hir.global_types,i));cursor+=1;i+=1;}
+    i=0; while(i<hir.constant_count){raz_compiler_rt_arena_set(kinds,cursor,8);raz_compiler_rt_arena_set(offsets,cursor,raz_compiler_rt_arena_get(hir.constant_name_offsets,i));raz_compiler_rt_arena_set(lengths,cursor,raz_compiler_rt_arena_get(hir.constant_name_lengths,i));raz_compiler_rt_arena_set(types,cursor,raz_compiler_rt_arena_get(hir.constant_types,i));cursor+=1;i+=1;}
+    raz_compiler_rt_arena_set(documents.semantic_counts,index,cursor); raz_compiler_rt_arena_set(documents.semantic_kinds,index,kinds); raz_compiler_rt_arena_set(documents.semantic_name_offsets,index,offsets); raz_compiler_rt_arena_set(documents.semantic_name_lengths,index,lengths); raz_compiler_rt_arena_set(documents.semantic_types,index,types);
+    destroy_hir(&mut hir);
+}
+
+fn lsp_document_set(LspDocuments&mut documents, i64 uri, i64 uri_length, i64 text, i64 text_length) -> i64 {
+    i64 index = lsp_document_find(documents, uri, uri_length);
+
+    if (index < 0) {
+        if (documents.count >= 256) {
+            return -1;
+        }
+        index = documents.count;
+        documents.count += 1;
+
+        i64 stored_uri = raz_compiler_rt_arena_create(uri_length + 1);
+
+        if (stored_uri == 0) {
+            return -1;
+        }
+        if (uri_length > 0) {
+            raz_compiler_rt_arena_copy(stored_uri, 0, uri, 0, uri_length);
+        }
+        raz_compiler_rt_arena_set(documents.uris, index, stored_uri);
+        raz_compiler_rt_arena_set(documents.uri_lengths, index, uri_length);
+        raz_compiler_rt_arena_set(documents.semantic_counts, index, 0);
+        raz_compiler_rt_arena_set(documents.semantic_kinds, index, 0);
+        raz_compiler_rt_arena_set(documents.semantic_name_offsets, index, 0);
+        raz_compiler_rt_arena_set(documents.semantic_name_lengths, index, 0);
+        raz_compiler_rt_arena_set(documents.semantic_types, index, 0);
+    } else {
+        lsp_semantic_cache_destroy(documents, index);
+        i64 old_text = raz_compiler_rt_arena_get(documents.texts, index);
+
+        if (old_text != 0) {
+            raz_compiler_rt_arena_destroy(old_text);
+        }
+    }
+
+    i64 stored_text = raz_compiler_rt_arena_create(text_length + 1);
+
+    if (stored_text == 0) {
+        return -1;
+    }
+    if (text_length > 0) {
+        raz_compiler_rt_arena_copy(stored_text, 0, text, 0, text_length);
+    }
+    raz_compiler_rt_arena_set(documents.texts, index, stored_text);
+    raz_compiler_rt_arena_set(documents.text_lengths, index, text_length);
+    lsp_semantic_cache_rebuild(documents, index);
+    return index;
+}
+
+fn lsp_document_remove(LspDocuments&mut documents, i64 uri, i64 uri_length) {
+    i64 index = lsp_document_find(documents, uri, uri_length);
+
+    if (index < 0) {
+        return;
+    }
+
+    i64 stored_uri = raz_compiler_rt_arena_get(documents.uris, index);
+    i64 stored_text = raz_compiler_rt_arena_get(documents.texts, index);
+    lsp_semantic_cache_destroy(documents, index);
+
+    if (stored_uri != 0) {
+        raz_compiler_rt_arena_destroy(stored_uri);
+    }
+    if (stored_text != 0) {
+        raz_compiler_rt_arena_destroy(stored_text);
+    }
+
+    i64 last = documents.count - 1;
+
+    if (index != last) {
+        raz_compiler_rt_arena_set(documents.uris, index, raz_compiler_rt_arena_get(documents.uris, last));
+        raz_compiler_rt_arena_set(
+        documents.uri_lengths,
+        index,
+        raz_compiler_rt_arena_get(documents.uri_lengths, last)
+        );
+        raz_compiler_rt_arena_set(documents.texts, index, raz_compiler_rt_arena_get(documents.texts, last));
+        raz_compiler_rt_arena_set(
+        documents.text_lengths,
+        index,
+        raz_compiler_rt_arena_get(documents.text_lengths, last)
+        );
+        raz_compiler_rt_arena_set(documents.semantic_counts,index,raz_compiler_rt_arena_get(documents.semantic_counts,last));
+        raz_compiler_rt_arena_set(documents.semantic_kinds,index,raz_compiler_rt_arena_get(documents.semantic_kinds,last));
+        raz_compiler_rt_arena_set(documents.semantic_name_offsets,index,raz_compiler_rt_arena_get(documents.semantic_name_offsets,last));
+        raz_compiler_rt_arena_set(documents.semantic_name_lengths,index,raz_compiler_rt_arena_get(documents.semantic_name_lengths,last));
+        raz_compiler_rt_arena_set(documents.semantic_types,index,raz_compiler_rt_arena_get(documents.semantic_types,last));
+    }
+    documents.count -= 1;
+}
+
+
+// Translate a file URI into the native path spelling expected by the compiler
+// runtime.  LSP URIs are percent-encoded; Windows file URIs also carry one
+// leading slash before the drive letter (file:///C:/...).
+fn lsp_file_uri_to_path(i64 uri, i64 uri_length, i64 output, i64 capacity) -> i64 {
+    i64 prefix[7] = [102, 105, 108, 101, 58, 47, 47];
+    if (uri_length < 8 || capacity <= 0) { return -1; }
+    i64 i = 0;
+    while (i < 7) {
+        if (raz_compiler_rt_arena_get(uri, i) != prefix[i]) { return -1; }
+        i += 1;
+    }
+    i64 cursor = 7;
+    // file:///C:/x -> C:/x.  Unix file:///x keeps the slash because the byte
+    // after it is not a drive-letter colon pair.
+    if (
+        cursor + 2 < uri_length &&
+        raz_compiler_rt_arena_get(uri, cursor) == 47 &&
+        raz_compiler_rt_arena_get(uri, cursor + 2) == 58
+    ) {
+        cursor += 1;
+    }
+    i64 length = 0;
+    while (cursor < uri_length) {
+        i64 byte = raz_compiler_rt_arena_get(uri, cursor);
+        if (byte == 37 && cursor + 2 < uri_length) {
+            i64 hi = lsp_hex_value(raz_compiler_rt_arena_get(uri, cursor + 1));
+            i64 lo = lsp_hex_value(raz_compiler_rt_arena_get(uri, cursor + 2));
+            if (hi >= 0 && lo >= 0) {
+                byte = hi * 16 + lo;
+                cursor += 2;
+            }
+        }
+        if (length >= capacity) { return -1; }
+        raz_compiler_rt_arena_set(output, length, byte);
+        length += 1;
+        cursor += 1;
+    }
+    return length;
+}
+
+fn lsp_uri_safe_byte(i64 byte) -> bool {
+    return (byte >= 48 && byte <= 57) ||
+        (byte >= 65 && byte <= 90) ||
+        (byte >= 97 && byte <= 122) ||
+        byte == 45 || byte == 46 || byte == 47 || byte == 58 || byte == 95 || byte == 126;
+}
+
+fn lsp_path_to_file_uri(i64 path, i64 path_length, i64 output, i64 capacity) -> i64 {
+    i64 prefix[8] = [102, 105, 108, 101, 58, 47, 47, 47];
+    if (capacity < 8) { return -1; }
+    i64 length = 0;
+    i64 i = 0;
+    while (i < 8) { raz_compiler_rt_arena_set(output, length, prefix[i]); length += 1; i += 1; }
+    // Absolute Unix paths already begin with '/', while Windows drive paths do
+    // not.  The prefix contributes the URI slash in the Windows case.
+    i = 0;
+    if (path_length > 0 && raz_compiler_rt_arena_get(path, 0) == 47) { i = 1; }
+    while (i < path_length) {
+        i64 byte = raz_compiler_rt_arena_get(path, i);
+        if (byte == 92) { byte = 47; }
+        if (lsp_uri_safe_byte(byte)) {
+            if (length >= capacity) { return -1; }
+            raz_compiler_rt_arena_set(output, length, byte); length += 1;
+        } else {
+            if (length + 3 > capacity) { return -1; }
+            i64 hex[16] = [48,49,50,51,52,53,54,55,56,57,65,66,67,68,69,70];
+            raz_compiler_rt_arena_set(output, length, 37);
+            raz_compiler_rt_arena_set(output, length + 1, hex[(byte / 16) % 16]);
+            raz_compiler_rt_arena_set(output, length + 2, hex[byte % 16]);
+            length += 3;
+        }
+        i += 1;
+    }
+    return length;
+}
+
+fn lsp_path_generated(i64 path, i64 start, i64 length) -> bool {
+    i64 i = start;
+    i64 end = start + length;
+    while (i < end) {
+        bool boundary = i == start || raz_compiler_rt_arena_get(path, i - 1) == 47 || raz_compiler_rt_arena_get(path, i - 1) == 92;
+        if (boundary) {
+            i64 remaining = end - i;
+            if (remaining >= 7 && raz_compiler_rt_arena_get(path,i)==116 && raz_compiler_rt_arena_get(path,i+1)==97 && raz_compiler_rt_arena_get(path,i+2)==114 && raz_compiler_rt_arena_get(path,i+3)==103 && raz_compiler_rt_arena_get(path,i+4)==101 && raz_compiler_rt_arena_get(path,i+5)==116 && (i+6==end || raz_compiler_rt_arena_get(path,i+6)==47 || raz_compiler_rt_arena_get(path,i+6)==92)) { return true; }
+            if (remaining >= 6 && raz_compiler_rt_arena_get(path,i)==98 && raz_compiler_rt_arena_get(path,i+1)==117 && raz_compiler_rt_arena_get(path,i+2)==105 && raz_compiler_rt_arena_get(path,i+3)==108 && raz_compiler_rt_arena_get(path,i+4)==100 && (i+5==end || raz_compiler_rt_arena_get(path,i+5)==47 || raz_compiler_rt_arena_get(path,i+5)==92)) { return true; }
+            if (remaining >= 5 && raz_compiler_rt_arena_get(path,i)==46 && raz_compiler_rt_arena_get(path,i+1)==103 && raz_compiler_rt_arena_get(path,i+2)==105 && raz_compiler_rt_arena_get(path,i+3)==116 && (i+4==end || raz_compiler_rt_arena_get(path,i+4)==47 || raz_compiler_rt_arena_get(path,i+4)==92)) { return true; }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn lsp_workspace_load_native(LspDocuments&mut documents, i64 root, i64 root_length) -> i64 {
+    i64 listing = raz_compiler_rt_arena_create(4194304);
+    if (listing == 0 || root == 0 || root_length <= 0) {
+        if (listing != 0) { raz_compiler_rt_arena_destroy(listing); }
+        return 0;
+    }
+    i64 listing_length = raz_compiler_rt_list_files_recursive(root, root_length, listing, 4194304);
+    if (listing_length < 0) { raz_compiler_rt_arena_destroy(listing); return 0; }
+    i64 loaded = 0;
+    i64 cursor = 0;
+    while (cursor < listing_length && documents.count < 256) {
+        i64 start = cursor;
+        while (cursor < listing_length && raz_compiler_rt_arena_get(listing, cursor) != 10) { cursor += 1; }
+        i64 end = cursor;
+        if (cursor < listing_length) { cursor += 1; }
+        i64 path_length = end - start;
+        bool rz = path_length >= 3 && raz_compiler_rt_arena_get(listing,end-3)==46 && raz_compiler_rt_arena_get(listing,end-2)==114 && raz_compiler_rt_arena_get(listing,end-1)==122;
+        if (rz && !lsp_path_generated(listing, start, path_length)) {
+            i64 path = raz_compiler_rt_arena_create(path_length + 1);
+            i64 text = raz_compiler_rt_arena_create(1048576);
+            i64 uri = raz_compiler_rt_arena_create(path_length * 3 + 16);
+            if (path != 0 && text != 0 && uri != 0) {
+                raz_compiler_rt_arena_copy(path, 0, listing, start, path_length);
+                i64 text_length = raz_compiler_rt_read_ascii(path, path_length, text, 1048576, );
+                i64 uri_length = lsp_path_to_file_uri(path, path_length, uri, path_length * 3 + 16);
+                if (text_length >= 0 && uri_length > 0 && lsp_document_find(documents, uri, uri_length) < 0) {
+                    if (lsp_document_set(documents, uri, uri_length, text, text_length) >= 0) { loaded += 1; }
+                }
+            }
+            if (path != 0) { raz_compiler_rt_arena_destroy(path); }
+            if (text != 0) { raz_compiler_rt_arena_destroy(text); }
+            if (uri != 0) { raz_compiler_rt_arena_destroy(uri); }
+        }
+    }
+    raz_compiler_rt_arena_destroy(listing);
+    return loaded;
+}
+
+fn lsp_manifest_dependencies(LspDocuments&mut documents, i64 root, i64 root_length) -> i64 {
+    i64 manifest_path = raz_compiler_rt_arena_create(root_length + 16);
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    if (manifest_path == 0 || manifest == 0) {
+        if (manifest_path != 0) { raz_compiler_rt_arena_destroy(manifest_path); }
+        if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
+        return 0;
+    }
+    raz_compiler_rt_arena_copy(manifest_path, 0, root, 0, root_length);
+    i64 path_length = root_length;
+    if (path_length > 0 && raz_compiler_rt_arena_get(manifest_path, path_length - 1) != 47 && raz_compiler_rt_arena_get(manifest_path, path_length - 1) != 92) {
+        raz_compiler_rt_arena_set(manifest_path, path_length, 47); path_length += 1;
+    }
+    i64 name[8] = [114,97,122,46,116,111,109,108];
+    i64 n = 0; while (n < 8) { raz_compiler_rt_arena_set(manifest_path, path_length + n, name[n]); n += 1; }
+    path_length += 8;
+    i64 manifest_length = raz_compiler_rt_read_ascii(manifest_path, path_length, manifest, 65536, );
+    if (manifest_length <= 0) { raz_compiler_rt_arena_destroy(manifest_path); raz_compiler_rt_arena_destroy(manifest); return 0; }
+
+    bool dependencies = false;
+    i64 loaded = 0;
+    i64 cursor = 0;
+    while (cursor < manifest_length && documents.count < 256) {
+        i64 start = cursor;
+        while (cursor < manifest_length && raz_compiler_rt_arena_get(manifest, cursor) != 10 && raz_compiler_rt_arena_get(manifest, cursor) != 13) { cursor += 1; }
+        i64 end = cursor;
+        while (cursor < manifest_length && (raz_compiler_rt_arena_get(manifest, cursor) == 10 || raz_compiler_rt_arena_get(manifest, cursor) == 13)) { cursor += 1; }
+        while (start < end && (raz_compiler_rt_arena_get(manifest,start) == 32 || raz_compiler_rt_arena_get(manifest,start) == 9)) { start += 1; }
+        while (end > start && (raz_compiler_rt_arena_get(manifest,end-1) == 32 || raz_compiler_rt_arena_get(manifest,end-1) == 9)) { end -= 1; }
+        if (start >= end || raz_compiler_rt_arena_get(manifest,start) == 35) { continue; }
+        if (raz_compiler_rt_arena_get(manifest,start) == 91) {
+            i64 dep[14] = [91,100,101,112,101,110,100,101,110,99,105,101,115,93];
+            dependencies = end - start == 14;
+            if (dependencies) {
+                i64 i = 0; while (i < 14) { if (raz_compiler_rt_arena_get(manifest,start+i) != dep[i]) { dependencies = false; break; } i += 1; }
+            }
+            continue;
+        }
+        if (!dependencies) { continue; }
+        i64 equal = start;
+        while (equal < end && raz_compiler_rt_arena_get(manifest,equal) != 61) { equal += 1; }
+        if (equal >= end) { continue; }
+        i64 value = equal + 1;
+        while (value < end && (raz_compiler_rt_arena_get(manifest,value)==32 || raz_compiler_rt_arena_get(manifest,value)==9)) { value += 1; }
+        if (value >= end || raz_compiler_rt_arena_get(manifest,value) != 34) { continue; }
+        value += 1;
+        i64 value_end = value;
+        while (value_end < end && raz_compiler_rt_arena_get(manifest,value_end) != 34) { value_end += 1; }
+        i64 value_length = value_end - value;
+        if (value_length <= 0) { continue; }
+        i64 first = raz_compiler_rt_arena_get(manifest,value);
+        bool path_dependency = first == 46 || first == 47 || first == 92 || (value_length >= 2 && raz_compiler_rt_arena_get(manifest,value+1) == 58);
+        if (!path_dependency) { continue; }
+        i64 dependency_path = raz_compiler_rt_arena_create(root_length + value_length + 4);
+        if (dependency_path == 0) { continue; }
+        i64 dependency_length = 0;
+        bool absolute = first == 47 || first == 92 || (value_length >= 2 && raz_compiler_rt_arena_get(manifest,value+1) == 58);
+        if (!absolute) {
+            raz_compiler_rt_arena_copy(dependency_path, 0, root, 0, root_length); dependency_length = root_length;
+            if (dependency_length > 0 && raz_compiler_rt_arena_get(dependency_path,dependency_length-1) != 47 && raz_compiler_rt_arena_get(dependency_path,dependency_length-1) != 92) {
+                raz_compiler_rt_arena_set(dependency_path,dependency_length,47); dependency_length += 1;
+            }
+        }
+        raz_compiler_rt_arena_copy(dependency_path, dependency_length, manifest, value, value_length); dependency_length += value_length;
+        i64 canonical_dependency = raz_compiler_rt_arena_create(8192);
+        if (canonical_dependency != 0) {
+            i64 canonical_length = raz_compiler_rt_normalize_path(dependency_path, dependency_length, canonical_dependency, 8192);
+            if (canonical_length > 0) { loaded += lsp_workspace_load_native(documents, canonical_dependency, canonical_length); }
+            raz_compiler_rt_arena_destroy(canonical_dependency);
+        }
+        raz_compiler_rt_arena_destroy(dependency_path);
+    }
+    raz_compiler_rt_arena_destroy(manifest_path); raz_compiler_rt_arena_destroy(manifest);
+    return loaded;
+}
+
+
+// Load content-addressed registry dependencies from the portable lockfile.  The
+// lock never embeds machine-local store paths; each checksum maps through the
+// same RAZ_PACKAGE_STORE / RAZ_HOME store-root policy used by the package
+// manager. Missing store entries are simply skipped: the LSP never performs
+// network I/O as a side effect of opening an editor.
+fn lsp_lock_registry_dependencies(LspDocuments&mut documents, i64 root, i64 root_length) -> i64 {
+    i64 lock_path = raz_compiler_rt_arena_create(root_length + 16);
+    i64 lock = raz_compiler_rt_arena_create(1048576);
+    if (lock_path == 0 || lock == 0) {
+        if (lock_path != 0) { raz_compiler_rt_arena_destroy(lock_path); }
+        if (lock != 0) { raz_compiler_rt_arena_destroy(lock); }
+        return 0;
+    }
+    raz_compiler_rt_arena_copy(lock_path,0,root,0,root_length);
+    i64 path_length=root_length;
+    if(path_length>0&&raz_compiler_rt_arena_get(lock_path,path_length-1)!=47&&raz_compiler_rt_arena_get(lock_path,path_length-1)!=92){raz_compiler_rt_arena_set(lock_path,path_length,47);path_length+=1;}
+    i64 name[8]=[114,97,122,46,108,111,99,107]; i64 n=0;while(n<8){raz_compiler_rt_arena_set(lock_path,path_length+n,name[n]);n+=1;}path_length+=8;
+    i64 lock_length=raz_compiler_rt_read_ascii(lock_path,path_length,lock,1048576,);
+    raz_compiler_rt_arena_destroy(lock_path);
+    if(lock_length<=0){raz_compiler_rt_arena_destroy(lock);return 0;}
+    i64 loaded=0; i64 cursor=0;
+    i64 checksum_key[8]=[99,104,101,99,107,115,117,109];
+    while(cursor<lock_length&&documents.count<256){
+        i64 start=cursor;while(cursor<lock_length&&raz_compiler_rt_arena_get(lock,cursor)!=10&&raz_compiler_rt_arena_get(lock,cursor)!=13){cursor+=1;}i64 end=cursor;while(cursor<lock_length&&(raz_compiler_rt_arena_get(lock,cursor)==10||raz_compiler_rt_arena_get(lock,cursor)==13)){cursor+=1;}
+        while(start<end&&(raz_compiler_rt_arena_get(lock,start)==32||raz_compiler_rt_arena_get(lock,start)==9)){start+=1;}
+        bool key=end-start>=8; i64 i=0;while(key&&i<8){if(raz_compiler_rt_arena_get(lock,start+i)!=checksum_key[i]){key=false;}i+=1;}if(!key){continue;}
+        i64 equal=start+8;while(equal<end&&raz_compiler_rt_arena_get(lock,equal)!=61){equal+=1;}if(equal>=end){continue;}i64 value=equal+1;while(value<end&&(raz_compiler_rt_arena_get(lock,value)==32||raz_compiler_rt_arena_get(lock,value)==9)){value+=1;}if(value>=end||raz_compiler_rt_arena_get(lock,value)!=34){continue;}value+=1;i64 value_end=value;while(value_end<end&&raz_compiler_rt_arena_get(lock,value_end)!=34){value_end+=1;}i64 checksum_length=value_end-value;if(checksum_length<=0){continue;}
+        i64 checksum=raz_compiler_rt_arena_create(checksum_length);i64 store=raz_compiler_rt_arena_create(8192);if(checksum==0||store==0){if(checksum!=0){raz_compiler_rt_arena_destroy(checksum);}if(store!=0){raz_compiler_rt_arena_destroy(store);}continue;}raz_compiler_rt_arena_copy(checksum,0,lock,value,checksum_length);i64 store_length=registry_store_path(checksum,checksum_length,store,8192);if(store_length>0&&raz_compiler_rt_path_exists_ascii(store,store_length)!=0){loaded+=lsp_workspace_load_native(documents,store,store_length);}raz_compiler_rt_arena_destroy(checksum);raz_compiler_rt_arena_destroy(store);
+    }
+    raz_compiler_rt_arena_destroy(lock); return loaded;
+}
+
+fn lsp_workspace_load(LspDocuments&mut documents, i64 root_uri, i64 root_uri_length) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    if (root == 0) { return 0; }
+    i64 root_length = lsp_file_uri_to_path(root_uri, root_uri_length, root, 8192);
+    if (root_length <= 0) { raz_compiler_rt_arena_destroy(root); return 0; }
+    i64 loaded = lsp_workspace_load_native(documents, root, root_length);
+    // Path dependencies are source workspaces too.  Registry/version
+    // dependencies are intentionally not guessed here; their resolved location
+    // comes from package state and can be added by the package-index layer.
+    loaded += lsp_manifest_dependencies(documents, root, root_length);
+    loaded += lsp_lock_registry_dependencies(documents, root, root_length);
+    raz_compiler_rt_arena_destroy(root);
+    return loaded;
+}
+
+fn lsp_document_restore_disk(LspDocuments&mut documents, i64 uri, i64 uri_length) -> bool {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 text = raz_compiler_rt_arena_create(1048576);
+    if (path == 0 || text == 0) {
+        if (path != 0) { raz_compiler_rt_arena_destroy(path); }
+        if (text != 0) { raz_compiler_rt_arena_destroy(text); }
+        return false;
+    }
+    i64 path_length = lsp_file_uri_to_path(uri, uri_length, path, 8192);
+    i64 text_length = -1;
+    if (path_length > 0) { text_length = raz_compiler_rt_read_ascii(path, path_length, text, 1048576, ); }
+    bool restored = false;
+    if (text_length >= 0) { restored = lsp_document_set(documents, uri, uri_length, text, text_length) >= 0; }
+    raz_compiler_rt_arena_destroy(path); raz_compiler_rt_arena_destroy(text);
+    return restored;
+}
+
+fn lsp_utf8_width(i64 lead) -> i64 {
+    if (lead < 128) {
+        return 1;
+    }
+    if (lead >= 192 && lead < 224) {
+        return 2;
+    }
+    if (lead >= 224 && lead < 240) {
+        return 3;
+    }
+    if (lead >= 240 && lead < 248) {
+        return 4;
+    }
+    return 1;
+}
+
+fn lsp_codepoint(i64 text, i64 offset, i64 length, i64&mut width) -> i64 {
+    i64 lead = raz_compiler_rt_arena_get(text, offset);
+
+    *width = lsp_utf8_width(lead);
+    if (offset + *width > length) {
+        *width = 1;
+        return lead;
+    }
+    if (*width == 1) {
+        return lead;
+    }
+    if (*width == 2) {
+        return (lead - 192) * 64 + raz_compiler_rt_arena_get(text, offset + 1) - 128;
+    }
+    if (*width == 3) {
+        return (lead - 224) * 4096 +
+        (raz_compiler_rt_arena_get(text, offset + 1) - 128) * 64 +
+        raz_compiler_rt_arena_get(text, offset + 2) - 128;
+    }
+    return (lead - 240) * 262144 +
+    (raz_compiler_rt_arena_get(text, offset + 1) - 128) * 4096 +
+    (raz_compiler_rt_arena_get(text, offset + 2) - 128) * 64 +
+    raz_compiler_rt_arena_get(text, offset + 3) - 128;
+}
+
+fn lsp_position(i64 text, i64 length, i64 target, i64&mut out_line, i64&mut out_character) {
+    i64 line = 0;
+    i64 character = 0;
+    i64 offset = 0;
+
+    if (target < 0) {
+        target = 0;
+    }
+    if (target > length) {
+        target = length;
+    }
+    while (offset < target) {
+        i64 byte = raz_compiler_rt_arena_get(text, offset);
+
+        if (byte == 10) {
+            line += 1;
+            character = 0;
+            offset += 1;
+        } else {
+            i64 width = 1;
+            i64 codepoint = lsp_codepoint(text, offset, length, &mut width);
+
+            if (codepoint > 65535) {
+                character += 2;
+            } else {
+                character += 1;
+            }
+            offset += width;
+        }
+    }
+    *out_line = line;
+    *out_character = character;
+}
+
+fn lsp_writer_position(LspWriter&mut out, i64 text, i64 length, i64 offset) -> bool {
+    i64 line = 0;
+    i64 character = 0;
+
+    lsp_position(text, length, offset, &mut line, &mut character);
+
+    i64 a[8] = [123, 34, 108, 105, 110, 101, 34, 58];
+    i64 b[13] = [44, 34, 99, 104, 97, 114, 97, 99, 116, 101, 114, 34, 58];
+
+    return lsp_writer_literal(out, &a, 8) &&
+    lsp_writer_decimal(out, line) &&
+    lsp_writer_literal(out, &b, 13) &&
+    lsp_writer_decimal(out, character) &&
+    lsp_writer_byte(out, 125);
+}
+
+fn lsp_writer_range(LspWriter&mut out, i64 text, i64 length, i64 start, i64 end) -> bool {
+    i64 a[9] = [123, 34, 115, 116, 97, 114, 116, 34, 58];
+    i64 b[7] = [44, 34, 101, 110, 100, 34, 58];
+
+    return lsp_writer_literal(out, &a, 9) &&
+    lsp_writer_position(out, text, length, start) &&
+    lsp_writer_literal(out, &b, 7) &&
+    lsp_writer_position(out, text, length, end) &&
+    lsp_writer_byte(out, 125);
+}
+
+fn lsp_diagnostic_message_kind(DiagnosticCode code) -> i64 {
+    return cli_frontend_diagnostic_message(code);
+}
+
+fn lsp_writer_diagnostic_message(LspWriter&mut out, DiagnosticCode code) -> bool {
+    i64 kind = lsp_diagnostic_message_kind(code);
+
+    if (kind == 1) {
+        i64 t[19] = [105, 110, 118, 97, 108, 105, 100, 32, 115, 111, 117, 114, 99, 101, 32, 98, 121, 116, 101];
+
+        return lsp_writer_literal(out, &t, 19);
+    }
+    if (kind == 2) {
+        i64 t[14] = [101, 120, 112, 101, 99, 116, 101, 100, 32, 116, 111, 107, 101, 110];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+    if (kind == 3) {
+        i64 t[19] = [101, 120, 112, 101, 99, 116, 101, 100, 32, 105, 100, 101, 110, 116, 105, 102, 105, 101, 114];
+
+        return lsp_writer_literal(out, &t, 19);
+    }
+    if (kind == 4) {
+        i64 t[14] = [116, 111, 111, 32, 109, 97, 110, 121, 32, 105, 116, 101, 109, 115];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+    if (kind == 5) {
+        i64 t[12] = [117, 110, 107, 110, 111, 119, 110, 32, 110, 97, 109, 101];
+
+        return lsp_writer_literal(out, &t, 12);
+    }
+    if (kind == 6) {
+        i64 t[14] = [100, 117, 112, 108, 105, 99, 97, 116, 101, 32, 110, 97, 109, 101];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+    if (kind == 7) {
+        i64 t[12] = [117, 110, 107, 110, 111, 119, 110, 32, 116, 121, 112, 101];
+
+        return lsp_writer_literal(out, &t, 12);
+    }
+    if (kind == 8) {
+        i64 t[20] = [119, 114, 111, 110, 103, 32, 97, 114, 103, 117, 109, 101, 110, 116, 32, 99, 111, 117, 110, 116];
+
+        return lsp_writer_literal(out, &t, 20);
+    }
+    if (kind == 9) {
+        i64 t[14] = [109, 105, 115, 115, 105, 110, 103, 32, 114, 101, 116, 117, 114, 110];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+    if (kind == 10) {
+        i64 t[12] = [105, 110, 118, 97, 108, 105, 100, 32, 109, 111, 118, 101];
+
+        return lsp_writer_literal(out, &t, 12);
+    }
+    if (kind == 11) {
+        i64 t[14] = [117, 115, 101, 32, 97, 102, 116, 101, 114, 32, 109, 111, 118, 101];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+    if (kind == 12) {
+        i64 t[15] = [98, 111, 114, 114, 111, 119, 32, 99, 111, 110, 102, 108, 105, 99, 116];
+
+        return lsp_writer_literal(out, &t, 15);
+    }
+    if (kind == 13) {
+        i64 t[14] = [97, 109, 98, 105, 103, 117, 111, 117, 115, 32, 110, 97, 109, 101];
+
+        return lsp_writer_literal(out, &t, 14);
+    }
+
+    i64 t[20] = [82, 97, 122, 32, 99, 111, 109, 112, 105, 108, 101, 114, 32, 101, 114, 114, 111, 114, 32, 32];
+
+    return lsp_writer_literal(out, &t, 18);
+}
+
+fn lsp_publish_diagnostics(i64 uri, i64 uri_length, i64 text, i64 text_length) -> bool {
+    Source source;
+
+    source.bytes = text;
+    source.length = text_length;
+
+    HirModule hir;
+    bool valid = build_hir(source, &mut hir);
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 1024)) {
+        return false;
+    }
+
+    i64 prefix[76] = [123, 34, 106, 115, 111, 110, 114, 112, 99, 34, 58, 34, 50, 46, 48, 34, 44, 34, 109, 101, 116, 104, 111, 100, 34, 58, 34, 116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 112, 117, 98, 108, 105, 115, 104, 68, 105, 97, 103, 110, 111, 115, 116, 105, 99, 115, 34, 44, 34, 112, 97, 114, 97, 109, 115, 34, 58, 123, 34, 117, 114, 105, 34, 58];
+    bool ok = lsp_writer_literal(&mut out, &prefix, 76);
+
+    ok = ok && lsp_writer_json_string(&mut out, uri, 0, uri_length);
+
+    i64 diagnostics[16] = [44, 34, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 115, 34, 58, 91];
+
+    ok = ok && lsp_writer_literal(&mut out, &diagnostics, 16);
+    if (!valid) {
+        i64 start = hir.diagnostic_offset;
+        i64 end = start;
+
+        if (start < text_length) {
+            end = start + 1;
+        }
+
+        i64 range_key[9] = [123, 34, 114, 97, 110, 103, 101, 34, 58];
+
+        ok = ok && lsp_writer_literal(&mut out, &range_key, 9);
+        ok = ok && lsp_writer_range(&mut out, text, text_length, start, end);
+
+        i64 severity[23] = [44, 34, 115, 101, 118, 101, 114, 105, 116, 121, 34, 58, 49, 44, 34, 99, 111, 100, 101, 34, 58, 34, 69];
+
+        ok = ok && lsp_writer_literal(&mut out, &severity, 23);
+
+        i64 numeric = diagnostic_code_value(hir.diagnostic_code);
+
+        if (numeric < 10) {
+            i64 z[3] = [48, 48, 48];
+
+            ok = ok && lsp_writer_literal(&mut out, &z, 3);
+        } else {
+            i64 z[2] = [48, 48];
+
+            ok = ok && lsp_writer_literal(&mut out, &z, 2);
+        }
+        ok = ok && lsp_writer_decimal(&mut out, numeric);
+
+        i64 message[14] = [34, 44, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 32];
+
+        ok = ok && lsp_writer_literal(&mut out, &message, 13);
+        ok = ok && lsp_writer_diagnostic_message(&mut out, hir.diagnostic_code);
+
+        i64 close_diag[2] = [34, 125];
+
+        ok = ok && lsp_writer_literal(&mut out, &close_diag, 2);
+    }
+
+    i64 suffix[3] = [93, 125, 125];
+
+    ok = ok && lsp_writer_literal(&mut out, &suffix, 3);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    if (valid || hir.diagnostic_code != DiagnosticCode::None) {
+        destroy_hir(&mut hir);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_clear_diagnostics(i64 uri, i64 uri_length) -> bool {
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 256)) {
+        return false;
+    }
+
+    i64 prefix[76] = [123, 34, 106, 115, 111, 110, 114, 112, 99, 34, 58, 34, 50, 46, 48, 34, 44, 34, 109, 101, 116, 104, 111, 100, 34, 58, 34, 116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 112, 117, 98, 108, 105, 115, 104, 68, 105, 97, 103, 110, 111, 115, 116, 105, 99, 115, 34, 44, 34, 112, 97, 114, 97, 109, 115, 34, 58, 123, 34, 117, 114, 105, 34, 58];
+
+    bool ok =
+    lsp_writer_literal(&mut out, &prefix, 76) &&
+    lsp_writer_json_string(&mut out, uri, 0, uri_length);
+    i64 suffix[20] = [44, 34, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 115, 34, 58, 91, 93, 125, 125, 32];
+
+    ok = ok && lsp_writer_literal(&mut out, &suffix, 19);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_send_initialize(i64 body, i64 length) -> bool {
+    LspWriter out;
+    if (!lsp_writer_init(&mut out, 2048)) { return false; }
+    bool ok = lsp_response_result_prefix(&mut out, body, length);
+    i64 result[778] = [123, 34, 115, 101, 114, 118, 101, 114, 73, 110, 102, 111, 34, 58, 123, 34, 110, 97, 109, 101, 34, 58, 34, 114, 97, 122, 45, 108, 115, 112, 34, 44, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 34, 49, 46, 48, 46, 48, 34, 125, 44, 34, 99, 97, 112, 97, 98, 105, 108, 105, 116, 105, 101, 115, 34, 58, 123, 34, 116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 83, 121, 110, 99, 34, 58, 123, 34, 111, 112, 101, 110, 67, 108, 111, 115, 101, 34, 58, 116, 114, 117, 101, 44, 34, 99, 104, 97, 110, 103, 101, 34, 58, 49, 125, 44, 34, 100, 111, 99, 117, 109, 101, 110, 116, 70, 111, 114, 109, 97, 116, 116, 105, 110, 103, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 104, 111, 118, 101, 114, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 99, 111, 109, 112, 108, 101, 116, 105, 111, 110, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 123, 34, 116, 114, 105, 103, 103, 101, 114, 67, 104, 97, 114, 97, 99, 116, 101, 114, 115, 34, 58, 91, 34, 46, 34, 44, 34, 58, 34, 93, 125, 44, 34, 100, 101, 102, 105, 110, 105, 116, 105, 111, 110, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 114, 101, 102, 101, 114, 101, 110, 99, 101, 115, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 114, 101, 110, 97, 109, 101, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 119, 111, 114, 107, 115, 112, 97, 99, 101, 83, 121, 109, 98, 111, 108, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 100, 111, 99, 117, 109, 101, 110, 116, 83, 121, 109, 98, 111, 108, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 115, 105, 103, 110, 97, 116, 117, 114, 101, 72, 101, 108, 112, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 123, 34, 116, 114, 105, 103, 103, 101, 114, 67, 104, 97, 114, 97, 99, 116, 101, 114, 115, 34, 58, 91, 34, 40, 34, 44, 34, 44, 34, 93, 125, 44, 34, 115, 101, 109, 97, 110, 116, 105, 99, 84, 111, 107, 101, 110, 115, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 123, 34, 108, 101, 103, 101, 110, 100, 34, 58, 123, 34, 116, 111, 107, 101, 110, 84, 121, 112, 101, 115, 34, 58, 91, 34, 107, 101, 121, 119, 111, 114, 100, 34, 44, 34, 102, 117, 110, 99, 116, 105, 111, 110, 34, 44, 34, 116, 121, 112, 101, 34, 44, 34, 118, 97, 114, 105, 97, 98, 108, 101, 34, 44, 34, 112, 97, 114, 97, 109, 101, 116, 101, 114, 34, 44, 34, 112, 114, 111, 112, 101, 114, 116, 121, 34, 44, 34, 101, 110, 117, 109, 77, 101, 109, 98, 101, 114, 34, 44, 34, 110, 97, 109, 101, 115, 112, 97, 99, 101, 34, 93, 44, 34, 116, 111, 107, 101, 110, 77, 111, 100, 105, 102, 105, 101, 114, 115, 34, 58, 91, 93, 125, 44, 34, 102, 117, 108, 108, 34, 58, 116, 114, 117, 101, 125, 44, 34, 99, 111, 100, 101, 65, 99, 116, 105, 111, 110, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 123, 34, 99, 111, 100, 101, 65, 99, 116, 105, 111, 110, 75, 105, 110, 100, 115, 34, 58, 91, 34, 113, 117, 105, 99, 107, 102, 105, 120, 34, 44, 34, 115, 111, 117, 114, 99, 101, 46, 102, 105, 120, 65, 108, 108, 46, 114, 97, 122, 34, 93, 125, 44, 34, 105, 110, 108, 97, 121, 72, 105, 110, 116, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 102, 111, 108, 100, 105, 110, 103, 82, 97, 110, 103, 101, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 100, 111, 99, 117, 109, 101, 110, 116, 72, 105, 103, 104, 108, 105, 103, 104, 116, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 115, 101, 108, 101, 99, 116, 105, 111, 110, 82, 97, 110, 103, 101, 80, 114, 111, 118, 105, 100, 101, 114, 34, 58, 116, 114, 117, 101, 125, 125];
+    ok = ok && lsp_writer_literal(&mut out, &result, 778) && lsp_writer_byte(&mut out, 125);
+    if (ok) { ok = lsp_send(&mut out); }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_writer_json_array_string(LspWriter&mut writer, i64[]value, i64 length) -> bool {
+    if (!lsp_writer_byte(writer, 34)) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        i64 byte = value[i];
+
+        if (byte == 34 || byte == 92) {
+            if (!lsp_writer_byte(writer, 92) || !lsp_writer_byte(writer, byte)) {
+                return false;
+            }
+        } else if (!lsp_writer_byte(writer, byte)) {
+            return false;
+        }
+        i += 1;
+    }
+    return lsp_writer_byte(writer, 34);
+}
+
+// Semantic editor queries reuse the production HIR as the source of identity
+// and scope.  The lexer is used only to translate an LSP cursor back to the
+// source token the compiler already understands.
+struct LspSemanticTarget {
+    bool found;
+    bool local;
+    i64 kind;
+    i64 function_index;
+    i64 name_offset;
+    i64 name_length;
+    i64 declaration_offset;
+    i64 type_kind;
+}
+
+fn lsp_semantic_target_clear(LspSemanticTarget&mut target) {
+    target.found = false;
+    target.local = false;
+    target.kind = 0;
+    target.function_index = -1;
+    target.name_offset = 0;
+    target.name_length = 0;
+    target.declaration_offset = 0;
+    target.type_kind = -1;
+}
+
+fn lsp_offset_from_position(i64 body, i64 body_length, i64 text, i64 text_length) -> i64 {
+    i64 position_key[8] = [112, 111, 115, 105, 116, 105, 111, 110];
+    i64 line_key[4] = [108, 105, 110, 101];
+    i64 character_key[9] = [99, 104, 97, 114, 97, 99, 116, 101, 114];
+    i64 position = lsp_json_find_key(body, body_length, &position_key, 8, 0);
+
+    if (position < 0) {
+        return 0;
+    }
+
+    i64 target_line = lsp_json_integer_field(body, body_length, &line_key, 4, position);
+    i64 target_character = lsp_json_integer_field(body, body_length, &character_key, 9, position);
+
+    if (target_line < 0) {
+        target_line = 0;
+    }
+    if (target_character < 0) {
+        target_character = 0;
+    }
+
+    i64 line = 0;
+    i64 character = 0;
+    i64 offset = 0;
+
+    while (offset < text_length && line < target_line) {
+        if (raz_compiler_rt_arena_get(text, offset) == 10) {
+            line += 1;
+        }
+        offset += 1;
+    }
+    while (offset < text_length && raz_compiler_rt_arena_get(text, offset) != 10 && character < target_character) {
+        i64 width = 1;
+        i64 codepoint = lsp_codepoint(text, offset, text_length, &mut width);
+        i64 units = 1;
+
+        if (codepoint > 65535) {
+            units = 2;
+        }
+        if (character + units > target_character) {
+            break;
+        }
+        character += units;
+        offset += width;
+    }
+    return offset;
+}
+
+fn lsp_identifier_at(i64 text, i64 text_length, i64 offset, i64&mut name_offset, i64&mut name_length) -> bool {
+    Source source;
+    source.bytes = text;
+    source.length = text_length;
+    Lexer scan;
+    init_lexer(&mut scan, source);
+    Token token;
+    next_token(&mut scan, &mut token);
+
+    while (token.kind != TokenKind::End) {
+        if (token.kind == TokenKind::Identifier && offset >= token.offset && offset <= token.offset + token.length) {
+            *name_offset = token.offset;
+            *name_length = token.length;
+            return true;
+        }
+        next_token(&mut scan, &mut token);
+    }
+    return false;
+}
+
+fn lsp_name_same(i64 text, i64 left_offset, i64 left_length, i64 right_offset, i64 right_length) -> bool {
+    if (left_length != right_length) {
+        return false;
+    }
+    i64 i = 0;
+    while (i < left_length) {
+        if (raz_compiler_rt_arena_get(text, left_offset + i) != raz_compiler_rt_arena_get(text, right_offset + i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn lsp_function_at(HirModule& hir, i64 offset, i64 text_length) -> i64 {
+    i64 best = -1;
+    i64 best_offset = -1;
+    i64 i = 0;
+    while (i < hir.function_count) {
+        i64 declaration = raz_compiler_rt_arena_get(hir.function_declaration_offsets, i);
+        if (declaration <= offset && declaration >= best_offset && declaration < text_length) {
+            best = i;
+            best_offset = declaration;
+        }
+        i += 1;
+    }
+    return best;
+}
+
+fn lsp_function_end(HirModule& hir, i64 function_index, i64 text_length) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(hir.function_declaration_offsets, function_index);
+    i64 end = text_length;
+    i64 i = 0;
+    while (i < hir.function_count) {
+        i64 candidate = raz_compiler_rt_arena_get(hir.function_declaration_offsets, i);
+        if (candidate > start && candidate < end) {
+            end = candidate;
+        }
+        i += 1;
+    }
+    return end;
+}
+
+fn lsp_semantic_resolve_hir(
+HirModule& hir,
+i64 text,
+i64 text_length,
+i64 cursor,
+i64 name_offset,
+i64 name_length,
+LspSemanticTarget&mut target,
+) -> bool {
+    lsp_semantic_target_clear(target);
+    i64 function_index = lsp_function_at(hir, cursor, text_length);
+    i64 i = 0;
+
+    if (function_index >= 0) {
+        while (i < hir.local_count) {
+            if (
+            raz_compiler_rt_arena_get(hir.local_function_indices, i) == function_index &&
+            lsp_name_same(
+            text,
+            name_offset,
+            name_length,
+            raz_compiler_rt_arena_get(hir.local_name_offsets, i),
+            raz_compiler_rt_arena_get(hir.local_name_lengths, i)
+            )
+            ) {
+                target.found = true;
+                target.local = true;
+                target.kind = 7;
+                target.function_index = function_index;
+                target.name_offset = name_offset;
+                target.name_length = name_length;
+                target.declaration_offset = raz_compiler_rt_arena_get(hir.local_name_offsets, i);
+                target.type_kind = raz_compiler_rt_arena_get(hir.local_types, i);
+                return true;
+            }
+            i += 1;
+        }
+        i = 0;
+        while (i < hir.parameter_count) {
+            if (
+            raz_compiler_rt_arena_get(hir.parameter_function_indices, i) == function_index &&
+            lsp_name_same(
+            text,
+            name_offset,
+            name_length,
+            raz_compiler_rt_arena_get(hir.parameter_name_offsets, i),
+            raz_compiler_rt_arena_get(hir.parameter_name_lengths, i)
+            )
+            ) {
+                target.found = true;
+                target.local = true;
+                target.kind = 6;
+                target.function_index = function_index;
+                target.name_offset = name_offset;
+                target.name_length = name_length;
+                target.declaration_offset = raz_compiler_rt_arena_get(hir.parameter_name_offsets, i);
+                target.type_kind = raz_compiler_rt_arena_get(hir.parameter_types, i);
+                return true;
+            }
+            i += 1;
+        }
+    }
+
+    i = 0;
+    while (i < hir.function_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.function_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.function_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true;
+            target.kind = 1;
+            target.function_index = i;
+            target.name_offset = name_offset;
+            target.name_length = name_length;
+            target.declaration_offset = declared;
+            target.type_kind = raz_compiler_rt_arena_get(hir.function_return_types, i);
+            return true;
+        }
+        i += 1;
+    }
+
+    i = 0;
+    while (i < hir.struct_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.struct_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.struct_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true; target.kind = 2; target.name_offset = name_offset; target.name_length = name_length;
+            target.declaration_offset = declared; return true;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < hir.enum_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.enum_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.enum_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true; target.kind = 3; target.name_offset = name_offset; target.name_length = name_length;
+            target.declaration_offset = declared; return true;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < hir.trait_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.trait_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.trait_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true; target.kind = 4; target.name_offset = name_offset; target.name_length = name_length;
+            target.declaration_offset = declared; return true;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < hir.global_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.global_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.global_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true; target.kind = 5; target.name_offset = name_offset; target.name_length = name_length;
+            target.declaration_offset = declared; target.type_kind = raz_compiler_rt_arena_get(hir.global_types, i); return true;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < hir.constant_count) {
+        i64 declared = raz_compiler_rt_arena_get(hir.constant_name_offsets, i);
+        i64 declared_length = raz_compiler_rt_arena_get(hir.constant_name_lengths, i);
+        if (lsp_name_same(text, name_offset, name_length, declared, declared_length)) {
+            target.found = true; target.kind = 8; target.name_offset = name_offset; target.name_length = name_length;
+            target.declaration_offset = declared; target.type_kind = raz_compiler_rt_arena_get(hir.constant_types, i); return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn lsp_semantic_resolve(
+i64 text,
+i64 text_length,
+i64 cursor,
+i64 name_offset,
+i64 name_length,
+LspSemanticTarget&mut target,
+) -> bool {
+    Source source;
+    source.bytes = text;
+    source.length = text_length;
+    HirModule hir;
+    if (!build_hir(source, &mut hir)) {
+        if (hir.diagnostic_code != DiagnosticCode::None) {
+            destroy_hir(&mut hir);
+        }
+        lsp_semantic_target_clear(target);
+        return false;
+    }
+    bool found = lsp_semantic_resolve_hir(&hir, text, text_length, cursor, name_offset, name_length, target);
+    destroy_hir(&mut hir);
+    return found;
+}
+
+fn lsp_writer_type_name(LspWriter&mut out, i64 type_kind) -> bool {
+    if (type_kind == 1) { i64 t[3] = [102,54,52]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 2) { i64 t[2] = [105,56]; return lsp_writer_literal(out, &t, 2); }
+    if (type_kind == 3) { i64 t[3] = [105,49,54]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 4) { i64 t[3] = [105,51,50]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 5) { i64 t[2] = [117,56]; return lsp_writer_literal(out, &t, 2); }
+    if (type_kind == 6) { i64 t[3] = [117,49,54]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 7) { i64 t[3] = [117,51,50]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 8) { i64 t[3] = [117,54,52]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 9) { i64 t[5] = [117,115,105,122,101]; return lsp_writer_literal(out, &t, 5); }
+    if (type_kind == 10) { i64 t[4] = [99,104,97,114]; return lsp_writer_literal(out, &t, 4); }
+    if (type_kind == 11) { i64 t[3] = [102,51,50]; return lsp_writer_literal(out, &t, 3); }
+    if (type_kind == 13) { i64 t[6] = [115,116,114,105,110,103]; return lsp_writer_literal(out, &t, 6); }
+    i64 t[3] = [105,54,52];
+    return lsp_writer_literal(out, &t, 3);
+}
+
+fn lsp_signature_range(i64 text, i64 text_length, i64 name_offset, i64&mut start, i64&mut end) {
+    *start = name_offset;
+    while (*start > 0) {
+        i64 byte = raz_compiler_rt_arena_get(text, *start - 1);
+        if (byte == 10 || byte == 13 || byte == 125 || byte == 59) { break; }
+        *start -= 1;
+    }
+    while (*start < name_offset && (raz_compiler_rt_arena_get(text, *start) == 32 || raz_compiler_rt_arena_get(text, *start) == 9)) { *start += 1; }
+    *end = name_offset;
+    while (*end < text_length) {
+        i64 byte = raz_compiler_rt_arena_get(text, *end);
+        if (byte == 123 || byte == 59 || byte == 10 || byte == 13) { break; }
+        *end += 1;
+    }
+    while (*end > *start && (raz_compiler_rt_arena_get(text, *end - 1) == 32 || raz_compiler_rt_arena_get(text, *end - 1) == 9)) { *end -= 1; }
+}
+
+fn lsp_send_hover(LspDocuments& documents, i64 body, i64 body_length, i64 document_index) -> bool {
+    i64 text = raz_compiler_rt_arena_get(documents.texts, document_index);
+    i64 text_length = raz_compiler_rt_arena_get(documents.text_lengths, document_index);
+    i64 cursor = lsp_offset_from_position(body, body_length, text, text_length);
+    i64 name_offset = 0; i64 name_length = 0;
+    if (!lsp_identifier_at(text, text_length, cursor, &mut name_offset, &mut name_length)) { return lsp_send_null_result(body, body_length); }
+    LspSemanticTarget target;
+    bool found = lsp_semantic_resolve(text, text_length, cursor, name_offset, name_length, &mut target);
+    if (!found || (target.kind == 1 && target.local)) { return lsp_send_null_result(body, body_length); }
+    LspWriter out;
+    if (!lsp_writer_init(&mut out, 2048)) { return false; }
+    bool ok = lsp_response_result_prefix(&mut out, body, body_length);
+    i64 a[43] = [123,34,99,111,110,116,101,110,116,115,34,58,123,34,107,105,110,100,34,58,34,109,97,114,107,100,111,119,110,34,44,34,118,97,108,117,101,34,58,34,96,96,96];
+    ok = ok && lsp_writer_literal(&mut out, &a, 43);
+    if (target.kind == 1) {
+        i64 sig_start = 0; i64 sig_end = 0; lsp_signature_range(text, text_length, target.declaration_offset, &mut sig_start, &mut sig_end);
+        i64 razline[5] = [114,97,122,92,110]; ok = ok && lsp_writer_literal(&mut out, &razline, 5);
+        ok = ok && lsp_writer_arena(&mut out, text, sig_start, sig_end - sig_start);
+    } else {
+        ok = ok && lsp_writer_type_name(&mut out, target.type_kind);
+        ok = ok && lsp_writer_byte(&mut out, 32) && lsp_writer_arena(&mut out, text, target.declaration_offset, name_length);
+    }
+    i64 b[9] = [92,110,96,96,96,34,125,125,125];
+    ok = ok && lsp_writer_literal(&mut out, &b, 9);
+    if (ok) { ok = lsp_send(&mut out); }
+    lsp_writer_destroy(&mut out); return ok;
+}
+
+fn lsp_write_location(LspWriter&mut out, i64 uri, i64 uri_length, i64 text, i64 text_length, i64 offset, i64 name_length) -> bool {
+    i64 a[8] = [123,34,117,114,105,34,58,32];
+    bool ok = lsp_writer_literal(out, &a, 7) && lsp_writer_json_string(out, uri, 0, uri_length);
+    i64 b[9] = [44,34,114,97,110,103,101,34,58];
+    return ok && lsp_writer_literal(out, &b, 9) && lsp_writer_range(out, text, text_length, offset, offset + name_length) && lsp_writer_byte(out, 125);
+}
+
+fn lsp_find_global_declaration(
+LspDocuments& documents, i64 name_text, i64 name_offset, i64 name_length,
+i64&mut out_document, LspSemanticTarget&mut out_target
+) -> bool {
+    i64 d = 0;
+    while (d < documents.count) {
+        i64 text = raz_compiler_rt_arena_get(documents.texts, d); i64 text_length = raz_compiler_rt_arena_get(documents.text_lengths, d);
+        Source source; source.bytes = text; source.length = text_length; HirModule hir;
+        if (build_hir(source, &mut hir)) {
+            // Search declarations by matching against the requested spelling copied from another document.
+            i64 i = 0;
+            while (i < hir.function_count) {
+                i64 declared = raz_compiler_rt_arena_get(hir.function_name_offsets, i); i64 dl = raz_compiler_rt_arena_get(hir.function_name_lengths, i);
+                if (dl == name_length) {
+                    bool same = true; i64 j = 0;
+                    while (j < dl) { if (raz_compiler_rt_arena_get(text, declared+j) != raz_compiler_rt_arena_get(name_text, name_offset+j)) { same=false; break; } j+=1; }
+                    if (same) { lsp_semantic_target_clear(out_target); out_target.found=true; out_target.kind=1; out_target.function_index=i; out_target.declaration_offset=declared; out_target.name_length=dl; out_target.type_kind=raz_compiler_rt_arena_get(hir.function_return_types,i); *out_document=d; destroy_hir(&mut hir); return true; }
+                }
+                i += 1;
+            }
+            destroy_hir(&mut hir);
+        } else if (hir.diagnostic_code != DiagnosticCode::None) { destroy_hir(&mut hir); }
+        d += 1;
+    }
+    return false;
+}
+
+fn lsp_send_definition(LspDocuments& documents, i64 body, i64 body_length, i64 document_index) -> bool {
+    i64 text = raz_compiler_rt_arena_get(documents.texts, document_index); i64 text_length=raz_compiler_rt_arena_get(documents.text_lengths,document_index);
+    i64 cursor=lsp_offset_from_position(body,body_length,text,text_length); i64 no=0; i64 nl=0;
+    if (!lsp_identifier_at(text,text_length,cursor,&mut no,&mut nl)) { return lsp_send_null_result(body,body_length); }
+    LspSemanticTarget target; bool found=lsp_semantic_resolve(text,text_length,cursor,no,nl,&mut target); i64 target_doc=document_index;
+    if (!found) { found=lsp_find_global_declaration(documents,text,no,nl,&mut target_doc,&mut target); }
+    if (!found) { return lsp_send_null_result(body,body_length); }
+    i64 target_text=raz_compiler_rt_arena_get(documents.texts,target_doc); i64 target_len=raz_compiler_rt_arena_get(documents.text_lengths,target_doc);
+    LspWriter out; if (!lsp_writer_init(&mut out,512)) { return false; }
+    bool ok=lsp_response_result_prefix(&mut out,body,body_length) && lsp_write_location(&mut out,raz_compiler_rt_arena_get(documents.uris,target_doc),raz_compiler_rt_arena_get(documents.uri_lengths,target_doc),target_text,target_len,target.declaration_offset,nl) && lsp_writer_byte(&mut out,125);
+    if(ok){ok=lsp_send(&mut out);} lsp_writer_destroy(&mut out); return ok;
+}
+
+fn lsp_occurrence_matches_target(HirModule& hir, i64 text, i64 text_length, i64 token_offset, i64 token_length, LspSemanticTarget& target) -> bool {
+    LspSemanticTarget resolved;
+    if (!lsp_semantic_resolve_hir(hir,text,text_length,token_offset,token_offset,token_length,&mut resolved)) { return false; }
+    if (target.local) { return resolved.local && resolved.kind==target.kind && resolved.function_index==target.function_index && resolved.declaration_offset==target.declaration_offset; }
+    return !resolved.local && resolved.kind==target.kind;
+}
+
+fn lsp_send_references(LspDocuments& documents, i64 body, i64 body_length, i64 document_index, bool highlights) -> bool {
+    i64 text = raz_compiler_rt_arena_get(documents.texts, document_index);
+    i64 text_length = raz_compiler_rt_arena_get(documents.text_lengths, document_index);
+    i64 cursor = lsp_offset_from_position(body, body_length, text, text_length);
+    i64 name_offset = 0;
+    i64 name_length = 0;
+    if (!lsp_identifier_at(text, text_length, cursor, &mut name_offset, &mut name_length)) {
+        return lsp_send_null_result(body, body_length);
+    }
+
+    LspSemanticTarget target;
+    bool found = lsp_semantic_resolve(text, text_length, cursor, name_offset, name_length, &mut target);
+    i64 target_document = document_index;
+    if (!found) {
+        found = lsp_find_global_declaration(documents, text, name_offset, name_length, &mut target_document, &mut target);
+    }
+    if (!found) {
+        return lsp_send_null_result(body, body_length);
+    }
+
+    LspWriter out;
+    if (!lsp_writer_init(&mut out, 8192)) { return false; }
+    bool ok = lsp_response_result_prefix(&mut out, body, body_length) && lsp_writer_byte(&mut out, 91);
+    bool first = true;
+    i64 d = 0;
+    while (ok && d < documents.count) {
+        if (target.local && d != target_document) { d += 1; continue; }
+        i64 document_text = raz_compiler_rt_arena_get(documents.texts, d);
+        i64 document_length = raz_compiler_rt_arena_get(documents.text_lengths, d);
+        Source source; source.bytes = document_text; source.length = document_length;
+        HirModule hir;
+        bool valid = build_hir(source, &mut hir);
+        Lexer scan; init_lexer(&mut scan, source); Token token; next_token(&mut scan, &mut token);
+        while (ok && token.kind != TokenKind::End) {
+            if (token.kind == TokenKind::Identifier && token.length == name_length) {
+                bool spelling = true;
+                i64 j = 0;
+                while (j < name_length) {
+                    if (raz_compiler_rt_arena_get(document_text, token.offset + j) != raz_compiler_rt_arena_get(text, name_offset + j)) { spelling = false; break; }
+                    j += 1;
+                }
+                bool matches = false;
+                if (spelling && valid) {
+                    matches = lsp_occurrence_matches_target(&mut hir, document_text, document_length, token.offset, token.length, &mut target);
+                } else if (spelling && !valid && !target.local) {
+                    // Workspace-level unresolved globals are still useful editor
+                    // references while another open document owns the declaration.
+                    matches = true;
+                }
+                if (matches) {
+                    if (!first) { ok = lsp_writer_byte(&mut out, 44); }
+                    first = false;
+                    if (highlights) {
+                        i64 range_key[9] = [123,34,114,97,110,103,101,34,58];
+                        ok = ok && lsp_writer_literal(&mut out, &range_key, 9) && lsp_writer_range(&mut out, document_text, document_length, token.offset, token.offset + token.length);
+                        i64 kind_key[10] = [44,34,107,105,110,100,34,58,49,125];
+                        ok = ok && lsp_writer_literal(&mut out, &kind_key, 10);
+                    } else {
+                        ok = ok && lsp_write_location(&mut out, raz_compiler_rt_arena_get(documents.uris, d), raz_compiler_rt_arena_get(documents.uri_lengths, d), document_text, document_length, token.offset, token.length);
+                    }
+                }
+            }
+            next_token(&mut scan, &mut token);
+        }
+        if (valid || hir.diagnostic_code != DiagnosticCode::None) { destroy_hir(&mut hir); }
+        d += 1;
+    }
+    ok = ok && lsp_writer_byte(&mut out, 93) && lsp_writer_byte(&mut out, 125);
+    if (ok) { ok = lsp_send(&mut out); }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_valid_identifier(i64 text, i64 length) -> bool {
+    if(length<=0){return false;} i64 i=0; while(i<length){i64 b=raz_compiler_rt_arena_get(text,i); bool valid=(b>=97&&b<=122)||(b>=65&&b<=90)||(b>=48&&b<=57)||b==95; if(!valid || (i==0&&b>=48&&b<=57)){return false;}i+=1;} return true;
+}
+
+fn lsp_send_rename(LspDocuments& documents, i64 body, i64 body_length, i64 document_index) -> bool {
+    i64 replacement = raz_compiler_rt_arena_create(256);
+    i64 key[7] = [110,101,119,78,97,109,101];
+    i64 replacement_length = lsp_json_string_field(body, body_length, &key, 7, replacement, 256, 0);
+    if (replacement_length < 0 || !lsp_valid_identifier(replacement, replacement_length)) {
+        raz_compiler_rt_arena_destroy(replacement);
+        return lsp_send_null_result(body, body_length);
+    }
+    i64 text = raz_compiler_rt_arena_get(documents.texts, document_index);
+    i64 text_length = raz_compiler_rt_arena_get(documents.text_lengths, document_index);
+    i64 cursor = lsp_offset_from_position(body, body_length, text, text_length);
+    i64 name_offset = 0; i64 name_length = 0;
+    if (!lsp_identifier_at(text, text_length, cursor, &mut name_offset, &mut name_length)) {
+        raz_compiler_rt_arena_destroy(replacement); return lsp_send_null_result(body, body_length);
+    }
+    LspSemanticTarget target;
+    bool found = lsp_semantic_resolve(text, text_length, cursor, name_offset, name_length, &mut target);
+    i64 target_document = document_index;
+    if (!found) { found = lsp_find_global_declaration(documents, text, name_offset, name_length, &mut target_document, &mut target); }
+    if (!found) { raz_compiler_rt_arena_destroy(replacement); return lsp_send_null_result(body, body_length); }
+
+    LspWriter out; if (!lsp_writer_init(&mut out, 8192)) { raz_compiler_rt_arena_destroy(replacement); return false; }
+    bool ok = lsp_response_result_prefix(&mut out, body, body_length);
+    i64 changes_key[12] = [123,34,99,104,97,110,103,101,115,34,58,123];
+    ok = ok && lsp_writer_literal(&mut out, &changes_key, 12);
+    bool first_document = true;
+    i64 d = 0;
+    while (ok && d < documents.count) {
+        if (target.local && d != target_document) { d += 1; continue; }
+        i64 document_text = raz_compiler_rt_arena_get(documents.texts, d);
+        i64 document_length = raz_compiler_rt_arena_get(documents.text_lengths, d);
+        Source source; source.bytes = document_text; source.length = document_length;
+        HirModule hir; bool valid = build_hir(source, &mut hir);
+        LspWriter edits; if (!lsp_writer_init(&mut edits, 4096)) { ok = false; break; }
+        bool first_edit = true;
+        Lexer scan; init_lexer(&mut scan, source); Token token; next_token(&mut scan, &mut token);
+        while (token.kind != TokenKind::End) {
+            if (token.kind == TokenKind::Identifier && token.length == name_length) {
+                bool spelling = true; i64 j = 0;
+                while (j < name_length) {
+                    if (raz_compiler_rt_arena_get(document_text, token.offset + j) != raz_compiler_rt_arena_get(text, name_offset + j)) { spelling = false; break; }
+                    j += 1;
+                }
+                bool matches = false;
+                if (spelling && valid) { matches = lsp_occurrence_matches_target(&mut hir, document_text, document_length, token.offset, token.length, &mut target); }
+                else if (spelling && !valid && !target.local) { matches = true; }
+                if (matches) {
+                    if (!first_edit) { lsp_writer_byte(&mut edits, 44); }
+                    first_edit = false;
+                    i64 range_key[9] = [123,34,114,97,110,103,101,34,58];
+                    lsp_writer_literal(&mut edits, &range_key, 9);
+                    lsp_writer_range(&mut edits, document_text, document_length, token.offset, token.offset + token.length);
+                    i64 new_key[11] = [44,34,110,101,119,84,101,120,116,34,58];
+                    lsp_writer_literal(&mut edits, &new_key, 11);
+                    lsp_writer_json_string(&mut edits, replacement, 0, replacement_length);
+                    lsp_writer_byte(&mut edits, 125);
+                }
+            }
+            next_token(&mut scan, &mut token);
+        }
+        if (valid || hir.diagnostic_code != DiagnosticCode::None) { destroy_hir(&mut hir); }
+        if (!first_edit) {
+            if (!first_document) { ok = ok && lsp_writer_byte(&mut out, 44); }
+            first_document = false;
+            ok = ok && lsp_writer_json_string(&mut out, raz_compiler_rt_arena_get(documents.uris, d), 0, raz_compiler_rt_arena_get(documents.uri_lengths, d));
+            ok = ok && lsp_writer_byte(&mut out, 58) && lsp_writer_byte(&mut out, 91) && lsp_writer_arena(&mut out, edits.data, 0, edits.length) && lsp_writer_byte(&mut out, 93);
+        }
+        lsp_writer_destroy(&mut edits); d += 1;
+    }
+    ok = ok && lsp_writer_byte(&mut out, 125) && lsp_writer_byte(&mut out, 125) && lsp_writer_byte(&mut out, 125);
+    if (ok) { ok = lsp_send(&mut out); }
+    lsp_writer_destroy(&mut out); raz_compiler_rt_arena_destroy(replacement); return ok;
+}
+
+fn lsp_send_signature_help(LspDocuments& documents,i64 body,i64 body_length,i64 document_index)->bool{
+    i64 text=raz_compiler_rt_arena_get(documents.texts,document_index);i64 tl=raz_compiler_rt_arena_get(documents.text_lengths,document_index);i64 cursor=lsp_offset_from_position(body,body_length,text,tl);Source source;source.bytes=text;source.length=tl;Lexer scan;init_lexer(&mut scan,source);Token previous;previous.kind=TokenKind::End;previous.offset=0;previous.length=0;Token current;next_token(&mut scan,&mut current);i64 call_offset=-1; i64 call_length=0;while(current.kind!=TokenKind::End&&current.offset<=cursor){if(current.kind==TokenKind::LeftParen&&previous.kind==TokenKind::Identifier){call_offset=previous.offset;call_length=previous.length;}previous=current;next_token(&mut scan,&mut current);}if(call_offset<0){return lsp_send_null_result(body,body_length);}i64 target_doc=-1;LspSemanticTarget target;if(!lsp_find_global_declaration(documents,text,call_offset,call_length,&mut target_doc,&mut target)){return lsp_send_null_result(body,body_length);}i64 dt=raz_compiler_rt_arena_get(documents.texts,target_doc);i64 dl=raz_compiler_rt_arena_get(documents.text_lengths,target_doc);i64 ss=0; i64 se=0;lsp_signature_range(dt,dl,target.declaration_offset,&mut ss,&mut se);LspWriter out;if(!lsp_writer_init(&mut out,1024)){return false;}bool ok=lsp_response_result_prefix(&mut out,body,body_length);i64 a[25]=[123,34,115,105,103,110,97,116,117,114,101,115,34,58,91,123,34,108,97,98,101,108,34,58,32];ok=ok&&lsp_writer_literal(&mut out,&a,24)&&lsp_writer_json_string(&mut out,dt,ss,se-ss);i64 b[43]=[125,93,44,34,97,99,116,105,118,101,83,105,103,110,97,116,117,114,101,34,58,48,44,34,97,99,116,105,118,101,80,97,114,97,109,101,116,101,114,34,58,48,125];ok=ok&&lsp_writer_literal(&mut out,&b,43)&&lsp_writer_byte(&mut out,125);if(ok){ok=lsp_send(&mut out);}lsp_writer_destroy(&mut out);return ok;
+}
+
+fn lsp_semantic_token_type(i64 kind)->i64{if(kind==1){return 1;}if(kind==2||kind==3||kind==4){return 2;}if(kind==6){return 4;}if(kind==7||kind==5||kind==8){return 3;}return 3;}
+
+fn lsp_send_semantic_tokens(i64 body,i64 body_length,i64 text,i64 text_length)->bool{
+    Source source;source.bytes=text;source.length=text_length;HirModule hir;if(!build_hir(source,&mut hir)){if(hir.diagnostic_code!=DiagnosticCode::None){destroy_hir(&mut hir);}return lsp_send_null_result(body,body_length);}LspWriter data;if(!lsp_writer_init(&mut data,8192)){destroy_hir(&mut hir);return false;}Lexer scan;init_lexer(&mut scan,source);Token token;next_token(&mut scan,&mut token);i64 prev_line=0; i64 prev_char=0;bool first=true;while(token.kind!=TokenKind::End){if(token.kind==TokenKind::Identifier){LspSemanticTarget target;if(lsp_semantic_resolve_hir(&mut hir,text,text_length,token.offset,token.offset,token.length,&mut target)){i64 line=0; i64 ch=0;lsp_position(text,text_length,token.offset,&mut line,&mut ch);if(!first){lsp_writer_byte(&mut data,44);}first=false;lsp_writer_decimal(&mut data,line-prev_line);lsp_writer_byte(&mut data,44);if(line==prev_line){lsp_writer_decimal(&mut data,ch-prev_char);}else{lsp_writer_decimal(&mut data,ch);}lsp_writer_byte(&mut data,44);lsp_writer_decimal(&mut data,token.length);lsp_writer_byte(&mut data,44);lsp_writer_decimal(&mut data,lsp_semantic_token_type(target.kind));i64 zero[2]=[44,48];lsp_writer_literal(&mut data,&zero,2);prev_line=line;prev_char=ch;}}next_token(&mut scan,&mut token);}LspWriter out;if(!lsp_writer_init(&mut out,data.length+256)){lsp_writer_destroy(&mut data);destroy_hir(&mut hir);return false;}bool ok=lsp_response_result_prefix(&mut out,body,body_length);i64 a[9]=[123,34,100,97,116,97,34,58,91];ok=ok&&lsp_writer_literal(&mut out,&a,9)&&lsp_writer_arena(&mut out,data.data,0,data.length);i64 b[3]=[93,125,125];ok=ok&&lsp_writer_literal(&mut out,&b,3);if(ok){ok=lsp_send(&mut out);}lsp_writer_destroy(&mut out);lsp_writer_destroy(&mut data);destroy_hir(&mut hir);return ok;
+}
+
+fn lsp_send_inlay_hints(i64 body,i64 body_length,i64 text,i64 text_length)->bool{
+    Source source;source.bytes=text;source.length=text_length;HirModule hir;if(!build_hir(source,&mut hir)){if(hir.diagnostic_code!=DiagnosticCode::None){destroy_hir(&mut hir);}return lsp_send_null_result(body,body_length);}LspWriter out;if(!lsp_writer_init(&mut out,4096)){destroy_hir(&mut hir);return false;}bool ok=lsp_response_result_prefix(&mut out,body,body_length)&&lsp_writer_byte(&mut out,91);bool first=true;i64 i=0;while(ok&&i<hir.local_count){i64 no=raz_compiler_rt_arena_get(hir.local_name_offsets,i);i64 nl=raz_compiler_rt_arena_get(hir.local_name_lengths,i);i64 start=no;while(start>0&&raz_compiler_rt_arena_get(text,start-1)!=10&&raz_compiler_rt_arena_get(text,start-1)!=59&&raz_compiler_rt_arena_get(text,start-1)!=123){start-=1;}bool has_auto=false;i64 j=start;while(j+4<=no){if(raz_compiler_rt_arena_get(text,j)==97&&raz_compiler_rt_arena_get(text,j+1)==117&&raz_compiler_rt_arena_get(text,j+2)==116&&raz_compiler_rt_arena_get(text,j+3)==111){has_auto=true;break;}j+=1;}if(has_auto){if(!first){ok=lsp_writer_byte(&mut out,44);}first=false;i64 pk[12]=[123,34,112,111,115,105,116,105,111,110,34,58];ok=ok&&lsp_writer_literal(&mut out,&pk,12)&&lsp_writer_position(&mut out,text,text_length,no+nl);i64 lk[12]=[44,34,108,97,98,101,108,34,58,34,58,32];ok=ok&&lsp_writer_literal(&mut out,&lk,12)&&lsp_writer_type_name(&mut out,raz_compiler_rt_arena_get(hir.local_types,i));i64 close[11]=[34,44,34,107,105,110,100,34,58,49,125];ok=ok&&lsp_writer_literal(&mut out,&close,11);}i+=1;}ok=ok&&lsp_writer_byte(&mut out,93)&&lsp_writer_byte(&mut out,125);if(ok){ok=lsp_send(&mut out);}lsp_writer_destroy(&mut out);destroy_hir(&mut hir);return ok;
+}
+
+fn lsp_send_workspace_symbols(LspDocuments& documents,i64 body,i64 body_length)->bool{
+    i64 query=raz_compiler_rt_arena_create(256);i64 qk[5]=[113,117,101,114,121];i64 ql=lsp_json_string_field(body,body_length,&qk,5,query,256,0);if(ql<0){ql=0;}LspWriter out;if(!lsp_writer_init(&mut out,8192)){raz_compiler_rt_arena_destroy(query);return false;}bool ok=lsp_response_result_prefix(&mut out,body,body_length)&&lsp_writer_byte(&mut out,91);bool first=true;i64 d=0;
+    while(ok&&d<documents.count){i64 text=raz_compiler_rt_arena_get(documents.texts,d);i64 count=raz_compiler_rt_arena_get(documents.semantic_counts,d);i64 kinds=raz_compiler_rt_arena_get(documents.semantic_kinds,d);i64 offsets=raz_compiler_rt_arena_get(documents.semantic_name_offsets,d);i64 lengths=raz_compiler_rt_arena_get(documents.semantic_name_lengths,d);i64 i=0;while(ok&&i<count){i64 no=raz_compiler_rt_arena_get(offsets,i);i64 nl=raz_compiler_rt_arena_get(lengths,i);bool matches_query=ql==0;if(!matches_query&&ql<=nl){i64 pos=0;while(pos+ql<=nl&&!matches_query){matches_query=true;i64 j=0;while(j<ql){if(raz_compiler_rt_arena_get(text,no+pos+j)!=raz_compiler_rt_arena_get(query,j)){matches_query=false;break;}j+=1;}pos+=1;}}if(matches_query){if(!first){ok=lsp_writer_byte(&mut out,44);}first=false;i64 nk[9]=[123,34,110,97,109,101,34,58,32];ok=ok&&lsp_writer_literal(&mut out,&nk,8)&&lsp_writer_json_string(&mut out,text,no,nl);i64 kk[8]=[44,34,107,105,110,100,34,58];ok=ok&&lsp_writer_literal(&mut out,&kk,8);i64 sk=raz_compiler_rt_arena_get(kinds,i);i64 lsp_kind=12;if(sk==2){lsp_kind=23;}else if(sk==3){lsp_kind=10;}else if(sk==4){lsp_kind=11;}else if(sk==5){lsp_kind=13;}else if(sk==8){lsp_kind=14;}ok=ok&&lsp_writer_decimal(&mut out,lsp_kind);i64 loc[14]=[44,34,108,111,99,97,116,105,111,110,34,58,123,34];ok=ok&&lsp_writer_literal(&mut out,&loc,14);i64 uk[5]=[117,114,105,34,58];ok=ok&&lsp_writer_literal(&mut out,&uk,5)&&lsp_writer_json_string(&mut out,raz_compiler_rt_arena_get(documents.uris,d),0,raz_compiler_rt_arena_get(documents.uri_lengths,d));i64 rk[9]=[44,34,114,97,110,103,101,34,58];ok=ok&&lsp_writer_literal(&mut out,&rk,9)&&lsp_writer_range(&mut out,text,raz_compiler_rt_arena_get(documents.text_lengths,d),no,no+nl);i64 cc[2]=[125,125];ok=ok&&lsp_writer_literal(&mut out,&cc,2);}i+=1;}d+=1;}
+    ok=ok&&lsp_writer_byte(&mut out,93)&&lsp_writer_byte(&mut out,125);if(ok){ok=lsp_send(&mut out);}lsp_writer_destroy(&mut out);raz_compiler_rt_arena_destroy(query);return ok;
+}
+
+fn lsp_write_completion_item(
+LspWriter&mut out,
+i64 text,
+i64 name_offset,
+i64 name_length,
+i64 kind,
+i64 detail_start,
+i64 detail_end,
+bool&mut first,
+) -> bool {
+    bool ok = true;
+    if (!*first) { ok = lsp_writer_byte(out, 44); }
+    *first = false;
+    i64 a[9] = [123,34,108,97,98,101,108,34,58];
+    ok = ok && lsp_writer_literal(out,&a,9) && lsp_writer_json_string(out,text,name_offset,name_length);
+    i64 b[8] = [44,34,107,105,110,100,34,58];
+    ok = ok && lsp_writer_literal(out,&b,8) && lsp_writer_decimal(out,kind);
+    if (detail_end > detail_start) {
+        i64 c[10] = [44,34,100,101,116,97,105,108,34,58];
+        ok = ok && lsp_writer_literal(out,&c,10) && lsp_writer_json_string(out,text,detail_start,detail_end-detail_start);
+    }
+    return ok && lsp_writer_byte(out,125);
+}
+
+fn lsp_send_completion(LspDocuments& documents, i64 body, i64 length, i64 document_index) -> bool {
+    LspWriter out;
+    if (!lsp_writer_init(&mut out, 16384)) { return false; }
+    bool ok=lsp_response_result_prefix(&mut out,body,length);
+    i64 prefix[31]=[123,34,105,115,73,110,99,111,109,112,108,101,116,101,34,58,102,97,108,115,101,44,34,105,116,101,109,115,34,58,91];
+    ok=ok&&lsp_writer_literal(&mut out,&prefix,31); bool first=true;
+    i64 k0[2]=[102,110]; i64 k1[6]=[115,116,114,117,99,116]; i64 k2[4]=[101,110,117,109];
+    i64 k3[5]=[116,114,97,105,116]; i64 k4[5]=[109,97,116,99,104]; i64 k5[6]=[114,101,116,117,114,110];
+    i64 k6[5]=[97,115,121,110,99]; i64 k7[5]=[97,119,97,105,116]; i64 k8[5]=[115,112,97,119,110];
+    i64 k9[6]=[117,110,115,97,102,101]; i64 k10[2]=[105,102]; i64 k11[5]=[119,104,105,108,101];
+    i64 k=0; while(ok&&k<12){ if(!first){ok=lsp_writer_byte(&mut out,44);} first=false; i64 a[9]=[123,34,108,97,98,101,108,34,58]; ok=ok&&lsp_writer_literal(&mut out,&a,9);
+        if(k==0){ok=ok&&lsp_writer_json_array_string(&mut out,&k0,2);}else if(k==1){ok=ok&&lsp_writer_json_array_string(&mut out,&k1,6);}else if(k==2){ok=ok&&lsp_writer_json_array_string(&mut out,&k2,4);}else if(k==3){ok=ok&&lsp_writer_json_array_string(&mut out,&k3,5);}else if(k==4){ok=ok&&lsp_writer_json_array_string(&mut out,&k4,5);}else if(k==5){ok=ok&&lsp_writer_json_array_string(&mut out,&k5,6);}else if(k==6){ok=ok&&lsp_writer_json_array_string(&mut out,&k6,5);}else if(k==7){ok=ok&&lsp_writer_json_array_string(&mut out,&k7,5);}else if(k==8){ok=ok&&lsp_writer_json_array_string(&mut out,&k8,5);}else if(k==9){ok=ok&&lsp_writer_json_array_string(&mut out,&k9,6);}else if(k==10){ok=ok&&lsp_writer_json_array_string(&mut out,&k10,2);}else{ok=ok&&lsp_writer_json_array_string(&mut out,&k11,5);} i64 z[11]=[44,34,107,105,110,100,34,58,49,52,125]; ok=ok&&lsp_writer_literal(&mut out,&z,11); k+=1; }
+    i64 d=0; while(ok&&d<documents.count){i64 text=raz_compiler_rt_arena_get(documents.texts,d);i64 tl=raz_compiler_rt_arena_get(documents.text_lengths,d);i64 count=raz_compiler_rt_arena_get(documents.semantic_counts,d);i64 kinds=raz_compiler_rt_arena_get(documents.semantic_kinds,d);i64 offsets=raz_compiler_rt_arena_get(documents.semantic_name_offsets,d);i64 lengths=raz_compiler_rt_arena_get(documents.semantic_name_lengths,d);i64 i=0;while(ok&&i<count){if(raz_compiler_rt_arena_get(kinds,i)==1){i64 no=raz_compiler_rt_arena_get(offsets,i);i64 nl=raz_compiler_rt_arena_get(lengths,i);i64 ss=0;i64 se=0;lsp_signature_range(text,tl,no,&mut ss,&mut se);ok=lsp_write_completion_item(&mut out,text,no,nl,3,ss,se,&mut first);}i+=1;}if(d==document_index){Source source;source.bytes=text;source.length=tl;HirModule hir;if(build_hir(source,&mut hir)){i=0;while(ok&&i<hir.local_count){i64 no=raz_compiler_rt_arena_get(hir.local_name_offsets,i);i64 nl=raz_compiler_rt_arena_get(hir.local_name_lengths,i);ok=lsp_write_completion_item(&mut out,text,no,nl,6,0,0,&mut first);i+=1;}i=0;while(ok&&i<hir.parameter_count){i64 no=raz_compiler_rt_arena_get(hir.parameter_name_offsets,i);i64 nl=raz_compiler_rt_arena_get(hir.parameter_name_lengths,i);ok=lsp_write_completion_item(&mut out,text,no,nl,6,0,0,&mut first);i+=1;}destroy_hir(&mut hir);}else if(hir.diagnostic_code!=DiagnosticCode::None){destroy_hir(&mut hir);}}d+=1;}
+    i64 suffix[3]=[93,125,125];ok=ok&&lsp_writer_literal(&mut out,&suffix,3);if(ok){ok=lsp_send(&mut out);}lsp_writer_destroy(&mut out);return ok;
+}
+
+fn lsp_symbol_kind(Source& source, Token& token) -> i64 {
+    if (token_is_namespace(source, token)) {
+        return 3;
+    }
+    if (token_is_enum(source, token)) {
+        return 10;
+    }
+    if (token_is_trait(source, token)) {
+        return 11;
+    }
+    if (token_is_fn(source, token)) {
+        return 12;
+    }
+    if (token_is_const(source, token)) {
+        return 14;
+    }
+    if (token_is_struct(source, token)) {
+        return 23;
+    }
+    if (token_is_static(source, token)) {
+        return 13;
+    }
+    return 0;
+}
+
+fn lsp_send_document_symbols(i64 body, i64 length, i64 text, i64 text_length) -> bool {
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 4096)) {
+        return false;
+    }
+
+    bool ok = lsp_response_result_prefix(&mut out, body, length) && lsp_writer_byte(&mut out, 91);
+    Source source;
+
+    source.bytes = text;
+    source.length = text_length;
+
+    Lexer scan;
+
+    init_lexer(&mut scan, source);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+
+    bool first = true;
+
+    while (ok && current.kind != TokenKind::End) {
+        i64 kind = lsp_symbol_kind(&source, &current);
+
+        if (kind > 0) {
+            Token name;
+
+            next_token(&mut scan, &mut name);
+            if (name.kind == TokenKind::Identifier) {
+                if (!first) {
+                    ok = lsp_writer_byte(&mut out, 44);
+                }
+                first = false;
+
+                i64 name_key[9] = [123, 34, 110, 97, 109, 101, 34, 58, 32];
+
+                ok = ok && lsp_writer_literal(&mut out, &name_key, 8);
+                ok = ok && lsp_writer_json_string(&mut out, text, name.offset, name.length);
+
+                i64 kind_key[8] = [44, 34, 107, 105, 110, 100, 34, 58];
+
+                ok = ok && lsp_writer_literal(&mut out, &kind_key, 8) && lsp_writer_decimal(&mut out, kind);
+
+                i64 range_key[9] = [44, 34, 114, 97, 110, 103, 101, 34, 58];
+
+                ok =
+                ok &&
+                lsp_writer_literal(&mut out, &range_key, 9) &&
+                lsp_writer_range(&mut out, text, text_length, name.offset, name.offset + name.length);
+                i64 select_key[18] = [44, 34, 115, 101, 108, 101, 99, 116, 105, 111, 110, 82, 97, 110, 103, 101, 34, 58];
+
+                ok =
+                ok &&
+                lsp_writer_literal(&mut out, &select_key, 18) &&
+                lsp_writer_range(&mut out, text, text_length, name.offset, name.offset + name.length) &&
+                lsp_writer_byte(&mut out, 125);
+                next_token(&mut scan, &mut current);
+                continue;
+            }
+            current = name;
+            continue;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    ok = ok && lsp_writer_byte(&mut out, 93) && lsp_writer_byte(&mut out, 125);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_send_formatting(i64 body, i64 length, i64 text, i64 text_length) -> bool {
+    i64 capacity = text_length * 2 + 4096;
+    i64 formatted = raz_compiler_rt_arena_create(capacity);
+
+    if (formatted == 0) {
+        return false;
+    }
+
+    i64 formatted_length = tooling_format_source(text, text_length, formatted, capacity);
+
+    if (formatted_length < 0) {
+        raz_compiler_rt_arena_destroy(formatted);
+        return lsp_send_null_result(body, length);
+    }
+
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, formatted_length + 512)) {
+        raz_compiler_rt_arena_destroy(formatted);
+        return false;
+    }
+
+    bool ok = lsp_response_result_prefix(&mut out, body, length);
+    i64 prefix[50] = [91, 123, 34, 114, 97, 110, 103, 101, 34, 58, 123, 34, 115, 116, 97, 114, 116, 34, 58, 123, 34, 108, 105, 110, 101, 34, 58, 48, 44, 34, 99, 104, 97, 114, 97, 99, 116, 101, 114, 34, 58, 48, 125, 44, 34, 101, 110, 100, 34, 58];
+
+    ok = ok && lsp_writer_literal(&mut out, &prefix, 50);
+
+    i64 end[32] = [123, 34, 108, 105, 110, 101, 34, 58, 50, 49, 52, 55, 52, 56, 51, 54, 52, 55, 44, 34, 99, 104, 97, 114, 97, 99, 116, 101, 114, 34, 58, 48];
+
+    ok = ok && lsp_writer_literal(&mut out, &end, 32);
+
+    i64 middle[13] = [125, 125, 44, 34, 110, 101, 119, 84, 101, 120, 116, 34, 58];
+
+    ok =
+    ok &&
+    lsp_writer_literal(&mut out, &middle, 13) &&
+    lsp_writer_json_string(&mut out, formatted, 0, formatted_length);
+    i64 suffix[3] = [125, 93, 125];
+
+    ok = ok && lsp_writer_literal(&mut out, &suffix, 3);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    raz_compiler_rt_arena_destroy(formatted);
+    return ok;
+}
+
+fn lsp_send_folding(i64 body, i64 length, i64 text, i64 text_length) -> bool {
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 4096)) {
+        return false;
+    }
+
+    bool ok = lsp_response_result_prefix(&mut out, body, length) && lsp_writer_byte(&mut out, 91);
+    i64 stack = raz_compiler_rt_arena_create(1024);
+    i64 depth = 0;
+    i64 line = 0;
+    bool first = true;
+    i64 i = 0;
+
+    while (ok && i < text_length) {
+        i64 byte = raz_compiler_rt_arena_get(text, i);
+
+        if (byte == 10) {
+            line += 1;
+        } else if (byte == 123 && depth < 1024) {
+            raz_compiler_rt_arena_set(stack, depth, line);
+            depth += 1;
+        } else if (byte == 125 && depth > 0) {
+            depth -= 1;
+
+            i64 start_line = raz_compiler_rt_arena_get(stack, depth);
+
+            if (line > start_line) {
+                if (!first) {
+                    ok = lsp_writer_byte(&mut out, 44);
+                }
+                first = false;
+
+                i64 a[14] = [123, 34, 115, 116, 97, 114, 116, 76, 105, 110, 101, 34, 58, 32];
+                i64 b[12] = [44, 34, 101, 110, 100, 76, 105, 110, 101, 34, 58, 32];
+                i64 c[17] = [44, 34, 107, 105, 110, 100, 34, 58, 34, 114, 101, 103, 105, 111, 110, 34, 125];
+
+                ok = ok && lsp_writer_literal(&mut out, &a, 13) && lsp_writer_decimal(&mut out, start_line);
+                ok = ok && lsp_writer_literal(&mut out, &b, 11) && lsp_writer_decimal(&mut out, line);
+                ok = ok && lsp_writer_literal(&mut out, &c, 17);
+            }
+        }
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(stack);
+    ok = ok && lsp_writer_byte(&mut out, 93) && lsp_writer_byte(&mut out, 125);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_send_selection(i64 body, i64 length, i64 text, i64 text_length) -> bool {
+    LspWriter out;
+
+    if (!lsp_writer_init(&mut out, 256)) {
+        return false;
+    }
+
+    bool ok = lsp_response_result_prefix(&mut out, body, length);
+    i64 prefix[10] = [91, 123, 34, 114, 97, 110, 103, 101, 34, 58];
+
+    ok =
+    ok &&
+    lsp_writer_literal(&mut out, &prefix, 10) &&
+    lsp_writer_range(&mut out, text, text_length, 0, text_length);
+    i64 suffix[2] = [125, 93];
+
+    ok = ok && lsp_writer_literal(&mut out, &suffix, 2) && lsp_writer_byte(&mut out, 125);
+    if (ok) {
+        ok = lsp_send(&mut out);
+    }
+    lsp_writer_destroy(&mut out);
+    return ok;
+}
+
+fn lsp_send_code_actions(i64 body, i64 length, i64 uri, i64 uri_length, i64 text, i64 text_length) -> bool {
+    i64 capacity = text_length * 2 + 4096;
+    i64 formatted = raz_compiler_rt_arena_create(capacity);
+    if (formatted == 0) { return false; }
+    i64 formatted_length = tooling_format_source(text, text_length, formatted, capacity);
+    LspWriter out;
+    if (!lsp_writer_init(&mut out, formatted_length + 2048)) { raz_compiler_rt_arena_destroy(formatted); return false; }
+    bool ok = lsp_response_result_prefix(&mut out, body, length) && lsp_writer_byte(&mut out, 91);
+    bool first = true;
+
+    // The parser reports ExpectedToken at the token following a missing
+    // terminator.  When the previous source line has content and does not
+    // already end in a structural delimiter, offer the precise semicolon edit.
+    Source source; source.bytes = text; source.length = text_length; HirModule hir;
+    bool valid = build_hir(source, &mut hir);
+    if (!valid && hir.diagnostic_code == DiagnosticCode::ExpectedToken) {
+        i64 line_start = hir.diagnostic_offset;
+        while (line_start > 0 && raz_compiler_rt_arena_get(text, line_start - 1) != 10) { line_start -= 1; }
+        i64 insert = line_start;
+        if (insert > 0) { insert -= 1; }
+        while (insert > 0) {
+            i64 byte = raz_compiler_rt_arena_get(text, insert - 1);
+            if (byte != 32 && byte != 9 && byte != 13) { break; }
+            insert -= 1;
+        }
+        if (insert > 0) {
+            i64 previous = raz_compiler_rt_arena_get(text, insert - 1);
+            if (previous != 59 && previous != 123 && previous != 125 && previous != 44) {
+                i64 title[73] = [123,34,116,105,116,108,101,34,58,34,73,110,115,101,114,116,32,109,105,115,115,105,110,103,32,115,101,109,105,99,111,108,111,110,34,44,34,107,105,110,100,34,58,34,113,117,105,99,107,102,105,120,34,44,34,101,100,105,116,34,58,123,34,99,104,97,110,103,101,115,34,58,123];
+                ok = ok && lsp_writer_literal(&mut out, &title, 73) && lsp_writer_json_string(&mut out, uri, 0, uri_length) && lsp_writer_byte(&mut out, 58) && lsp_writer_byte(&mut out, 91);
+                i64 range_key[9] = [123,34,114,97,110,103,101,34,58];
+                ok = ok && lsp_writer_literal(&mut out, &range_key, 9) && lsp_writer_range(&mut out, text, text_length, insert, insert);
+                i64 replacement[13] = [44,34,110,101,119,84,101,120,116,34,58,34,59];
+                ok = ok && lsp_writer_literal(&mut out, &replacement, 13);
+                i64 close[6] = [34,125,93,125,125,125];
+                ok = ok && lsp_writer_literal(&mut out, &close, 6);
+                first = false;
+            }
+        }
+    }
+    if (valid || hir.diagnostic_code != DiagnosticCode::None) { destroy_hir(&mut hir); }
+
+    bool changed = formatted_length >= 0 && !lsp_arena_equal(text, text_length, formatted, formatted_length);
+    if (changed) {
+        if (!first) { ok = ok && lsp_writer_byte(&mut out, 44); }
+        i64 a[77] = [123,34,116,105,116,108,101,34,58,34,70,111,114,109,97,116,32,82,97,122,32,100,111,99,117,109,101,110,116,34,44,34,107,105,110,100,34,58,34,115,111,117,114,99,101,46,102,105,120,65,108,108,46,114,97,122,34,44,34,101,100,105,116,34,58,123,34,99,104,97,110,103,101,115,34,58,123];
+        ok = ok && lsp_writer_literal(&mut out, &a, 76) && lsp_writer_json_string(&mut out, uri, 0, uri_length);
+        i64 b[51] = [58,91,123,34,114,97,110,103,101,34,58,123,34,115,116,97,114,116,34,58,123,34,108,105,110,101,34,58,48,44,34,99,104,97,114,97,99,116,101,114,34,58,48,125,44,34,101,110,100,34,58];
+        ok = ok && lsp_writer_literal(&mut out, &b, 51);
+        i64 end[32] = [123,34,108,105,110,101,34,58,50,49,52,55,52,56,51,54,52,55,44,34,99,104,97,114,97,99,116,101,114,34,58,48];
+        ok = ok && lsp_writer_literal(&mut out, &end, 32);
+        i64 c[13] = [125,125,44,34,110,101,119,84,101,120,116,34,58];
+        ok = ok && lsp_writer_literal(&mut out, &c, 13) && lsp_writer_json_string(&mut out, formatted, 0, formatted_length);
+        i64 d[7] = [125,93,125,125,125,125,125];
+        ok = ok && lsp_writer_literal(&mut out, &d, 7);
+    }
+    ok = ok && lsp_writer_byte(&mut out, 93) && lsp_writer_byte(&mut out, 125);
+    if (ok) { ok = lsp_send(&mut out); }
+    lsp_writer_destroy(&mut out); raz_compiler_rt_arena_destroy(formatted); return ok;
+}
+
+fn lsp_method_equals(i64 method, i64 method_length, i64[]value, i64 value_length) -> bool {
+    return lsp_ascii_equal(method, 0, method_length, value, value_length);
+}
+
+fn lsp_command(i64 argc) -> i64 {
+    if (argc != 2) {
+        cli_print_invalid_arguments();
+        return 2;
+    }
+
+    // LSP is a byte protocol.  Windows CRT text mode would otherwise expand
+    // the explicit CRLF header bytes emitted by lsp_send() into CRCRLF.
+    // Set both protocol streams to binary before reading or writing a frame.
+    if (raz_rt_stdio_set_binary(0) <= 0 || raz_rt_stdio_set_binary(1) <= 0) {
+        return 40;
+    }
+
+    LspInput input;
+    LspDocuments documents;
+
+    if (!lsp_input_init(&mut input) || !lsp_documents_init(&mut documents)) {
+        return 40;
+    }
+
+    bool shutdown = false;
+    bool running = true;
+
+    while (running) {
+        i64 body = 0;
+        i64 body_length = 0;
+
+        if (!lsp_read_message(&mut input, &mut body, &mut body_length)) {
+            break;
+        }
+
+        i64 method = raz_compiler_rt_arena_create(128);
+        i64 uri = raz_compiler_rt_arena_create(8192);
+        i64 text = raz_compiler_rt_arena_create(body_length + 1);
+        i64 method_key[6] = [109, 101, 116, 104, 111, 100];
+        i64 uri_key[3] = [117, 114, 105];
+        i64 text_key[4] = [116, 101, 120, 116];
+        i64 method_length = lsp_json_string_field(body, body_length, &method_key, 6, method, 128, 0);
+        i64 uri_length = lsp_json_string_field(body, body_length, &uri_key, 3, uri, 8192, 0);
+        i64 text_length = lsp_json_string_field(body, body_length, &text_key, 4, text, body_length + 1, 0);
+        i64 initialize[10] = [105, 110, 105, 116, 105, 97, 108, 105, 122, 101];
+        i64 did_open[20] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 105, 100, 79, 112, 101, 110];
+        i64 did_change[22] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 105, 100, 67, 104, 97, 110, 103, 101];
+        i64 did_close[21] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 105, 100, 67, 108, 111, 115, 101];
+        i64 formatting[23] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 102, 111, 114, 109, 97, 116, 116, 105, 110, 103];
+        i64 completion[23] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 99, 111, 109, 112, 108, 101, 116, 105, 111, 110];
+        i64 symbols[27] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 111, 99, 117, 109, 101, 110, 116, 83, 121, 109, 98, 111, 108];
+        i64 actions[23] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 99, 111, 100, 101, 65, 99, 116, 105, 111, 110];
+        i64 folding[25] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 102, 111, 108, 100, 105, 110, 103, 82, 97, 110, 103, 101];
+        i64 selection[27] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 115, 101, 108, 101, 99, 116, 105, 111, 110, 82, 97, 110, 103, 101];
+        i64 hover[18] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 104, 111, 118, 101, 114];
+        i64 definition[23] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 101, 102, 105, 110, 105, 116, 105, 111, 110];
+        i64 references[23] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 114, 101, 102, 101, 114, 101, 110, 99, 101, 115];
+        i64 rename[19] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 114, 101, 110, 97, 109, 101];
+        i64 signature[26] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 115, 105, 103, 110, 97, 116, 117, 114, 101, 72, 101, 108, 112];
+        i64 semantic[32] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 115, 101, 109, 97, 110, 116, 105, 99, 84, 111, 107, 101, 110, 115, 47, 102, 117, 108, 108];
+        i64 inlay[22] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 105, 110, 108, 97, 121, 72, 105, 110, 116];
+        i64 highlight[30] = [116, 101, 120, 116, 68, 111, 99, 117, 109, 101, 110, 116, 47, 100, 111, 99, 117, 109, 101, 110, 116, 72, 105, 103, 104, 108, 105, 103, 104, 116];
+        i64 workspace[16] = [119, 111, 114, 107, 115, 112, 97, 99, 101, 47, 115, 121, 109, 98, 111, 108];
+        i64 shutdown_word[8] = [115, 104, 117, 116, 100, 111, 119, 110];
+        i64 exit_word[4] = [101, 120, 105, 116];
+
+        if (method_length >= 0 && lsp_method_equals(method, method_length, &initialize, 10)) {
+            // Index unopened workspace modules before the editor begins sending
+            // overlays.  `rootUri` is the canonical modern LSP project root.
+            i64 root_uri = raz_compiler_rt_arena_create(8192);
+            i64 root_key[7] = [114, 111, 111, 116, 85, 114, 105];
+            i64 root_uri_length = -1;
+            if (root_uri != 0) { root_uri_length = lsp_json_string_field(body, body_length, &root_key, 7, root_uri, 8192, 0); }
+            if (root_uri_length > 0) { lsp_workspace_load(&mut documents, root_uri, root_uri_length); }
+            if (root_uri != 0) { raz_compiler_rt_arena_destroy(root_uri); }
+            lsp_send_initialize(body, body_length);
+        } else if (
+        method_length >= 0 &&
+        (
+        lsp_method_equals(method, method_length, &did_open, 20) ||
+        lsp_method_equals(method, method_length, &did_change, 22)
+        )
+        ) {
+            if (uri_length >= 0 && text_length >= 0) {
+                i64 index = lsp_document_set(&mut documents, uri, uri_length, text, text_length);
+
+                if (index >= 0) {
+                    lsp_publish_diagnostics(
+                    raz_compiler_rt_arena_get(documents.uris, index),
+                    raz_compiler_rt_arena_get(documents.uri_lengths, index),
+                    raz_compiler_rt_arena_get(documents.texts, index),
+                    raz_compiler_rt_arena_get(documents.text_lengths, index),
+                    );
+                }
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &did_close, 21)) {
+            if (uri_length >= 0) {
+                lsp_clear_diagnostics(uri, uri_length);
+                // Closing an editor overlay must not remove the module from the
+                // project index. Restore its saved bytes; only non-file/removed
+                // documents disappear from the workspace.
+                if (!lsp_document_restore_disk(&mut documents, uri, uri_length)) {
+                    lsp_document_remove(&mut documents, uri, uri_length);
+                }
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &formatting, 23)) {
+            i64 index = -1;
+
+            if (uri_length >= 0) {
+                index = lsp_document_find(&documents, uri, uri_length);
+            }
+            if (index >= 0) {
+                lsp_send_formatting(
+                body,
+                body_length,
+                raz_compiler_rt_arena_get(documents.texts, index),
+                raz_compiler_rt_arena_get(documents.text_lengths, index),
+                );
+            } else {
+                lsp_send_null_result(body, body_length);
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &completion, 23)) {
+            i64 index = -1;
+            if (uri_length >= 0) { index = lsp_document_find(&documents, uri, uri_length); }
+            if (index >= 0) { lsp_send_completion(&documents, body, body_length, index); }
+            else { lsp_send_null_result(body, body_length); }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &hover, 18)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_hover(&documents,body,body_length,index);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &definition, 23)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_definition(&documents,body,body_length,index);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &references, 23)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_references(&documents,body,body_length,index,false);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &rename, 19)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_rename(&documents,body,body_length,index);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &signature, 26)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_signature_help(&documents,body,body_length,index);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &semantic, 32)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_semantic_tokens(body,body_length,raz_compiler_rt_arena_get(documents.texts,index),raz_compiler_rt_arena_get(documents.text_lengths,index));}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &inlay, 22)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_inlay_hints(body,body_length,raz_compiler_rt_arena_get(documents.texts,index),raz_compiler_rt_arena_get(documents.text_lengths,index));}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &highlight, 30)) {
+            i64 index=-1; if(uri_length>=0){index=lsp_document_find(&documents,uri,uri_length);} if(index>=0){lsp_send_references(&documents,body,body_length,index,true);}else{lsp_send_null_result(body,body_length);}
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &workspace, 16)) {
+            lsp_send_workspace_symbols(&documents,body,body_length);
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &symbols, 27)) {
+            i64 index = -1;
+
+            if (uri_length >= 0) {
+                index = lsp_document_find(&documents, uri, uri_length);
+            }
+            if (index >= 0) {
+                lsp_send_document_symbols(
+                body,
+                body_length,
+                raz_compiler_rt_arena_get(documents.texts, index),
+                raz_compiler_rt_arena_get(documents.text_lengths, index),
+                );
+            } else {
+                lsp_send_null_result(body, body_length);
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &actions, 23)) {
+            i64 index = -1;
+
+            if (uri_length >= 0) {
+                index = lsp_document_find(&documents, uri, uri_length);
+            }
+            if (index >= 0) {
+                lsp_send_code_actions(
+                body,
+                body_length,
+                uri,
+                uri_length,
+                raz_compiler_rt_arena_get(documents.texts, index),
+                raz_compiler_rt_arena_get(documents.text_lengths, index),
+                );
+            } else {
+                lsp_send_null_result(body, body_length);
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &folding, 25)) {
+            i64 index = -1;
+
+            if (uri_length >= 0) {
+                index = lsp_document_find(&documents, uri, uri_length);
+            }
+            if (index >= 0) {
+                lsp_send_folding(
+                body,
+                body_length,
+                raz_compiler_rt_arena_get(documents.texts, index),
+                raz_compiler_rt_arena_get(documents.text_lengths, index),
+                );
+            } else {
+                lsp_send_null_result(body, body_length);
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &selection, 27)) {
+            i64 index = -1;
+
+            if (uri_length >= 0) {
+                index = lsp_document_find(&documents, uri, uri_length);
+            }
+            if (index >= 0) {
+                lsp_send_selection(
+                body,
+                body_length,
+                raz_compiler_rt_arena_get(documents.texts, index),
+                raz_compiler_rt_arena_get(documents.text_lengths, index),
+                );
+            } else {
+                lsp_send_null_result(body, body_length);
+            }
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &shutdown_word, 8)) {
+            shutdown = true;
+            lsp_send_null_result(body, body_length);
+        } else if (method_length >= 0 && lsp_method_equals(method, method_length, &exit_word, 4)) {
+            running = false;
+        } else {
+            i64 id_key[2] = [105, 100];
+
+            if (lsp_json_find_key(body, body_length, &id_key, 2, 0) >= 0) {
+                LspWriter error;
+
+                if (lsp_writer_init(&mut error, 256)) {
+                    lsp_response_begin(&mut error, body, body_length);
+
+                    i64 e[60] = [44, 34, 101, 114, 114, 111, 114, 34, 58, 123, 34, 99, 111, 100, 101, 34, 58, 45, 51, 50, 54, 48, 49, 44, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 109, 101, 116, 104, 111, 100, 32, 110, 111, 116, 32, 105, 109, 112, 108, 101, 109, 101, 110, 116, 101, 100, 34, 125, 125];
+
+                    lsp_writer_literal(&mut error, &e, 60);
+                    lsp_send(&mut error);
+                    lsp_writer_destroy(&mut error);
+                }
+            }
+        }
+        raz_compiler_rt_arena_destroy(method);
+        raz_compiler_rt_arena_destroy(uri);
+        raz_compiler_rt_arena_destroy(text);
+        raz_compiler_rt_arena_destroy(body);
+    }
+    lsp_documents_destroy(&mut documents);
+    lsp_input_destroy(&mut input);
+    if (shutdown) {
+        return 0;
+    }
+    return 1;
+}

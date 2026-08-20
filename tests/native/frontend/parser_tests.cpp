@@ -37,7 +37,7 @@ import core::option;
 struct Point { f64 x; f64 y; }
 fn add(i64 left, i64 right) -> i64 {
   i64 total = left + right * 2;
-  if total > 10 { return total; } else { return 10; }
+  if (total > 10) { return total; } else { return 10; }
 }
 )", diagnostics, sources);
   require(!diagnostics.has_errors(), "valid program parses");

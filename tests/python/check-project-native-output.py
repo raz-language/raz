@@ -28,7 +28,7 @@ require("compiler/src/driver/cli.rz", "fn cli_print_project_source_failure()", "
 # `build` and `run` both produce the default native artifact: run links and
 # launches the same executable rather than interpreting the program.
 require("compiler/src/main.rz", "(cli_command == 3 || cli_command == 12) && project_manifest && cli_output_path == 0", "project default artifact selection")
-require("compiler/src/main.rz", "cli_maybe_run_artifact(run_after_build, cli_output_path, cli_output_length)", "run launches the linked artifact")
+require("compiler/src/main.rz", "i64 exit_status = cli_maybe_run_artifact(", "run launches the linked artifact")
 require("compiler/src/driver/cli.rz", "fn cli_run_native_artifact(", "native artifact launcher")
 require("compiler/src/main.rz", "ProjectNativeBuild native_build;", "native project state")
 require("compiler/src/main.rz", "forge_native = true;", "Forge object emission")
