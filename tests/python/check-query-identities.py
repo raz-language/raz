@@ -15,7 +15,7 @@ types = (root / "compiler/src/hir/query/types.rz").read_text(encoding="utf-8")
 resolution = (root / "compiler/src/hir/query/resolution.rz").read_text(encoding="utf-8")
 traits = (root / "compiler/src/hir/generics/type_instantiation.rz").read_text(encoding="utf-8")
 instantiate = (root / "compiler/src/hir/generics/instantiate.rz").read_text(encoding="utf-8")
-order = (root / "compiler/host-source-order.txt").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 checks = {
     "symbol interner stores exact semantic names": all(x in model + builder + symbols for x in [
@@ -44,7 +44,7 @@ checks = {
     "associated types use TypeId and SymbolId": all(x in instantiate for x in [
         "base_type", "item_symbol", "hir_query_intern_symbol",
         "hir_query_intern_value_type", "hir_query_kind_associated_type()"]),
-    "identity modules are in host compiler order": all(x in order for x in [
+    "identity modules are in the semantic compiler source graph": all(x in order for x in [
         "src/hir/query/symbols.rz", "src/hir/query/types.rz",
         "src/hir/query/resolution.rz", "src/hir/query/identity.rz"]),
 }

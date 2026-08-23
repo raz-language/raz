@@ -2,10 +2,10 @@
 # Copyright 2026 Mario Vinciguerra
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the same Raz source through Forge and LLVM and compare exit status.
+"""Run the same Raz source through Forge and LLVM and compare observable behavior.
 
-This is an opt-in executable differential harness for a locally built compiler
-compiler. It intentionally does not run during lightweight source validation.
+The harness compares exit status, stdout, and stderr. It remains opt-in for
+lightweight source validation because it requires executable toolchain artifacts.
 """
 from __future__ import annotations
 import argparse
@@ -58,6 +58,10 @@ def main() -> int:
         forge_link_cmd = [str(linker), str(forge_object), str(args.runtime)]
         if os.name != 'nt':
             forge_link_cmd += ['-lpthread', '-ldl']
+        else:
+            # The runtime archive pulls Windows sockets/crypto members, matching
+            # what the Forge and bootstrap link drivers pass.
+            forge_link_cmd += ['-lws2_32', '-lbcrypt', '-lcrypt32']
         forge_link_cmd += ['-o', str(exe)]
         forge_link = run(forge_link_cmd)
         if forge_link.returncode != 0:
@@ -83,10 +87,27 @@ def main() -> int:
             raise SystemExit(f'LLVM compilation/link failed: {llvm_compile.returncode}')
         llvm_exec = run([str(exe)])
 
+        mismatches: list[str] = []
         if forge_exec.returncode != llvm_exec.returncode:
-            print(f'backend-differential: FAIL Forge={forge_exec.returncode} LLVM={llvm_exec.returncode}')
+            mismatches.append(f'exit Forge={forge_exec.returncode} LLVM={llvm_exec.returncode}')
+        if forge_exec.stdout != llvm_exec.stdout:
+            mismatches.append('stdout differs')
+        if forge_exec.stderr != llvm_exec.stderr:
+            mismatches.append('stderr differs')
+        if mismatches:
+            print('backend-differential: FAIL ' + '; '.join(mismatches))
+            if forge_exec.stdout != llvm_exec.stdout:
+                print('--- Forge stdout ---')
+                print(forge_exec.stdout, end='')
+                print('--- LLVM stdout ---')
+                print(llvm_exec.stdout, end='')
+            if forge_exec.stderr != llvm_exec.stderr:
+                print('--- Forge stderr ---')
+                print(forge_exec.stderr, end='')
+                print('--- LLVM stderr ---')
+                print(llvm_exec.stderr, end='')
             return 1
-        print(f'backend-differential: PASS exit={llvm_exec.returncode}')
+        print(f'backend-differential: PASS exit={llvm_exec.returncode} stdout={len(llvm_exec.stdout)}B stderr={len(llvm_exec.stderr)}B')
         return 0
 
 

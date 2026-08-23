@@ -170,7 +170,6 @@ ElfObjectResult emit_elf64_x86_64_image(codegen::x86_64::EncodedModuleImage imag
     symbols.push_back({0, static_cast<std::uint8_t>((stb_local << 4U) | stt_section), 0, data_index, 0, 0});
     if (has_tls_section)
         symbols.push_back({0, static_cast<std::uint8_t>((stb_local << 4U) | stt_section), 0, tdata_index, 0, 0});
-    const std::uint32_t first_global_symbol = has_tls_section ? 5U : 4U;
 
     std::unordered_map<std::string, std::uint32_t> symbol_indexes;
     auto add_defined_symbol = [&](const std::string& name, std::uint32_t index) -> bool {
@@ -180,6 +179,30 @@ ElfObjectResult emit_elf64_x86_64_image(codegen::x86_64::EncodedModuleImage imag
         }
         return true;
     };
+    auto global_size = [&](const codegen::x86_64::EncodedGlobal& global) -> std::size_t {
+        const auto& bytes = global.section == codegen::x86_64::DataSection::read_only ? encoded.image.read_only_data :
+            (global.section == codegen::x86_64::DataSection::tls ? encoded.image.thread_local_data : encoded.image.writable_data);
+        std::size_t size = bytes.size() - global.data_offset;
+        for (const auto& candidate : encoded.image.globals) {
+            if (candidate.section == global.section && candidate.data_offset > global.data_offset)
+                size = std::min(size, candidate.data_offset - global.data_offset);
+        }
+        return size;
+    };
+    // ELF requires every STB_LOCAL symbol to precede global/weak symbols.
+    // Preserve Forge IR internal linkage here instead of exporting module-local
+    // data such as compiler string literals into the final program namespace.
+    for (const auto& global : encoded.image.globals) {
+        if (!global.is_internal) continue;
+        const auto section = global.section == codegen::x86_64::DataSection::read_only ? rodata_index :
+            (global.section == codegen::x86_64::DataSection::tls ? tdata_index : data_index);
+        const auto symbol_index = static_cast<std::uint32_t>(symbols.size());
+        if (!add_defined_symbol(global.name, symbol_index)) return result;
+        const auto symbol_type = global.section == codegen::x86_64::DataSection::tls ? stt_tls : stt_object;
+        symbols.push_back({strings.add(global.name), static_cast<std::uint8_t>((stb_local << 4U) | symbol_type), 0,
+                           section, global.data_offset, global_size(global)});
+    }
+    const std::uint32_t first_global_symbol = static_cast<std::uint32_t>(symbols.size());
     for (std::size_t index = 0; index < encoded.image.entries.size(); ++index) {
         const auto& [name, offset] = encoded.image.entries[index];
         const auto next = index + 1 < encoded.image.entries.size()
@@ -191,20 +214,14 @@ ElfObjectResult emit_elf64_x86_64_image(codegen::x86_64::EncodedModuleImage imag
                            text_index, offset, next >= offset ? next - offset : 0});
     }
     for (const auto& global : encoded.image.globals) {
+        if (global.is_internal) continue;
         const auto section = global.section == codegen::x86_64::DataSection::read_only ? rodata_index :
             (global.section == codegen::x86_64::DataSection::tls ? tdata_index : data_index);
-        const auto& bytes = global.section == codegen::x86_64::DataSection::read_only ? encoded.image.read_only_data :
-            (global.section == codegen::x86_64::DataSection::tls ? encoded.image.thread_local_data : encoded.image.writable_data);
-        std::size_t size = bytes.size() - global.data_offset;
-        for (const auto& candidate : encoded.image.globals) {
-            if (candidate.section == global.section && candidate.data_offset > global.data_offset)
-                size = std::min(size, candidate.data_offset - global.data_offset);
-        }
         const auto symbol_index = static_cast<std::uint32_t>(symbols.size());
         if (!add_defined_symbol(global.name, symbol_index)) return result;
         const auto symbol_type = global.section == codegen::x86_64::DataSection::tls ? stt_tls : stt_object;
         symbols.push_back({strings.add(global.name), static_cast<std::uint8_t>((stb_global << 4U) | symbol_type), 0,
-                           section, global.data_offset, size});
+                           section, global.data_offset, global_size(global)});
     }
 
     auto require_external = [&](const std::string& name) -> std::uint32_t {

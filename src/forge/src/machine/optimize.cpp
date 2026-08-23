@@ -2273,4 +2273,485 @@ OptimizationStats optimize_module(Module& module, const SlpCostModel& slp_cost_m
     return total;
 }
 
+
+OptimizationStats optimize_aarch64_canonical_function(Function& function) {
+    OptimizationStats stats;
+    for (const auto& block : function.blocks)
+        stats.instructions_before += static_cast<std::uint32_t>(block.instructions.size());
+
+    std::vector<VirtualRegister> aliases(function.register_count);
+    std::iota(aliases.begin(), aliases.end(), VirtualRegister{0});
+    const auto resolve = [&](VirtualRegister reg) {
+        auto root = reg;
+        while (root < aliases.size() && aliases[root] != root) root = aliases[root];
+        return root;
+    };
+
+    for (auto& block : function.blocks) {
+        std::vector<Instruction> kept;
+        kept.reserve(block.instructions.size());
+        for (auto instruction : block.instructions) {
+            for (auto& input : instruction.inputs) input = resolve(input);
+            for (auto& successor : instruction.successors)
+                for (auto& argument : successor.arguments) argument = resolve(argument);
+
+            const bool copy = is_copy(instruction.opcode) && instruction.inputs.size() == 1U;
+            const bool zero_offset = instruction.opcode == Opcode::ptr_offset &&
+                                     instruction.inputs.size() == 1U && instruction.immediate == 0;
+            const bool redundant_cast = is_redundant_cast(instruction) && instruction.inputs.size() == 1U;
+            if ((copy || zero_offset || redundant_cast) && instruction.result < aliases.size()) {
+                const auto source = resolve(instruction.inputs.front());
+                if (source < aliases.size() && compatible(function, instruction.result, source)) {
+                    aliases[instruction.result] = source;
+                    instruction.inputs.front() = source;
+                    // Machine SSA keeps an explicit definition for every vreg.
+                    // Canonicalize target-independent no-ops to copies and
+                    // propagate the alias into consumers instead of deleting the
+                    // definition and weakening verifier invariants.
+                    if (zero_offset || redundant_cast) instruction.opcode = Opcode::copy;
+                    if (copy) ++stats.copies_propagated;
+                    else if (zero_offset) ++stats.zero_offsets_eliminated;
+                    else ++stats.redundant_casts_eliminated;
+                }
+            }
+            kept.push_back(std::move(instruction));
+        }
+        block.instructions = std::move(kept);
+    }
+
+    // A copy can feed a successor or an instruction in a block visited before
+    // the copy's defining block in layout order. Resolve the completed alias
+    // forest once *before* any vreg compaction. Resolving after compaction would
+    // incorrectly interpret compacted register numbers as indices into the old
+    // alias table (and can silently redirect returns/edges to the wrong value).
+    for (auto& block : function.blocks) {
+        for (auto& instruction : block.instructions) {
+            for (auto& input : instruction.inputs) input = resolve(input);
+            for (auto& successor : instruction.successors)
+                for (auto& argument : successor.arguments) argument = resolve(argument);
+        }
+    }
+
+    // AArch64 target-safe immediate selection. Keep this deliberately narrower
+    // than x86's generic `$imm` producer: ADD/SUB/CMP accept the architectural
+    // 12-bit immediate (optionally shifted by 12), while register shifts accept
+    // an immediate in the element-width range. Logical-immediate encoding is a
+    // separate bitmask legality problem and remains register-register here.
+    const auto add_sub_immediate = [](std::int64_t value) noexcept {
+        if (value < 0) return false;
+        const auto unsigned_value = static_cast<std::uint64_t>(value);
+        return unsigned_value <= 4095U ||
+               ((unsigned_value & 4095U) == 0U && (unsigned_value >> 12U) <= 4095U);
+    };
+    const auto shift_immediate = [](Opcode opcode, std::int64_t value) noexcept {
+        if (value < 0) return false;
+        const bool wide = opcode == Opcode::shl_i64 || opcode == Opcode::shr_s_i64 || opcode == Opcode::shr_u_i64;
+        return static_cast<std::uint64_t>(value) < (wide ? 64U : 32U);
+    };
+    std::vector<Instruction*> definitions(function.register_count, nullptr);
+    std::vector<std::uint32_t> uses(function.register_count, 0U);
+    for (auto& block : function.blocks) {
+        for (auto& instruction : block.instructions) {
+            if (has_result(instruction.opcode) && instruction.result < definitions.size())
+                definitions[instruction.result] = &instruction;
+            for (const auto input : instruction.inputs)
+                if (input < uses.size()) ++uses[input];
+            for (const auto& successor : instruction.successors)
+                for (const auto argument : successor.arguments)
+                    if (argument < uses.size()) ++uses[argument];
+        }
+    }
+    const auto constant_definition = [&](VirtualRegister reg) -> Instruction* {
+        auto* definition = reg < definitions.size() ? definitions[reg] : nullptr;
+        if (definition == nullptr || (definition->opcode != Opcode::load_immediate &&
+                                      definition->opcode != Opcode::load_immediate_i64)) return nullptr;
+        return definition;
+    };
+    for (auto& block : function.blocks) {
+        for (auto& instruction : block.instructions) {
+            if (instruction.inputs.size() != 2U) continue;
+            const bool add = instruction.opcode == Opcode::add_i32 || instruction.opcode == Opcode::add_i64;
+            const bool sub = instruction.opcode == Opcode::sub_i32 || instruction.opcode == Opcode::sub_i64;
+            const bool shift = instruction.opcode == Opcode::shl_i32 || instruction.opcode == Opcode::shl_i64 ||
+                               instruction.opcode == Opcode::shr_s_i32 || instruction.opcode == Opcode::shr_s_i64 ||
+                               instruction.opcode == Opcode::shr_u_i32 || instruction.opcode == Opcode::shr_u_i64;
+            const bool comparison = is_integer_comparison(instruction.opcode);
+            if (!add && !sub && !shift && !comparison) continue;
+
+            std::size_t constant_index = 1U;
+            auto* definition = constant_definition(instruction.inputs[constant_index]);
+            if (definition == nullptr && add) {
+                constant_index = 0U;
+                definition = constant_definition(instruction.inputs[constant_index]);
+            }
+            if (definition == nullptr) continue;
+            const auto value = definition->immediate;
+            if ((add || sub || comparison) && !add_sub_immediate(value)) continue;
+            if (shift && !shift_immediate(instruction.opcode, value)) continue;
+            if (constant_index == 0U) std::swap(instruction.inputs[0], instruction.inputs[1]);
+            const auto constant_reg = instruction.inputs[1];
+            instruction.inputs.resize(1U);
+            instruction.immediate = value;
+            instruction.symbol = comparison ? "$cmpimm" : "$imm";
+            if (constant_reg < uses.size() && uses[constant_reg] != 0U) --uses[constant_reg];
+            if (comparison) ++stats.immediate_comparisons_selected;
+            else ++stats.immediate_forms_selected;
+        }
+    }
+
+    // AArch64 reduction SLP. Recover effective addresses through canonical
+    // ptr_offset/copy definitions, then collapse exact single-use add trees over
+    // contiguous memory into the shared packed reduction pseudo. This mirrors
+    // the legality discipline of the x86 reducer without importing x86 machine
+    // pseudos into the AArch64 pipeline.
+    bool packed_any = false;
+    {
+        std::vector<Instruction*> reduction_defs(function.register_count, nullptr);
+        std::vector<std::uint32_t> reduction_uses(function.register_count, 0U);
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (has_result(instruction.opcode) && instruction.result < reduction_defs.size())
+                    reduction_defs[instruction.result] = &instruction;
+                for (const auto input : instruction.inputs)
+                    if (input < reduction_uses.size()) ++reduction_uses[input];
+                for (const auto& successor : instruction.successors)
+                    for (const auto argument : successor.arguments)
+                        if (argument < reduction_uses.size()) ++reduction_uses[argument];
+            }
+        }
+
+        struct EffectiveAddress { VirtualRegister base{}; std::int64_t offset{}; };
+        const auto address_of = [&](VirtualRegister reg, std::int64_t displacement) {
+            EffectiveAddress result{reg, displacement};
+            std::size_t depth = 0U;
+            while (result.base < reduction_defs.size() && depth++ < 16U) {
+                const auto* definition = reduction_defs[result.base];
+                if (definition == nullptr) break;
+                if (definition->opcode == Opcode::ptr_offset && definition->inputs.size() == 1U) {
+                    result.offset += definition->immediate;
+                    result.base = definition->inputs.front();
+                    continue;
+                }
+                if (is_copy(definition->opcode) && definition->inputs.size() == 1U) {
+                    result.base = definition->inputs.front();
+                    continue;
+                }
+                break;
+            }
+            return result;
+        };
+
+        std::unordered_set<VirtualRegister> erased_reduction_results;
+        const auto form_reduction = [&](VirtualRegister root, bool wide) -> bool {
+            const auto add_opcode = wide ? Opcode::add_i64 : Opcode::add_i32;
+            const auto load_opcode = wide ? Opcode::load_ptr_i64 : Opcode::load_ptr_i32;
+            const std::size_t lane_bytes = wide ? 8U : 4U;
+            const std::size_t minimum_lanes = wide ? 2U : 4U;
+            const std::size_t maximum_lanes = wide ? 16U : 32U;
+            struct Leaf { VirtualRegister base{}; std::int64_t offset{}; };
+            std::vector<Leaf> leaves;
+            std::vector<VirtualRegister> visited;
+            const auto collect = [&](auto&& collect_self, VirtualRegister reg) -> bool {
+                if (reg >= reduction_defs.size() || reduction_defs[reg] == nullptr) return false;
+                auto* definition = reduction_defs[reg];
+                if (definition->opcode == load_opcode && definition->inputs.size() == 1U) {
+                    const auto address = address_of(definition->inputs.front(), definition->immediate);
+                    leaves.push_back({address.base, address.offset});
+                    visited.push_back(reg);
+                    return true;
+                }
+                if (definition->opcode != add_opcode || !definition->symbol.empty() ||
+                    definition->inputs.size() != 2U || reduction_uses[reg] != 1U)
+                    return false;
+                if (!collect_self(collect_self, definition->inputs[0]) ||
+                    !collect_self(collect_self, definition->inputs[1])) return false;
+                visited.push_back(reg);
+                return true;
+            };
+            if (!collect(collect, root)) return false;
+            if (leaves.size() < minimum_lanes || leaves.size() > maximum_lanes ||
+                (leaves.size() & (leaves.size() - 1U)) != 0U) return false;
+            const auto base = leaves.front().base;
+            std::vector<std::int64_t> offsets;
+            offsets.reserve(leaves.size());
+            for (const auto& leaf : leaves) {
+                if (leaf.base != base) return false;
+                offsets.push_back(leaf.offset);
+            }
+            std::sort(offsets.begin(), offsets.end());
+            for (std::size_t index = 0; index < offsets.size(); ++index)
+                if (offsets[index] != static_cast<std::int64_t>(index * lane_bytes)) return false;
+
+            auto* root_definition = reduction_defs[root];
+            root_definition->opcode = wide ? Opcode::reduce_add_i64_contiguous : Opcode::reduce_add_i32_contiguous;
+            root_definition->inputs = {base};
+            root_definition->immediate = static_cast<std::int64_t>(leaves.size());
+            root_definition->argument_index = 0U;
+            root_definition->symbol.clear();
+            root_definition->vector_bits = 128U;
+            for (const auto reg : visited)
+                if (reg != root) erased_reduction_results.insert(reg);
+            ++stats.slp_candidates_considered;
+            ++stats.slp_candidates_selected;
+            ++stats.slp_width_128_selected;
+            packed_any = true;
+            return true;
+        };
+        for (auto& block : function.blocks) {
+            for (auto& terminator : block.instructions) {
+                if ((terminator.opcode != Opcode::return_i32 && terminator.opcode != Opcode::return_i64) ||
+                    terminator.inputs.size() != 1U) continue;
+                const bool wide = terminator.opcode == Opcode::return_i64;
+                (void)form_reduction(terminator.inputs.front(), wide);
+            }
+        }
+        if (!erased_reduction_results.empty()) {
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& instruction) {
+                    return has_result(instruction.opcode) && erased_reduction_results.contains(instruction.result);
+                }), instructions.end());
+            }
+        }
+    }
+
+    // AArch64 SLP: recognize straight-line unrolled integer maps directly
+    // from canonical machine IR. Unlike the x86 optimizer, this does not depend
+    // on x86 memory-operand pseudos; it recovers effective addresses through
+    // ptr_offset definitions and replaces a full 128-bit-or-larger run with the
+    // shared packed memory pseudo consumed by the NEON encoder.
+    for (auto& block : function.blocks) {
+        if (block.instructions.size() < 7U) continue;
+        std::vector<std::size_t> definition(function.register_count, std::numeric_limits<std::size_t>::max());
+        std::vector<std::uint32_t> block_uses(function.register_count, 0U);
+        for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+            const auto& ins = block.instructions[index];
+            if (has_result(ins.opcode) && ins.result < definition.size()) definition[ins.result] = index;
+            for (const auto input : ins.inputs) if (input < block_uses.size()) ++block_uses[input];
+            for (const auto& successor : ins.successors)
+                for (const auto argument : successor.arguments) if (argument < block_uses.size()) ++block_uses[argument];
+        }
+        struct Address { VirtualRegister base{}; std::int64_t offset{}; };
+        const auto address_of = [&](VirtualRegister reg, std::int64_t displacement) {
+            Address result{reg, displacement};
+            std::size_t depth = 0U;
+            while (result.base < definition.size() && depth++ < 16U) {
+                const auto at = definition[result.base];
+                if (at == std::numeric_limits<std::size_t>::max()) break;
+                const auto& def = block.instructions[at];
+                if (def.opcode == Opcode::ptr_offset && def.inputs.size() == 1U) {
+                    result.offset += def.immediate;
+                    result.base = def.inputs.front();
+                    continue;
+                }
+                if (is_copy(def.opcode) && def.inputs.size() == 1U) {
+                    result.base = def.inputs.front();
+                    continue;
+                }
+                break;
+            }
+            return result;
+        };
+        struct Lane {
+            std::size_t load_index{}, arithmetic_index{}, store_index{};
+            VirtualRegister source_base{}, destination_base{}, scalar{};
+            std::int64_t source_offset{}, destination_offset{};
+            Opcode operation{};
+            std::size_t lane_bytes{};
+        };
+        std::vector<Lane> lanes;
+        for (std::size_t store_index = 0; store_index < block.instructions.size(); ++store_index) {
+            const auto& store = block.instructions[store_index];
+            const bool i32 = store.opcode == Opcode::store_ptr_i32;
+            const bool i64 = store.opcode == Opcode::store_ptr_i64;
+            if ((!i32 && !i64) || store.inputs.size() != 2U) continue;
+            const auto value = store.inputs[0];
+            if (value >= definition.size() || definition[value] == std::numeric_limits<std::size_t>::max()) continue;
+            const auto arithmetic_index = definition[value];
+            const auto& arithmetic = block.instructions[arithmetic_index];
+            const auto supported = [&](Opcode op) {
+                if (i64) return op == Opcode::add_i64 || op == Opcode::sub_i64 || op == Opcode::and_i64 ||
+                                op == Opcode::or_i64 || op == Opcode::xor_i64;
+                return op == Opcode::add_i32 || op == Opcode::sub_i32 || op == Opcode::and_i32 ||
+                       op == Opcode::or_i32 || op == Opcode::xor_i32;
+            };
+            if (!supported(arithmetic.opcode) || arithmetic.inputs.size() != 2U ||
+                value >= block_uses.size() || block_uses[value] != 1U) continue;
+            std::size_t load_operand = 0U;
+            const auto expected_load = i64 ? Opcode::load_ptr_i64 : Opcode::load_ptr_i32;
+            auto load_index = arithmetic.inputs[0] < definition.size() ? definition[arithmetic.inputs[0]] : std::numeric_limits<std::size_t>::max();
+            if (load_index == std::numeric_limits<std::size_t>::max() || block.instructions[load_index].opcode != expected_load) {
+                if (arithmetic.opcode == Opcode::sub_i32 || arithmetic.opcode == Opcode::sub_i64) continue;
+                load_operand = 1U;
+                load_index = arithmetic.inputs[1] < definition.size() ? definition[arithmetic.inputs[1]] : std::numeric_limits<std::size_t>::max();
+                if (load_index == std::numeric_limits<std::size_t>::max() || block.instructions[load_index].opcode != expected_load) continue;
+            }
+            const auto& load = block.instructions[load_index];
+            if (load.inputs.size() != 1U || load.result >= block_uses.size() || block_uses[load.result] != 1U) continue;
+            const auto source = address_of(load.inputs[0], load.immediate);
+            const auto destination = address_of(store.inputs[1], store.immediate);
+            lanes.push_back({load_index, arithmetic_index, store_index, source.base, destination.base,
+                             arithmetic.inputs[1U - load_operand], source.offset, destination.offset,
+                             arithmetic.opcode, i64 ? 8U : 4U});
+        }
+
+        std::vector<bool> erase(block.instructions.size(), false);
+        std::vector<std::pair<std::size_t, Instruction>> replacements;
+        for (std::size_t start = 0; start < lanes.size();) {
+            const auto first = lanes[start];
+            std::size_t end = start + 1U;
+            while (end < lanes.size()) {
+                const auto& lane = lanes[end];
+                const auto ordinal = end - start;
+                if (lane.operation != first.operation || lane.lane_bytes != first.lane_bytes ||
+                    lane.source_base != first.source_base || lane.destination_base != first.destination_base ||
+                    lane.scalar != first.scalar || first.source_offset != 0 || first.destination_offset != 0 ||
+                    lane.source_offset != static_cast<std::int64_t>(ordinal * first.lane_bytes) ||
+                    lane.destination_offset != static_cast<std::int64_t>(ordinal * first.lane_bytes)) break;
+                ++end;
+            }
+            auto count = end - start;
+            std::size_t selected = 0U;
+            for (const auto candidate : {8U, 4U, 2U}) {
+                if (candidate <= count && candidate * first.lane_bytes >= 16U) { selected = candidate; break; }
+            }
+            if (selected == 0U) { ++start; continue; }
+            // Without noalias/provenance metadata, two distinct pointer values
+            // may still overlap at runtime. Packing an in-place map is always
+            // order-equivalent because all lanes are loaded before any lane in
+            // the same 128-bit chunk is stored. Separate source/destination
+            // maps stay available as explicit packed pseudos, but automatic
+            // SLP waits for a future alias proof.
+            if (first.source_base != first.destination_base) { ++start; continue; }
+
+            std::size_t earliest = block.instructions.size();
+            std::size_t latest = 0U;
+            std::unordered_set<std::size_t> owned;
+            for (std::size_t lane_index = 0; lane_index < selected; ++lane_index) {
+                const auto& lane = lanes[start + lane_index];
+                for (const auto index : {lane.load_index, lane.arithmetic_index, lane.store_index}) {
+                    owned.insert(index); earliest = std::min(earliest, index); latest = std::max(latest, index);
+                }
+            }
+            bool safe_window = true;
+            for (std::size_t index = earliest; index <= latest; ++index) {
+                if (owned.contains(index)) continue;
+                const auto& candidate = block.instructions[index];
+                if (candidate.opcode != Opcode::ptr_offset && !is_copy(candidate.opcode)) {
+                    safe_window = false; break;
+                }
+            }
+            if (!safe_window) { ++start; continue; }
+
+            Instruction packed;
+            packed.opcode = first.lane_bytes == 8U ? Opcode::binary_i64_contiguous_map : Opcode::binary_i32_contiguous_map;
+            if (first.source_base == first.destination_base) {
+                packed.opcode = first.lane_bytes == 8U ? Opcode::binary_i64_contiguous_inplace : Opcode::binary_i32_contiguous_inplace;
+                packed.inputs = {first.source_base, first.scalar};
+            } else {
+                packed.inputs = {first.source_base, first.destination_base, first.scalar};
+            }
+            packed.immediate = static_cast<std::int64_t>(selected);
+            packed.argument_index = static_cast<std::uint32_t>(first.operation);
+            packed.vector_bits = 128U;
+            replacements.emplace_back(earliest, std::move(packed));
+            for (const auto index : owned) erase[index] = true;
+            packed_any = true;
+            ++stats.slp_candidates_considered;
+            ++stats.slp_candidates_selected;
+            ++stats.slp_width_128_selected;
+            start += selected;
+        }
+
+        if (!replacements.empty()) {
+            std::unordered_map<std::size_t, Instruction> replacement_at;
+            for (auto& replacement : replacements) replacement_at.emplace(replacement.first, std::move(replacement.second));
+            std::vector<Instruction> rewritten;
+            rewritten.reserve(block.instructions.size());
+            for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+                if (auto found = replacement_at.find(index); found != replacement_at.end())
+                    rewritten.push_back(std::move(found->second));
+                if (!erase[index]) rewritten.push_back(std::move(block.instructions[index]));
+            }
+            block.instructions = std::move(rewritten);
+        }
+    }
+
+    if (packed_any) {
+        // Delete now-dead address/copy definitions and then compact the virtual
+        // register file. This keeps the machine verifier's one-definition-per-
+        // vreg invariant while ensuring vectorization actually removes scalar
+        // work instead of merely adding a packed store beside it.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            std::vector<std::uint32_t> uses(function.register_count, 0U);
+            for (const auto& block : function.blocks)
+                for (const auto& instruction : block.instructions) {
+                    for (const auto input : instruction.inputs) if (input < uses.size()) ++uses[input];
+                    for (const auto& successor : instruction.successors)
+                        for (const auto argument : successor.arguments) if (argument < uses.size()) ++uses[argument];
+                }
+            for (auto& block : function.blocks) {
+                auto& instructions = block.instructions;
+                const auto old_size = instructions.size();
+                instructions.erase(std::remove_if(instructions.begin(), instructions.end(), [&](const Instruction& ins) {
+                    return has_result(ins.opcode) && ins.result < uses.size() && uses[ins.result] == 0U &&
+                           is_removable_when_dead(ins.opcode);
+                }), instructions.end());
+                if (instructions.size() != old_size) changed = true;
+            }
+        }
+
+        std::vector<bool> retained(function.register_count, false);
+        for (const auto& block : function.blocks) {
+            for (const auto parameter : block.parameters) if (parameter < retained.size()) retained[parameter] = true;
+            for (const auto& instruction : block.instructions)
+                if (has_result(instruction.opcode) && instruction.result < retained.size()) retained[instruction.result] = true;
+        }
+        std::vector<VirtualRegister> remap(function.register_count, function.register_count);
+        std::vector<std::uint8_t> widths;
+        std::vector<RegisterClass> classes;
+        for (VirtualRegister reg = 0; reg < function.register_count; ++reg) {
+            if (!retained[reg]) continue;
+            remap[reg] = static_cast<VirtualRegister>(widths.size());
+            widths.push_back(function.register_widths[reg]);
+            classes.push_back(function.register_classes[reg]);
+        }
+        for (auto& block : function.blocks) {
+            for (auto& parameter : block.parameters) parameter = remap[parameter];
+            for (auto& instruction : block.instructions) {
+                for (auto& input : instruction.inputs) input = remap[input];
+                for (auto& successor : instruction.successors)
+                    for (auto& argument : successor.arguments) argument = remap[argument];
+                if (has_result(instruction.opcode)) instruction.result = remap[instruction.result];
+            }
+        }
+        function.register_count = static_cast<VirtualRegister>(widths.size());
+        function.register_widths = std::move(widths);
+        function.register_classes = std::move(classes);
+    }
+
+    for (const auto& block : function.blocks)
+        stats.instructions_after += static_cast<std::uint32_t>(block.instructions.size());
+    return stats;
+}
+
+OptimizationStats optimize_aarch64_canonical_module(Module& module) {
+    OptimizationStats total;
+    for (auto& function : module.functions) {
+        const auto stats = optimize_aarch64_canonical_function(function);
+#define FORGE_ACCUMULATE(field) total.field += stats.field
+        FORGE_ACCUMULATE(instructions_before);
+        FORGE_ACCUMULATE(instructions_after);
+        FORGE_ACCUMULATE(copies_propagated);
+        FORGE_ACCUMULATE(zero_offsets_eliminated);
+        FORGE_ACCUMULATE(redundant_casts_eliminated);
+        FORGE_ACCUMULATE(immediate_forms_selected);
+        FORGE_ACCUMULATE(immediate_comparisons_selected);
+#undef FORGE_ACCUMULATE
+    }
+    return total;
+}
+
 } // namespace forge::machine

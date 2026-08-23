@@ -46,7 +46,7 @@ except RuntimeError as error:
     print(f'Canonical production compiler source set is invalid: {error}')
     sys.exit(1)
 if canonical_sources[-1] != root / 'compiler' / 'src' / 'main.rz':
-    print('Canonical production compiler entrypoint must be compiler/src/main.rz and last in host-source-order.txt')
+    print('Canonical production compiler entrypoint must be compiler/src/main.rz and the semantic entry point')
     sys.exit(1)
 
 forbidden = [
@@ -121,4 +121,4 @@ if generated:
         print(f'  {item}')
     sys.exit(1)
 
-print(f'compiler source layout: PASS ({len(canonical_sources)} ordered Raz modules)')
+print(f'compiler source layout: PASS ({len(canonical_sources)} discovered Raz modules)')

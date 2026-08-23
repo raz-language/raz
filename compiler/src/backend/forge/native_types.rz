@@ -6,18 +6,18 @@ namespace raz_compiler_backend_forge_native_types;
 public import raz_compiler_backend_forge_native_support;
 
 fn forge_native_writer_array_name(ForgeWriter&mut out, i64 element_type, i64 extent) {
-    i64 prefix[12] = [64, 95, 95, 114, 97, 122, 95, 97, 114, 114, 95, 97];
+    
 
-    writer_chars(out, &prefix, 12);
+    writer_literal(out, "@__raz_arr_a");
     writer_decimal(out, forge_native_type(element_type));
     writer_put(out, 95);
     writer_decimal(out, extent);
 }
 
 fn forge_native_writer_struct_array_name(ForgeWriter&mut out, i64 element_structure, i64 extent) {
-    i64 prefix[13] = [64, 95, 95, 114, 97, 122, 95, 97, 114, 114, 115, 95, 115];
+    
 
-    writer_chars(out, &prefix, 13);
+    writer_literal(out, "@__raz_arrs_s");
     writer_decimal(out, element_structure);
     writer_put(out, 95);
     writer_decimal(out, extent);
@@ -40,14 +40,14 @@ fn forge_native_fixed_array_supported(i64 extent, i64 element_type, i64 element_
     if (extent <= 0 || element_structure >= 0) {
         return false;
     }
-    // The current MIR aggregate image uses one native 64-bit slot per element.
-    // Only layouts with the same native width are true by-value Forge arrays.
-    if (element_type == 12 || element_type == 14) {
-        return true;
-    }
+    // Fixed arrays have normal contiguous native layout. The structured Forge
+    // path carries element type and extent explicitly, so narrow primitive
+    // arrays must never fall back to the legacy Stage-1 64-bit-slot image.
+    // Otherwise &array[0] exposes the wrong stride to FFI/unsafe code.
     return (
-        forge_native_primitive_type_supported(element_type) &&
-        forge_native_scalar_storage_size(element_type) == 8
+        element_type == 12 ||
+        element_type == 14 ||
+        forge_native_primitive_type_supported(element_type)
     );
 }
 
@@ -370,6 +370,53 @@ fn forge_native_scalar_local_type(HirModule& hir, i64 function_index, i64 local_
     return forge_native_parameter_type(hir, parameter_index);
 }
 
+// MIR lowering may synthesize frame slots that have no HIR local declaration
+// (for example the temporary storage used to auto-borrow an rvalue receiver).
+// Structured Forge uses real stack storage, so infer those synthetic slots from
+// the typed local load/store operations instead of rejecting them and falling
+// back to the legacy arena/reference runtime.
+fn forge_native_scalar_mir_local_type(
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 local_slot,
+) -> i64 {
+    i64 known = forge_native_scalar_local_type(hir, function_index, local_slot);
+
+    if (known >= 0) {
+        return known;
+    }
+    if (
+        local_slot < 0 ||
+        local_slot >= raz_compiler_rt_arena_get(mir.function_local_counts, function_index)
+    ) {
+        return -1;
+    }
+
+    i64 instruction = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = instruction + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+
+    while (instruction < end) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
+
+        if ((opcode == 3 || opcode == 9) && raz_compiler_rt_arena_get(mir.op_a, instruction) == local_slot) {
+            i64 type_kind = raz_compiler_rt_arena_get(mir.op_types, instruction);
+
+            if (type_kind == 15 || (type_kind >= 1024 && type_kind < 1280)) {
+                return 12;
+            }
+            if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+                return type_kind;
+            }
+            if (forge_native_primitive_type_supported(type_kind)) {
+                return type_kind;
+            }
+        }
+        instruction += 1;
+    }
+    return -1;
+}
+
 fn forge_native_scalar_local_signature(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
     i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
 
@@ -584,12 +631,13 @@ fn forge_native_value_used_as_image_pointer(
         // pointer type from the callee parameter instead of trusting the old
         // handle-shaped op_type metadata.
         if (opcode == 9 && raz_compiler_rt_arena_get(mir.op_b, cursor) == value) {
-            i64 local_type = forge_native_scalar_local_type(
+            i64 local_type = forge_native_scalar_mir_local_type(
                 hir,
+                mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, cursor),
             );
-            if (local_type == 12 || local_type == 13 || local_type == 14) {
+            if (local_type == 12 || local_type == 14) {
                 return true;
             }
         }
@@ -678,8 +726,9 @@ fn forge_native_register_type(HirModule& hir, MirModule& mir, i64 function_index
         );
     }
     if (opcode == 3) {
-        return forge_native_scalar_local_type(
+        return forge_native_scalar_mir_local_type(
             hir,
+            mir,
             function_index,
             raz_compiler_rt_arena_get(mir.op_a, value),
         );
@@ -743,12 +792,13 @@ fn forge_native_build_image_pointer_values(HirModule& hir, MirModule& mir, i64 i
                 }
             }
             if (opcode == 9) {
-                i64 local_type = forge_native_scalar_local_type(
+                i64 local_type = forge_native_scalar_mir_local_type(
                     hir,
+                    mir,
                     function_index,
                     raz_compiler_rt_arena_get(mir.op_a, instruction),
                 );
-                if (local_type == 12 || local_type == 13 || local_type == 14) {
+                if (local_type == 12 || local_type == 14) {
                     i64 stored = raz_compiler_rt_arena_get(mir.op_b, instruction);
 
                     if (stored >= 0 && stored < mir.instruction_count) {
@@ -850,8 +900,9 @@ fn forge_native_register_type_fast(
         );
     }
     if (opcode == 3) {
-        return forge_native_scalar_local_type(
+        return forge_native_scalar_mir_local_type(
             hir,
+            mir,
             function_index,
             raz_compiler_rt_arena_get(mir.op_a, value),
         );
@@ -931,11 +982,84 @@ fn forge_native_image_address_supported(
     return primitive_type_is_integer(forge_native_register_type(hir, mir, function_index, index));
 }
 
+fn forge_native_register_is_pointer_fast(
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 value,
+    i64 image_pointer_values,
+) -> bool {
+    return forge_native_register_type_fast(
+        hir,
+        mir,
+        function_index,
+        value,
+        image_pointer_values,
+    ) == 12;
+}
+
+fn forge_native_image_address_supported_fast(
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 base,
+    i64 index,
+    i64 image_pointer_values,
+) -> bool {
+    if (!forge_native_register_is_pointer_fast(hir, mir, function_index, base, image_pointer_values)) {
+        return false;
+    }
+
+    i64 structure = forge_native_register_structure_id(hir, mir, function_index, base, 0);
+
+    if (structure >= 0) {
+        i64 field = forge_native_constant_index(mir, index);
+
+        return field >= 0 && field < raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    }
+
+    i64 extent = -1;
+    i64 element_type = -1;
+    i64 element_structure = -1;
+
+    if (
+        forge_native_register_array_info(
+            hir,
+            mir,
+            function_index,
+            base,
+            0,
+            &mut extent,
+            &mut element_type,
+            &mut element_structure,
+        )
+    ) {
+        i64 constant_element = forge_native_constant_index(mir, index);
+
+        if (constant_element >= 0) {
+            return (
+                constant_element < extent &&
+                forge_native_array_supported(hir, extent, element_type, element_structure)
+            );
+        }
+        return (
+            forge_native_array_supported(hir, extent, element_type, element_structure) &&
+            primitive_type_is_integer(
+                forge_native_register_type_fast(hir, mir, function_index, index, image_pointer_values)
+            )
+        );
+    }
+    return primitive_type_is_integer(
+        forge_native_register_type_fast(hir, mir, function_index, index, image_pointer_values)
+    );
+}
+
 fn forge_native_scalar_opcode_supported(
     HirModule& hir,
     MirModule& mir,
     i64 function_index,
     i64 instruction,
+    i64 image_pointer_values,
 ) -> bool {
     i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
     i64 type_kind = raz_compiler_rt_arena_get(mir.op_types, instruction);
@@ -991,11 +1115,12 @@ fn forge_native_scalar_opcode_supported(
                     return false;
                 }
                 if (opcode == 48) {
-                    return forge_native_register_is_pointer(
+                    return forge_native_register_is_pointer_fast(
                         hir,
                         mir,
                         function_index,
                         raz_compiler_rt_arena_get(mir.op_b, instruction),
+            image_pointer_values,
                     );
                 }
                 return true;
@@ -1005,10 +1130,10 @@ fn forge_native_scalar_opcode_supported(
         // Arithmetic and comparisons are valid for integer and floating-point
         // primitives. Remainder, bitwise operations, and shifts remain integer-only.
         if (opcode == 2) {
-            return forge_native_register_type(hir, mir, function_index, instruction) >= 0;
+            return forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values) >= 0;
         }
         if (opcode == 3) {
-            i64 local_result_type = forge_native_register_type(hir, mir, function_index, instruction);
+            i64 local_result_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
 
             return (
                 forge_native_primitive_type_supported(local_result_type) ||
@@ -1018,7 +1143,7 @@ fn forge_native_scalar_opcode_supported(
             );
         }
         if (opcode == 1) {
-            i64 constant_type = forge_native_register_type(hir, mir, function_index, instruction);
+            i64 constant_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
 
             return forge_native_primitive_type_supported(constant_type) || constant_type == 12;
         }
@@ -1054,11 +1179,12 @@ fn forge_native_scalar_opcode_supported(
     if (opcode == 44) {
         i64 signature = raz_compiler_rt_arena_get(mir.op_d, instruction);
 
-        i64 callee_type = forge_native_register_type(
+        i64 callee_type = forge_native_register_type_fast(
             hir,
             mir,
             function_index,
             raz_compiler_rt_arena_get(mir.op_a, instruction),
+            image_pointer_values,
         );
         if (
             (callee_type != 12 && callee_type != 14) ||
@@ -1083,11 +1209,12 @@ fn forge_native_scalar_opcode_supported(
 
         while (argument < count) {
             if (
-                forge_native_register_type(
+                forge_native_register_type_fast(
                     hir,
                     mir,
                     function_index,
                     raz_compiler_rt_arena_get(mir.call_arguments, start + argument),
+            image_pointer_values,
                 ) < 0
             ) {
                 return false;
@@ -1140,11 +1267,12 @@ fn forge_native_scalar_opcode_supported(
                 return false;
             }
             if (
-                forge_native_register_type(
+                forge_native_register_type_fast(
                     hir,
                     mir,
                     function_index,
                     raz_compiler_rt_arena_get(mir.call_arguments, argument_start + capture),
+            image_pointer_values,
                 ) < 0
             ) {
                 return false;
@@ -1158,11 +1286,12 @@ fn forge_native_scalar_opcode_supported(
 
         if (
             !forge_native_function_signature_supported(hir, signature) ||
-            !forge_native_register_is_pointer(
+            !forge_native_register_is_pointer_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, instruction),
+            image_pointer_values,
             )
         ) {
             return false;
@@ -1184,11 +1313,12 @@ fn forge_native_scalar_opcode_supported(
 
         while (argument < count) {
             if (
-                forge_native_register_type(
+                forge_native_register_type_fast(
                     hir,
                     mir,
                     function_index,
                     raz_compiler_rt_arena_get(mir.call_arguments, start + argument),
+            image_pointer_values,
                 ) < 0
             ) {
                 return false;
@@ -1200,17 +1330,18 @@ fn forge_native_scalar_opcode_supported(
     if (opcode == 25) {
         i64 local_slot = raz_compiler_rt_arena_get(mir.op_a, instruction);
 
-        return forge_native_scalar_local_type(hir, function_index, local_slot) >= 0;
+        return forge_native_scalar_mir_local_type(hir, mir, function_index, local_slot) >= 0;
     }
     if (opcode == 26) {
-        i64 result_type = forge_native_register_type(hir, mir, function_index, instruction);
+        i64 result_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
 
         return (
-            forge_native_register_is_pointer(
+            forge_native_register_is_pointer_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, instruction),
+            image_pointer_values,
             ) &&
             (
                 forge_native_primitive_type_supported(result_type) ||
@@ -1222,30 +1353,33 @@ fn forge_native_scalar_opcode_supported(
     }
     if (opcode == 27) {
         return (
-            forge_native_register_is_pointer(
+            forge_native_register_is_pointer_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, instruction),
+            image_pointer_values,
             ) &&
-            forge_native_register_type(
+            forge_native_register_type_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_b, instruction),
+            image_pointer_values,
             ) >= 0
         );
     }
     if (opcode == 28) {
-        i64 result_type = forge_native_register_type(hir, mir, function_index, instruction);
+        i64 result_type = forge_native_register_type_fast(hir, mir, function_index, instruction, image_pointer_values);
 
         return (
-            forge_native_image_address_supported(
+            forge_native_image_address_supported_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, instruction),
                 raz_compiler_rt_arena_get(mir.op_b, instruction),
+            image_pointer_values,
             ) &&
             (
                 forge_native_primitive_type_supported(result_type) ||
@@ -1257,12 +1391,13 @@ fn forge_native_scalar_opcode_supported(
     }
     if (opcode == 29) {
         if (
-            !forge_native_image_address_supported(
+            !forge_native_image_address_supported_fast(
                 hir,
                 mir,
                 function_index,
                 raz_compiler_rt_arena_get(mir.op_a, instruction),
                 raz_compiler_rt_arena_get(mir.op_b, instruction),
+            image_pointer_values,
             )
         ) {
             return false;
@@ -1270,7 +1405,7 @@ fn forge_native_scalar_opcode_supported(
 
         i64 stored = raz_compiler_rt_arena_get(mir.op_c, instruction);
 
-        if (forge_native_register_type(hir, mir, function_index, stored) >= 0) {
+        if (forge_native_register_type_fast(hir, mir, function_index, stored, image_pointer_values) >= 0) {
             return true;
         }
         // Aggregate stores are handled below by structured aggregate-copy
@@ -1320,7 +1455,7 @@ fn forge_native_scalar_opcode_supported(
         i64 base = raz_compiler_rt_arena_get(mir.op_a, instruction);
         i64 index = raz_compiler_rt_arena_get(mir.op_b, instruction);
 
-        return forge_native_image_address_supported(hir, mir, function_index, base, index);
+        return forge_native_image_address_supported_fast(hir, mir, function_index, base, index, image_pointer_values);
     }
     if (opcode == 49) {
         i64 global_index = raz_compiler_rt_arena_get(mir.op_a, instruction);
@@ -1415,7 +1550,7 @@ fn forge_native_scalar_globals_supported(HirModule& hir, MirModule& mir) -> bool
     return true;
 }
 
-fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_index) -> i64 {
+fn forge_native_support_failure_code_cached(HirModule& hir, MirModule& mir, i64 main_index, i64 image_pointer_values) -> i64 {
     if (main_index < 0) {
         return 1000001;
     }
@@ -1452,7 +1587,7 @@ fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_in
         i64 local_count = raz_compiler_rt_arena_get(mir.function_local_counts, function_index);
 
         while (local_slot < local_count) {
-            if (forge_native_scalar_local_type(hir, function_index, local_slot) < 0) {
+            if (forge_native_scalar_mir_local_type(hir, mir, function_index, local_slot) < 0) {
                 return 3000000 + function_index * 1000 + local_slot;
             }
             local_slot += 1;
@@ -1462,7 +1597,7 @@ fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_in
         i64 end = instruction + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
 
         while (instruction < end) {
-            if (!forge_native_scalar_opcode_supported(hir, mir, function_index, instruction)) {
+            if (!forge_native_scalar_opcode_supported(hir, mir, function_index, instruction, image_pointer_values)) {
                 i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
 
                 return 400000000 + opcode * 1000000 + instruction;
@@ -1472,6 +1607,26 @@ fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_in
         function_index += 1;
     }
     return 0;
+}
+
+fn forge_native_support_failure_code(HirModule& hir, MirModule& mir, i64 main_index) -> i64 {
+    i64 image_pointer_values = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (image_pointer_values == 0) {
+        return 1000005;
+    }
+    if (!forge_native_build_image_pointer_values(hir, mir, image_pointer_values)) {
+        raz_compiler_rt_arena_destroy(image_pointer_values);
+        return 1000005;
+    }
+    i64 code = forge_native_support_failure_code_cached(
+        hir,
+        mir,
+        main_index,
+        image_pointer_values,
+    );
+    raz_compiler_rt_arena_destroy(image_pointer_values);
+    return code;
 }
 
 fn forge_native_write_support_diagnostic_code(i64 code) {
@@ -1492,61 +1647,36 @@ fn forge_native_write_support_diagnostic_code(i64 code) {
     writer_destroy(&mut diagnostic);
 }
 
-fn forge_native_write_support_diagnostic(HirModule& hir, MirModule& mir, i64 main_index) {
-    forge_native_write_support_diagnostic_code(forge_native_support_failure_code(hir, mir, main_index));
+fn forge_native_write_support_diagnostic(Source& source, HirModule& hir, MirModule& mir, i64 main_index) {
+    i64 code = forge_native_support_failure_code(hir, mir, main_index);
+    ForgeWriter diagnostic;
+
+    diagnostic.capacity = 192;
+    diagnostic.data = raz_compiler_rt_arena_create(diagnostic.capacity);
+    diagnostic.length = 0;
+    diagnostic.failed = diagnostic.data == 0;
+    if (!diagnostic.failed) {
+        writer_decimal(&mut diagnostic, code);
+        if (code >= 2000000 && code < 2100000) {
+            i64 function_index = code - 2000000;
+            if (function_index >= 0 && function_index < hir.function_count) {
+                writer_put(&mut diagnostic, 32);
+                writer_text(
+                    &mut diagnostic,
+                    source,
+                    raz_compiler_rt_arena_get(hir.function_name_offsets, function_index),
+                    raz_compiler_rt_arena_get(hir.function_name_lengths, function_index),
+                );
+            }
+        }
+        writer_newline(&mut diagnostic);
+
+        i64 path[29] = [102, 111, 114, 103, 101, 45, 115, 116, 114, 117, 99, 116, 117, 114, 101, 100, 45, 102, 97, 105, 108, 117, 114, 101, 46, 116, 120, 116, 0];
+        raz_rt_write_ascii_i64(&mut path[0], 28, diagnostic.data, diagnostic.length);
+    }
+    writer_destroy(&mut diagnostic);
 }
 
 fn forge_native_scalar_module_supported(HirModule& hir, MirModule& mir, i64 main_index) -> bool {
-    if (
-        main_index < 0 ||
-        hir.function_count != mir.function_count ||
-        !forge_native_scalar_globals_supported(hir, mir)
-    ) {
-        return false;
-    }
-    if (raz_compiler_rt_arena_get(hir.function_parameter_counts, main_index) != 0) {
-        return false;
-    }
-    if (
-        raz_compiler_rt_arena_get(hir.function_returns_value, main_index) != 0 &&
-        (
-            !primitive_type_is_integer(raz_compiler_rt_arena_get(hir.function_return_types, main_index)) ||
-            primitive_type_width(raz_compiler_rt_arena_get(hir.function_return_types, main_index)) != 64
-        )
-    ) {
-        return false;
-    }
-
-    i64 function_index = 0;
-
-    while (function_index < hir.function_count) {
-        if (
-            !forge_native_scalar_function_type_supported(hir, function_index) ||
-            !forge_native_flat_aggregate_locals_supported(hir, function_index)
-        ) {
-            return false;
-        }
-
-        i64 local_slot = 0;
-        i64 local_count = raz_compiler_rt_arena_get(mir.function_local_counts, function_index);
-
-        while (local_slot < local_count) {
-            if (forge_native_scalar_local_type(hir, function_index, local_slot) < 0) {
-                return false;
-            }
-            local_slot += 1;
-        }
-
-        i64 instruction = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
-        i64 end = instruction + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
-
-        while (instruction < end) {
-            if (!forge_native_scalar_opcode_supported(hir, mir, function_index, instruction)) {
-                return false;
-            }
-            instruction += 1;
-        }
-        function_index += 1;
-    }
-    return true;
+    return forge_native_support_failure_code(hir, mir, main_index) == 0;
 }

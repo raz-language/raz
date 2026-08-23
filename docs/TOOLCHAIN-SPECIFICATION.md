@@ -4,7 +4,7 @@ The `raz` command is the project, package, and toolchain driver. `razc` is the d
 
 ## Backend contract
 
-Raz lowers every program through typed HIR and backend-neutral MIR. Forge is the default production backend. LLVM is a first-class alternate backend implemented through the Raz toolchain.
+Raz lowers every program through typed HIR and backend-neutral MIR. Forge is the default production backend on x86-64 Windows/Linux. LLVM is a first-class production backend and remains the automatic native default on AArch64 and macOS. Forge now provides an experimental AArch64 ELF machine/object path, but it is not yet the qualified default.
 
 Backend selection must not change language semantics. See [Backends](BACKENDS.md) for target, optimization, linkage, and backend qualification details.
 
@@ -25,7 +25,7 @@ See [Compiler reproducibility](COMPILER-REPRODUCIBILITY.md).
 
 ## Native artifacts
 
-Supported x86-64 hosts can produce native artifacts through Forge or the LLVM/Clang path plus the platform linker/runtime boundary. The repository includes System V AMD64 and Windows x64 ABI and object-format qualification.
+Supported x86-64 hosts can produce native artifacts through Forge or LLVM/Clang. Linux AArch64 and macOS arm64 use LLVM/Clang with the same backend-neutral MIR and runtime contract. Qualification covers Windows x64/COFF, System V AMD64/ELF, AAPCS64/ELF, and Darwin AArch64/Mach-O object production. Forge production-parity native code generation remains x86-64; experimental AArch64 ELF64 and Darwin Mach-O arm64 encoders are available for qualification work.
 
 ## Installed layout
 

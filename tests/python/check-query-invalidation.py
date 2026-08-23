@@ -12,7 +12,7 @@ engine = (root / 'compiler/src/hir/query/engine.rz').read_text(encoding='utf-8')
 invalidation = (root / 'compiler/src/hir/query/invalidation.rz').read_text(encoding='utf-8')
 fingerprints = (root / 'compiler/src/hir/query/fingerprints.rz').read_text(encoding='utf-8')
 comptime = (root / 'compiler/src/hir/semantic/comptime.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 checks = {
     'semantic input families have independent fingerprints': all(x in model + invalidation for x in [

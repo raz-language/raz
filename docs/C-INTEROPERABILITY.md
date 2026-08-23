@@ -8,7 +8,7 @@ Raz exposes C ABI boundaries with `@abi(C)` functions and C-layout aggregates wi
 raz bindgen <header.h> [--target-abi=windows|unix] [output.rz]
 ```
 
-If `output.rz` is omitted, bindgen writes the generated source to stdout. `--target-abi=windows` uses the Windows x64 LLP64 data model (`long` is 32-bit). `--target-abi=unix` uses the x86-64 Unix LP64 data model (`long` is 64-bit).
+If `output.rz` is omitted, bindgen writes the generated source to stdout. `--target-abi=windows` uses the Windows x64 LLP64 data model (`long` is 32-bit). `--target-abi=unix` uses the Unix LP64 data model used by supported x86-64 and AArch64 Unix targets (`long` is 64-bit).
 
 The generated source is intended to be checked into the consuming package when a stable native API is being wrapped. This keeps builds deterministic and avoids requiring the original C headers on every downstream machine.
 

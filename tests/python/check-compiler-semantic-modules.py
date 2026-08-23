@@ -2,58 +2,68 @@
 # Copyright 2026 Mario Vinciguerra
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify the production compiler uses semantic modules in production.
-
-The bootstrap order is retained only as host-compiler metadata. Production package
-builds must not contain compiler/source-order.txt, because its presence selects
-legacy ordered-compilation-unit behavior in the project driver.
-"""
+"""Verify the production compiler is a semantic module graph with no order files."""
 from pathlib import Path
+import re
 import sys
+sys.dont_write_bytecode = True
 
 root = Path(__file__).resolve().parents[2]
 compiler = root / "compiler"
 source_root = compiler / "src"
-legacy_order = compiler / "source-order.txt"
-bootstrap_order = compiler / "host-source-order.txt"
+bootstrap_driver = (root / "tools" / "bootstrap.py").read_text(encoding="utf-8")
 
-if legacy_order.exists():
-    print("compiler-semantic-modules: FAIL: compiler/source-order.txt selects legacy concatenation")
+for forbidden in (compiler / "source-order.txt", compiler / "host-source-order.txt"):
+    if forbidden.exists():
+        print(f"compiler-semantic-modules: FAIL: ordering metadata must not exist: {forbidden.relative_to(root)}")
+        sys.exit(1)
+
+if "def compiler_modules()" not in bootstrap_driver:
+    print("compiler-semantic-modules: FAIL: bootstrap has no semantic source discovery")
     sys.exit(1)
-if not bootstrap_order.is_file():
-    print("compiler-semantic-modules: FAIL: missing compiler/host-source-order.txt")
+for forbidden_text in (
+    'line.startswith("namespace raz_compiler_")',
+    'line.startswith("public import raz_compiler_")',
+    'line.startswith("import raz_compiler_")',
+    "host-source-order.txt",
+):
+    if forbidden_text in bootstrap_driver:
+        print(f"compiler-semantic-modules: FAIL: bootstrap contains legacy module handling: {forbidden_text}")
+        sys.exit(1)
+
+sources = sorted(source_root.rglob("*.rz"))
+if not sources:
+    print("compiler-semantic-modules: FAIL: no compiler modules discovered")
+    sys.exit(1)
+entry = source_root / "main.rz"
+if entry not in sources:
+    print("compiler-semantic-modules: FAIL: compiler/src/main.rz is missing")
     sys.exit(1)
 
-entries = [
-    line.strip().replace("\\", "/")
-    for line in bootstrap_order.read_text(encoding="utf-8").splitlines()
-    if line.strip() and not line.lstrip().startswith("#")
-]
-if not entries or entries[-1] != "src/main.rz":
-    print("compiler-semantic-modules: FAIL: bootstrap order must end with src/main.rz")
-    sys.exit(1)
-
-expected = {path.relative_to(compiler).as_posix() for path in source_root.rglob("*.rz")}
-if set(entries) != expected or len(entries) != len(expected):
-    print("compiler-semantic-modules: FAIL: bootstrap order must cover compiler/src exactly once")
-    sys.exit(1)
-
-def module_namespace(entry: str) -> str:
-    stem = Path(entry[4:]).with_suffix("").as_posix().replace("/", "_").replace("-", "_")
-    return "raz_compiler_" + stem
-
-for index, entry in enumerate(entries):
-    path = compiler / entry
+namespace_re = re.compile(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+import_re = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+namespaces: dict[str, Path] = {}
+imports_by_path: dict[Path, set[str]] = {}
+for path in sources:
     text = path.read_text(encoding="utf-8")
-    namespace = f"namespace {module_namespace(entry)};"
-    if namespace not in text:
-        print(f"compiler-semantic-modules: FAIL: {entry} is missing explicit namespace: {namespace}")
+    match = namespace_re.search(text)
+    if match is None:
+        print(f"compiler-semantic-modules: FAIL: missing namespace: {path.relative_to(compiler)}")
         sys.exit(1)
-    if index == 0:
-        continue
-    edge = f"public import {module_namespace(entries[index - 1])};"
-    if edge not in text:
-        print(f"compiler-semantic-modules: FAIL: {entry} is missing semantic predecessor edge: {edge}")
+    namespace = match.group(1)
+    if namespace in namespaces:
+        print(f"compiler-semantic-modules: FAIL: duplicate namespace: {namespace}")
         sys.exit(1)
+    namespaces[namespace] = path
+    imports_by_path[path] = set(import_re.findall(text))
 
-print(f"compiler-semantic-modules: PASS ({len(entries)} semantic modules; bootstrap order retained only for host construction)")
+for path, imports in imports_by_path.items():
+    for dependency in imports:
+        if dependency.startswith("raz_compiler_") and dependency not in namespaces:
+            print(
+                "compiler-semantic-modules: FAIL: unresolved compiler import "
+                f"{dependency} in {path.relative_to(compiler)}"
+            )
+            sys.exit(1)
+
+print(f"compiler-semantic-modules: PASS ({len(sources)} semantic modules; no source-order metadata)")

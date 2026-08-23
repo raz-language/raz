@@ -31,16 +31,16 @@ required = {
     'forge_fn': ['opcode == 47', 'opcode == 48', 'opcode == 49'],
     'forge': ['opcode == 47', 'opcode == 48', 'opcode == 49', 'emit_forge_module_globals'],
     'llvm': ['llvm_emit_module_globals', 'opcode == 47', 'opcode == 48', 'opcode == 49'],
-    'llvm_globals': ['llvm_emit_module_globals_impl', 'tls_word', 'llvm_emit_global_lifecycle'],
+    'llvm_globals': ['llvm_emit_module_globals_impl', 'thread_local', 'llvm_emit_global_lifecycle'],
 }
 for key, markers in required.items():
     for marker in markers:
         if marker not in text[key]:
             raise SystemExit(f'module-storage: FAIL missing {marker!r} in {files[key].relative_to(root)}')
 
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 for name in ['src/backend/forge/globals_codegen.rz', 'src/backend/forge/function_codegen.rz', 'src/backend/llvm/globals_codegen.rz']:
     if name not in order:
-        raise SystemExit(f'module-storage: FAIL missing source-order entry {name}')
+        raise SystemExit(f'module-storage: FAIL missing semantic source module {name}')
 
 print('module-storage: PASS (shared HIR/MIR globals/statics + aggregate lifecycle + extern data + LLVM TLS)')

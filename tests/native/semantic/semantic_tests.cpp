@@ -56,6 +56,16 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  if (!check("fn valid(bool flag) -> i64 { return flag as i64; }", true)) {
+    std::cerr << "explicit bool-to-integer cast failed\n";
+    return EXIT_FAILURE;
+  }
+
+  if (!check("fn invalid(bool flag) -> i64 { i64 value = flag; return value; }", false)) {
+    std::cerr << "bool became implicitly numeric\n";
+    return EXIT_FAILURE;
+  }
+
   if (!check("fn invalid() -> i64 { i64 value = 1; f64 other = 2.0; f64 result = value + other; return 0; }", false)) {
     std::cerr << "mixed numeric arithmetic without a cast was not rejected\n";
     return EXIT_FAILURE;

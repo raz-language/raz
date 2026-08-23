@@ -67,7 +67,7 @@ See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough
 | `raz new` · `raz init` | Create or initialize a package |
 | `raz check` | Parse, resolve, type-check, and validate |
 | `raz build` · `raz run` | Build a native artifact, or build and execute |
-| `raz test` · `raz lint` | Run `test_` functions; run semantic validation |
+| `raz test` · `raz lint` | Run/filter `test_` functions with per-test results; run semantic validation |
 | `raz fmt` · `raz doc` | Canonical formatting; API documentation |
 | `raz add` · `raz remove` · `raz update` | Manage dependencies and re-resolve constraints |
 | `raz search` · `raz info` · `raz outdated` | Inspect the official registry and tracked versions |
@@ -76,7 +76,26 @@ See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough
 | `raz bindgen` | Generate Raz C-ABI declarations from supported C headers |
 | `raz c-header` | Generate C declarations for explicit Raz C-ABI exports |
 
-Normal executable package builds are native by default: `raz build` writes `target/debug/<package>` (`.exe` on Windows), and `raz build --release` writes `target/release/<package>`. Forge `.fir` output is reserved for explicit backend/emission workflows.
+Normal executable package builds are native by default: `raz build` writes `target/debug/bin/<package>` (`.exe` on Windows), and `raz build --release` writes `target/release/bin/<package>`. Forge `.fir` output is reserved for explicit backend/emission workflows.
+
+Each profile has the same predictable artifact layout; normal profile builds create the category directories together:
+
+```text
+target/
+├── debug/
+│   ├── bin/       executables
+│   ├── lib/       static/shared libraries
+│   ├── obj/       native object files
+│   ├── ir/        backend/intermediate IR
+│   ├── modules/   semantic module metadata
+│   └── packages/  package/distribution artifacts
+├── release/
+│   └── ... same profile layout ...
+├── cache/          incremental and link state
+├── git/            materialized git dependencies
+├── store/          package store
+└── profile/        explicit compiler profiling output
+```
 
 Build output is concise and package-oriented:
 
@@ -142,14 +161,14 @@ Verified MIR ──────────► diagnostics · language server ·
 
 | Backend | Role |
 |---|---|
-| **Forge** | Default native backend, linked in-process. SSA-based optimization, ABI lowering, machine lowering, register allocation, instruction encoding, deterministic ELF/COFF emission. |
+| **Forge** | Default native backend on x86-64 Windows/Linux, linked in-process. Production x86-64 allocation/encoding plus experimental AArch64 ELF64 and Darwin Mach-O arm64 object paths. |
 | **LLVM** | Production option. Emits LLVM IR from the same verified MIR and uses an external LLVM/Clang toolchain for native code generation. |
 | **WebAssembly** | Portable `.wasm` output under a documented ABI. |
 | **RXE** | Portable bytecode target with a specified format and instruction set. |
 
 Backend selection never changes language semantics. Compiler construction is reproducible: a compatibility-pinned host compiler builds the production compiler, and the result is verified before the toolchain is produced.
 
-See [Architecture](docs/ARCHITECTURE.md), [Backends](docs/BACKENDS.md), [MIR](docs/MIR.md), and [Compiler reproducibility](docs/COMPILER-REPRODUCIBILITY.md).
+See [Architecture](docs/ARCHITECTURE.md), [Backends](docs/BACKENDS.md), [Platform support](docs/PLATFORM-SUPPORT.md), [MIR](docs/MIR.md), and [Compiler reproducibility](docs/COMPILER-REPRODUCIBILITY.md). Release qualification and backend differential requirements are defined in [Release qualification](docs/RELEASE-QUALIFICATION.md).
 
 ## Platform support
 
@@ -157,14 +176,18 @@ See [Architecture](docs/ARCHITECTURE.md), [Backends](docs/BACKENDS.md), [MIR](do
 |---|---|---|
 | **Windows x64** | Forge, LLVM/Clang | Windows x64 · COFF |
 | **Linux x86-64** | Forge, LLVM/Clang | System V AMD64 · ELF |
+| **Linux AArch64** (`aarch64-unknown-linux-gnu`) | LLVM/Clang (default), Forge experimental | AAPCS64 · ELF |
+| **macOS arm64** (`arm64-apple-macos`) | LLVM/Clang (default), Forge experimental | Darwin AArch64 · Mach-O |
 | **WebAssembly** | — | Documented [WASM ABI v1](docs/WASM-ABI-v1.md) |
 | **RXE** | — | Portable [RXE v1](docs/RXE-v1-FORMAT.md) bytecode |
 
-Both ABIs and object formats are covered by repository qualification. Platform-specific standard-library facilities are documented per module and do not imply portability to unsupported targets.
+Forge now includes experimental AArch64 ELF64 and Darwin Mach-O arm64 machine/object backends. The AArch64 path has native physical register allocation, copy coalescing/CFG-hole reuse/spill-slot coloring, target-safe immediate selection, register-native scalar encoding, 128-bit NEON integer maps and add reductions, packed chain/postfix-DAG evaluation, call-safe full-width Q spills, Linux TLS IE, and Darwin TLV TLS. Raz still automatically selects LLVM for ordinary AArch64 builds until the remaining reusable-DAG/masked/wider-vector forms, uncommon ABI, JIT, and recursive-bootstrap qualification reach parity. Explicit Forge native emission can exercise Linux AArch64 and macOS arm64 objects today.
+
+Platform-specific standard-library facilities are documented per module and do not imply portability to unsupported targets.
 
 ## Packages and workspaces
 
-The official registry is hosted at [`raz-language/packages`](https://github.com/raz-language/packages) — a GitHub-backed static registry of immutable, deterministic archives. Published packages include `crypto`, `serde`, `toml`, `regex`, `uuid`, `semver`, `datetime`, `websocket`, `http-router`, `sqlite`, and `postgres`.
+The official registry is hosted at [`raz-language/packages`](https://github.com/raz-language/packages) — a GitHub-backed static registry of immutable, deterministic archives. Published packages cover serialization/data formats, security, web protocols, databases, testing, archives/compression, and exact numeric types. The current catalog includes `json`, `yaml`, `toml`, `csv`, `xml`, `cbor`, `msgpack`, `protobuf`, `serde`, `encoding`, `crypto`, `jwt`, `uuid`, `regex`, `semver`, `datetime`, `websocket`, `http-router`, `multipart`, `sqlite`, `postgres`, `archive`, `compression`, `testing`, `decimal`, and `bigint`. See [Official packages](docs/OFFICIAL-PACKAGES.md).
 
 Dependencies are declared as semantic-version constraints and pinned exactly in `raz.lock`. Archives are integrity-checked and stored in a shared content-addressed cache, so `build`, `check`, `run`, and `test` hydrate missing locked packages automatically — a clean checkout needs no separate install step. Offline builds, vendoring, Git dependencies, private registries, and mirrors are supported, and a root manifest can coordinate many member packages against one lockfile.
 
@@ -172,7 +195,7 @@ See [Package management](docs/PACKAGE-MANAGEMENT.md).
 
 ## Building from source
 
-Raz builds from source on Windows and Linux. `bootstrap.bat` and `bootstrap.sh` configure the native host components, construct the Raz compiler, and verify compiler reproducibility before producing the toolchain. Repository-native CMake artifacts live under `build/<profile>/`, while compiler-produced qualification and project artifacts live under `target/`. Native components alone can be built with the CMake `release` preset.
+Raz builds from source on Windows, Linux, and macOS. On x86-64 Windows/Linux, the compatibility host compiler constructs the first production compiler directly. AArch64 hosts and macOS hosts use a compatible prebuilt Raz stage-0 compiler (`--stage0` or `RAZ_STAGE0_COMPILER`) to produce the first LLVM-native object, then continue with normal self-hosted reproducibility builds. This stage-0 requirement can disappear once Forge AArch64 reaches recursive-bootstrap parity, not merely when object encoding exists. `bootstrap.bat` and `bootstrap.sh` configure native host components, construct the production compiler, and verify compiler reproducibility before producing the toolchain. Repository-native CMake artifacts live under `build/<profile>/`, while compiler-produced qualification and project artifacts live under `target/`. Native components alone can be built with the CMake `release` preset.
 
 See [Compiler bootstrap](docs/COMPILER-BOOTSTRAP.md) and [Windows build](docs/WINDOWS-BUILD.md).
 
@@ -232,3 +255,6 @@ Please do not report security vulnerabilities through public issues. See [SECURI
 ## License
 
 Raz is licensed under the [Apache License 2.0](LICENSE). Forge retains its nested Apache-2.0 license for independent redistribution. See [NOTICE](NOTICE) and [Licensing](docs/LICENSING.md) for attribution and redistribution details.
+
+
+Performance regression policy and benchmark tooling are documented in [`docs/PERFORMANCE-QUALIFICATION.md`](docs/PERFORMANCE-QUALIFICATION.md).

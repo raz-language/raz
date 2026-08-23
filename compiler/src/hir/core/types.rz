@@ -211,6 +211,15 @@ fn hir_parameter_spells_bool(HirBuilder&mut builder, i64 parameter) -> bool {
 }
 
 fn hir_require_value_type(HirBuilder&mut builder, i64&mut node, i64 target_type) -> bool {
+    // References are distinct values in Raz. Passing `T&` / `T&mut` to a
+    // parameter of type `T` must never silently reinterpret the reference
+    // handle as the scalar value. Callers that want the referent use `*value`
+    // explicitly; pointer/address conversion remains an explicit cast path.
+    if (raz_compiler_rt_arena_get(builder.module.node_references, *node) != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
     i64 source_type = raz_compiler_rt_arena_get(builder.module.node_types, *node);
 
     if (source_type == target_type) {
@@ -784,25 +793,25 @@ fn hir_find_struct_field(HirBuilder&mut builder, i64 structure, i64 offset, i64 
     }
 
     i64 seed = (structure * 131 + 43) % 281474976710597;
-    i64 cache_slot = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 1024;
+    i64 cache_slot = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 8192;
 
     if (
-        raz_compiler_rt_arena_get(builder.field_name_cache_structures, cache_slot) == structure &&
+        raz_compiler_rt_arena_get_unchecked(builder.field_name_cache_structures, cache_slot) == structure + 1 &&
         raz_compiler_rt_arena_get(
             builder.field_name_cache_field_epochs,
             cache_slot,
         ) == builder.module.struct_field_count &&
-        raz_compiler_rt_arena_get(builder.field_name_cache_name_lengths, cache_slot) == length &&
+        raz_compiler_rt_arena_get_unchecked(builder.field_name_cache_name_lengths, cache_slot) == length &&
         token_same(
             &builder.scan.input,
-            raz_compiler_rt_arena_get(builder.field_name_cache_name_offsets, cache_slot),
+            raz_compiler_rt_arena_get_unchecked(builder.field_name_cache_name_offsets, cache_slot),
             length,
             offset,
             length,
         )
     ) {
         builder.scope_cache_hits += 1;
-        return raz_compiler_rt_arena_get(builder.field_name_cache_results, cache_slot);
+        return raz_compiler_rt_arena_get_unchecked(builder.field_name_cache_results, cache_slot);
     }
     builder.scope_cache_misses += 1;
 
@@ -829,15 +838,15 @@ fn hir_find_struct_field(HirBuilder&mut builder, i64 structure, i64 offset, i64 
         }
         field += 1;
     }
-    raz_compiler_rt_arena_set(builder.field_name_cache_structures, cache_slot, structure);
-    raz_compiler_rt_arena_set(builder.field_name_cache_name_offsets, cache_slot, offset);
-    raz_compiler_rt_arena_set(builder.field_name_cache_name_lengths, cache_slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.field_name_cache_structures, cache_slot, structure + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.field_name_cache_name_offsets, cache_slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.field_name_cache_name_lengths, cache_slot, length);
     raz_compiler_rt_arena_set(
         builder.field_name_cache_field_epochs,
         cache_slot,
         builder.module.struct_field_count,
     );
-    raz_compiler_rt_arena_set(builder.field_name_cache_results, cache_slot, result);
+    raz_compiler_rt_arena_set_unchecked(builder.field_name_cache_results, cache_slot, result);
     return result;
 }
 

@@ -1,6 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
 #include "runtime_internal.hpp"
 
 using namespace raz::runtime_detail;
@@ -712,29 +713,103 @@ std::uint64_t raz_rt_trait_object_method_signature_id(const void* handle, std::u
 
 }
 
-extern "C" std::int64_t raz_rt_tool_available(const char* data, std::int64_t length) {
-  if (data == nullptr || length <= 0) return 0;
-  const std::string name(data, static_cast<std::size_t>(length));
+namespace {
+
+bool raz_runtime_tool_is_file(const std::filesystem::path& path) {
+  std::error_code error;
+  return std::filesystem::is_regular_file(path, error) && !error;
+}
+
+std::filesystem::path raz_runtime_resolve_tool(std::string name) {
+  if (name.empty()) return {};
+  std::replace(name.begin(), name.end(), '\\', '/');
+  const std::filesystem::path requested(name);
+
+  // Explicit paths always win. This keeps RAZ_LLVM_CC/RAZ_LLVM_CXX and other
+  // caller-provided tool paths predictable even when another copy is on PATH.
+  if (requested.has_parent_path() || requested.has_root_name()) {
+    if (!raz_runtime_tool_is_file(requested)) return {};
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(requested, error);
+    return error ? requested : absolute;
+  }
+
 #if defined(_WIN32)
-  const DWORD required = SearchPathA(nullptr, name.c_str(), ".exe", 0, nullptr, nullptr);
-  if (required != 0) return 1;
-  return SearchPathA(nullptr, name.c_str(), nullptr, 0, nullptr, nullptr) != 0 ? 1 : 0;
+  auto search_path = [&](const char* extension) -> std::filesystem::path {
+    const DWORD required = SearchPathA(nullptr, name.c_str(), extension, 0, nullptr, nullptr);
+    if (required == 0) return {};
+    std::string buffer(static_cast<std::size_t>(required) + 1U, '\0');
+    const DWORD written = SearchPathA(nullptr, name.c_str(), extension,
+                                     static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+    if (written == 0 || written >= buffer.size()) return {};
+    buffer.resize(written);
+    return std::filesystem::path(buffer);
+  };
+
+  if (auto found = search_path(".exe"); !found.empty()) return found;
+  if (auto found = search_path(nullptr); !found.empty()) return found;
+
+  std::string executable_name = name;
+  if (std::filesystem::path(executable_name).extension().empty()) executable_name += ".exe";
+
+  auto under = [&](const char* variable, const std::filesystem::path& suffix) -> std::filesystem::path {
+    const char* value = std::getenv(variable);
+    if (value == nullptr || *value == '\0') return {};
+    const auto candidate = std::filesystem::path(value) / suffix / executable_name;
+    return raz_runtime_tool_is_file(candidate) ? candidate : std::filesystem::path{};
+  };
+
+  // LLVM's official Windows installer does not add itself to PATH unless the
+  // user asks it to. Raz should still work from an ordinary PowerShell window.
+  if (auto found = under("RAZ_LLVM_BIN", {}); !found.empty()) return found;
+  if (auto found = under("LLVM_HOME", "bin"); !found.empty()) return found;
+  if (auto found = under("LLVM_ROOT", "bin"); !found.empty()) return found;
+  if (auto found = under("ProgramFiles", std::filesystem::path("LLVM") / "bin"); !found.empty()) return found;
+  if (auto found = under("ProgramFiles(x86)", std::filesystem::path("LLVM") / "bin"); !found.empty()) return found;
+
+  // Visual Studio can install LLVM without exposing it globally either. These
+  // environment variables are present in VS developer shells and are harmless
+  // to probe from normal shells when absent.
+  if (auto found = under("VSINSTALLDIR", std::filesystem::path("VC") / "Tools" / "Llvm" / "x64" / "bin"); !found.empty()) return found;
+  if (auto found = under("VCINSTALLDIR", std::filesystem::path("Tools") / "Llvm" / "x64" / "bin"); !found.empty()) return found;
+  return {};
 #else
-  if (name.find('/') != std::string::npos) return ::access(name.c_str(), X_OK) == 0 ? 1 : 0;
   const char* raw_path = std::getenv("PATH");
-  if (raw_path == nullptr) return 0;
-  std::string path(raw_path);
+  if (raw_path == nullptr) return {};
+  const std::string path(raw_path);
   std::size_t start = 0;
   while (start <= path.size()) {
     const auto end = path.find(':', start);
     const auto count = end == std::string::npos ? path.size() - start : end - start;
-    std::filesystem::path candidate = count == 0 ? std::filesystem::path(name) : std::filesystem::path(path.substr(start, count)) / name;
-    if (::access(candidate.c_str(), X_OK) == 0) return 1;
+    const std::filesystem::path candidate = count == 0
+        ? std::filesystem::path(name)
+        : std::filesystem::path(path.substr(start, count)) / name;
+    if (::access(candidate.c_str(), X_OK) == 0) return candidate;
     if (end == std::string::npos) break;
     start = end + 1;
   }
-  return 0;
+  return {};
 #endif
+}
+
+}  // namespace
+
+extern "C" std::int64_t raz_rt_tool_resolve(const char* data, std::int64_t length,
+                                               char* output, std::int64_t capacity) {
+  if (data == nullptr || length <= 0 || output == nullptr || capacity <= 0) return -1;
+  const auto path = raz_runtime_resolve_tool(std::string(data, static_cast<std::size_t>(length)));
+  if (path.empty()) return -1;
+  const std::string text = path.string();
+  if (static_cast<std::uint64_t>(capacity) <= text.size()) return -1;
+  std::memcpy(output, text.data(), text.size());
+  output[text.size()] = '\0';
+  return static_cast<std::int64_t>(text.size());
+}
+
+extern "C" std::int64_t raz_rt_tool_available(const char* data, std::int64_t length) {
+  if (data == nullptr || length <= 0) return 0;
+  char resolved[32768]{};
+  return raz_rt_tool_resolve(data, length, resolved, static_cast<std::int64_t>(sizeof(resolved))) > 0 ? 1 : 0;
 }
 
 extern "C" std::int64_t raz_rt_host_platform() {
@@ -757,6 +832,14 @@ extern "C" std::int64_t raz_rt_host_arch() {
 #else
   return 0;
 #endif
+}
+
+extern "C" std::int64_t raz_rt_secure_zero(void* data, std::int64_t length) {
+  if (data == nullptr || length < 0) return 0;
+  volatile unsigned char* bytes = static_cast<volatile unsigned char*>(data);
+  for (std::int64_t i = 0; i < length; ++i) bytes[i] = 0;
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  return 1;
 }
 
 extern "C" std::int64_t raz_rt_sha256(const unsigned char* data, std::int64_t length,

@@ -79,12 +79,13 @@ raz check
 raz build
 raz run
 raz test
+raz test --filter=test_parser
 raz fmt
 raz lint
 raz doc
 ```
 
-For executable packages, a normal `raz build` writes the native program under `target/debug/`. On Windows, a package named `hello` produces `target/debug/hello.exe`; on Linux and macOS it produces `target/debug/hello`. Use `raz build --release` for the optimized `target/release/` artifact. Backend IR such as `.fir` is only produced by explicit backend/emission commands.
+For executable packages, a normal `raz build` writes the native program under `target/debug/bin/`. On Windows, a package named `hello` produces `target/debug/bin/hello.exe`; on Linux and macOS it produces `target/debug/bin/hello`. Use `raz build --release` for the optimized `target/release/bin/` artifact. Backend IR such as `.fir` is only produced by explicit backend/emission commands.
 
 Useful project commands include:
 
@@ -842,7 +843,7 @@ src/
 
 Path dependencies are declared in `raz.toml` and loaded recursively. Project construction is deterministic; cycles are rejected and repeated diamond dependencies are deduplicated.
 
-Most packages use deterministic source discovery. Packages such as the compiler that require one specific physical concatenation order can provide `source-order.txt`. That metadata keeps build ordering separate from filenames.
+Packages use deterministic semantic source discovery. The Raz compiler itself requires no physical concatenation order or compiler source-order metadata. `source-order.txt` remains recognized only as a legacy compatibility mechanism for older packages.
 
 `raz.lock` records the resolved package graph and manifest fingerprints deterministically. Human-readable registry constraints stay in `raz.toml`; the lockfile records the exact selected version and verified package checksum/store identity used for reproducible builds.
 
@@ -1087,7 +1088,7 @@ The project toolchain also provides backend/target discovery, compiler query pro
 
 **Summary**
 
-Diagnostics carry stable codes, formatting is canonical rather than configurable, and `raz test` discovers `test_` functions by name.
+Diagnostics carry stable codes, formatting is canonical rather than configurable, and `raz test` discovers `test_` functions by name. Focus a run with `raz test --filter=<text>`; the test runner prints per-test status plus pass/fail totals. `std::testing` provides status-returning `expect`, `expect_i64_eq`, `expect_u64_eq`, and `expect_bool_eq` helpers for tests that want value-aware failure diagnostics.
 
 **Exercises**
 

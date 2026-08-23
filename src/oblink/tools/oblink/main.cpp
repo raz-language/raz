@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -14,6 +15,69 @@
 #endif
 
 namespace {
+std::vector<std::string> parse_response_file(const std::filesystem::path& path, std::string& error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    error = "unable to open response file: " + path.string();
+    return {};
+  }
+  std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  std::vector<std::string> arguments;
+  std::string current;
+  bool quoted = false;
+  auto flush = [&]() {
+    if (!current.empty()) {
+      arguments.push_back(current);
+      current.clear();
+    }
+  };
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    const char c = text[index];
+    if (c == '"') {
+      quoted = !quoted;
+      continue;
+    }
+    // Preserve ordinary Windows path separators. Only treat a backslash as an
+    // escape when it protects a quote inside a quoted response-file argument.
+    if (quoted && c == '\\' && index + 1U < text.size() && text[index + 1U] == '"') {
+      current.push_back('"');
+      ++index;
+      continue;
+    }
+    if (!quoted && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) {
+      flush();
+      continue;
+    }
+    current.push_back(c);
+  }
+  if (quoted) {
+    error = "unterminated quote in response file: " + path.string();
+    return {};
+  }
+  flush();
+  return arguments;
+}
+
+bool expand_response_arguments(const std::vector<std::string>& source,
+                               std::vector<std::string>& destination,
+                               std::string& error,
+                               unsigned depth = 0) {
+  if (depth > 8U) {
+    error = "response-file nesting exceeds 8 levels";
+    return false;
+  }
+  for (const auto& argument : source) {
+    if (argument.size() <= 1U || argument.front() != '@') {
+      destination.push_back(argument);
+      continue;
+    }
+    auto nested = parse_response_file(std::filesystem::path(argument.substr(1)), error);
+    if (!error.empty()) return false;
+    if (!expand_response_arguments(nested, destination, error, depth + 1U)) return false;
+  }
+  return true;
+}
+
 bool parse_u64(std::string_view text, std::uint64_t& value) {
   const char* begin = text.data();
   const char* end = begin + text.size();
@@ -30,6 +94,7 @@ void usage() {
   std::cout << "ObLink " OBLINK_VERSION " - native linker for Forge objects\n\n"
                "usage: oblink <input.obj|input.lib>... -o <program.exe> [options]\n\n"
                "options:\n"
+               "  @<file>               read additional arguments from a response file\n"
                "  -o <path>             output PE32+ executable\n"
                "  -L<path>, -L <path>  add COFF library search directory\n"
                "  -l<name>, -l <name>  link name.lib from search paths\n"
@@ -48,51 +113,60 @@ void usage() {
 int main(int argc, char** argv) {
   oblink::LinkOptions options;
   std::vector<std::filesystem::path> inputs;
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
+  std::vector<std::string> raw_arguments;
+  raw_arguments.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0U);
+  for (int i = 1; i < argc; ++i) raw_arguments.emplace_back(argv[i]);
+  std::vector<std::string> arguments;
+  std::string response_error;
+  if (!expand_response_arguments(raw_arguments, arguments, response_error)) {
+    std::cerr << "oblink: error: " << response_error << '\n';
+    return 2;
+  }
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
+    std::string arg = arguments[i];
     if (arg == "--help" || arg == "-h") { usage(); return 0; }
     if (arg == "--version") { std::cout << "oblink " OBLINK_VERSION "\n"; return 0; }
     if (arg == "-o") {
-      if (++i >= argc) { std::cerr << "oblink: error: -o requires a path\n"; return 2; }
-      options.output = argv[i]; continue;
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: -o requires a path\n"; return 2; }
+      options.output = arguments[i]; continue;
     }
     if (arg == "-L") {
-      if (++i >= argc) { std::cerr << "oblink: error: -L requires a path\n"; return 2; }
-      options.library_paths.emplace_back(argv[i]); continue;
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: -L requires a path\n"; return 2; }
+      options.library_paths.emplace_back(arguments[i]); continue;
     }
     if (arg.rfind("-L", 0) == 0 && arg.size() > 2U) {
       options.library_paths.emplace_back(arg.substr(2)); continue;
     }
     if (arg == "-l") {
-      if (++i >= argc) { std::cerr << "oblink: error: -l requires a name\n"; return 2; }
-      options.libraries.emplace_back(argv[i]); continue;
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: -l requires a name\n"; return 2; }
+      options.libraries.emplace_back(arguments[i]); continue;
     }
     if (arg.rfind("-l", 0) == 0 && arg.size() > 2U) {
       options.libraries.emplace_back(arg.substr(2)); continue;
     }
     if (arg == "--entry") {
-      if (++i >= argc) { std::cerr << "oblink: error: --entry requires a symbol\n"; return 2; }
-      options.entry = argv[i]; options.infer_crt_startup = false; continue;
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: --entry requires a symbol\n"; return 2; }
+      options.entry = arguments[i]; options.infer_crt_startup = false; continue;
     }
     if (arg == "--no-crt-startup") { options.infer_crt_startup = false; continue; }
     if (arg == "--verbose") { options.verbose = true; continue; }
     if (arg == "--map") {
-      if (++i >= argc) { std::cerr << "oblink: error: --map requires a path\n"; return 2; }
-      options.map_output = argv[i]; continue;
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: --map requires a path\n"; return 2; }
+      options.map_output = arguments[i]; continue;
     }
     if (arg == "--stack" || arg == "--heap") {
-      if (++i >= argc) { std::cerr << "oblink: error: " << arg << " requires a byte count\n"; return 2; }
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: " << arg << " requires a byte count\n"; return 2; }
       std::uint64_t value{};
-      if (!parse_u64(argv[i], value) || value == 0U) {
-        std::cerr << "oblink: error: invalid " << arg << " byte count: " << argv[i] << '\n'; return 2;
+      if (!parse_u64(arguments[i], value) || value == 0U) {
+        std::cerr << "oblink: error: invalid " << arg << " byte count: " << arguments[i] << '\n'; return 2;
       }
       if (arg == "--stack") options.stack_reserve = value;
       else options.heap_reserve = value;
       continue;
     }
     if (arg == "--subsystem") {
-      if (++i >= argc) { std::cerr << "oblink: error: --subsystem requires a value\n"; return 2; }
-      std::string value = argv[i];
+      if (++i >= arguments.size()) { std::cerr << "oblink: error: --subsystem requires a value\n"; return 2; }
+      std::string value = arguments[i];
       if (value == "console") options.subsystem = 3;
       else if (value == "windows") options.subsystem = 2;
       else { std::cerr << "oblink: error: unsupported subsystem: " << value << '\n'; return 2; }

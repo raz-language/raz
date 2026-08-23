@@ -13,7 +13,7 @@ loans = (root / 'compiler/src/mir/ownership/loan_regions.rz').read_text(encoding
 reborrows = (root / 'compiler/src/mir/ownership/reborrows.rz').read_text(encoding='utf-8')
 semantics = (root / 'compiler/src/mir/ownership/semantics.rz').read_text(encoding='utf-8')
 pipeline = (root / 'compiler/src/mir/transform/pipeline.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 checks = {
     'loan provenance stored in MIR model': 'ownership_event_parents' in model and 'ownership_event_parents' in builder,

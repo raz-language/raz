@@ -17,9 +17,9 @@ fn hir_find_function(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
         return cached_result;
     }
 
-    i64 index = 0;
+    i64 index = hir_function_lookup_head(builder, offset, length);
 
-    while (index < builder.module.function_count) {
+    while (index >= 0) {
         i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, index);
 
         if (
@@ -36,7 +36,7 @@ fn hir_find_function(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
             hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, index);
             return index;
         }
-        index += 1;
+        index = hir_function_lookup_next_index(builder, index);
     }
     if (builder.namespace_lookup_target_hash >= 0) {
         hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, -1);
@@ -46,8 +46,8 @@ fn hir_find_function(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
     i64 imported = -1;
     i64 imported_offset = -1;
 
-    index = 0;
-    while (index < builder.module.function_count) {
+    index = hir_function_lookup_head(builder, offset, length);
+    while (index >= 0) {
         i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, index);
 
         if (
@@ -68,7 +68,7 @@ fn hir_find_function(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
             imported = index;
             imported_offset = declaration_offset;
         }
-        index += 1;
+        index = hir_function_lookup_next_index(builder, index);
     }
     hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, imported);
     return imported;
@@ -240,6 +240,12 @@ fn hir_register_local(HirBuilder&mut builder, i64 index, i64 slot) {
     i64 previous = raz_compiler_rt_arena_get(builder.module.function_last_locals, builder.current_function);
 
     raz_compiler_rt_arena_set(builder.module.local_previous_function_locals, index, previous);
+    i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.local_name_offsets, index);
+
+    if (declaration_offset <= 0) {
+        declaration_offset = builder.current.offset;
+    }
+    raz_compiler_rt_arena_set(builder.module.local_declaration_offsets, index, declaration_offset);
     raz_compiler_rt_arena_set(builder.module.local_slots, index, slot);
     raz_compiler_rt_arena_set(builder.module.function_last_locals, builder.current_function, index + 1);
 }
@@ -253,7 +259,7 @@ fn hir_lexical_cache_slot(
 ) -> i64 {
     i64 seed = (function_index * 131 + (block_index + 2) * 17 + 29) % 281474976710597;
 
-    return raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 1024;
+    return raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 8192;
 }
 
 fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i64&mut slot) -> bool {
@@ -263,14 +269,14 @@ fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i
     i64 cache_slot = hir_lexical_cache_slot(builder, function_index, builder.current_block, offset, length);
 
     if (
-        raz_compiler_rt_arena_get(builder.lexical_cache_functions, cache_slot) == function_index &&
-        raz_compiler_rt_arena_get(builder.lexical_cache_blocks, cache_slot) == builder.current_block &&
-        raz_compiler_rt_arena_get(builder.lexical_cache_parameter_epochs, cache_slot) == parameter_count &&
-        raz_compiler_rt_arena_get(builder.lexical_cache_local_epochs, cache_slot) == local_epoch &&
-        raz_compiler_rt_arena_get(builder.lexical_cache_name_lengths, cache_slot) == length &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_blocks, cache_slot) == builder.current_block &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_parameter_epochs, cache_slot) == parameter_count &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_local_epochs, cache_slot) == local_epoch &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_name_lengths, cache_slot) == length &&
         token_same(
             &builder.scan.input,
-            raz_compiler_rt_arena_get(builder.lexical_cache_name_offsets, cache_slot),
+            raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_name_offsets, cache_slot),
             length,
             offset,
             length,
@@ -278,13 +284,13 @@ fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i
     ) {
         builder.scope_cache_hits += 1;
 
-        i64 cached_kind = raz_compiler_rt_arena_get(builder.lexical_cache_kinds, cache_slot);
+        i64 cached_kind = raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_kinds, cache_slot);
 
         if (cached_kind < 0) {
             return false;
         }
         *kind = cached_kind;
-        *slot = raz_compiler_rt_arena_get(builder.lexical_cache_slots, cache_slot);
+        *slot = raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_slots, cache_slot);
         return true;
     }
     builder.scope_cache_misses += 1;
@@ -347,14 +353,14 @@ fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i
             link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, index);
         }
     }
-    raz_compiler_rt_arena_set(builder.lexical_cache_functions, cache_slot, function_index);
-    raz_compiler_rt_arena_set(builder.lexical_cache_blocks, cache_slot, builder.current_block);
-    raz_compiler_rt_arena_set(builder.lexical_cache_name_offsets, cache_slot, offset);
-    raz_compiler_rt_arena_set(builder.lexical_cache_name_lengths, cache_slot, length);
-    raz_compiler_rt_arena_set(builder.lexical_cache_parameter_epochs, cache_slot, parameter_count);
-    raz_compiler_rt_arena_set(builder.lexical_cache_local_epochs, cache_slot, local_epoch);
-    raz_compiler_rt_arena_set(builder.lexical_cache_kinds, cache_slot, found_kind);
-    raz_compiler_rt_arena_set(builder.lexical_cache_slots, cache_slot, found_slot);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_blocks, cache_slot, builder.current_block);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_name_offsets, cache_slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_name_lengths, cache_slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_parameter_epochs, cache_slot, parameter_count);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_kinds, cache_slot, found_kind);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_slots, cache_slot, found_slot);
     if (found_kind < 0) {
         return false;
     }
@@ -366,15 +372,15 @@ fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i
 fn hir_local_index_from_slot(HirBuilder&mut builder, i64 slot) -> i64 {
     i64 function_index = builder.current_function;
     i64 local_epoch = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
-    i64 cache_slot = (function_index * 131 + slot * 17 + 47) % 1024;
+    i64 cache_slot = (function_index * 131 + slot * 17 + 47) % 8192;
 
     if (
-        raz_compiler_rt_arena_get(builder.slot_local_cache_functions, cache_slot) == function_index &&
-        raz_compiler_rt_arena_get(builder.slot_local_cache_slots, cache_slot) == slot &&
-        raz_compiler_rt_arena_get(builder.slot_local_cache_local_epochs, cache_slot) == local_epoch
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_slots, cache_slot) == slot &&
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_local_epochs, cache_slot) == local_epoch
     ) {
         builder.scope_cache_hits += 1;
-        return raz_compiler_rt_arena_get(builder.slot_local_cache_results, cache_slot);
+        return raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_results, cache_slot);
     }
     builder.scope_cache_misses += 1;
 
@@ -390,10 +396,10 @@ fn hir_local_index_from_slot(HirBuilder&mut builder, i64 slot) -> i64 {
             link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, index);
         }
     }
-    raz_compiler_rt_arena_set(builder.slot_local_cache_functions, cache_slot, function_index);
-    raz_compiler_rt_arena_set(builder.slot_local_cache_slots, cache_slot, slot);
-    raz_compiler_rt_arena_set(builder.slot_local_cache_local_epochs, cache_slot, local_epoch);
-    raz_compiler_rt_arena_set(builder.slot_local_cache_results, cache_slot, result);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_slots, cache_slot, slot);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_results, cache_slot, result);
     return result;
 }
 
@@ -751,12 +757,13 @@ fn hir_local_reference_used_after(HirBuilder&mut builder, i64 local, i64 after_o
     return raz_compiler_rt_arena_get(builder.local_reference_last_uses, local) > after_offset;
 }
 
-fn hir_has_active_borrow(
+fn hir_has_active_borrow_at(
     HirBuilder&mut builder,
     i64 root_kind,
     i64 root_index,
     i64 path,
     i64 requested_kind,
+    i64 at_offset,
 ) -> bool {
     i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, builder.current_function);
 
@@ -768,7 +775,7 @@ fn hir_has_active_borrow(
 
             if (
                 borrow_kind != 0 &&
-                hir_local_reference_used_after(builder, index, builder.current.offset) &&
+                hir_local_reference_used_after(builder, index, at_offset) &&
                 raz_compiler_rt_arena_get(builder.local_borrow_source_kinds, index) == root_kind &&
                 raz_compiler_rt_arena_get(builder.local_borrow_source_indices, index) == root_index
             ) {
@@ -784,6 +791,23 @@ fn hir_has_active_borrow(
     return false;
 }
 
+fn hir_has_active_borrow(
+    HirBuilder&mut builder,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 requested_kind,
+) -> bool {
+    return hir_has_active_borrow_at(
+        builder,
+        root_kind,
+        root_index,
+        path,
+        requested_kind,
+        builder.current.offset,
+    );
+}
+
 fn hir_validate_borrow(HirBuilder&mut builder, i64 operand, i64 mutable_borrow) -> bool {
     i64 root_kind = 0;
     i64 root_index = -1;
@@ -794,8 +818,16 @@ fn hir_validate_borrow(HirBuilder&mut builder, i64 operand, i64 mutable_borrow) 
         return false;
     }
     if (hir_path_is_moved(builder, root_kind, root_index, path)) {
-        hir_fail(builder, DiagnosticCode::UseAfterMove);
-        return false;
+        // Whole-value move order is finalized by the CFG ownership pass.
+        // Deferred child blocks are parsed after later root statements, so a
+        // future `move value` may already be visible here even though this
+        // borrow occurs earlier in source order. Partial-path moves remain an
+        // immediate error because they are not represented by that whole-root
+        // CFG state.
+        if (!hir_root_is_whole_moved(builder, root_kind, root_index)) {
+            hir_fail(builder, DiagnosticCode::UseAfterMove);
+            return false;
+        }
     }
     if (
         root_kind == 4 &&
@@ -1247,7 +1279,30 @@ fn hir_parse_dyn_trait_call(
             &mut representative,
         )
     ) {
-        hir_fail(builder, DiagnosticCode::UnknownName);
+        // A declared dyn-trait method can still be unavailable when the
+        // assembled package graph contains no concrete implementation from
+        // which to derive the erased call signature/dispatch target.  Report
+        // that separately from an actually unknown member name.
+        i64 method_start = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+        i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+        i64 slot = 0;
+        bool declared = false;
+        while (slot < method_count && !declared) {
+            i64 candidate = method_start + slot;
+            declared = token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, candidate),
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, candidate),
+                method_offset,
+                method_length,
+            );
+            slot += 1;
+        }
+        if (declared) {
+            hir_fail(builder, DiagnosticCode::DynTraitMethodUnavailable);
+        } else {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+        }
         return false;
     }
     hir_advance(builder);
@@ -1477,8 +1532,44 @@ fn hir_parse_inherent_call(
         i64 parameter = parameter_start + index;
         i64 parameter_structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter);
         i64 parameter_slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, parameter);
+        i64 parameter_reference = raz_compiler_rt_arena_get(builder.module.parameter_references, parameter);
         i64 argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
 
+        // Method syntax owns receiver auto-borrowing. Ordinary function calls
+        // still require an explicit `&`/`&mut`, while `value.method()` works
+        // for both addressable places and temporary scalar values.
+        if (index == 0 && include_receiver != 0 && parameter_reference == 1) {
+            if (raz_compiler_rt_arena_get(builder.module.node_references, argument) == 0) {
+                i64 mutable_borrow = raz_compiler_rt_arena_get(
+                    builder.module.parameter_reference_mutable,
+                    parameter
+                );
+
+                i64 root_kind = 0;
+                i64 root_index = -1;
+                i64 root_path = 0;
+
+                if (
+                    hir_node_path(builder, argument, &mut root_kind, &mut root_index, &mut root_path) &&
+                    !hir_validate_borrow(builder, argument, mutable_borrow)
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    return false;
+                }
+
+                i64 borrowed = -1;
+
+                if (!hir_add_node(builder, 17, argument, 0, 0, mutable_borrow, &mut borrowed)) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    return false;
+                }
+                hir_copy_node_type(builder, borrowed, argument);
+                raz_compiler_rt_arena_set(builder.module.node_references, borrowed, 1);
+                raz_compiler_rt_arena_set(builder.module.node_reference_mutable, borrowed, mutable_borrow);
+                argument = borrowed;
+                argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+            }
+        }
         if (parameter_slice != 0) {
             i64 sliced = -1;
 
@@ -1496,7 +1587,20 @@ fn hir_parse_inherent_call(
             argument = sliced;
             argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
         }
-        if (parameter_structure >= 0) {
+        if (parameter_reference != 0) {
+            if (
+                !hir_require_reference_type(
+                    builder,
+                    &mut argument,
+                    parameter_reference,
+                    parameter_structure,
+                    raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+        } else if (parameter_structure >= 0) {
             if (argument_structure != parameter_structure) {
                 raz_compiler_rt_arena_destroy(pending_arguments);
                 hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -1618,18 +1722,18 @@ fn hir_find_name_in_function(
     i64 parameter_count = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index);
     i64 local_epoch = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
     i64 seed = (function_index * 131 + (block_index + 2) * 17 + (before_offset % 104729) + 71) % 281474976710597;
-    i64 cache_slot = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 1024;
+    i64 cache_slot = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 8192;
 
     if (
-        raz_compiler_rt_arena_get(builder.function_name_cache_functions, cache_slot) == function_index &&
-        raz_compiler_rt_arena_get(builder.function_name_cache_blocks, cache_slot) == block_index &&
-        raz_compiler_rt_arena_get(builder.function_name_cache_before_offsets, cache_slot) == before_offset &&
-        raz_compiler_rt_arena_get(builder.function_name_cache_parameter_epochs, cache_slot) == parameter_count &&
-        raz_compiler_rt_arena_get(builder.function_name_cache_local_epochs, cache_slot) == local_epoch &&
-        raz_compiler_rt_arena_get(builder.function_name_cache_name_lengths, cache_slot) == length &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_blocks, cache_slot) == block_index &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_before_offsets, cache_slot) == before_offset &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_parameter_epochs, cache_slot) == parameter_count &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_local_epochs, cache_slot) == local_epoch &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_name_lengths, cache_slot) == length &&
         token_same(
             &builder.scan.input,
-            raz_compiler_rt_arena_get(builder.function_name_cache_name_offsets, cache_slot),
+            raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_name_offsets, cache_slot),
             length,
             offset,
             length,
@@ -1637,13 +1741,13 @@ fn hir_find_name_in_function(
     ) {
         builder.scope_cache_hits += 1;
 
-        i64 cached_kind = raz_compiler_rt_arena_get(builder.function_name_cache_kinds, cache_slot);
+        i64 cached_kind = raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_kinds, cache_slot);
 
         if (cached_kind < 0) {
             return false;
         }
         *root_kind = cached_kind;
-        *root_index = raz_compiler_rt_arena_get(builder.function_name_cache_indices, cache_slot);
+        *root_index = raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_indices, cache_slot);
         return true;
     }
     builder.scope_cache_misses += 1;
@@ -1702,15 +1806,15 @@ fn hir_find_name_in_function(
         }
         link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, local);
     }
-    raz_compiler_rt_arena_set(builder.function_name_cache_functions, cache_slot, function_index);
-    raz_compiler_rt_arena_set(builder.function_name_cache_blocks, cache_slot, block_index);
-    raz_compiler_rt_arena_set(builder.function_name_cache_before_offsets, cache_slot, before_offset);
-    raz_compiler_rt_arena_set(builder.function_name_cache_name_offsets, cache_slot, offset);
-    raz_compiler_rt_arena_set(builder.function_name_cache_name_lengths, cache_slot, length);
-    raz_compiler_rt_arena_set(builder.function_name_cache_parameter_epochs, cache_slot, parameter_count);
-    raz_compiler_rt_arena_set(builder.function_name_cache_local_epochs, cache_slot, local_epoch);
-    raz_compiler_rt_arena_set(builder.function_name_cache_kinds, cache_slot, found_kind);
-    raz_compiler_rt_arena_set(builder.function_name_cache_indices, cache_slot, found_index);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_blocks, cache_slot, block_index);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_before_offsets, cache_slot, before_offset);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_name_offsets, cache_slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_name_lengths, cache_slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_parameter_epochs, cache_slot, parameter_count);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_kinds, cache_slot, found_kind);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_indices, cache_slot, found_index);
     if (found_kind < 0) {
         return false;
     }
@@ -2151,6 +2255,7 @@ fn hir_parse_immediate_closure(HirBuilder&mut builder, i64 fn_offset, i64 closur
 
     builder.module.closure_count += 1;
     hir_initialize_closure_function(builder, function_index, closure_id, closure_kind, fn_offset);
+    hir_function_lookup_insert(builder, function_index);
     raz_compiler_rt_arena_set(
         builder.module.function_closure_parent_functions,
         function_index,
@@ -2588,6 +2693,39 @@ fn hir_flow_local_index(HirBuilder&mut builder, i64 slot) -> i64 {
     return hir_local_index_from_slot(builder, slot);
 }
 
+// Plain assignment reinitializes the exact destination place. This includes
+// whole values reached through a mutable reference (`move *self; *self = ...`).
+fn hir_flow_reinitialize_assignment_target(
+    HirBuilder&mut builder,
+    i64 target,
+    i64 local_state,
+    i64 parameter_state,
+) -> bool {
+    i64 root_kind = 0;
+    i64 root_index = -1;
+    i64 path = 0;
+
+    if (!hir_node_path(builder, target, &mut root_kind, &mut root_index, &mut path) || path != 0) {
+        return false;
+    }
+    if (root_kind == 3) {
+        i64 slot = hir_flow_local_state_slot(builder, root_index);
+
+        if (slot >= 0) {
+            raz_compiler_rt_arena_set(local_state, slot, 0);
+            return true;
+        }
+    } else if (root_kind == 2) {
+        i64 slot = hir_flow_parameter_state_slot(builder, root_index);
+
+        if (slot >= 0) {
+            raz_compiler_rt_arena_set(parameter_state, slot, 0);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 parameter_state) -> bool {
     if (node < 0) {
         return true;
@@ -2830,6 +2968,56 @@ fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 pa
     return true;
 }
 
+fn hir_flow_block_falls_through(HirBuilder&mut builder, i64 block) -> bool {
+    if (block < 0) {
+        return true;
+    }
+    i64 start = raz_compiler_rt_arena_get(builder.module.block_statement_starts, block);
+    i64 end = start + raz_compiler_rt_arena_get(builder.module.block_statement_counts, block);
+    i64 statement = start;
+
+    while (statement < end) {
+        i64 kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+        if (kind == 2 || kind == 11 || kind == 12) {
+            return false;
+        }
+        if (kind == 14) {
+            if (!hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.statement_a, statement))) {
+                return false;
+            }
+        } else if (kind == 7) {
+            i64 then_block = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+            i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+
+            if (
+                else_block >= 0 &&
+                !hir_flow_block_falls_through(builder, then_block) &&
+                !hir_flow_block_falls_through(builder, else_block)
+            ) {
+                return false;
+            }
+        } else if (kind == 15) {
+            i64 arm = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+            i64 arm_end = arm + raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            bool any_falls_through = false;
+
+            while (arm < arm_end) {
+                if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                    any_falls_through = true;
+                    break;
+                }
+                arm += 1;
+            }
+            if (!any_falls_through) {
+                return false;
+            }
+        }
+        statement += 1;
+    }
+    return true;
+}
+
 fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 parameter_state) -> bool {
     i64 start = raz_compiler_rt_arena_get(builder.module.block_statement_starts, block);
     i64 end = start + raz_compiler_rt_arena_get(builder.module.block_statement_counts, block);
@@ -2873,16 +3061,32 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
             }
             hir_flow_copy_state(builder, local_state, left_locals, true);
             hir_flow_copy_state(builder, parameter_state, left_parameters, false);
+            bool then_falls_through = hir_flow_block_falls_through(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_b, statement)
+            );
             hir_flow_copy_state(builder, entry_locals, local_state, true);
             hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
 
             i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            bool else_falls_through = true;
 
-            if (else_block >= 0 && !hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
-                return false;
+            if (else_block >= 0) {
+                if (!hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
+                    return false;
+                }
+                else_falls_through = hir_flow_block_falls_through(builder, else_block);
             }
-            hir_flow_union_state(builder, left_locals, local_state, local_state, true);
-            hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+            if (then_falls_through && else_falls_through) {
+                hir_flow_union_state(builder, left_locals, local_state, local_state, true);
+                hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+            } else if (then_falls_through) {
+                hir_flow_copy_state(builder, left_locals, local_state, true);
+                hir_flow_copy_state(builder, left_parameters, parameter_state, false);
+            } else if (!else_falls_through) {
+                hir_flow_copy_state(builder, entry_locals, local_state, true);
+                hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+            }
             raz_compiler_rt_arena_destroy(entry_locals);
             raz_compiler_rt_arena_destroy(entry_parameters);
             raz_compiler_rt_arena_destroy(left_locals);
@@ -2953,6 +3157,10 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
             while (arm < arm_end) {
                 hir_flow_copy_state(builder, entry_locals, local_state, true);
                 hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+                i64 arm_guard = raz_compiler_rt_arena_get(builder.module.match_arm_guards, arm);
+                if (arm_guard >= 0 && !hir_flow_check_node(builder, arm_guard, local_state, parameter_state)) {
+                    return false;
+                }
                 if (
                     !hir_flow_check_block(
                         builder,
@@ -2963,24 +3171,31 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
                 ) {
                     return false;
                 }
-                if (first) {
-                    hir_flow_copy_state(builder, local_state, merged_locals, true);
-                    hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
-                    first = false;
-                } else {
-                    hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true, );
-                    hir_flow_union_state(
-                        builder,
-                        merged_parameters,
-                        parameter_state,
-                        merged_parameters,
-                        false,
-                    );
+                if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                    if (first) {
+                        hir_flow_copy_state(builder, local_state, merged_locals, true);
+                        hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
+                        first = false;
+                    } else {
+                        hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true, );
+                        hir_flow_union_state(
+                            builder,
+                            merged_parameters,
+                            parameter_state,
+                            merged_parameters,
+                            false,
+                        );
+                    }
                 }
                 arm += 1;
             }
-            hir_flow_copy_state(builder, merged_locals, local_state, true);
-            hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+            if (!first) {
+                hir_flow_copy_state(builder, merged_locals, local_state, true);
+                hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+            } else {
+                hir_flow_copy_state(builder, entry_locals, local_state, true);
+                hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+            }
             raz_compiler_rt_arena_destroy(entry_locals);
             raz_compiler_rt_arena_destroy(entry_parameters);
             raz_compiler_rt_arena_destroy(merged_locals);
@@ -3026,12 +3241,11 @@ fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 
             i64 target = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
             i64 operation = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
 
-            if (raz_compiler_rt_arena_get(builder.module.node_kinds, target) == 3 && operation == 0) {
-                raz_compiler_rt_arena_set(
-                    local_state,
-                    raz_compiler_rt_arena_get(builder.module.node_a, target),
-                    0,
-                );
+            if (
+                operation == 0 &&
+                hir_flow_reinitialize_assignment_target(builder, target, local_state, parameter_state)
+            ) {
+                // Assignment writes new storage; it does not read the moved destination.
             } else if (!hir_flow_check_node(builder, target, local_state, parameter_state)) {
                 return false;
             }
@@ -3090,16 +3304,32 @@ fn hir_flow_check_root_statement(
         }
         hir_flow_copy_state(builder, local_state, left_locals, true);
         hir_flow_copy_state(builder, parameter_state, left_parameters, false);
+        bool then_falls_through = hir_flow_block_falls_through(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.statement_b, statement)
+        );
         hir_flow_copy_state(builder, entry_locals, local_state, true);
         hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
 
         i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+        bool else_falls_through = true;
 
-        if (else_block >= 0 && !hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
-            return false;
+        if (else_block >= 0) {
+            if (!hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
+                return false;
+            }
+            else_falls_through = hir_flow_block_falls_through(builder, else_block);
         }
-        hir_flow_union_state(builder, left_locals, local_state, local_state, true);
-        hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+        if (then_falls_through && else_falls_through) {
+            hir_flow_union_state(builder, left_locals, local_state, local_state, true);
+            hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+        } else if (then_falls_through) {
+            hir_flow_copy_state(builder, left_locals, local_state, true);
+            hir_flow_copy_state(builder, left_parameters, parameter_state, false);
+        } else if (!else_falls_through) {
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+        }
         raz_compiler_rt_arena_destroy(entry_locals);
         raz_compiler_rt_arena_destroy(entry_parameters);
         raz_compiler_rt_arena_destroy(left_locals);
@@ -3184,18 +3414,25 @@ fn hir_flow_check_root_statement(
             ) {
                 return false;
             }
-            if (first) {
-                hir_flow_copy_state(builder, local_state, merged_locals, true);
-                hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
-                first = false;
-            } else {
-                hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true);
-                hir_flow_union_state(builder, merged_parameters, parameter_state, merged_parameters, false, );
+            if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                if (first) {
+                    hir_flow_copy_state(builder, local_state, merged_locals, true);
+                    hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
+                    first = false;
+                } else {
+                    hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true);
+                    hir_flow_union_state(builder, merged_parameters, parameter_state, merged_parameters, false, );
+                }
             }
             arm += 1;
         }
-        hir_flow_copy_state(builder, merged_locals, local_state, true);
-        hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+        if (!first) {
+            hir_flow_copy_state(builder, merged_locals, local_state, true);
+            hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+        } else {
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+        }
         raz_compiler_rt_arena_destroy(entry_locals);
         raz_compiler_rt_arena_destroy(entry_parameters);
         raz_compiler_rt_arena_destroy(merged_locals);
@@ -3247,12 +3484,10 @@ fn hir_flow_check_root_statement(
         i64 target = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
         i64 operation = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
 
-        if (raz_compiler_rt_arena_get(builder.module.node_kinds, target) == 3 && operation == 0) {
-            raz_compiler_rt_arena_set(
-                local_state,
-                raz_compiler_rt_arena_get(builder.module.node_a, target),
-                0,
-            );
+        if (
+            operation == 0 &&
+            hir_flow_reinitialize_assignment_target(builder, target, local_state, parameter_state)
+        ) {
             return true;
         }
         return hir_flow_check_node(builder, target, local_state, parameter_state);

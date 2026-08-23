@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[2]
 future = (root / 'compiler/src/backend/wasm/runtime_future.rz').read_text(encoding='utf-8')
 codegen = (root / 'compiler/src/backend/wasm/codegen.rz').read_text(encoding='utf-8')
 wasi = (root / 'compiler/src/backend/wasm/wasi.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 assert 'src/backend/wasm/runtime_future.rz' in order
 assert 'public import raz_compiler_backend_wasm_runtime_future;' in codegen

@@ -7,10 +7,10 @@
 [![Release](https://img.shields.io/badge/release-2.0.0-2563eb)](CHANGELOG.md)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-00599c)](CMakeLists.txt)
 [![License](https://img.shields.io/badge/license-Apache--2.0-16a34a)](LICENSE)
-[![C API](https://img.shields.io/badge/C%20API-v10-7c3aed)](include/forge-c/forge.h)
-[![Target](https://img.shields.io/badge/target-x86--64-334155)](#platform-support)
+[![C API](https://img.shields.io/badge/C%20API-v16-7c3aed)](include/forge-c/forge.h)
+[![Target](https://img.shields.io/badge/target-x86--64%20%7C%20AArch64-334155)](#platform-support)
 
-Forge provides typed SSA IR, verification, optimization pipelines, an interpreter, an x86-64 JIT and native backend, deterministic ELF/COFF output, and frontend SDKs for C++ and C.
+Forge provides typed SSA IR, verification, optimization pipelines, an interpreter, an x86-64 JIT/native backend, an experimental AArch64 native object backend, deterministic ELF/COFF output, and frontend SDKs for C++ and C.
 
 [Quick start](#quick-start) · [Frontend guide](docs/building-a-language.md) · [Architecture](docs/architecture.md) · [Contributing](CONTRIBUTING.md)
 
@@ -37,7 +37,7 @@ Verified SSA IR
       ▼
 Optimization pipeline
       ▼
-Machine IR · allocation · x86-64 encoding
+Machine IR · target lowering · native encoding
       ├──────────────► JIT
       └──────────────► ELF64 / COFF object files
 ```
@@ -50,7 +50,7 @@ Machine IR · allocation · x86-64 encoding
 | **IR** | Typed SSA, block arguments, globals, calls, aggregates, canonical text, binary serialization |
 | **Optimization** | `-O0` through `-O3`, `-Os`, `-Oz`, liveness, DCE, CFG cleanup, copy propagation, pass reports |
 | **Execution** | Reference interpreter, x86-64 JIT, runtime bindings, interpreter/JIT differential tests |
-| **Native output** | System V and Windows x64 lowering, deterministic ELF64/COFF objects, static archives, shared-library linking |
+| **Native output** | System V/Windows x64 plus experimental AAPCS64 lowering, deterministic ELF64/COFF/Mach-O arm64 objects, static archives, shared-library linking |
 | **ABI tooling** | Aggregate classification, variadic/calling-convention metadata, register and stack usage summaries |
 | **Incremental builds** | Fingerprints, dependency invalidation, parallel scheduling, cached functions, object and executable caching |
 
@@ -170,13 +170,13 @@ const auto diagnostics = builder.verify();
 ```c
 #include <forge-c/forge.h>
 
-#if FORGE_C_API_VERSION != 14
+#if FORGE_C_API_VERSION != 16
 #error "Unsupported Forge C API version"
 #endif
 ```
 
 The opaque C API is suitable for Rust, Zig, Go, C#, Python extensions, Raz, and other languages with C FFI support.
-C API v14 retains in-memory parsing, optimizer-pipeline selection, structured construction, and two-call COFF/ELF object emission, and adds native thread-local globals plus `tls.address` lowering. Frontends can therefore migrate from textual IR transport to zero-serialization module construction without launching a Forge tool executable.
+C API v16 retains in-memory parsing, optimizer-pipeline selection, structured construction, and two-call COFF/ELF/Mach-O object emission, and adds native thread-local globals plus `tls.address` lowering and explicit Darwin arm64 object selection. Frontends can therefore migrate from textual IR transport to zero-serialization module construction without launching a Forge tool executable.
 
 Start with:
 
@@ -187,7 +187,7 @@ Start with:
 
 ## Native ABI and libraries
 
-Forge exposes System V AMD64 and Windows x64 aggregate ABI classification through `<forge/target/abi.hpp>`. Frontends can inspect integer/SSE classes, indirect passing, register consumption, stack bytes, and variadic state before lowering language-level signatures.
+Forge exposes System V AMD64, Windows x64, and AAPCS64 aggregate ABI classification through `<forge/target/abi.hpp>`. Frontends can inspect integer/SSE classes, indirect passing, register consumption, stack bytes, and variadic state before lowering language-level signatures.
 
 Function declarations also carry calling-convention, linkage, visibility, and variadic metadata through textual and binary IR. See [Native ABI classification and libraries](docs/abi-and-libraries.md).
 
@@ -198,9 +198,9 @@ forge archive create -o libmath.a math.o helpers.o
 forge link-shared --linker=c++ -o libmath.so math.o helpers.o
 ```
 
-## Native backend
+## Native backends
 
-The x86-64 backend includes:
+The production x86-64 backend includes:
 
 - System V AMD64 and Windows x64 scalar/pointer calling conventions
 - Integer and scalar floating-point lowering
@@ -210,6 +210,8 @@ The x86-64 backend includes:
 - Compare/branch fusion and fallthrough-aware block layout
 - Short branch relaxation and frameless leaf functions
 - Deterministic ELF64 and COFF AMD64 object emission
+
+Forge also contains an experimental AArch64 backend with AAPCS64 scalar/aggregate classification, HFA support, an AArch64 linear-scan allocator using preserved `x19`-`x28`/`v8`-`v15`, copy coalescing/hole-aware reuse/spill-slot coloring, register-native scalar A64 instruction encoding, Linux initial-exec TLS, Darwin TLV TLS, target-safe immediate selection, 128-bit NEON integer maps/reductions, packed chain/DAG lowering, call-safe full-width vector spilling, and alias-safe automatic SLP/reduction formation, plus deterministic ELF64 AArch64 plus Mach-O arm64 objects. x86-only machine pseudos remain isolated from the AArch64 path. See [AArch64 backend](docs/aarch64-backend.md).
 
 The interpreter is the semantic reference implementation. Native behavior is checked through differential tests.
 
@@ -262,7 +264,7 @@ The release matrix installs Forge into an isolated prefix and builds independent
 
 ## Optimizer and analysis
 
-Forge ships reusable function analyses and a deterministic scalar optimization pipeline. At `-O2` and `-O3`, late scalar cleanup now runs to a bounded fixpoint so opportunities exposed by memory, loop, and CFG transforms are consumed without unbounded compile-time growth. Forge includes conservative alias analysis, global memory dataflow, scalar stack promotion, and natural-loop discovery. Stack promotion handles same-block locals, acyclic joins, and loop-carried scalar state through liveness-pruned dominance-frontier block-parameter placement and dominator-tree SSA renaming. The optimizer still forwards values across CFG edges, eliminates overwritten stores, and hoists safe loop-invariant expressions.
+Forge ships reusable function analyses and a deterministic scalar optimization pipeline. At `-O2` and `-O3`, late scalar cleanup now runs to a bounded fixpoint so opportunities exposed by memory, loop, and CFG transforms are consumed without unbounded compile-time growth. Forge includes conservative alias analysis, global memory dataflow, scalar stack promotion, and natural-loop discovery. Stack promotion handles same-block locals, acyclic joins, and loop-carried scalar state through liveness-pruned dominance-frontier block-parameter placement and dominator-tree SSA renaming. The optimizer still forwards values across CFG edges, eliminates overwritten stores, hoists safe loop-invariant expressions, and can hoist a canonical invariant loop-header guard to the preheader without duplicating the loop body.
 
 ```text
 CFG + dominators + use/def
@@ -278,16 +280,17 @@ The alias analysis intentionally returns `may_alias` when provenance or offsets 
 
 ## Platform support
 
-| Capability | Linux x86-64 | Windows x86-64 |
-|---|:---:|:---:|
-| Compiler and SDK | ✅ | ✅ |
-| Interpreter | ✅ | ✅ |
-| Native JIT | ✅ | ✅ |
-| System V ABI | ✅ | — |
-| Windows x64 ABI | — | ✅ |
-| ELF64 objects | ✅ | Generated and validated |
-| COFF AMD64 objects | Generated and validated | ✅ |
-| ASan + UBSan release gate | ✅ | Toolchain-dependent |
+| Capability | Linux x86-64 | Windows x86-64 | Linux AArch64 | macOS arm64 |
+|---|:---:|:---:|:---:|:---:|
+| Compiler and SDK | ✅ | ✅ | Cross-build capable | Cross-build capable |
+| Interpreter | ✅ | ✅ | Portable | Portable |
+| Native JIT | ✅ | ✅ | — | — |
+| System V / Windows ABI | ✅ | ✅ | — | — |
+| AAPCS64 / Darwin arm64 ABI classification | Generated/validated | Generated/validated | Experimental | Experimental |
+| ELF64 objects | ✅ | Generated and validated | Experimental native encoder | Cross-generated |
+| Mach-O arm64 objects | Cross-generated | Cross-generated | Cross-generated | Experimental native encoder |
+| COFF AMD64 objects | Generated and validated | ✅ | — | — |
+| ASan + UBSan release gate | ✅ | Toolchain-dependent | Not yet qualified | Not yet qualified |
 
 ## Project status and boundaries
 
@@ -299,7 +302,7 @@ The following are not currently part of the supported surface:
 - Per-function mixed calling conventions in one emitted object
 - Unwind and debug metadata
 - Full arbitrary live-range splitting beyond the current call-boundary and CFG-aware splitting infrastructure
-- Architectures other than x86-64
+- Production-parity native architectures other than x86-64 (AArch64 ELF is experimental)
 
 See [docs/release-readiness.md](docs/release-readiness.md) for the release contract and [docs/roadmap.md](docs/roadmap.md) for planned work.
 

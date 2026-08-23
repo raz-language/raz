@@ -26,6 +26,7 @@ constexpr std::uint32_t section_rdata = 0x40000040;
 constexpr std::uint32_t section_data = 0xC0000040;
 constexpr std::uint32_t section_tls = 0xC0000040;
 constexpr std::uint8_t storage_external = 2;
+constexpr std::uint8_t storage_static = 3;
 constexpr std::uint16_t symbol_function = 0x20;
 
 void add_error(Diagnostics& diagnostics, std::string message) {
@@ -70,6 +71,7 @@ struct Symbol {
     std::uint32_t value{};
     std::int16_t section{};
     std::uint16_t type{};
+    std::uint8_t storage_class{storage_external};
 };
 
 struct Relocation {
@@ -123,18 +125,20 @@ CoffObjectResult emit_coff_x86_64_image(codegen::x86_64::EncodedModuleImage imag
     const bool has_tls_section = !encoded.image.thread_local_data.empty();
     std::vector<Symbol> symbols;
     std::unordered_map<std::string, std::uint32_t> symbol_indexes;
-    auto add_symbol = [&](std::string name, std::uint32_t value, std::int16_t section, std::uint16_t type) {
+    auto add_symbol = [&](std::string name, std::uint32_t value, std::int16_t section, std::uint16_t type,
+                          std::uint8_t storage_class = storage_external) {
         const auto index = static_cast<std::uint32_t>(symbols.size());
         symbol_indexes.emplace(name, index);
-        symbols.push_back(Symbol{std::move(name), value, section, type});
+        symbols.push_back(Symbol{std::move(name), value, section, type, storage_class});
         return index;
     };
-    auto add_defined_symbol = [&](const std::string& name, std::uint32_t value, std::int16_t section, std::uint16_t type) -> bool {
+    auto add_defined_symbol = [&](const std::string& name, std::uint32_t value, std::int16_t section, std::uint16_t type,
+                                  std::uint8_t storage_class = storage_external) -> bool {
         if (symbol_indexes.contains(name)) {
             add_error(result.diagnostics, "duplicate defined symbol while emitting COFF object: " + name);
             return false;
         }
-        (void)add_symbol(name, value, section, type);
+        (void)add_symbol(name, value, section, type, storage_class);
         return true;
     };
     for (const auto& [name, offset] : encoded.image.entries) {
@@ -153,7 +157,7 @@ CoffObjectResult emit_coff_x86_64_image(codegen::x86_64::EncodedModuleImage imag
         }
         const std::int16_t section = global.section == codegen::x86_64::DataSection::read_only ? 2 :
             (global.section == codegen::x86_64::DataSection::tls ? (has_tls_section ? 4 : 0) : 3);
-        if (!add_defined_symbol(global.name, value, section, 0)) return result;
+        if (!add_defined_symbol(global.name, value, section, 0, global.is_internal ? storage_static : storage_external)) return result;
     }
     auto require_external = [&](const std::string& name) {
         if (const auto found = symbol_indexes.find(name); found != symbol_indexes.end()) return found->second;
@@ -287,7 +291,7 @@ CoffObjectResult emit_coff_x86_64_image(codegen::x86_64::EncodedModuleImage imag
         symbol_writer.integer(symbol.value);
         symbol_writer.integer(symbol.section);
         symbol_writer.integer(symbol.type);
-        symbol_writer.integer(storage_external);
+        symbol_writer.integer(symbol.storage_class);
         symbol_writer.integer(std::uint8_t{0});
     }
     const auto symbol_bytes = std::move(symbol_writer).take();

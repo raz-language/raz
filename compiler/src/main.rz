@@ -4,52 +4,25 @@
 namespace raz_compiler_main;
 
 public import raz_compiler_driver_razup;
-
 // Keep the compiler entrypoint boring: load input, run each phase in order, emit
 // backend artifacts, and leave the actual language rules in the subsystem modules above.
 fn main() -> i64 {
     write_compiler_diagnostic(80, 0, 0);
     if (bootstrap_qualifications_requested()) {
-        if (!qualify_extended_lexer()) {
-            return 39;
-        }
-        if (!qualify_mir_control_flow()) {
-            return 47;
-        }
-        if (!emit_forge_cfg_qualification()) {
-            return 48;
-        }
-        if (!qualify_mir_memory()) {
-            return 49;
-        }
-        if (!qualify_mir_many_arguments()) {
-            return 50;
-        }
-        if (!qualify_mir_extern_dispatch()) {
-            return 51;
-        }
-        if (!qualify_mir_call_frame_ownership()) {
-            return 54;
-        }
-        if (!qualify_mir_owned_aggregate()) {
-            return 52;
-        }
-        if (!qualify_mir_owned_array()) {
-            return 53;
+        i64 qualification = run_bootstrap_qualifications();
+
+        if (qualification != 0) {
+            return qualification;
         }
     }
     write_compiler_diagnostic(81, 0, 0);
-
     i64 process_argc = raz_compiler_rt_process_argc();
-
     if (razup_invoked()) {
         return razup_command(process_argc);
     }
-
     i64 cli_command = cli_detect_command(process_argc);
     i64 cli_argc = 0;
     i64 first_program_argument = 0;
-
     if (
         !cli_prepare_argument_partition(process_argc, cli_command, &mut cli_argc, &mut first_program_argument)
     ) {
@@ -69,9 +42,7 @@ fn main() -> i64 {
             cli_print_invalid_arguments();
             return 2;
         }
-
         i64 topic = cli_help_topic(cli_argc);
-
         if (topic > 0) {
             cli_print_command_help(topic);
         } else if (cli_argc > 2) {
@@ -94,23 +65,18 @@ fn main() -> i64 {
         cli_print_command_help(cli_command);
         return 0;
     }
-
     bool auxiliary_handled = false;
     i64 auxiliary_status = driver_command_dispatch(cli_argc, cli_command, &mut auxiliary_handled);
-
     if (auxiliary_handled) {
         return auxiliary_status;
     }
-
     i64 backend = backend_default();
-
     if (cli_command == 5) {
         backend = 0;
     }
     if (cli_command == 6) {
         backend = 1;
     }
-
     bool forge_native = false;
     bool forge_structured_only = false;
     bool profile_queries = cli_command == 11;
@@ -118,6 +84,8 @@ fn main() -> i64 {
     bool test_after_build = cli_command == 16;
     bool bench_after_build = cli_command == 40;
     i64 bench_iterations = 10;
+    i64 test_filter = raz_compiler_rt_arena_create(4096);
+    i64 test_filter_length = 0;
     bool check_only = cli_command == 4 || cli_command == 11 || cli_command == 17;
     i64 requested_features = raz_compiler_rt_arena_create(4096);
     i64 requested_features_length = 0;
@@ -125,18 +93,13 @@ fn main() -> i64 {
     bool default_features = true;
     bool release_profile = false;
     i64 cli_started_nanos = raz_compiler_rt_monotonic_nanos();
-
-    if (requested_features == 0) {
+    if (requested_features == 0 || test_filter == 0) {
         return 40;
     }
-
     LlvmTargetOptions llvm_options;
-
     llvm_target_options_init(&mut llvm_options);
-
     i64 argument_base = cli_command_argument_base(cli_command);
     bool scanning_options = true;
-
     while (scanning_options && argument_base < cli_argc) {
         i64 option_argument = raz_compiler_rt_arena_create(4096);
 
@@ -152,7 +115,15 @@ fn main() -> i64 {
 
         i64 backend_shortcut = cli_backend_shortcut(option_argument, option_length);
         i64 bench_option = 0;
+        i64 test_filter_option = 0;
 
+        if (test_after_build) {
+            test_filter_option = cli_test_filter_option(option_argument, option_length, test_filter, 4096);
+            if (test_filter_option < 0) {
+                cli_print_invalid_arguments();
+                return 2;
+            }
+        }
         if (bench_after_build) {
             bench_option = cli_bench_iterations_option(option_argument, option_length);
             if (bench_option < 0) {
@@ -160,7 +131,10 @@ fn main() -> i64 {
                 return 2;
             }
         }
-        if (bench_option > 0) {
+        if (test_filter_option > 0) {
+            test_filter_length = test_filter_option;
+            argument_base += 1;
+        } else if (bench_option > 0) {
             bench_iterations = bench_option;
             argument_base += 1;
         } else if (path_is_check_option(option_argument, option_length)) {
@@ -240,7 +214,10 @@ fn main() -> i64 {
         cli_print_invalid_arguments();
         return 2;
     }
-
+    if (backend == 1 && llvm_cross_target_executable_requires_runtime(&llvm_options)) {
+        cli_print_cross_target_runtime_required();
+        return 2;
+    }
     i64 remaining_argc = cli_argc - argument_base;
 
     if (remaining_argc > 2) {
@@ -300,14 +277,14 @@ fn main() -> i64 {
             return 40;
         }
 
-        i64 default_manifest_bytes[8] = [114, 97, 122, 46, 116, 111, 109, 108];
+        string default_manifest_bytes = "raz.toml";
         i64 default_manifest_index = 0;
 
         while (default_manifest_index < 8) {
             raz_compiler_rt_arena_set(
                 default_manifest,
                 default_manifest_index,
-                default_manifest_bytes[default_manifest_index],
+                compiler_literal_byte(default_manifest_bytes, default_manifest_index),
             );
             default_manifest_index += 1;
         }
@@ -359,8 +336,12 @@ fn main() -> i64 {
     }
 
     i64 manifest_capacity = 65536;
-    i64 source_capacity = 4194304;
+    // Source text is byte data. Keep a generous aggregate ceiling without paying
+    // the old 8-byte-cell cost per source byte; the compiler arena ABI records
+    // width so every existing checked get/set/copy path remains valid.
+    i64 source_capacity = 16777216;
     i64 module_capacity = 4194304;
+    // intentional-byte-array: raw stage1 manifest path for the i64-pointer runtime file ABI.
     i64 manifest_path[18] = [115, 116, 97, 103, 101, 49, 45, 112, 97, 99, 107, 97, 103, 101, 46, 116, 120, 116];
     i64 manifest = raz_compiler_rt_arena_create(manifest_capacity);
 
@@ -386,7 +367,7 @@ fn main() -> i64 {
         }
     }
 
-    i64 bytes = raz_compiler_rt_arena_create(source_capacity);
+    i64 bytes = raz_compiler_rt_arena_create_width(source_capacity, 1);
 
     if (bytes == 0) {
         raz_compiler_rt_arena_destroy(manifest);
@@ -428,7 +409,7 @@ fn main() -> i64 {
         }
     }
     if (direct_source) {
-        i64 module_bytes = raz_compiler_rt_arena_create(module_capacity);
+        i64 module_bytes = raz_compiler_rt_arena_create_width(module_capacity, 1);
 
         if (module_bytes == 0) {
             return 40;
@@ -486,7 +467,7 @@ fn main() -> i64 {
                 path_length -= 1;
             }
             if (path_length > 0) {
-                i64 module_bytes = raz_compiler_rt_arena_create(module_capacity);
+                i64 module_bytes = raz_compiler_rt_arena_create_width(module_capacity, 1);
 
                 if (module_bytes == 0) {
                     return 40;
@@ -525,9 +506,9 @@ fn main() -> i64 {
     write_compiler_diagnostic(90, module_count, length);
 
     Source input;
-
     input.bytes = bytes;
     input.length = length;
+    i64 backend_options_key = backend_codegen_cache_key(backend, &llvm_options);
     i64 cache_restore_kind = incremental_restore_kind(
         check_only,
         profile_queries,
@@ -538,6 +519,7 @@ fn main() -> i64 {
         &input,
         backend,
         llvm_options.emit_kind,
+        backend_options_key,
         forge_native,
         forge_structured_only,
         release_profile,
@@ -561,6 +543,7 @@ fn main() -> i64 {
         project_native_build_destroy(&mut native_build);
         return restored_status;
     }
+    cli_print_dependency_compile_statuses(cli_command, &input, cli_manifest_path, cli_manifest_length);
     cli_print_compile_status(cli_command, cli_manifest_path, cli_manifest_length);
     // bytes. Avoid a second full-file lexer pass here: on the production compiler
     // this source is large and arena-backed, so the redundant preflight scan was
@@ -580,22 +563,26 @@ fn main() -> i64 {
     }
 
     bool hir_built = false;
+    i64 hir_started_nanos = raz_compiler_rt_monotonic_nanos();
 
     if (check_only && check_hints.enabled != 0) {
         hir_built = build_hir_with_check_hints(input, &mut check_hints, &mut hir);
     } else {
         hir_built = build_hir(input, &mut hir);
     }
+    compiler_phase_trace("hir", hir_started_nanos);
     incremental_destroy_check_hints(&mut check_hints);
     if (!hir_built) {
         write_compiler_diagnostic(2, diagnostic_code_value(hir.diagnostic_code), hir.diagnostic_offset);
         cli_render_frontend_diagnostic(&input, hir.diagnostic_code, hir.diagnostic_offset);
         return 43;
     }
+    i64 hir_post_started_nanos = raz_compiler_rt_monotonic_nanos();
     incremental_store_check(cli_manifest_path, cli_manifest_length, &input);
     incremental_classify_module_changes(cli_manifest_path, cli_manifest_length, &mut hir);
     incremental_load_module_cache_state(cli_manifest_path, cli_manifest_length, &mut hir);
     incremental_persist_module_fingerprints(cli_manifest_path, cli_manifest_length, &hir);
+    compiler_phase_trace("hir-post", hir_post_started_nanos);
     if (profile_queries) {
         write_query_profile(&hir);
     }
@@ -615,19 +602,25 @@ fn main() -> i64 {
     );
 
     MirModule mir;
+    i64 mir_lower_started_nanos = raz_compiler_rt_monotonic_nanos();
 
     if (!lower_hir(&hir, &mut mir)) {
         write_compiler_diagnostic(3, 0, 0);
         destroy_hir(&mut hir);
         return 44;
     }
+    compiler_phase_trace("hir-to-mir", mir_lower_started_nanos);
+    i64 mir_pipeline_started_nanos = raz_compiler_rt_monotonic_nanos();
     if (!run_mir_pipeline(&mut mir, llvm_options.optimization_kind)) {
         write_compiler_diagnostic(3, mir.function_count, mir.instruction_count);
         destroy_mir(&mut mir);
         destroy_hir(&mut hir);
         return 45;
     }
+    compiler_phase_trace("mir-pipeline", mir_pipeline_started_nanos);
+    i64 mir_persist_started_nanos = raz_compiler_rt_monotonic_nanos();
     incremental_persist_module_mir_state(cli_manifest_path, cli_manifest_length, &hir, &mut mir);
+    compiler_phase_trace("mir-persist", mir_persist_started_nanos);
     write_compiler_diagnostic(94, mir.function_count, mir.instruction_count);
     if (test_after_build || bench_after_build) {
         cli_print_status(5, cli_manifest_path, cli_manifest_length);
@@ -635,7 +628,7 @@ fn main() -> i64 {
         i64 execution_status = 0;
 
         if (test_after_build) {
-            execution_status = execute_mir_tests(&input, &hir, &mut mir);
+            execution_status = execute_mir_tests(&input, &hir, &mut mir, test_filter, test_filter_length);
         } else {
             execution_status = execute_mir_benches(&input, &hir, &mut mir, bench_iterations);
         }
@@ -683,6 +676,7 @@ fn main() -> i64 {
         backend_output_path = llvm_sidecar_path;
         backend_output_length = cli_output_length + 3;
     }
+    i64 backend_started_nanos = raz_compiler_rt_monotonic_nanos();
     if (
         !emit_backend_module(
             backend,
@@ -698,6 +692,13 @@ fn main() -> i64 {
     ) {
         cli_print_backend_emit_failure();
         return 46;
+    }
+    compiler_phase_trace("backend-emit", backend_started_nanos);
+    if (
+        (backend == 1 && llvm_options.emit_kind != 0) ||
+        (backend == 0 && native_build.active)
+    ) {
+        cli_print_status(12, cli_manifest_path, cli_manifest_length);
     }
     if (backend == 1 && llvm_options.emit_kind != 0) {
         if (
@@ -722,6 +723,7 @@ fn main() -> i64 {
         &input,
         backend,
         llvm_options.emit_kind,
+        backend_options_key,
         forge_native,
         forge_structured_only,
         release_profile,

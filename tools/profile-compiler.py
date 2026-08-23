@@ -29,11 +29,10 @@ def _stage_compiler(source_root: Path, work: Path) -> None:
         ignore=shutil.ignore_patterns(".raz", "target", "compiler-diagnostic.txt", "forge-phase-profile.txt"),
         copy_function=_link_or_copy,
     )
-    order = source_root / "host-source-order.txt"
     manifest = source_root / "raz.toml"
-    if not order.is_file() or not manifest.is_file():
+    entry = source_root / "src" / "main.rz"
+    if not manifest.is_file() or not entry.is_file():
         raise RuntimeError(f"{source_root} is not a canonical Raz compiler project")
-    (work / "source-order.txt").write_text(order.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def main() -> int:
@@ -55,7 +54,7 @@ def main() -> int:
     _stage_compiler(source_root, work)
     diagnostic = work / "compiler-diagnostic.txt"
     forge_profile = work / "forge-phase-profile.txt"
-    query_profile = work / "compiler-query-profile.txt"
+    query_profile = work / "target" / "profile" / "compiler-query-profile.txt"
     env = os.environ.copy()
     env["RAZ_FORGE_PHASE_PROFILE"] = str(forge_profile)
 

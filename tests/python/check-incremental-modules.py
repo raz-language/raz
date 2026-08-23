@@ -35,7 +35,7 @@ checks = {
     'interface changes invalidate importing modules':
         'incremental_module_dependency_targets' in inc and 'incremental_module_dependency_owners' in inc,
     'module graph snapshot is versioned':
-        'RAZINC' not in inc or '[82, 65, 90, 73, 78, 67, 32, 50, 10]' in inc,
+        'RAZINC' not in inc or 'writer_literal(&mut writer, "RAZINC 2\\n")' in inc,
     'optimized per-module MIR state is persisted':
         'fn incremental_persist_module_mir_state(' in inc and 'incremental_persist_module_mir_state(' in main,
 }

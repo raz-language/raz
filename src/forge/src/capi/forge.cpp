@@ -15,11 +15,16 @@
 #include "forge/machine/lower.hpp"
 #include "forge/object/coff.hpp"
 #include "forge/object/elf.hpp"
+#include "forge/object/macho.hpp"
+#include "forge/object/incremental.hpp"
 #include "forge/pass/pipeline.hpp"
 #include "forge/target/abi.hpp"
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <sstream>
@@ -378,6 +383,48 @@ int forge_function_set_target_feature(forge_function_t* function, const char* ta
     return 1;
 }
 
+
+int forge_function_copy_body_from(forge_function_t* handle, const forge_module_t* source_module,
+                                  const char* source_function_name) {
+    auto* destination = function_of(handle);
+    if (!destination || !source_module || !source_module->value || !source_function_name) {
+        set_error("invalid function body copy request");
+        return 0;
+    }
+    const auto found = std::find_if(source_module->value->functions().begin(), source_module->value->functions().end(),
+        [&](const forge::ir::Function& function) { return function.name == source_function_name; });
+    if (found == source_module->value->functions().end() || found->is_external || found->is_signature) {
+        set_error("cached function body not found");
+        return 0;
+    }
+    if (destination->return_type != found->return_type ||
+        destination->return_aggregate_kind != found->return_aggregate_kind ||
+        destination->return_aggregate_name != found->return_aggregate_name ||
+        destination->return_owned != found->return_owned ||
+        destination->return_borrow_mode != found->return_borrow_mode ||
+        destination->return_borrow_parameter != found->return_borrow_parameter ||
+        destination->variadic != found->variadic ||
+        destination->calling_convention != found->calling_convention ||
+        destination->target_feature != found->target_feature ||
+        destination->parameters.size() != found->parameters.size()) {
+        set_error("cached function signature mismatch");
+        return 0;
+    }
+    for (std::size_t index = 0; index < destination->parameters.size(); ++index) {
+        const auto& left = destination->parameters[index];
+        const auto& right = found->parameters[index];
+        if (left.name != right.name || left.type != right.type || left.aggregate_kind != right.aggregate_kind ||
+            left.aggregate_name != right.aggregate_name || left.owned != right.owned ||
+            left.borrow_mode != right.borrow_mode || left.function_signature_name != right.function_signature_name) {
+            set_error("cached function parameter mismatch");
+            return 0;
+        }
+    }
+    destination->blocks = found->blocks;
+    last_error.clear();
+    return 1;
+}
+
 forge_function_t* forge_function_create(forge_module_t* module, const char* name, forge_type_kind_t return_type,
                                         const forge_type_kind_t* parameter_types, size_t parameter_count) {
     if (module == nullptr || module->value == nullptr) { set_error("module is null"); return nullptr; }
@@ -635,13 +682,32 @@ bool build_native_object_bytes(forge_module_t* module, forge_native_abi_t abi,
         last_error = forge::diagnostics::render_all(module->diagnostics);
         return false;
     }
-    auto lowered = forge::machine::lower_module(*module->value);
+    const auto architecture = (abi == FORGE_ABI_AAPCS64 || abi == FORGE_ABI_DARWIN_ARM64)
+        ? forge::machine::TargetArchitecture::aarch64
+        : forge::machine::TargetArchitecture::x86_64;
+    auto lowered = forge::machine::lower_module(*module->value, {architecture});
     if (!lowered.ok()) {
         module->diagnostics = std::move(lowered.diagnostics);
         last_error = forge::diagnostics::render_all(module->diagnostics);
         return false;
     }
-    if (abi == FORGE_ABI_WINDOWS_X64) {
+    if (abi == FORGE_ABI_DARWIN_ARM64) {
+        auto object = forge::object::emit_macho64_aarch64(*lowered.module);
+        if (!object.ok()) {
+            module->diagnostics = std::move(object.diagnostics);
+            last_error = forge::diagnostics::render_all(module->diagnostics);
+            return false;
+        }
+        bytes = std::move(object.bytes);
+    } else if (abi == FORGE_ABI_AAPCS64) {
+        auto object = forge::object::emit_elf64_aarch64(*lowered.module);
+        if (!object.ok()) {
+            module->diagnostics = std::move(object.diagnostics);
+            last_error = forge::diagnostics::render_all(module->diagnostics);
+            return false;
+        }
+        bytes = std::move(object.bytes);
+    } else if (abi == FORGE_ABI_WINDOWS_X64) {
         auto object = forge::object::emit_coff_x86_64(
             *lowered.module, forge::codegen::x86_64::Abi::windows);
         if (!object.ok()) {
@@ -715,6 +781,215 @@ size_t forge_module_write_object_file(forge_module_t* module, forge_native_abi_t
         return 0;
     } catch (...) {
         set_error("Forge object file emission failed");
+        return 0;
+    }
+}
+
+
+size_t forge_module_write_object_file_incremental(forge_module_t* module, forge_native_abi_t abi,
+                                                  const char* output_path,
+                                                  const char* cache_root,
+                                                  const char* previous_module_path,
+                                                  const char* frontend_id,
+                                                  const char* configuration,
+                                                  size_t* rebuilt_functions,
+                                                  size_t* reused_functions) {
+    if (rebuilt_functions) *rebuilt_functions = 0;
+    if (reused_functions) *reused_functions = 0;
+    if (!module || !module->value || output_path == nullptr || *output_path == '\0' ||
+        cache_root == nullptr || *cache_root == '\0' ||
+        previous_module_path == nullptr || *previous_module_path == '\0') {
+        set_error("invalid incremental object emission request");
+        return 0;
+    }
+    // Function artifacts currently encode x86-64 relocation images. Keep the
+    // regular monolithic path authoritative on AArch64 until the corresponding
+    // incremental artifact encoder exists there too.
+    if (abi == FORGE_ABI_AAPCS64 || abi == FORGE_ABI_DARWIN_ARM64)
+        return forge_module_write_object_file(module, abi, output_path);
+    try {
+        module->diagnostics = forge::ir::verify_module(*module->value);
+        if (!module->diagnostics.empty()) {
+            last_error = forge::diagnostics::render_all(module->diagnostics);
+            return 0;
+        }
+
+        forge::ir::IncrementalSnapshot previous;
+        const std::filesystem::path previous_path(previous_module_path);
+        if (std::filesystem::is_regular_file(previous_path)) {
+            std::ifstream input(previous_path, std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            if (!text.empty()) {
+                auto parsed = forge::ir::parse_module(text);
+                if (parsed.ok()) previous = forge::ir::build_incremental_snapshot(*parsed.module);
+            }
+        }
+        const auto current = forge::ir::build_incremental_snapshot(*module->value);
+        auto plan = forge::ir::build_incremental_build_plan(
+            previous, current, frontend_id ? frontend_id : "raz",
+            configuration ? configuration : "", forge::ir::ArtifactKind::object);
+
+        // External/signature-only functions have no native body artifact. Keep
+        // them in the IR snapshot for module fingerprinting, but not in the
+        // function artifact build plan.
+        std::set<std::string> definitions;
+        for (const auto& function : module->value->functions())
+            if (!function.is_external && !function.is_signature) definitions.insert(function.name);
+        plan.functions.erase(std::remove_if(plan.functions.begin(), plan.functions.end(),
+            [&](const forge::ir::FunctionBuildDecision& decision) {
+                return decision.action != forge::ir::BuildAction::remove && !definitions.contains(decision.name);
+            }), plan.functions.end());
+
+        auto lowered = forge::machine::lower_module(*module->value, {forge::machine::TargetArchitecture::x86_64});
+        if (!lowered.ok()) {
+            module->diagnostics = std::move(lowered.diagnostics);
+            last_error = forge::diagnostics::render_all(module->diagnostics);
+            return 0;
+        }
+        std::map<std::string, const forge::machine::Function*> machine_functions;
+        for (const auto& function : lowered.module->functions)
+            machine_functions.emplace(function.name, &function);
+
+        const auto native_abi = abi == FORGE_ABI_WINDOWS_X64
+            ? forge::codegen::x86_64::Abi::windows
+            : forge::codegen::x86_64::Abi::system_v;
+
+        // Raz projects can contain thousands of functions. Opening one tiny
+        // file per function dominated incremental rebuilds (and is especially
+        // costly on Windows), so keep Forge's content-addressed keys but pack
+        // all native function artifacts into one atomically replaced file.
+        using PackedArtifacts = std::map<std::string, std::vector<std::uint8_t>>;
+        const auto pack_path = std::filesystem::path(cache_root) / "artifacts-v1.pack";
+        PackedArtifacts packed;
+        if (std::filesystem::is_regular_file(pack_path)) {
+            std::ifstream input(pack_path, std::ios::binary);
+            char magic[8]{};
+            std::uint32_t count{};
+            input.read(magic, 8);
+            input.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (input && std::string_view(magic, 8) == std::string_view("RZFCACHE", 8) && count < 1'000'000U) {
+                for (std::uint32_t index = 0; index < count && input; ++index) {
+                    char key_bytes[64]{};
+                    std::uint64_t size{};
+                    input.read(key_bytes, 64);
+                    input.read(reinterpret_cast<char*>(&size), sizeof(size));
+                    if (!input || size > (1ULL << 32U)) { packed.clear(); break; }
+                    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+                    if (size != 0) input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+                    if (!input) { packed.clear(); break; }
+                    packed.emplace(std::string(key_bytes, 64), std::move(bytes));
+                }
+            }
+        }
+
+        for (auto& decision : plan.functions) {
+            if (decision.action == forge::ir::BuildAction::remove) continue;
+            const auto cached = packed.find(decision.semantic_cache_key);
+            if (cached != packed.end()) {
+                if (reused_functions) ++*reused_functions;
+                continue;
+            }
+            const auto found = machine_functions.find(decision.name);
+            if (found == machine_functions.end()) {
+                set_error(("incremental machine function missing: " + decision.name).c_str());
+                return 0;
+            }
+            auto artifact = forge::object::compile_native_function_artifact(*found->second, native_abi);
+            if (!artifact.ok()) {
+                module->diagnostics = std::move(artifact.diagnostics);
+                last_error = forge::diagnostics::render_all(module->diagnostics);
+                return 0;
+            }
+            packed[decision.semantic_cache_key] = std::move(artifact.bytes);
+            if (rebuilt_functions) ++*rebuilt_functions;
+        }
+
+        const auto format = abi == FORGE_ABI_WINDOWS_X64
+            ? forge::object::NativeObjectFormat::coff
+            : forge::object::NativeObjectFormat::elf64;
+        // Match monolithic object layout by replaying cached artifacts in the
+        // machine module's original function order rather than the snapshot's
+        // lexical-name order.
+        std::map<std::string, const forge::ir::FunctionBuildDecision*> decisions;
+        for (const auto& decision : plan.functions) decisions.emplace(decision.name, &decision);
+        std::vector<forge::ir::FunctionArtifact> ordered_artifacts;
+        ordered_artifacts.reserve(lowered.module->functions.size());
+        for (const auto& function : lowered.module->functions) {
+            const auto decision = decisions.find(function.name);
+            if (decision == decisions.end() || decision->second->semantic_cache_key.empty()) {
+                set_error(("incremental function decision missing: " + function.name).c_str());
+                return 0;
+            }
+            const auto artifact = packed.find(decision->second->semantic_cache_key);
+            if (artifact == packed.end()) {
+                set_error(("incremental function artifact missing: " + function.name).c_str());
+                return 0;
+            }
+            ordered_artifacts.push_back({function.name, artifact->second});
+        }
+        auto assembled = forge::object::assemble_native_object_artifacts(
+            ordered_artifacts, lowered.module->globals, format, native_abi);
+        if (!assembled.ok()) {
+            module->diagnostics = std::move(assembled.diagnostics);
+            last_error = forge::diagnostics::render_all(module->diagnostics);
+            return 0;
+        }
+        std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+        if (!output) { set_error("unable to create incremental object output file"); return 0; }
+        if (!assembled.bytes.empty()) output.write(
+            reinterpret_cast<const char*>(assembled.bytes.data()),
+            static_cast<std::streamsize>(assembled.bytes.size()));
+        if (!output) { set_error("unable to write incremental object output file"); return 0; }
+
+        if (!pack_path.parent_path().empty()) std::filesystem::create_directories(pack_path.parent_path());
+        const auto pack_temporary = std::filesystem::path(pack_path.string() + ".tmp");
+        {
+            std::ofstream pack(pack_temporary, std::ios::binary | std::ios::trunc);
+            const char magic[8] = {'R','Z','F','C','A','C','H','E'};
+            const auto count = static_cast<std::uint32_t>(packed.size());
+            pack.write(magic, 8);
+            pack.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            for (const auto& [key, bytes] : packed) {
+                if (key.size() != 64) continue;
+                const auto size = static_cast<std::uint64_t>(bytes.size());
+                pack.write(key.data(), 64);
+                pack.write(reinterpret_cast<const char*>(&size), sizeof(size));
+                if (!bytes.empty()) pack.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            }
+            if (!pack) { set_error("unable to write packed function cache"); return 0; }
+        }
+        std::error_code pack_error;
+        std::filesystem::rename(pack_temporary, pack_path, pack_error);
+        if (pack_error) {
+            std::filesystem::remove(pack_path, pack_error);
+            pack_error.clear();
+            std::filesystem::rename(pack_temporary, pack_path, pack_error);
+            if (pack_error) { std::filesystem::remove(pack_temporary); set_error("unable to commit packed function cache"); return 0; }
+        }
+
+        // Commit the module snapshot only after the object is complete. An
+        // interrupted build therefore cannot make a newer snapshot point at
+        // missing function artifacts.
+        if (!previous_path.parent_path().empty()) std::filesystem::create_directories(previous_path.parent_path());
+        const auto temporary = std::filesystem::path(previous_path.string() + ".tmp");
+        {
+            std::ofstream state(temporary, std::ios::binary | std::ios::trunc);
+            if (state) state << forge::ir::print_module(*module->value);
+        }
+        std::error_code rename_error;
+        std::filesystem::rename(temporary, previous_path, rename_error);
+        if (rename_error) {
+            std::filesystem::remove(previous_path, rename_error);
+            rename_error.clear();
+            std::filesystem::rename(temporary, previous_path, rename_error);
+        }
+        last_error.clear();
+        return assembled.bytes.size();
+    } catch (const std::exception& error) {
+        last_error = error.what();
+        return 0;
+    } catch (...) {
+        set_error("incremental Forge object file emission failed");
         return 0;
     }
 }
@@ -882,8 +1157,10 @@ size_t forge_module_function_abi_json(const forge_module_t* module,
     const auto found = std::find_if(module->value->functions().begin(), module->value->functions().end(),
         [&](const forge::ir::Function& function) { return function.name == function_name; });
     if (found == module->value->functions().end()) { set_error("function not found"); return 0; }
-    const auto native_abi = abi == FORGE_ABI_WINDOWS_X64 ? forge::target::NativeAbi::windows_x64
-                                                         : forge::target::NativeAbi::system_v_x86_64;
+    const auto native_abi = (abi == FORGE_ABI_AAPCS64 || abi == FORGE_ABI_DARWIN_ARM64)
+        ? forge::target::NativeAbi::aapcs64
+        : abi == FORGE_ABI_WINDOWS_X64 ? forge::target::NativeAbi::windows_x64
+                                       : forge::target::NativeAbi::system_v_x86_64;
     const auto classified = forge::target::classify_function(*module->value, *found, native_abi);
     std::ostringstream json;
     json << "{\"function\":\"" << found->name << "\",\"variadic\":" << (classified.variadic ? "true" : "false")
@@ -897,8 +1174,14 @@ size_t forge_module_function_abi_json(const forge_module_t* module,
         json << "{\"size\":" << parameter.size << ",\"alignment\":" << parameter.alignment
              << ",\"registerCount\":" << static_cast<unsigned>(parameter.register_count)
              << ",\"indirect\":" << (parameter.passed_indirectly ? "true" : "false")
-             << ",\"classes\":[\"" << forge::target::abi_value_class_name(parameter.classes[0])
-             << "\",\"" << forge::target::abi_value_class_name(parameter.classes[1]) << "\"]}";
+             << ",\"homogeneousFloat\":" << (parameter.homogeneous_float ? "true" : "false")
+             << ",\"classes\":[";
+        const auto class_count = std::max<std::size_t>(1U, parameter.register_count);
+        for (std::size_t piece = 0; piece < class_count && piece < parameter.classes.size(); ++piece) {
+            if (piece) json << ',';
+            json << '"' << forge::target::abi_value_class_name(parameter.classes[piece]) << '"';
+        }
+        json << "]}";
     }
     json << "]}";
     last_error.clear();

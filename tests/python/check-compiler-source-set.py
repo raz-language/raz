@@ -22,7 +22,7 @@ discovered = sorted(path.resolve() for path in source_root.rglob("*.rz"))
 if set(discovered) != set(path.resolve() for path in ordered):
     expected = {path.resolve() for path in ordered}
     actual = set(discovered)
-    print("compiler-source-set: FAIL: host-source-order.txt does not cover compiler/src exactly")
+    print("compiler-source-set: FAIL: semantic compiler discovery does not cover compiler/src exactly")
     for path in sorted(actual - expected):
         print(f"  unlisted: {path.relative_to(root)}")
     for path in sorted(expected - actual):
@@ -34,9 +34,8 @@ if relative[-1] != "src/main.rz":
     print("compiler-source-set: FAIL: src/main.rz must be the final compiler source")
     sys.exit(1)
 
-# Physical filenames are descriptive; host compiler ordering belongs in
-# host-source-order.txt rather than numeric filename prefixes. Production
-# compilation uses explicit semantic imports instead of physical concatenation.
+# Physical filenames are descriptive. Production compilation uses explicit
+# semantic imports instead of physical concatenation or ordering metadata.
 for entry in relative:
     name = Path(entry).name
     if re.match(r"^[0-9]+_", name):

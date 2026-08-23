@@ -625,8 +625,8 @@ std::string SemanticAnalyzer::analyze_expression(const SyntaxNode& node) {
       return target;
     }
 
-    if (!is_numeric(source) || !is_numeric(target)) {
-      diagnostics_.error("D2289", node.range, "'as' requires numeric types or an unsafe raw-pointer cast");
+    if (!native_cast_type(source) || !native_cast_type(target)) {
+      diagnostics_.error("D2289", node.range, "'as' requires scalar numeric/bool types or an unsafe raw-pointer cast");
       return target;
     }
 

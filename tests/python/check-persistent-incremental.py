@@ -10,7 +10,7 @@ inc = (root / 'compiler/src/driver/incremental.rz').read_text()
 main = (root / 'compiler/src/main.rz').read_text()
 model = (root / 'compiler/src/hir/core/model.rz').read_text()
 comptime = (root / 'compiler/src/hir/semantic/comptime.rz').read_text()
-order = (root / 'compiler/host-source-order.txt').read_text()
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 ignore = (root / '.gitignore').read_text()
 
 checks = {

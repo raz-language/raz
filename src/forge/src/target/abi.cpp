@@ -6,216 +6,314 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 namespace forge::target {
 namespace {
 
-AbiValueClass merge_class(AbiValueClass left, AbiValueClass right) noexcept {
-    if (left == AbiValueClass::none) return right;
-    if (right == AbiValueClass::none) return left;
-    if (left == AbiValueClass::memory || right == AbiValueClass::memory) return AbiValueClass::memory;
-    if (left == AbiValueClass::integer || right == AbiValueClass::integer) return AbiValueClass::integer;
-    return AbiValueClass::sse;
-}
-
-bool mark_range(AggregateAbiClassification& result, std::size_t offset, std::size_t size,
-                AbiValueClass value_class) noexcept {
-    if (size == 0 || offset > result.size || size > result.size - offset) return false;
-    const auto first = offset / 8;
-    const auto last = (offset + size - 1) / 8;
-    if (last >= result.classes.size()) return false;
-    for (std::size_t slot = first; slot <= last; ++slot)
-        result.classes[slot] = merge_class(result.classes[slot], value_class);
-    return true;
-}
-
-const ir::StructDecl* find_struct(const ir::Module& module, std::string_view name) noexcept {
-    const auto it = std::find_if(module.structs().begin(), module.structs().end(),
+const ir::StructDecl* find_struct(const ir::Module& module, const std::string& name) {
+    const auto found = std::find_if(module.structs().begin(), module.structs().end(),
         [&](const ir::StructDecl& item) { return item.name == name; });
-    return it == module.structs().end() ? nullptr : &*it;
+    return found == module.structs().end() ? nullptr : &*found;
 }
 
-const ir::ArrayDecl* find_array(const ir::Module& module, std::string_view name) noexcept {
-    const auto it = std::find_if(module.arrays().begin(), module.arrays().end(),
+const ir::ArrayDecl* find_array(const ir::Module& module, const std::string& name) {
+    const auto found = std::find_if(module.arrays().begin(), module.arrays().end(),
         [&](const ir::ArrayDecl& item) { return item.name == name; });
-    return it == module.arrays().end() ? nullptr : &*it;
+    return found == module.arrays().end() ? nullptr : &*found;
 }
 
-AbiValueClass scalar_class(ir::Type type) noexcept {
-    return type.is_float() ? AbiValueClass::sse : AbiValueClass::integer;
-}
+struct Leaf {
+    std::size_t offset{};
+    std::size_t size{};
+    ir::Type type;
+};
 
-bool classify_sysv_contents(const ir::Module& module, ir::AggregateRefKind kind, std::string_view name,
-                            const DataLayout& layout, std::size_t base,
-                            AggregateAbiClassification& result) {
-    if (kind == ir::AggregateRefKind::structure) {
-        const auto* declaration = find_struct(module, name);
-        if (!declaration) return false;
-        const auto structure = layout.struct_layout(module, *declaration);
-        if (!structure || structure->fields.size() != declaration->fields.size()) return false;
-        for (std::size_t index = 0; index < declaration->fields.size(); ++index) {
-            const auto& field = declaration->fields[index];
-            const auto& field_layout = structure->fields[index];
+struct LeafCollector {
+    const ir::Module& module;
+    const DataLayout& data_layout;
+    std::unordered_set<std::string> active;
+
+    bool aggregate(ir::AggregateRefKind kind, const std::string& name, std::size_t base, std::vector<Leaf>& output) {
+        if (kind == ir::AggregateRefKind::structure) {
+            const auto* declaration = find_struct(module, name);
+            if (!declaration) return false;
+            return structure(*declaration, base, output);
+        }
+        if (kind == ir::AggregateRefKind::array) {
+            const auto* declaration = find_array(module, name);
+            if (!declaration) return false;
+            return array(*declaration, base, output);
+        }
+        return false;
+    }
+
+    bool structure(const ir::StructDecl& declaration, std::size_t base, std::vector<Leaf>& output) {
+        const std::string key = "s:" + declaration.name;
+        if (!active.insert(key).second) return false;
+        struct Guard {
+            std::unordered_set<std::string>& active;
+            std::string key;
+            ~Guard() { active.erase(key); }
+        } guard{active, key};
+        const auto layout = data_layout.struct_layout(module, declaration);
+        if (!layout || layout->fields.size() != declaration.fields.size()) return false;
+        for (std::size_t index = 0; index < declaration.fields.size(); ++index) {
+            const auto& field = declaration.fields[index];
+            const auto offset = base + layout->fields[index].offset;
             if (field.aggregate_kind == ir::AggregateRefKind::scalar) {
-                if (!mark_range(result, base + field_layout.offset, field_layout.size, scalar_class(field.type))) return false;
-            } else if (!classify_sysv_contents(module, field.aggregate_kind, field.aggregate_name, layout,
-                                               base + field_layout.offset, result)) {
+                const auto size = data_layout.size_of(field.type);
+                if (!size) return false;
+                output.push_back({offset, *size, field.type});
+            } else if (!aggregate(field.aggregate_kind, field.aggregate_name, offset, output)) {
                 return false;
             }
         }
         return true;
     }
-    if (kind == ir::AggregateRefKind::array) {
-        const auto* declaration = find_array(module, name);
-        if (!declaration) return false;
-        const auto array = layout.array_layout(module, *declaration);
-        if (!array) return false;
-        for (std::size_t index = 0; index < declaration->element_count; ++index) {
-            const auto offset = base + index * array->stride;
-            if (declaration->element_aggregate_kind == ir::AggregateRefKind::scalar) {
-                const auto size = layout.size_of(declaration->element_type);
-                if (!size || !mark_range(result, offset, *size, scalar_class(declaration->element_type))) return false;
-            } else if (!classify_sysv_contents(module, declaration->element_aggregate_kind,
-                                               declaration->element_aggregate_name, layout, offset, result)) {
+
+    bool array(const ir::ArrayDecl& declaration, std::size_t base, std::vector<Leaf>& output) {
+        const std::string key = "a:" + declaration.name;
+        if (!active.insert(key).second) return false;
+        struct Guard {
+            std::unordered_set<std::string>& active;
+            std::string key;
+            ~Guard() { active.erase(key); }
+        } guard{active, key};
+        const auto layout = data_layout.array_layout(module, declaration);
+        if (!layout) return false;
+        for (std::size_t index = 0; index < declaration.element_count; ++index) {
+            const auto offset = base + index * layout->stride;
+            if (declaration.element_aggregate_kind == ir::AggregateRefKind::scalar) {
+                const auto size = data_layout.size_of(declaration.element_type);
+                if (!size) return false;
+                output.push_back({offset, *size, declaration.element_type});
+            } else if (!aggregate(declaration.element_aggregate_kind, declaration.element_aggregate_name, offset, output)) {
                 return false;
             }
         }
         return true;
     }
-    return false;
+};
+
+std::optional<std::pair<std::size_t, std::size_t>> aggregate_layout(
+    const ir::Module& module, ir::AggregateRefKind kind, const std::string& name, const DataLayout& data_layout) {
+    const auto size = data_layout.aggregate_size(module, kind, name);
+    const auto alignment = data_layout.aggregate_alignment(module, kind, name);
+    if (!size || !alignment) return std::nullopt;
+    return std::pair{*size, *alignment};
 }
 
-AggregateAbiClassification scalar_parameter(ir::Type type, const DataLayout& layout) {
+bool collect_leaves(const ir::Module& module, ir::AggregateRefKind kind, const std::string& name,
+                    const DataLayout& data_layout, std::vector<Leaf>& output) {
+    return LeafCollector{module, data_layout, {}}.aggregate(kind, name, 0, output);
+}
+
+std::optional<std::pair<ir::Type, std::size_t>> homogeneous_float_shape(
+    const std::vector<Leaf>& leaves, std::size_t aggregate_size) {
+    if (leaves.empty() || leaves.size() > 4) return std::nullopt;
+    const auto type = leaves.front().type;
+    if (!type.is_float()) return std::nullopt;
+    const auto width = type.kind() == ir::TypeKind::f32 ? std::size_t{4} : std::size_t{8};
+    for (std::size_t index = 0; index < leaves.size(); ++index) {
+        if (leaves[index].type != type || leaves[index].size != width || leaves[index].offset != index * width)
+            return std::nullopt;
+    }
+    if (aggregate_size != leaves.size() * width) return std::nullopt;
+    return std::pair{type, width};
+}
+
+AggregateAbiClassification indirect_classification(std::size_t size, std::size_t alignment, bool return_indirect) {
     AggregateAbiClassification result;
-    result.size = layout.size_of(type).value_or(0);
-    result.alignment = layout.alignment_of(type).value_or(0);
-    if (result.size != 0) {
-        result.classes[0] = scalar_class(type);
-        result.register_count = 1;
+    result.size = size;
+    result.alignment = alignment;
+    result.passed_indirectly = true;
+    result.returned_indirectly = return_indirect;
+    result.classes = {AbiValueClass::indirect};
+    return result;
+}
+
+AggregateAbiClassification classify_sysv(
+    std::size_t size, std::size_t alignment, const std::vector<Leaf>& leaves) {
+    if (size == 0) {
+        AggregateAbiClassification result;
+        result.size = 0;
+        result.alignment = alignment;
+        return result;
+    }
+    if (size > 16) {
+        auto result = indirect_classification(size, alignment, true);
+        result.classes[0] = AbiValueClass::memory;
+        return result;
+    }
+
+    AggregateAbiClassification result;
+    result.size = size;
+    result.alignment = alignment;
+    result.register_count = static_cast<std::uint8_t>((size + 7U) / 8U);
+    result.classes.assign(result.register_count, AbiValueClass::sse);
+    result.piece_widths.assign(result.register_count, 8U);
+    for (std::size_t piece = 0; piece < result.register_count; ++piece) {
+        const auto begin = piece * 8U;
+        const auto end = std::min(size, begin + 8U);
+        bool has_leaf = false;
+        bool all_float = true;
+        for (const auto& leaf : leaves) {
+            if (leaf.offset >= end || leaf.offset + leaf.size <= begin) continue;
+            has_leaf = true;
+            if (!leaf.type.is_float()) all_float = false;
+        }
+        result.classes[piece] = has_leaf && all_float ? AbiValueClass::sse : AbiValueClass::integer;
+        const auto occupied = end - begin;
+        result.piece_widths[piece] = static_cast<std::uint8_t>(occupied <= 4U ? 4U : 8U);
     }
     return result;
 }
 
-std::size_t stack_slot_size(const AggregateAbiClassification& value) noexcept {
-    if (value.passed_indirectly) return 8;
-    return std::max<std::size_t>(8, ((value.size + 7) / 8) * 8);
+AggregateAbiClassification classify_windows(std::size_t size, std::size_t alignment) {
+    if (size == 1 || size == 2 || size == 4 || size == 8) {
+        AggregateAbiClassification result;
+        result.size = size;
+        result.alignment = alignment;
+        result.register_count = 1;
+        result.classes = {AbiValueClass::integer};
+        result.piece_widths = {static_cast<std::uint8_t>(size <= 4U ? 4U : 8U)};
+        return result;
+    }
+    return indirect_classification(size, alignment, true);
+}
+
+AggregateAbiClassification classify_aapcs64(
+    std::size_t size, std::size_t alignment, const std::vector<Leaf>& leaves) {
+    if (size == 0) {
+        AggregateAbiClassification result;
+        result.size = 0;
+        result.alignment = alignment;
+        return result;
+    }
+    if (const auto hfa = homogeneous_float_shape(leaves, size)) {
+        AggregateAbiClassification result;
+        result.size = size;
+        result.alignment = alignment;
+        result.register_count = static_cast<std::uint8_t>(leaves.size());
+        result.homogeneous_float = true;
+        result.classes.assign(leaves.size(), AbiValueClass::sse);
+        result.piece_widths.assign(leaves.size(), static_cast<std::uint8_t>(hfa->second));
+        return result;
+    }
+    if (size > 16) return indirect_classification(size, alignment, true);
+
+    AggregateAbiClassification result;
+    result.size = size;
+    result.alignment = alignment;
+    result.register_count = static_cast<std::uint8_t>((size + 7U) / 8U);
+    result.classes.assign(result.register_count, AbiValueClass::integer);
+    result.piece_widths.assign(result.register_count, 8U);
+    if (result.register_count != 0 && size <= 4U) result.piece_widths[0] = 4U;
+    return result;
+}
+
+AggregateAbiClassification scalar_classification(ir::Type type, NativeAbi abi, const DataLayout& data_layout) {
+    AggregateAbiClassification result;
+    const auto size = data_layout.size_of(type).value_or(0);
+    const auto alignment = data_layout.alignment_of(type).value_or(1);
+    result.size = size;
+    result.alignment = alignment;
+    if (size == 0) return result;
+    result.register_count = 1;
+    result.classes = {type.is_float() ? AbiValueClass::sse : AbiValueClass::integer};
+    result.piece_widths = {static_cast<std::uint8_t>(size <= 4U ? 4U : 8U)};
+    (void)abi;
+    return result;
+}
+
+std::size_t stack_slot_size(std::size_t size) {
+    const auto rounded = checked_align_to(std::max<std::size_t>(size, 1U), 8U);
+    return rounded.value_or(size);
 }
 
 } // namespace
 
-const char* abi_value_class_name(AbiValueClass value) noexcept {
-    switch (value) {
-    case AbiValueClass::none: return "none";
-    case AbiValueClass::integer: return "integer";
-    case AbiValueClass::sse: return "sse";
-    case AbiValueClass::memory: return "memory";
-    }
-    return "none";
-}
-
 std::optional<AggregateAbiClassification> classify_aggregate(
-    const ir::Module& module, ir::AggregateRefKind kind, std::string_view name,
-    NativeAbi abi, const DataLayout& layout) {
-    if (kind == ir::AggregateRefKind::scalar || name.empty()) return std::nullopt;
-    const auto size = layout.aggregate_size(module, kind, std::string(name));
-    const auto alignment = layout.aggregate_alignment(module, kind, std::string(name));
-    if (!size || !alignment) return std::nullopt;
-
-    AggregateAbiClassification result;
-    result.size = *size;
-    result.alignment = *alignment;
-
-    if (abi == NativeAbi::windows_x64) {
-        if (*size == 1 || *size == 2 || *size == 4 || *size == 8) {
-            result.classes[0] = AbiValueClass::integer;
-            result.register_count = 1;
-        } else {
-            result.classes[0] = AbiValueClass::memory;
-            result.passed_indirectly = true;
-            result.returned_indirectly = true;
-        }
-        return result;
+    const ir::Module& module,
+    ir::AggregateRefKind kind,
+    const std::string& name,
+    NativeAbi abi,
+    const DataLayout& data_layout) {
+    if (kind == ir::AggregateRefKind::scalar) return std::nullopt;
+    const auto layout = aggregate_layout(module, kind, name, data_layout);
+    if (!layout) return std::nullopt;
+    std::vector<Leaf> leaves;
+    if (!collect_leaves(module, kind, name, data_layout, leaves)) return std::nullopt;
+    switch (abi) {
+    case NativeAbi::system_v_x86_64: return classify_sysv(layout->first, layout->second, leaves);
+    case NativeAbi::windows_x64: return classify_windows(layout->first, layout->second);
+    case NativeAbi::aapcs64: return classify_aapcs64(layout->first, layout->second, leaves);
     }
-
-    if (*size == 0 || *size > 16) {
-        result.classes[0] = AbiValueClass::memory;
-        result.passed_indirectly = true;
-        result.returned_indirectly = true;
-        return result;
-    }
-    result.register_count = static_cast<std::uint8_t>((*size + 7) / 8);
-    if (!classify_sysv_contents(module, kind, name, layout, 0, result)) return std::nullopt;
-    for (std::size_t index = 0; index < result.register_count; ++index)
-        if (result.classes[index] == AbiValueClass::none) result.classes[index] = AbiValueClass::integer;
-    return result;
+    return std::nullopt;
 }
 
 FunctionAbiClassification classify_function(
-    const ir::Module& module, const ir::Function& function, NativeAbi abi, const DataLayout& layout) {
+    const ir::Module& module,
+    const ir::Function& function,
+    NativeAbi abi,
+    const DataLayout& data_layout) {
     FunctionAbiClassification result;
     result.variadic = function.variadic;
-    if (function.returns_aggregate()) {
-        if (const auto classified = classify_aggregate(module, function.return_aggregate_kind,
-                                                       function.return_aggregate_name, abi, layout))
-            result.return_value = *classified;
-    } else if (function.return_type != ir::void_type()) {
-        result.return_value = scalar_parameter(function.return_type, layout);
-    }
 
-    const std::size_t max_integer = abi == NativeAbi::system_v_x86_64 ? 6 : 4;
-    const std::size_t max_floating = abi == NativeAbi::system_v_x86_64 ? 8 : 4;
+    std::size_t integer_used = 0;
+    std::size_t floating_used = 0;
     std::size_t windows_slots = 0;
+    const std::size_t integer_limit = abi == NativeAbi::system_v_x86_64 ? 6U : abi == NativeAbi::aapcs64 ? 8U : 4U;
+    const std::size_t floating_limit = abi == NativeAbi::system_v_x86_64 ? 8U : abi == NativeAbi::aapcs64 ? 8U : 4U;
 
     for (const auto& parameter : function.parameters) {
-        AggregateAbiClassification value;
+        AggregateAbiClassification classification;
         if (parameter.is_aggregate()) {
-            if (const auto classified = classify_aggregate(module, parameter.aggregate_kind,
-                                                           parameter.aggregate_name, abi, layout))
-                value = *classified;
-            else {
-                value.classes[0] = AbiValueClass::memory;
-                value.passed_indirectly = true;
-                value.returned_indirectly = true;
+            const auto aggregate = classify_aggregate(module, parameter.aggregate_kind, parameter.aggregate_name, abi, data_layout);
+            if (!aggregate) {
+                classification = indirect_classification(data_layout.pointer_size, data_layout.pointer_alignment, false);
+            } else {
+                classification = *aggregate;
             }
         } else {
-            value = scalar_parameter(parameter.type, layout);
+            classification = scalar_classification(parameter.type, abi, data_layout);
         }
-        result.parameters.push_back(value);
 
         if (abi == NativeAbi::windows_x64) {
-            if (windows_slots < 4) {
-                ++windows_slots;
-                if (!value.passed_indirectly && value.classes[0] == AbiValueClass::sse)
-                    ++result.floating_registers;
-                else
-                    ++result.integer_registers;
+            // Win64 has four ordinal argument slots shared by GP and XMM registers.
+            // Indirect aggregates consume one GP slot containing the temporary address.
+            if (windows_slots < 4U) {
+                const bool floating = !classification.passed_indirectly && classification.register_count == 1U &&
+                    !classification.classes.empty() && classification.classes[0] == AbiValueClass::sse;
+                if (floating) ++floating_used;
+                else ++integer_used;
             } else {
-                result.stack_bytes += stack_slot_size(value);
+                result.stack_bytes += 8U;
             }
-            continue;
-        }
-
-        if (value.passed_indirectly) {
-            if (result.integer_registers < max_integer) ++result.integer_registers;
-            else result.stack_bytes += 8;
-            continue;
-        }
-
-        std::size_t need_integer = 0;
-        std::size_t need_floating = 0;
-        for (std::size_t index = 0; index < value.register_count; ++index) {
-            if (value.classes[index] == AbiValueClass::sse) ++need_floating;
-            else ++need_integer;
-        }
-        if (result.integer_registers + need_integer <= max_integer &&
-            result.floating_registers + need_floating <= max_floating) {
-            result.integer_registers += need_integer;
-            result.floating_registers += need_floating;
+            ++windows_slots;
+        } else if (classification.passed_indirectly) {
+            if (integer_used < integer_limit) ++integer_used;
+            else result.stack_bytes += 8U;
         } else {
-            result.stack_bytes += stack_slot_size(value);
+            std::size_t needed_integer = 0;
+            std::size_t needed_floating = 0;
+            for (std::size_t piece = 0; piece < classification.register_count && piece < classification.classes.size(); ++piece) {
+                if (classification.classes[piece] == AbiValueClass::sse) ++needed_floating;
+                else ++needed_integer;
+            }
+            if (integer_used + needed_integer <= integer_limit && floating_used + needed_floating <= floating_limit) {
+                integer_used += needed_integer;
+                floating_used += needed_floating;
+            } else {
+                result.stack_bytes += stack_slot_size(classification.size);
+            }
         }
+        result.parameters.push_back(std::move(classification));
     }
 
+    result.integer_registers = integer_used;
+    result.floating_registers = floating_used;
     return result;
 }
 

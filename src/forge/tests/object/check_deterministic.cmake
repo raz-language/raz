@@ -1,11 +1,16 @@
 # Copyright 2026 Mario Vinciguerra
 # SPDX-License-Identifier: Apache-2.0
 
-execute_process(COMMAND "${FORGE}" compile "${INPUT}" --format=${FORMAT} -o "${OUTPUT1}" RESULT_VARIABLE r1)
+set(arch_args)
+if(DEFINED ARCH AND NOT ARCH STREQUAL "")
+  list(APPEND arch_args "--arch=${ARCH}")
+endif()
+
+execute_process(COMMAND "${FORGE}" compile "${INPUT}" ${arch_args} --format=${FORMAT} -o "${OUTPUT1}" RESULT_VARIABLE r1)
 if(NOT r1 EQUAL 0)
   message(FATAL_ERROR "first object emission failed")
 endif()
-execute_process(COMMAND "${FORGE}" compile "${INPUT}" --format=${FORMAT} -o "${OUTPUT2}" RESULT_VARIABLE r2)
+execute_process(COMMAND "${FORGE}" compile "${INPUT}" ${arch_args} --format=${FORMAT} -o "${OUTPUT2}" RESULT_VARIABLE r2)
 if(NOT r2 EQUAL 0)
   message(FATAL_ERROR "second object emission failed")
 endif()

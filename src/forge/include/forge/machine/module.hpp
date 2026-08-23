@@ -216,6 +216,10 @@ struct Instruction {
     // Active lane count for masked AVX-512 emission. Zero means unmasked, so a
     // fully populated vector needs no opmask register.
     std::uint8_t vector_mask_lanes{};
+    // AAPCS64 returns large aggregates through x8 instead of consuming x0.
+    // This bit marks a call whose first machine input is that hidden result
+    // pointer, allowing target encoders to keep the shared call IR intact.
+    bool indirect_result{};
 };
 
 struct Block {
@@ -230,6 +234,9 @@ struct Function {
     // this instead of silently discarding frontend target_feature metadata.
     std::string target_feature;
     std::uint32_t argument_count{};
+    // True when machine argument slot zero is a hidden aggregate-result
+    // pointer. On AAPCS64 this slot arrives in x8 rather than x0.
+    bool indirect_result_parameter{};
     std::vector<std::uint8_t> argument_widths;
     std::vector<RegisterClass> argument_classes;
     VirtualRegister register_count{};
@@ -273,6 +280,7 @@ struct Global {
     bool is_constant{};
     bool is_external{};
     bool is_thread_local{};
+    bool is_internal{};
     std::vector<std::uint8_t> initializer;
 };
 

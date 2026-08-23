@@ -11,7 +11,7 @@ builder = (root / 'compiler/src/hir/core/builder.rz').read_text(encoding='utf-8'
 identity = (root / 'compiler/src/hir/query/identity.rz').read_text(encoding='utf-8')
 instantiate = (root / 'compiler/src/hir/generics/instantiate.rz').read_text(encoding='utf-8')
 types = (root / 'compiler/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 combined = instantiate + '\n' + types
 
 legacy = [

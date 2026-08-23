@@ -21,6 +21,7 @@
 #include "forge/object/archive.hpp"
 #include "forge/object/native_link.hpp"
 #include "forge/object/elf.hpp"
+#include "forge/object/macho.hpp"
 #include "forge/pass/pipeline.hpp"
 #include "forge/version.hpp"
 
@@ -52,7 +53,7 @@ void usage() {
               << "  explain <file.fir> [-O0|-O1|-O2|-O3|-Os|-Oz] explain optimization decisions\n"
               << "  doctor                  check the local Forge toolchain\n"
               << "  opt <file.fir> [-O0|-O1|-O2|-O3|-Os|-Oz] optimize and print Forge IR\n"
-              << "  compile <file.fir> [-O0|-O1|-O2|-O3|-Os|-Oz] [--pass-stats] [--format=auto|elf|coff] -o <file> emit x86-64 object\n"
+              << "  compile <file.fir> [-O0|-O1|-O2|-O3|-Os|-Oz] [--pass-stats] [--arch=auto|x86_64|aarch64] [--format=auto|elf|coff|macho] -o <file> emit native object\n"
               << "  archive create -o <library> <objects...> create a deterministic static library\n"
               << "  link-shared [-o <library>] [--linker=<driver>] <objects...> link a native shared library\n"
               << "  new-language <name> [directory] scaffold a Forge frontend project\n"
@@ -342,6 +343,7 @@ int main(int argc, char** argv) {
 
     if (command == "compile" && argc >= 5) {
         std::string_view format = "auto";
+        std::string_view architecture = "auto";
         std::string output_path;
         auto level = forge::pass::OptimizationLevel::o2;
         bool pass_stats = false;
@@ -349,18 +351,40 @@ int main(int argc, char** argv) {
             const std::string_view argument = argv[index];
             if (argument == "-o" && index + 1 < argc) output_path = argv[++index];
             else if (argument.rfind("--format=", 0) == 0) format = argument.substr(9);
+            else if (argument.rfind("--arch=", 0) == 0) architecture = argument.substr(7);
             else if (argument == "--pass-stats") pass_stats = true;
             else if (const auto parsed_level = forge::pass::parse_optimization_level(argument)) level = *parsed_level;
             else { std::cerr << "error: unknown compile option " << argument << '\n'; return 2; }
         }
 
         if (output_path.empty()) { std::cerr << "error: compile requires -o <file>\n"; return 2; }
+        if (architecture == "auto") {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            architecture = "aarch64";
+#else
+            architecture = "x86_64";
+#endif
+        }
+        if (architecture != "x86_64" && architecture != "aarch64") {
+            std::cerr << "error: expected --arch=auto, x86_64, or aarch64\n";
+            return 2;
+        }
         if (format == "auto") {
 #if defined(_WIN32)
-            format = "coff";
+            format = architecture == "aarch64" ? "elf" : "coff";
+#elif defined(__APPLE__)
+            format = architecture == "aarch64" ? "macho" : "elf";
 #else
             format = "elf";
 #endif
+        }
+        if (architecture == "aarch64" && format != "elf" && format != "macho") {
+            std::cerr << "error: Forge AArch64 emits ELF64 or Mach-O arm64; use --format=elf or --format=macho\n";
+            return 2;
+        }
+        if (architecture == "x86_64" && format == "macho") {
+            std::cerr << "error: Forge Mach-O emission is currently implemented for arm64 only\n";
+            return 2;
         }
         auto module = load_verified(argv[2]);
         if (!module) return 1;
@@ -393,11 +417,22 @@ int main(int argc, char** argv) {
             std::cerr << "error: " << error.what() << '\n';
             return 1;
         }
-        auto lowered = forge::machine::lower_module(*module);
+        const auto machine_architecture = architecture == "aarch64"
+            ? forge::machine::TargetArchitecture::aarch64
+            : forge::machine::TargetArchitecture::x86_64;
+        auto lowered = forge::machine::lower_module(*module, {machine_architecture});
         if (!lowered.ok()) { print_diagnostics(lowered.diagnostics); return 1; }
         std::vector<std::byte> bytes;
         std::string_view label;
-        if (format == "elf") {
+        if (architecture == "aarch64" && format == "macho") {
+            auto object = forge::object::emit_macho64_aarch64(*lowered.module);
+            if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
+            bytes = std::move(object.bytes); label = "Mach-O arm64";
+        } else if (architecture == "aarch64") {
+            auto object = forge::object::emit_elf64_aarch64(*lowered.module);
+            if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
+            bytes = std::move(object.bytes); label = "ELF64 AArch64";
+        } else if (format == "elf") {
             auto object = forge::object::emit_elf64_x86_64(*lowered.module, forge::codegen::x86_64::Abi::system_v);
             if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
             bytes = std::move(object.bytes); label = "ELF64";
@@ -405,7 +440,7 @@ int main(int argc, char** argv) {
             auto object = forge::object::emit_coff_x86_64(*lowered.module, forge::codegen::x86_64::Abi::windows);
             if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
             bytes = std::move(object.bytes); label = "COFF AMD64";
-        } else { std::cerr << "error: expected --format=auto, elf, or coff\n"; return 2; }
+        } else { std::cerr << "error: expected --format=auto, elf, coff, or macho\n"; return 2; }
         std::ofstream output(output_path, std::ios::binary);
         if (!output) { std::cerr << "error: cannot create " << output_path << '\n'; return 1; }
         output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));

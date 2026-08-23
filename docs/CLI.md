@@ -1,6 +1,6 @@
 # Raz CLI
 
-`raz` is the compiler and project driver. The default backend is Forge; LLVM can be selected explicitly.
+`raz` is the compiler and project driver. Forge is the default native backend on x86-64 Windows/Linux. LLVM remains selected automatically on AArch64 hosts while the bundled Forge AArch64 ELF path is experimental.
 
 ## General
 
@@ -25,7 +25,7 @@ raz build [options] [input] [output]
 raz build --release
 raz run <input>
 raz check <input>
-raz test <input>
+raz test [--filter=<text>] <input>
 raz lint <input>
 ```
 
@@ -35,7 +35,7 @@ These apply to `build`, `run`, `check`, `test`, and `lint` unless noted.
 
 | Option | Values | Effect |
 |---|---|---|
-| `--backend=<name>` | `forge` · `llvm` | Select the code-generation backend. Forge is the default. |
+| `--backend=<name>` | `forge` · `llvm` | Select the code-generation backend. Host default: Forge on x86-64 Windows/Linux, LLVM on AArch64/macOS. Forge AArch64 is experimental. |
 | `--forge` · `--llvm` | | Shorthand for the corresponding `--backend`. |
 | `--wasm` · `--rxe` | | Select the WebAssembly or RXE target instead of native output. |
 | `--opt=<level>` | `0` `1` `2` `3` `s` `z` | Optimization level; `s` and `z` optimize for size. |
@@ -68,7 +68,7 @@ arguments that begin with `-` are preserved exactly. Direct-source interpreter
 runs (`raz run file.rz`) do not create a child process and therefore reject a
 post-separator argv; use a package/native run when the program needs arguments.
 
-For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug artifacts go to `target/debug/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/<package>`. The Forge object used for native linking is kept under `target/<profile>/native/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
+For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug executables go to `target/debug/bin/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/bin/<package>`. Native objects live under `target/<profile>/obj/`, static/shared libraries under `target/<profile>/lib/`, backend IR under `target/<profile>/ir/`, semantic module metadata under `target/<profile>/modules/`, and distributable package archives under `target/<profile>/packages/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
 
 
 ## C interoperability
@@ -88,6 +88,8 @@ raz forge --forge-native <input> <output.obj>
 
 raz llvm --emit=llvm <input> <output.ll>
 raz llvm --emit=obj --opt=3 <input> <output.obj>
+raz llvm --emit=obj --target=aarch64-unknown-linux-gnu <input> <output.o>
+raz llvm --emit=obj --target=arm64-apple-macos <input> <output.o>
 raz llvm --emit=exe <input> <output>
 ```
 
@@ -107,7 +109,7 @@ raz doc <file.rz> [output.md]
 
 `raz fmt` formats a single `.rz` file or recursively formats every `.rz` file under a directory. With no path it formats the current directory. `--check` reports every file that would change and exits nonzero without rewriting source.
 
-`raz test` discovers zero-argument, non-extern functions whose names begin with `test_`. A return value of zero means success; a nonzero result fails the test command.
+`raz test` discovers zero-argument, non-extern functions whose names begin with `test_`. It prints every selected test with an `ok`/`FAILED` result and a final pass/fail summary. A return value of zero means success; a nonzero result fails the test command. Use `--filter=<text>` to run only tests whose names contain the supplied text; this is the same focused-test contract used by the first-party VS Code Test Explorer.
 
 ## Package commands
 
@@ -349,3 +351,5 @@ The JSON form uses the `raz-diagnostic-catalog-v1` schema and is suitable for ID
 ## Vendoring
 
 `raz vendor` materializes the exact registry and pinned Git dependency graph from `raz.lock` into `vendor/` and writes `.raz-vendor`. While the marker is present, normal builds resolve registry packages from `vendor/registry/<checksum>` and Git materializations from `vendor/git/` without consulting the network or the global package store. `raz vendor --check` verifies the vendored registry tree against lockfile checksums and confirms every tracked Git dependency is present. Re-run `raz vendor` after `raz update`.
+
+`raz pack` writes its default `.dpk` to `target/release/packages/`; pass an explicit path to override it.

@@ -4,6 +4,7 @@
 namespace raz_compiler_driver_registry;
 
 public import raz_compiler_driver_registry_transport;
+import raz_compiler_driver_package;
 
 // Registry index resolution, semantic-version selection, integrity validation,
 // and deterministic resolution-cache support for the compilered package manager.
@@ -12,6 +13,113 @@ public import raz_compiler_driver_registry_transport;
 // without changing resolution or lockfile semantics.
 extern fn raz_rt_task_spawn_callable_i64(FnOnce() -> i64 operation) -> i8*mut;
 extern fn raz_rt_task_join_i64(i8*mut task) -> i64;
+
+// Resolve a registry dependency alias through the derived resolution cache.
+// target/raz.cache rows are: alias name version store-path checksum. The manifest
+// remains authoritative for the requested constraint; the cache only supplies
+// the checksum needed to reconstruct the verified content-addressed store path.
+public fn registry_cached_root(i64 alias, i64 alias_length, i64 output, i64 capacity) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(20);
+    i64 data = raz_compiler_rt_arena_create(1048576);
+
+    if (path == 0 || data == 0 || output == 0 || alias_length <= 0) {
+        return -1;
+    }
+
+    i64 path_length = registry_project_state_prepare(0, path, 20);
+
+    if (path_length <= 0) {
+        raz_compiler_rt_arena_destroy(path);
+        raz_compiler_rt_arena_destroy(data);
+        return -1;
+    }
+
+    i64 i = 0;
+    i64 length = raz_compiler_rt_read_ascii(path, path_length, data, 1048576);
+
+    raz_compiler_rt_arena_destroy(path);
+    if (length <= 0) {
+        raz_compiler_rt_arena_destroy(data);
+        return -1;
+    }
+
+    i64 pos = 0;
+
+    while (pos < length) {
+        i64 start = pos;
+
+        while (pos < length && raz_compiler_rt_arena_get(data, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos < length) {
+            pos += 1;
+        }
+
+        i64 cursor = start;
+        i64 ordinal = 0;
+        i64 alias_start = 0;
+        i64 alias_len = 0;
+        i64 checksum_start = 0;
+        i64 checksum_len = 0;
+
+        while (cursor < end) {
+            while (cursor < end && ascii_is_space(raz_compiler_rt_arena_get(data, cursor))) {
+                cursor += 1;
+            }
+            if (cursor >= end) {
+                break;
+            }
+
+            i64 token_start = cursor;
+
+            while (cursor < end && !ascii_is_space(raz_compiler_rt_arena_get(data, cursor))) {
+                cursor += 1;
+            }
+            if (ordinal == 0) {
+                alias_start = token_start;
+                alias_len = cursor - token_start;
+            } else if (ordinal == 4) {
+                checksum_start = token_start;
+                checksum_len = cursor - token_start;
+            }
+            ordinal += 1;
+        }
+
+        bool same = alias_len == alias_length;
+
+        i = 0;
+        while (same && i < alias_length) {
+            if (raz_compiler_rt_arena_get(data, alias_start + i) != raz_compiler_rt_arena_get(alias, i)) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (same && checksum_len> 0) {
+            i64 checksum = raz_compiler_rt_arena_create(checksum_len);
+
+            if (checksum == 0) {
+                raz_compiler_rt_arena_destroy(data);
+                return -1;
+            }
+            i = 0;
+            while (i < checksum_len) {
+                raz_compiler_rt_arena_set(checksum, i, raz_compiler_rt_arena_get(data, checksum_start + i));
+                i += 1;
+            }
+
+            i64 store_length = registry_store_path(checksum, checksum_len, output, capacity);
+
+            raz_compiler_rt_arena_destroy(checksum);
+            raz_compiler_rt_arena_destroy(data);
+            return store_length;
+        }
+    }
+    raz_compiler_rt_arena_destroy(data);
+    return -1;
+}
 
 // All project-local generated package-manager state lives beneath target/.
 // This keeps the project root limited to durable metadata (raz.toml / raz.lock)
@@ -26,11 +134,11 @@ public fn registry_project_state_path(i64 kind, i64 output, i64 capacity) -> i64
             return -1;
         }
 
-        i64 bytes[16] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+        string bytes = "target/raz.cache";
         i64 i = 0;
 
         while (i < 16) {
-            raz_compiler_rt_arena_set(output, i, bytes[i]);
+            raz_compiler_rt_arena_set(output, i, compiler_literal_byte(bytes, i));
             i += 1;
         }
         return 16;
@@ -40,11 +148,11 @@ public fn registry_project_state_path(i64 kind, i64 output, i64 capacity) -> i64
             return -1;
         }
 
-        i64 bytes[19] = [116, 97, 114, 103, 101, 116, 47, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+        string bytes = "target/raz.registry";
         i64 i = 0;
 
         while (i < 19) {
-            raz_compiler_rt_arena_set(output, i, bytes[i]);
+            raz_compiler_rt_arena_set(output, i, compiler_literal_byte(bytes, i));
             i += 1;
         }
         return 19;
@@ -73,11 +181,11 @@ public fn registry_project_state_prepare(i64 kind, i64 output, i64 capacity) -> 
         return -1;
     }
 
-    i64 target_bytes[6] = [116, 97, 114, 103, 101, 116];
+    string target_bytes = "target";
     i64 i = 0;
 
     while (i < 6) {
-        raz_compiler_rt_arena_set(target_dir, i, target_bytes[i]);
+        raz_compiler_rt_arena_set(target_dir, i, compiler_literal_byte(target_bytes, i));
         i += 1;
     }
     if (raz_compiler_rt_create_dir_ascii(target_dir, 6) != 0) {
@@ -91,38 +199,38 @@ public fn registry_project_state_prepare(i64 kind, i64 output, i64 capacity) -> 
     i64 root_length = 0;
 
     if (kind == 0) {
-        i64 r16_bytes[16] = [46, 47, 46, 114, 97, 122, 47, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+        string r16_bytes = "./.raz/raz.cache";
 
         i = 0;
         while (i < 16) {
-            raz_compiler_rt_arena_set(r16, i, r16_bytes[i]);
+            raz_compiler_rt_arena_set(r16, i, compiler_literal_byte(r16_bytes, i));
             i += 1;
         }
         r16_length = 16;
 
-        i64 root_bytes[12] = [46, 47, 46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
+        string root_bytes = "./.raz.cache";
 
         i = 0;
         while (i < 12) {
-            raz_compiler_rt_arena_set(root_legacy, i, root_bytes[i]);
+            raz_compiler_rt_arena_set(root_legacy, i, compiler_literal_byte(root_bytes, i));
             i += 1;
         }
         root_length = 12;
     } else if (kind == 1) {
-        i64 r16_bytes[19] = [46, 47, 46, 114, 97, 122, 47, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+        string r16_bytes = "./.raz/raz.registry";
 
         i = 0;
         while (i < 19) {
-            raz_compiler_rt_arena_set(r16, i, r16_bytes[i]);
+            raz_compiler_rt_arena_set(r16, i, compiler_literal_byte(r16_bytes, i));
             i += 1;
         }
         r16_length = 19;
 
-        i64 root_bytes[15] = [46, 47, 46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
+        string root_bytes = "./.raz.registry";
 
         i = 0;
         while (i < 15) {
-            raz_compiler_rt_arena_set(root_legacy, i, root_bytes[i]);
+            raz_compiler_rt_arena_set(root_legacy, i, compiler_literal_byte(root_bytes, i));
             i += 1;
         }
         root_length = 15;
@@ -155,129 +263,107 @@ fn registry_report_status(i64 status) -> i64 {
         return 0;
     }
     if (status == 40) {
-        i64 text[55] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110, 32, 114, 97, 110, 32, 111, 117, 116, 32, 111, 102, 32, 105, 110, 116, 101, 114, 110, 97, 108, 32, 114, 101, 115, 111, 117, 114, 99, 101, 115, 10];
 
-        cli_write_stream(2, &text, 55);
+        cli_write_literal_stream(2, "error: package operation ran out of internal resources\n");
         return status;
     }
     if (status == 55) {
-        i64 text[114] = [101, 114, 114, 111, 114, 58, 32, 105, 110, 118, 97, 108, 105, 100, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 111, 109, 109, 97, 110, 100, 32, 97, 114, 103, 117, 109, 101, 110, 116, 115, 32, 111, 114, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 115, 112, 101, 99, 105, 102, 105, 99, 97, 116, 105, 111, 110, 10, 32, 32, 104, 101, 108, 112, 58, 32, 114, 117, 110, 32, 39, 114, 97, 122, 32, 60, 99, 111, 109, 109, 97, 110, 100, 62, 32, 45, 45, 104, 101, 108, 112, 39, 32, 102, 111, 114, 32, 117, 115, 97, 103, 101, 10];
 
-        cli_write_stream(2, &text, 114);
+        cli_write_literal_stream(2, "error: invalid package command arguments or dependency specification\n  help: run 'raz <command> --help' for usage\n");
         return status;
     }
     if (status == 56) {
-        i64 text[52] = [101, 114, 114, 111, 114, 58, 32, 99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 119, 114, 105, 116, 101, 32, 112, 97, 99, 107, 97, 103, 101, 32, 109, 101, 116, 97, 100, 97, 116, 97, 32, 111, 114, 32, 108, 111, 99, 107, 102, 105, 108, 101, 10];
 
-        cli_write_stream(2, &text, 52);
+        cli_write_literal_stream(2, "error: could not write package metadata or lockfile\n");
         return status;
     }
     if (status == 57) {
-        i64 text[46] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 109, 97, 110, 105, 102, 101, 115, 116, 32, 105, 115, 32, 109, 105, 115, 115, 105, 110, 103, 32, 111, 114, 32, 105, 110, 118, 97, 108, 105, 100, 10];
 
-        cli_write_stream(2, &text, 46);
+        cli_write_literal_stream(2, "error: package manifest is missing or invalid\n");
         return status;
     }
     if (status == 58) {
-        i64 text[65] = [101, 114, 114, 111, 114, 58, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 103, 114, 97, 112, 104, 32, 105, 115, 32, 99, 121, 99, 108, 105, 99, 32, 111, 114, 32, 101, 120, 99, 101, 101, 100, 115, 32, 116, 104, 101, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 32, 100, 101, 112, 116, 104, 10];
 
-        cli_write_stream(2, &text, 65);
+        cli_write_literal_stream(2, "error: dependency graph is cyclic or exceeds the supported depth\n");
         return status;
     }
     if (status == 59) {
-        i64 text[117] = [101, 114, 114, 111, 114, 58, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 97, 108, 105, 97, 115, 32, 119, 97, 115, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100, 32, 105, 110, 32, 116, 104, 105, 115, 32, 112, 97, 99, 107, 97, 103, 101, 10, 32, 32, 104, 101, 108, 112, 58, 32, 114, 117, 110, 32, 39, 114, 97, 122, 32, 116, 114, 101, 101, 39, 32, 116, 111, 32, 105, 110, 115, 112, 101, 99, 116, 32, 116, 104, 101, 32, 99, 117, 114, 114, 101, 110, 116, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 103, 114, 97, 112, 104, 10];
 
-        cli_write_stream(2, &text, 117);
+        cli_write_literal_stream(2, "error: dependency alias was not found in this package\n  help: run 'raz tree' to inspect the current dependency graph\n");
         return status;
     }
     if (status == 60) {
-        i64 text[111] = [101, 114, 114, 111, 114, 58, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 105, 110, 100, 101, 120, 32, 105, 115, 32, 117, 110, 97, 118, 97, 105, 108, 97, 98, 108, 101, 10, 32, 32, 104, 101, 108, 112, 58, 32, 99, 104, 101, 99, 107, 32, 116, 104, 101, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 99, 111, 110, 102, 105, 103, 117, 114, 97, 116, 105, 111, 110, 32, 111, 114, 32, 117, 115, 101, 32, 97, 32, 112, 111, 112, 117, 108, 97, 116, 101, 100, 32, 111, 102, 102, 108, 105, 110, 101, 32, 99, 97, 99, 104, 101, 10];
 
-        cli_write_stream(2, &text, 111);
+        cli_write_literal_stream(2, "error: registry index is unavailable\n  help: check the registry configuration or use a populated offline cache\n");
         return status;
     }
     if (status == 61) {
-        i64 text[61] = [101, 114, 114, 111, 114, 58, 32, 110, 111, 32, 112, 97, 99, 107, 97, 103, 101, 32, 118, 101, 114, 115, 105, 111, 110, 32, 115, 97, 116, 105, 115, 102, 105, 101, 115, 32, 116, 104, 101, 32, 114, 101, 113, 117, 101, 115, 116, 101, 100, 32, 99, 111, 110, 115, 116, 114, 97, 105, 110, 116, 10];
 
-        cli_write_stream(2, &text, 61);
+        cli_write_literal_stream(2, "error: no package version satisfies the requested constraint\n");
         return status;
     }
     if (status == 62) {
-        i64 text[64] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 104, 101, 99, 107, 115, 117, 109, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 109, 97, 116, 99, 104, 32, 116, 104, 101, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 111, 114, 32, 108, 111, 99, 107, 102, 105, 108, 101, 10];
 
-        cli_write_stream(2, &text, 64);
+        cli_write_literal_stream(2, "error: package checksum does not match the registry or lockfile\n");
         return status;
     }
     if (status == 63) {
-        i64 text[123] = [101, 114, 114, 111, 114, 58, 32, 99, 97, 99, 104, 101, 100, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 111, 110, 116, 101, 110, 116, 32, 102, 97, 105, 108, 101, 100, 32, 105, 110, 116, 101, 103, 114, 105, 116, 121, 32, 118, 101, 114, 105, 102, 105, 99, 97, 116, 105, 111, 110, 10, 32, 32, 104, 101, 108, 112, 58, 32, 114, 101, 109, 111, 118, 101, 32, 116, 104, 101, 32, 99, 111, 114, 114, 117, 112, 116, 32, 115, 116, 111, 114, 101, 32, 101, 110, 116, 114, 121, 32, 97, 110, 100, 32, 114, 117, 110, 32, 114, 97, 122, 32, 102, 101, 116, 99, 104, 32, 97, 103, 97, 105, 110, 10];
 
-        cli_write_stream(2, &text, 123);
+        cli_write_literal_stream(2, "error: cached package content failed integrity verification\n  help: remove the corrupt store entry and run raz fetch again\n");
         return status;
     }
     if (status == 64) {
-        i64 text[63] = [101, 114, 114, 111, 114, 58, 32, 114, 101, 113, 117, 105, 114, 101, 100, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 111, 110, 116, 101, 110, 116, 32, 105, 115, 32, 117, 110, 97, 118, 97, 105, 108, 97, 98, 108, 101, 32, 105, 110, 32, 111, 102, 102, 108, 105, 110, 101, 32, 109, 111, 100, 101, 10];
 
-        cli_write_stream(2, &text, 63);
+        cli_write_literal_stream(2, "error: required package content is unavailable in offline mode\n");
         return status;
     }
     if (status == 65) {
-        i64 text[49] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 97, 114, 99, 104, 105, 118, 101, 32, 111, 114, 32, 115, 116, 111, 114, 101, 32, 111, 112, 101, 114, 97, 116, 105, 111, 110, 32, 102, 97, 105, 108, 101, 100, 10];
 
-        cli_write_stream(2, &text, 49);
+        cli_write_literal_stream(2, "error: package archive or store operation failed\n");
         return status;
     }
     if (status == 66) {
-        i64 text[55] = [101, 114, 114, 111, 114, 58, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 116, 114, 97, 110, 115, 112, 111, 114, 116, 32, 114, 101, 116, 117, 114, 110, 101, 100, 32, 97, 110, 32, 105, 110, 118, 97, 108, 105, 100, 32, 114, 101, 115, 112, 111, 110, 115, 101, 10];
 
-        cli_write_stream(2, &text, 55);
+        cli_write_literal_stream(2, "error: registry transport returned an invalid response\n");
         return status;
     }
     if (status == 67) {
-        i64 text[47] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 116, 114, 97, 110, 115, 112, 111, 114, 116, 32, 111, 114, 32, 112, 117, 98, 108, 105, 99, 97, 116, 105, 111, 110, 32, 102, 97, 105, 108, 101, 100, 10];
 
-        cli_write_stream(2, &text, 47);
+        cli_write_literal_stream(2, "error: package transport or publication failed\n");
         return status;
     }
     if (status == 68) {
-        i64 text[72] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 115, 111, 117, 114, 99, 101, 32, 111, 114, 32, 115, 105, 103, 110, 97, 116, 117, 114, 101, 32, 99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 98, 101, 32, 116, 114, 117, 115, 116, 101, 100, 32, 111, 114, 32, 109, 97, 116, 101, 114, 105, 97, 108, 105, 122, 101, 100, 10];
 
-        cli_write_stream(2, &text, 72);
+        cli_write_literal_stream(2, "error: package source or signature could not be trusted or materialized\n");
         return status;
     }
     if (status == 69) {
-        i64 text[30] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 115, 105, 103, 110, 105, 110, 103, 32, 102, 97, 105, 108, 101, 100, 10];
 
-        cli_write_stream(2, &text, 30);
+        cli_write_literal_stream(2, "error: package signing failed\n");
         return status;
     }
     if (status == 72) {
-        i64 text[152] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 105, 115, 32, 110, 111, 116, 32, 112, 117, 98, 108, 105, 115, 104, 97, 98, 108, 101, 58, 32, 109, 101, 116, 97, 100, 97, 116, 97, 32, 111, 114, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 112, 97, 116, 104, 115, 32, 97, 114, 101, 32, 110, 111, 110, 45, 112, 111, 114, 116, 97, 98, 108, 101, 10, 32, 32, 104, 101, 108, 112, 58, 32, 117, 115, 101, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 32, 111, 114, 32, 112, 97, 116, 104, 115, 32, 118, 101, 110, 100, 111, 114, 101, 100, 32, 105, 110, 115, 105, 100, 101, 32, 116, 104, 101, 32, 112, 97, 99, 107, 97, 103, 101, 10];
 
-        cli_write_stream(2, &text, 152);
+        cli_write_literal_stream(2, "error: package is not publishable: metadata or dependency paths are non-portable\n  help: use registry dependencies or paths vendored inside the package\n");
         return status;
     }
     if (status == 73) {
-        i64 text[132] = [101, 114, 114, 111, 114, 58, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 103, 114, 97, 112, 104, 32, 99, 111, 110, 116, 97, 105, 110, 115, 32, 99, 111, 110, 102, 108, 105, 99, 116, 105, 110, 103, 32, 112, 97, 99, 107, 97, 103, 101, 32, 105, 100, 101, 110, 116, 105, 116, 105, 101, 115, 10, 32, 32, 104, 101, 108, 112, 58, 32, 97, 108, 105, 103, 110, 32, 118, 101, 114, 115, 105, 111, 110, 115, 32, 115, 111, 32, 101, 97, 99, 104, 32, 112, 97, 99, 107, 97, 103, 101, 32, 110, 97, 109, 101, 32, 114, 101, 115, 111, 108, 118, 101, 115, 32, 116, 111, 32, 111, 110, 101, 32, 112, 97, 99, 107, 97, 103, 101, 10];
 
-        cli_write_stream(2, &text, 132);
+        cli_write_literal_stream(2, "error: dependency graph contains conflicting package identities\n  help: align versions so each package name resolves to one package\n");
         return status;
     }
     if (status == 74) {
-        i64 text[121] = [101, 114, 114, 111, 114, 58, 32, 114, 97, 122, 46, 108, 111, 99, 107, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 115, 97, 116, 105, 115, 102, 121, 32, 114, 97, 122, 46, 116, 111, 109, 108, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 99, 111, 110, 115, 116, 114, 97, 105, 110, 116, 115, 10, 32, 32, 104, 101, 108, 112, 58, 32, 114, 117, 110, 32, 39, 114, 97, 122, 32, 117, 112, 100, 97, 116, 101, 39, 32, 116, 111, 32, 114, 101, 115, 111, 108, 118, 101, 32, 116, 104, 101, 32, 110, 101, 119, 32, 99, 111, 110, 115, 116, 114, 97, 105, 110, 116, 115, 10];
 
-        cli_write_stream(2, &text, 121);
+        cli_write_literal_stream(2, "error: raz.lock does not satisfy raz.toml dependency constraints\n  help: run 'raz update' to resolve the new constraints\n");
         return status;
     }
     if (status == 78) {
-        i64 text[134] = [101, 114, 114, 111, 114, 58, 32, 118, 101, 110, 100, 111, 114, 101, 100, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121, 32, 116, 114, 101, 101, 32, 105, 115, 32, 109, 105, 115, 115, 105, 110, 103, 32, 111, 114, 32, 102, 97, 105, 108, 101, 100, 32, 105, 110, 116, 101, 103, 114, 105, 116, 121, 32, 118, 101, 114, 105, 102, 105, 99, 97, 116, 105, 111, 110, 10, 32, 32, 104, 101, 108, 112, 58, 32, 114, 117, 110, 32, 39, 114, 97, 122, 32, 118, 101, 110, 100, 111, 114, 39, 32, 116, 111, 32, 114, 101, 102, 114, 101, 115, 104, 32, 118, 101, 110, 100, 111, 114, 47, 32, 102, 114, 111, 109, 32, 114, 97, 122, 46, 108, 111, 99, 107, 10];
 
-        cli_write_stream(2, &text, 134);
+        cli_write_literal_stream(2, "error: vendored dependency tree is missing or failed integrity verification\n  help: run 'raz vendor' to refresh vendor/ from raz.lock\n");
         return status;
     }
 
-    i64 text[30] = [101, 114, 114, 111, 114, 58, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 111, 109, 109, 97, 110, 100, 32, 102, 97, 105, 108, 101, 100, 10];
-
-    cli_write_stream(2, &text, 30);
+    cli_write_literal_stream(2, "error: package command failed\n");
     return status;
 }
 
@@ -758,12 +844,12 @@ fn registry_resolve_mode(
         i += 1;
     }
 
-    i64 http[7] = [104, 116, 116, 112, 58, 47, 47];
-    i64 https[8] = [104, 116, 116, 112, 115, 58, 47, 47];
+    string http = "http://";
+    string https = "https://";
 
     bool remote =
-        registry_starts(source, source_length, &http, 7) ||
-        registry_starts(source, source_length, &https, 8);
+        registry_starts_literal(source, source_length, http) ||
+        registry_starts_literal(source, source_length, https);
     if (!remote && base_length> 0) {
         i64 joined = raz_compiler_rt_arena_create(16384);
 
@@ -863,9 +949,7 @@ fn registry_print_resolution(i64 name, i64 nl, i64 constraint, i64 cl) -> i64 {
     if (s == 0) {
         cli_write_arena(name, nl);
 
-        i64 at[1] = [64];
-
-        cli_write(&at, 1);
+        cli_write_literal("@");
 
         i64 vl = 0;
 
@@ -874,9 +958,7 @@ fn registry_print_resolution(i64 name, i64 nl, i64 constraint, i64 cl) -> i64 {
         }
         cli_write_arena(v, vl);
 
-        i64 sep[4] = [32, 45, 62, 32];
-
-        cli_write(&sep, 4);
+        cli_write_literal(" -> ");
 
         i64 pl = 0;
 
@@ -885,9 +967,7 @@ fn registry_print_resolution(i64 name, i64 nl, i64 constraint, i64 cl) -> i64 {
         }
         cli_write_arena(p, pl);
 
-        i64 e[1] = [10];
-
-        cli_write(&e, 1);
+        cli_write_literal("\n");
     }
     raz_compiler_rt_arena_destroy(v);
     raz_compiler_rt_arena_destroy(p);
@@ -1056,14 +1136,10 @@ fn registry_name_seen_before(i64 data, i64 before, i64 name_start, i64 name_leng
 fn registry_print_name_version(i64 name, i64 name_start, i64 name_length, i64 version, i64 version_length) {
     cli_write_arena(name, name_length);
 
-    i64 at[1] = [64];
-
-    cli_write(&at, 1);
+    cli_write_literal("@");
     cli_write_arena(version, version_length);
 
-    i64 newline[1] = [10];
-
-    cli_write(&newline, 1);
+    cli_write_literal("\n");
 }
 
 fn registry_search_index_fallback(i64 argc) -> i64 {
@@ -1087,11 +1163,11 @@ fn registry_search_index_fallback(i64 argc) -> i64 {
         return 55;
     }
 
-    i64 any_bytes[7] = [62, 61, 48, 46, 48, 46, 48];
+    string any_bytes = ">=0.0.0";
     i64 i = 0;
 
     while (i < 7) {
-        raz_compiler_rt_arena_set(any, i, any_bytes[i]);
+        raz_compiler_rt_arena_set(any, i, compiler_literal_byte(any_bytes, i));
         i += 1;
     }
 
@@ -1154,9 +1230,9 @@ fn registry_search_index_fallback(i64 argc) -> i64 {
         }
     }
     if (matches == 0) {
-        i64 none[20] = [78, 111, 32, 112, 97, 99, 107, 97, 103, 101, 115, 32, 102, 111, 117, 110, 100, 46, 10, 0];
+        string none = "No packages found.\n";
 
-        cli_write(&none, 19);
+        cli_write_literal(none);
     }
     raz_compiler_rt_arena_destroy(query);
     raz_compiler_rt_arena_destroy(data);
@@ -1219,22 +1295,25 @@ fn registry_write_slice(i64 data, i64 start, i64 length) {
     raz_compiler_rt_arena_destroy(temp);
 }
 
+fn registry_cache_print_path_literal(string label, i64 path, i64 path_length) {
+    cli_write_literal(label);
+    cli_write_arena(path, path_length);
+    if (raz_compiler_rt_path_exists_ascii(path, path_length) != 0) { cli_write_literal(" [present]"); }
+    else { cli_write_literal(" [missing]"); }
+    cli_write_literal("\n");
+}
+
 fn registry_cache_print_path(i64[]label, i64 label_length, i64 path, i64 path_length) {
     cli_write(label, label_length);
     cli_write_arena(path, path_length);
 
-    i64 present[10] = [32, 91, 112, 114, 101, 115, 101, 110, 116, 93];
-    i64 missing[10] = [32, 91, 109, 105, 115, 115, 105, 110, 103, 93];
-
     if (raz_compiler_rt_path_exists_ascii(path, path_length) != 0) {
-        cli_write(&present, 10);
+        cli_write_literal(" [present]");
     } else {
-        cli_write(&missing, 10);
+        cli_write_literal(" [missing]");
     }
 
-    i64 nl[1] = [10];
-
-    cli_write(&nl, 1);
+    cli_write_literal("\n");
 }
 
 fn registry_cache_command(i64 argc) -> i64 {
@@ -1252,12 +1331,12 @@ fn registry_cache_command(i64 argc) -> i64 {
         }
 
         i64 length = raz_compiler_rt_process_arg(2, action, 32);
-        i64 clean_word[5] = [99, 108, 101, 97, 110];
-        i64 status_word[6] = [115, 116, 97, 116, 117, 115];
+        string clean_word = "clean";
+        string status_word = "status";
 
-        if (cli_arg_equals(action, length, &clean_word, 5)) {
+        if (cli_arg_equals_literal(action, length, clean_word)) {
             clean = true;
-        } else if (!cli_arg_equals(action, length, &status_word, 6)) {
+        } else if (!cli_arg_equals_literal(action, length, status_word)) {
             raz_compiler_rt_arena_destroy(action);
             return 55;
         }
@@ -1281,15 +1360,13 @@ fn registry_cache_command(i64 argc) -> i64 {
         raz_compiler_rt_remove_path_ascii(index, il);
         raz_compiler_rt_remove_path_ascii(store, sl);
 
-        i64 done[39] = [67, 108, 101, 97, 110, 101, 100, 32, 82, 97, 122, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 97, 110, 100, 32, 112, 97, 99, 107, 97, 103, 101, 32, 99, 97, 99, 104, 101, 10];
-
-        cli_write(&done, 39);
+        cli_write_literal("Cleaned Raz registry and package cache\n");
     } else {
-        i64 index_label[16] = [114, 101, 103, 105, 115, 116, 114, 121, 32, 105, 110, 100, 101, 120, 58, 32];
-        i64 store_label[15] = [112, 97, 99, 107, 97, 103, 101, 32, 115, 116, 111, 114, 101, 58, 32];
+        string index_label = "registry index: ";
+        string store_label = "package store: ";
 
-        registry_cache_print_path(&index_label, 16, index, il);
-        registry_cache_print_path(&store_label, 15, store, sl);
+        registry_cache_print_path_literal(index_label, index, il);
+        registry_cache_print_path_literal(store_label, store, sl);
     }
     raz_compiler_rt_arena_destroy(index);
     raz_compiler_rt_arena_destroy(store);
@@ -1340,11 +1417,11 @@ fn registry_search_command(i64 argc) -> i64 {
         return 40;
     }
 
-    i64 sb[10] = [115, 101, 97, 114, 99, 104, 46, 116, 120, 116];
+    string sb = "search.txt";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(suffix, i, sb[i]);
+        raz_compiler_rt_arena_set(suffix, i, compiler_literal_byte(sb, i));
         i += 1;
     }
 
@@ -1406,45 +1483,32 @@ fn registry_search_command(i64 argc) -> i64 {
         ) {
             registry_write_slice(data, ns, nl);
 
-            i64 at[1] = [64];
-
-            cli_write(&at, 1);
+            cli_write_literal("@");
             registry_write_slice(data, vs, vl);
             if (dl> 0) {
-                i64 sep[3] = [32, 32, 45];
 
-                cli_write(&sep, 3);
+                cli_write_literal("  -");
 
-                i64 space[1] = [32];
-
-                cli_write(&space, 1);
+                cli_write_literal(" ");
                 registry_write_slice(data, ds, dl);
             }
             if (ol> 0) {
-                i64 owner_open[10] = [32, 32, 91, 111, 119, 110, 101, 114, 115, 58];
 
-                cli_write(&owner_open, 10);
+                cli_write_literal("  [owners:");
 
-                i64 space[1] = [32];
-
-                cli_write(&space, 1);
+                cli_write_literal(" ");
                 registry_write_slice(data, os, ol);
 
-                i64 close[1] = [93];
-
-                cli_write(&close, 1);
+                cli_write_literal("]");
             }
 
-            i64 newline[1] = [10];
-
-            cli_write(&newline, 1);
+            cli_write_literal("\n");
             matches += 1;
         }
     }
     if (matches == 0) {
-        i64 none[19] = [78, 111, 32, 112, 97, 99, 107, 97, 103, 101, 115, 32, 102, 111, 117, 110, 100, 46, 10];
 
-        cli_write(&none, 19);
+        cli_write_literal("No packages found.\n");
     }
     raz_compiler_rt_arena_destroy(query);
     raz_compiler_rt_arena_destroy(resolver);
@@ -1475,11 +1539,11 @@ fn registry_info_command(i64 argc) -> i64 {
         return 55;
     }
 
-    i64 any_bytes[7] = [62, 61, 48, 46, 48, 46, 48];
+    string any_bytes = ">=0.0.0";
     i64 i = 0;
 
     while (i < 7) {
-        raz_compiler_rt_arena_set(any, i, any_bytes[i]);
+        raz_compiler_rt_arena_set(any, i, compiler_literal_byte(any_bytes, i));
         i += 1;
     }
 
@@ -1496,19 +1560,13 @@ fn registry_info_command(i64 argc) -> i64 {
         return 61;
     }
 
-    i64 name_label[6] = [110, 97, 109, 101, 58, 32];
-
-    cli_write(&name_label, 6);
+    cli_write_literal("name: ");
     cli_write_arena(name, nl);
 
-    i64 latest_label[9] = [10, 108, 97, 116, 101, 115, 116, 58, 32];
-
-    cli_write(&latest_label, 9);
+    cli_write_literal("\nlatest: ");
     cli_write_arena(latest, ll);
 
-    i64 versions_label[11] = [10, 118, 101, 114, 115, 105, 111, 110, 115, 58, 10];
-
-    cli_write(&versions_label, 11);
+    cli_write_literal("\nversions:\n");
 
     i64 cursor = 0;
 
@@ -1542,9 +1600,8 @@ fn registry_info_command(i64 argc) -> i64 {
             registry_token(data, start, end, 1, &mut vs, &mut vl) &&
             registry_bytes_equal(data, ns, row_nl, name, 0, nl)
         ) {
-            i64 indent[2] = [32, 32];
 
-            cli_write(&indent, 2);
+            cli_write_literal("  ");
             // cli_write_arena reads from offset zero, so copy this token first.
 
             i64 token = raz_compiler_rt_arena_create(vl);
@@ -1559,9 +1616,7 @@ fn registry_info_command(i64 argc) -> i64 {
             }
             cli_write_arena(token, vl);
 
-            i64 newline[1] = [10];
-
-            cli_write(&newline, 1);
+            cli_write_literal("\n");
             raz_compiler_rt_arena_destroy(token);
         }
     }
@@ -1581,11 +1636,11 @@ fn registry_root_dependency_path(i64 alias, i64 alias_length, i64 output, i64 ca
         return -1;
     }
 
-    i64 p[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+    string p = "./raz.toml";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(path, i, p[i]);
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(p, i));
         i += 1;
     }
 
@@ -1664,7 +1719,7 @@ fn registry_dependency_version(i64 alias, i64 alias_length, i64 output, i64 capa
     // names in the shared content-addressed store. Path dependencies retain the
     // original manifest-path fallback below.
 
-    i64 rl = package_lock_registry_cached_root(alias, alias_length, root, 8192);
+    i64 rl = registry_cached_root(alias, alias_length, root, 8192);
 
     if (rl <= 0) {
         i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);
@@ -1708,8 +1763,8 @@ fn registry_dependency_version(i64 alias, i64 alias_length, i64 output, i64 capa
         return -1;
     }
 
-    i64 vk[7] = [118, 101, 114, 115, 105, 111, 110];
-    i64 result = package_manifest_field(manifest, length, &vk, 7, output, capacity);
+    string vk = "version";
+    i64 result = package_manifest_field_literal(manifest, length, vk, output, capacity);
 
     raz_compiler_rt_arena_destroy(dependency);
     raz_compiler_rt_arena_destroy(root);
@@ -1745,9 +1800,8 @@ fn registry_outdated_command() -> i64 {
     i64 i = 0;
 
     if (tracking_length <= 0) {
-        i64 none[26] = [78, 111, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 46, 10];
 
-        cli_write(&none, 26);
+        cli_write_literal("No registry dependencies.\n");
         return 0;
     }
 
@@ -1825,11 +1879,11 @@ fn registry_outdated_command() -> i64 {
             return 55;
         }
 
-        i64 any_bytes[7] = [62, 61, 48, 46, 48, 46, 48];
+        string any_bytes = ">=0.0.0";
 
         i = 0;
         while (i < 7) {
-            raz_compiler_rt_arena_set(any, i, any_bytes[i]);
+            raz_compiler_rt_arena_set(any, i, compiler_literal_byte(any_bytes, i));
             i += 1;
         }
 
@@ -1839,14 +1893,10 @@ fn registry_outdated_command() -> i64 {
         if (cvl> 0 && lvl> 0 && registry_version_greater(latest, 0, lvl, current, 0, cvl)) {
             cli_write_arena(alias, al);
 
-            i64 sep1[2] = [32, 32];
-
-            cli_write(&sep1, 2);
+            cli_write_literal("  ");
             cli_write_arena(current, cvl);
 
-            i64 arrow[4] = [32, 45, 62, 32];
-
-            cli_write(&arrow, 4);
+            cli_write_literal(" -> ");
             cli_write_arena(latest, lvl);
 
             i64 compatible = raz_compiler_rt_arena_create(256);
@@ -1865,19 +1915,14 @@ fn registry_outdated_command() -> i64 {
                 256,
             );
             if (col> 0 && registry_version_greater(compatible, 0, col, current, 0, cvl)) {
-                i64 open[13] = [32, 40, 99, 111, 109, 112, 97, 116, 105, 98, 108, 101, 32];
 
-                cli_write(&open, 13);
+                cli_write_literal(" (compatible ");
                 cli_write_arena(compatible, col);
 
-                i64 close[1] = [41];
-
-                cli_write(&close, 1);
+                cli_write_literal(")");
             }
 
-            i64 newline[1] = [10];
-
-            cli_write(&newline, 1);
+            cli_write_literal("\n");
             raz_compiler_rt_arena_destroy(compatible);
             outdated += 1;
         }
@@ -1890,9 +1935,9 @@ fn registry_outdated_command() -> i64 {
         raz_compiler_rt_arena_destroy(any);
     }
     if (outdated == 0) {
-        i64 ok[43] = [65, 108, 108, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 32, 97, 114, 101, 32, 117, 112, 32, 116, 111, 32, 100, 97, 116, 101, 46, 10, 0];
+        string ok = "All registry dependencies are up to date.\n";
 
-        cli_write(&ok, 42);
+        cli_write_literal(ok);
     }
     raz_compiler_rt_arena_destroy(tracking_path);
     raz_compiler_rt_arena_destroy(tracking);
@@ -1929,9 +1974,8 @@ fn registry_admin_safe(i64 value, i64 length, bool version) -> bool {
 }
 
 fn registry_status_command() -> i64 {
-    i64 line1[47] = [114, 101, 103, 105, 115, 116, 114, 121, 58, 32, 114, 97, 122, 45, 108, 97, 110, 103, 117, 97, 103, 101, 47, 112, 97, 99, 107, 97, 103, 101, 115, 32, 40, 71, 105, 116, 72, 117, 98, 41, 10, 97, 117, 116, 104, 58, 32];
 
-    cli_write(&line1, 47);
+    cli_write_literal("registry: raz-language/packages (GitHub)\nauth: ");
 
     i64 token = raz_compiler_rt_arena_create(8192);
     i64 tl = 0;
@@ -1940,34 +1984,30 @@ fn registry_status_command() -> i64 {
         tl = registry_publish_token(token, 8192, true);
     }
     if (tl > 0) {
-        i64 yes[4] = [121, 101, 115, 10];
+        string yes = "yes\n";
 
-        cli_write(&yes, 4);
+        cli_write_literal(yes);
     } else {
-        i64 no[3] = [110, 111, 10];
+        string no = "no\n";
 
-        cli_write(&no, 3);
+        cli_write_literal(no);
     }
     if (token != 0) {
         raz_compiler_rt_arena_destroy(token);
     }
 
-    i64 offline_label[9] = [111, 102, 102, 108, 105, 110, 101, 58, 32];
-
-    cli_write(&offline_label, 9);
+    cli_write_literal("offline: ");
     if (registry_offline()) {
-        i64 yes[4] = [121, 101, 115, 10];
+        string yes = "yes\n";
 
-        cli_write(&yes, 4);
+        cli_write_literal(yes);
     } else {
-        i64 no[3] = [110, 111, 10];
+        string no = "no\n";
 
-        cli_write(&no, 3);
+        cli_write_literal(no);
     }
 
-    i64 cache_label[7] = [99, 97, 99, 104, 101, 58, 32];
-
-    cli_write(&cache_label, 7);
+    cli_write_literal("cache: ");
 
     i64 cache_path = raz_compiler_rt_arena_create(8192);
     bool cached = false;
@@ -1979,13 +2019,11 @@ fn registry_status_command() -> i64 {
         raz_compiler_rt_arena_destroy(cache_path);
     }
     if (cached) {
-        i64 yes[4] = [121, 101, 115, 10];
 
-        cli_write(&yes, 4);
+        cli_write_literal("yes\n");
     } else {
-        i64 no[3] = [110, 111, 10];
 
-        cli_write(&no, 3);
+        cli_write_literal("no\n");
     }
     return 0;
 }
@@ -2006,15 +2044,15 @@ fn registry_admin_command(i64 argc) -> i64 {
     i64 al = raz_compiler_rt_process_arg(2, action, 32);
     i64 pl = raz_compiler_rt_process_arg(3, package_name, 256);
     i64 vl = raz_compiler_rt_process_arg(4, value, 256);
-    i64 owner_add[9] = [111, 119, 110, 101, 114, 45, 97, 100, 100];
-    i64 owner_remove[12] = [111, 119, 110, 101, 114, 45, 114, 101, 109, 111, 118, 101];
-    i64 yank[4] = [121, 97, 110, 107];
-    i64 unyank[6] = [117, 110, 121, 97, 110, 107];
+    string owner_add = "owner-add";
+    string owner_remove = "owner-remove";
+    string yank = "yank";
+    string unyank = "unyank";
 
     bool owner_action =
-        cli_arg_equals(action, al, &owner_add, 9) ||
-        cli_arg_equals(action, al, &owner_remove, 12);
-    bool version_action = cli_arg_equals(action, al, &yank, 4) || cli_arg_equals(action, al, &unyank, 6);
+        cli_arg_equals_literal(action, al, owner_add) ||
+        cli_arg_equals_literal(action, al, owner_remove);
+    bool version_action = cli_arg_equals_literal(action, al, yank) || cli_arg_equals_literal(action, al, unyank);
 
     if (
         (!owner_action && !version_action) ||
@@ -2030,14 +2068,10 @@ fn registry_admin_command(i64 argc) -> i64 {
         return 67;
     }
 
-    i64 queued[26] = [81, 117, 101, 117, 101, 100, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 117, 112, 100, 97, 116, 101, 32, 111, 110, 32];
-
-    cli_write(&queued, 26);
+    cli_write_literal("Queued registry update on ");
     cli_write_arena(package_name, pl);
 
-    i64 via[13] = [32, 118, 105, 97, 32, 71, 105, 116, 72, 117, 98, 46, 10];
-
-    cli_write(&via, 13);
+    cli_write_literal(" via GitHub.\n");
     raz_compiler_rt_arena_destroy(action);
     raz_compiler_rt_arena_destroy(package_name);
     raz_compiler_rt_arena_destroy(value);
@@ -2053,8 +2087,8 @@ fn registry_command(i64 argc) -> i64 {
         }
 
         i64 sl = raz_compiler_rt_process_arg(2, sub, 32);
-        i64 status_word[6] = [115, 116, 97, 116, 117, 115];
-        bool status = cli_arg_equals(sub, sl, &status_word, 6);
+        string status_word = "status";
+        bool status = cli_arg_equals_literal(sub, sl, status_word);
 
         raz_compiler_rt_arena_destroy(sub);
         if (status) {
@@ -2115,7 +2149,7 @@ fn registry_spec_parse(
     i64 con_cap,
     i64&mut cl,
 ) -> bool {
-    i64 prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+    string prefix = "registry:";
 
     if (length <= 10) {
         return false;
@@ -2124,7 +2158,7 @@ fn registry_spec_parse(
     i64 i = 0;
 
     while (i<9) {
-        if (raz_compiler_rt_arena_get(spec, i) != prefix[i]) {
+        if (raz_compiler_rt_arena_get(spec, i) != compiler_literal_byte(prefix, i)) {
             return false;
         }
         i += 1;
@@ -2270,26 +2304,19 @@ fn registry_write_tracking(
         if (eq >= e || !package_key_equals(old, s, eq, alias, al)) {
             package_append(out, 1048576, &mut cursor, old, s, e - s);
 
-            i64 lf[1] = [10];
-
-            package_append_literal(out, 1048576, &mut cursor, &lf, 1);
+            package_append_string_literal(out, 1048576, &mut cursor, "\n");
         }
     }
     package_append(out, 1048576, &mut cursor, alias, 0, al);
 
-    i64 mid[4] = [32, 61, 32, 34];
-
-    package_append_literal(out, 1048576, &mut cursor, &mid, 4);
+    package_append_string_literal(out, 1048576, &mut cursor, " = \"");
     package_append(out, 1048576, &mut cursor, name, 0, nl);
 
-    i64 at[1] = [64];
-
-    package_append_literal(out, 1048576, &mut cursor, &at, 1);
+    package_append_string_literal(out, 1048576, &mut cursor, "@");
     package_append(out, 1048576, &mut cursor, constraint, 0, cl);
     if (section_kind != 2) {
-        i64 pipe[1] = [124];
 
-        package_append_literal(out, 1048576, &mut cursor, &pipe, 1);
+        package_append_string_literal(out, 1048576, &mut cursor, "|");
 
         i64 digit[1] = [0];
 
@@ -2297,9 +2324,7 @@ fn registry_write_tracking(
         package_append_literal(out, 1048576, &mut cursor, &digit, 1);
     }
 
-    i64 tail[2] = [34, 10];
-
-    package_append_literal(out, 1048576, &mut cursor, &tail, 2);
+    package_append_string_literal(out, 1048576, &mut cursor, "\"\n");
 
     i64 w = raz_compiler_rt_write_ascii(path, path_length, out, cursor);
 
@@ -2322,11 +2347,11 @@ fn registry_sync_tracking_from_manifest() -> i64 {
         return 40;
     }
 
-    i64 mp[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+    string mp = "./raz.toml";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(manifest_path, i, mp[i]);
+        raz_compiler_rt_arena_set(manifest_path, i, compiler_literal_byte(mp, i));
         i += 1;
     }
 
@@ -2412,10 +2437,10 @@ fn registry_sync_tracking_from_manifest() -> i64 {
 
         i = 0;
 
-        i64 prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+        string prefix = "registry:";
 
         while (is_registry && i < 9) {
-            if (raz_compiler_rt_arena_get(spec, i) != prefix[i]) {
+            if (raz_compiler_rt_arena_get(spec, i) != compiler_literal_byte(prefix, i)) {
                 is_registry = false;
             }
             i += 1;
@@ -2536,27 +2561,21 @@ fn registry_write_cache(
         if (!same && end> start) {
             package_append(out, 1048576, &mut cur, old, start, end - start);
 
-            i64 lf[1] = [10];
-
-            package_append_literal(out, 1048576, &mut cur, &lf, 1);
+            package_append_string_literal(out, 1048576, &mut cur, "\n");
         }
     }
     package_append(out, 1048576, &mut cur, alias, 0, al);
 
-    i64 sp[1] = [32];
-
-    package_append_literal(out, 1048576, &mut cur, &sp, 1);
+    package_append_string_literal(out, 1048576, &mut cur, " ");
     package_append(out, 1048576, &mut cur, name, 0, nl);
-    package_append_literal(out, 1048576, &mut cur, &sp, 1);
+    package_append_string_literal(out, 1048576, &mut cur, " ");
     package_append(out, 1048576, &mut cur, version, 0, vl);
-    package_append_literal(out, 1048576, &mut cur, &sp, 1);
+    package_append_string_literal(out, 1048576, &mut cur, " ");
     package_append(out, 1048576, &mut cur, pathv, 0, pl);
-    package_append_literal(out, 1048576, &mut cur, &sp, 1);
+    package_append_string_literal(out, 1048576, &mut cur, " ");
     package_append(out, 1048576, &mut cur, checksum, 0, cl);
 
-    i64 lf[1] = [10];
-
-    package_append_literal(out, 1048576, &mut cur, &lf, 1);
+    package_append_string_literal(out, 1048576, &mut cur, "\n");
 
     i64 w = raz_compiler_rt_write_ascii(fp, path_length, out, cur);
 
@@ -2574,11 +2593,11 @@ fn registry_virtual_path(i64 checksum, i64 checksum_length, i64 output, i64 capa
         return -1;
     }
 
-    i64 prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+    string prefix = "registry:";
     i64 i = 0;
 
     while (i < 9) {
-        raz_compiler_rt_arena_set(output, i, prefix[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(prefix, i));
         i += 1;
     }
     i = 0;
@@ -2604,11 +2623,11 @@ fn registry_manifest_spec(
         return -1;
     }
 
-    i64 prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+    string prefix = "registry:";
     i64 i = 0;
 
     while (i < 9) {
-        raz_compiler_rt_arena_set(output, i, prefix[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(prefix, i));
         i += 1;
     }
     i = 0;
@@ -2634,11 +2653,11 @@ fn registry_rebuild_lock_from_resolved_cache() -> i64 {
         return 40;
     }
 
-    i64 lp[10] = [46, 47, 114, 97, 122, 46, 108, 111, 99, 107];
+    string lp = "./raz.lock";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(path, i, lp[i]);
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(lp, i));
         i += 1;
     }
 
@@ -2813,12 +2832,12 @@ fn package_add_official_registry_command(i64 spec, i64 sl, i64 section_kind) -> 
     } else {
         // No version means latest stable version accepted by the v1 resolver.
 
-        i64 any[7] = [62, 61, 48, 46, 48, 46, 48];
+        string any = ">=0.0.0";
 
         cl = 7;
         i = 0;
         while (i < cl) {
-            raz_compiler_rt_arena_set(constraint, i, any[i]);
+            raz_compiler_rt_arena_set(constraint, i, compiler_literal_byte(any, i));
             i += 1;
         }
     }
@@ -2871,7 +2890,13 @@ fn registry_resolve_context_job(i64 context) -> i64 {
     );
 }
 
+fn package_registry_update_finish(i64 status) -> i64 {
+    if (status == 0) { cli_print_status_literal(6, "dependency update"); }
+    return status;
+}
+
 fn package_registry_update_command() -> i64 {
+    cli_print_status_literal(9, "registry dependencies");
     i64 sync_status = registry_sync_tracking_from_manifest();
 
     if (sync_status != 0) {
@@ -2903,7 +2928,7 @@ fn package_registry_update_command() -> i64 {
         if (git_status != 0) {
             return git_status;
         }
-        return package_lock_command();
+        return package_registry_update_finish(package_lock_command());
     }
     // Resolve all tracked dependencies concurrently, but defer manifest/cache/
     // lockfile mutation until every worker has joined.  This keeps network and
@@ -3036,7 +3061,7 @@ fn package_registry_update_command() -> i64 {
         job_count += 1;
     }
     if (job_count == 0) {
-        return package_lock_command();
+        return package_registry_update_finish(package_lock_command());
     }
 
     i64 status = 0;
@@ -3086,6 +3111,7 @@ fn package_registry_update_command() -> i64 {
             while (hl < 64 && raz_compiler_rt_arena_get(checksum, hl) != 0) {
                 hl += 1;
             }
+            cli_print_status_name_version(11, name, nl, version, vl);
             // The manifest already contains the human registry declaration. Update
             // only exact resolved state and the lockfile; never rewrite user intent.
             if (status == 0) {
@@ -3128,7 +3154,7 @@ fn package_registry_update_command() -> i64 {
     raz_compiler_rt_arena_destroy(tasks);
     raz_compiler_rt_arena_destroy(fp);
     raz_compiler_rt_arena_destroy(data);
-    return status;
+    return package_registry_update_finish(status);
 }
 
 // Rebuild derived target/raz.cache rows from an exact lockfile entry and the
@@ -3367,6 +3393,19 @@ fn registry_fetch_locked_entry(
     return status;
 }
 
+fn registry_lock_key_equals_literal(i64 data, i64 start, i64 equal, string key) -> bool {
+    i64 key_length = compiler_literal_length(key);
+    while (start < equal && ascii_is_space(raz_compiler_rt_arena_get(data, start))) { start += 1; }
+    while (equal > start && ascii_is_space(raz_compiler_rt_arena_get(data, equal - 1))) { equal -= 1; }
+    if (equal - start != key_length) { return false; }
+    i64 i = 0;
+    while (i < key_length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(key, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
 fn registry_lock_key_equals(i64 data, i64 start, i64 equal, i64[]key, i64 key_length) -> bool {
     while (start < equal && ascii_is_space(raz_compiler_rt_arena_get(data, start))) {
         start += 1;
@@ -3427,13 +3466,13 @@ fn registry_fetch_lock_data(i64 data, i64 length) -> i64 {
             pos += 1;
         }
 
-        i64 package_header[11] = [91, 91, 112, 97, 99, 107, 97, 103, 101, 93, 93];
+        string package_header = "[[package]]";
         bool header = end - start == 11;
 
         if (header) {
             i = 0;
             while (i < 11) {
-                if (raz_compiler_rt_arena_get(data, start + i) != package_header[i]) {
+                if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(package_header, i)) {
                     header = false;
                     break;
                 }
@@ -3467,25 +3506,25 @@ fn registry_fetch_lock_data(i64 data, i64 length) -> i64 {
             continue;
         }
 
-        i64 name_key[4] = [110, 97, 109, 101];
-        i64 version_key[7] = [118, 101, 114, 115, 105, 111, 110];
-        i64 source_key[6] = [115, 111, 117, 114, 99, 101];
-        i64 checksum_key[8] = [99, 104, 101, 99, 107, 115, 117, 109];
+        string name_key = "name";
+        string version_key = "version";
+        string source_key = "source";
+        string checksum_key = "checksum";
 
-        if (registry_lock_key_equals(data, start, equal, &name_key, 4)) {
+        if (registry_lock_key_equals_literal(data, start, equal, name_key)) {
             name_length = copy_quoted_value(data, equal + 1, end, name, 4096);
-        } else if (registry_lock_key_equals(data, start, equal, &version_key, 7)) {
+        } else if (registry_lock_key_equals_literal(data, start, equal, version_key)) {
             version_length = copy_quoted_value(data, equal + 1, end, version, 256);
-        } else if (registry_lock_key_equals(data, start, equal, &checksum_key, 8)) {
+        } else if (registry_lock_key_equals_literal(data, start, equal, checksum_key)) {
             checksum_length = copy_quoted_value(data, equal + 1, end, checksum, 128);
-        } else if (registry_lock_key_equals(data, start, equal, &source_key, 6)) {
+        } else if (registry_lock_key_equals_literal(data, start, equal, source_key)) {
             i64 source_length = copy_quoted_value(data, equal + 1, end, source, 64);
-            i64 expected[8] = [114, 101, 103, 105, 115, 116, 114, 121];
+            string expected = "registry";
 
             registry_source = source_length == 8;
             i = 0;
             while (registry_source && i < 8) {
-                if (raz_compiler_rt_arena_get(source, i) != expected[i]) {
+                if (raz_compiler_rt_arena_get(source, i) != compiler_literal_byte(expected, i)) {
                     registry_source = false;
                 }
                 i += 1;
@@ -3539,11 +3578,11 @@ fn registry_fetch_package_lock(i64 root, i64 root_length) -> i64 {
         root_length += 1;
     }
 
-    i64 suffix[8] = [114, 97, 122, 46, 108, 111, 99, 107];
+    string suffix = "raz.lock";
 
     i = 0;
     while (i < 8) {
-        raz_compiler_rt_arena_set(path, root_length + i, suffix[i]);
+        raz_compiler_rt_arena_set(path, root_length + i, compiler_literal_byte(suffix, i));
         i += 1;
     }
 
@@ -3679,11 +3718,11 @@ fn registry_vendor_active() -> bool {
         return false;
     }
 
-    i64 bytes[13] = [46, 47, 46, 114, 97, 122, 45, 118, 101, 110, 100, 111, 114];
+    string bytes = "./.raz-vendor";
     i64 i = 0;
 
     while (i < 13) {
-        raz_compiler_rt_arena_set(marker, i, bytes[i]);
+        raz_compiler_rt_arena_set(marker, i, compiler_literal_byte(bytes, i));
         i += 1;
     }
 
@@ -3694,7 +3733,7 @@ fn registry_vendor_active() -> bool {
 }
 
 fn registry_vendor_path(i64 checksum, i64 checksum_length, i64 output, i64 capacity) -> i64 {
-    i64 prefix[18] = [46, 47, 118, 101, 110, 100, 111, 114, 47, 114, 101, 103, 105, 115, 116, 114, 121, 47];
+    string prefix = "./vendor/registry/";
 
     if (output == 0 || checksum == 0 || checksum_length <= 0 || 18 + checksum_length > capacity) {
         return -1;
@@ -3703,7 +3742,7 @@ fn registry_vendor_path(i64 checksum, i64 checksum_length, i64 output, i64 capac
     i64 i = 0;
 
     while (i < 18) {
-        raz_compiler_rt_arena_set(output, i, prefix[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(prefix, i));
         i += 1;
     }
     i = 0;
@@ -3746,12 +3785,12 @@ fn registry_vendor_verify_lock_data(i64 data, i64 length) -> i64 {
             pos += 1;
         }
 
-        i64 package_header[11] = [91, 91, 112, 97, 99, 107, 97, 103, 101, 93, 93];
+        string package_header = "[[package]]";
         bool header = end - start == 11;
         i64 i = 0;
 
         while (header && i < 11) {
-            if (raz_compiler_rt_arena_get(data, start + i) != package_header[i]) {
+            if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(package_header, i)) {
                 header = false;
             }
             i += 1;
@@ -3785,19 +3824,19 @@ fn registry_vendor_verify_lock_data(i64 data, i64 length) -> i64 {
             continue;
         }
 
-        i64 source_key[6] = [115, 111, 117, 114, 99, 101];
-        i64 checksum_key[8] = [99, 104, 101, 99, 107, 115, 117, 109];
+        string source_key = "source";
+        string checksum_key = "checksum";
 
-        if (registry_lock_key_equals(data, start, equal, &checksum_key, 8)) {
+        if (registry_lock_key_equals_literal(data, start, equal, checksum_key)) {
             checksum_length = copy_quoted_value(data, equal + 1, end, checksum, 128);
-        } else if (registry_lock_key_equals(data, start, equal, &source_key, 6)) {
+        } else if (registry_lock_key_equals_literal(data, start, equal, source_key)) {
             i64 sl = copy_quoted_value(data, equal + 1, end, source, 64);
-            i64 expected[8] = [114, 101, 103, 105, 115, 116, 114, 121];
+            string expected = "registry";
 
             registry_source = sl == 8;
             i = 0;
             while (registry_source && i < 8) {
-                if (raz_compiler_rt_arena_get(source, i) != expected[i]) {
+                if (raz_compiler_rt_arena_get(source, i) != compiler_literal_byte(expected, i)) {
                     registry_source = false;
                 }
                 i += 1;
@@ -3899,11 +3938,11 @@ fn package_registry_prepare_build(i64 manifest_path, i64 manifest_length) -> i64
         }
     }
 
-    i64 suffix[8] = [114, 97, 122, 46, 108, 111, 99, 107];
+    string suffix = "raz.lock";
     i64 j = 0;
 
     while (j < 8) {
-        raz_compiler_rt_arena_set(lock_path, cursor + j, suffix[j]);
+        raz_compiler_rt_arena_set(lock_path, cursor + j, compiler_literal_byte(suffix, j));
         j += 1;
     }
     lock_length = cursor + 8;
@@ -3953,11 +3992,11 @@ fn package_registry_fetch_command() -> i64 {
         return 40;
     }
 
-    i64 lp[10] = [46, 47, 114, 97, 122, 46, 108, 111, 99, 107];
+    string lp = "./raz.lock";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(lock_path, i, lp[i]);
+        raz_compiler_rt_arena_set(lock_path, i, compiler_literal_byte(lp, i));
         i += 1;
     }
 
@@ -4034,9 +4073,7 @@ fn registry_remove_tracking(i64 alias, i64 al) -> i64 {
         if (eq >= e || !package_key_equals(old, s, eq, alias, al)) {
             package_append(out, 1048576, &mut cursor, old, s, e - s);
 
-            i64 lf[1] = [10];
-
-            package_append_literal(out, 1048576, &mut cursor, &lf, 1);
+            package_append_string_literal(out, 1048576, &mut cursor, "\n");
         }
     }
 
@@ -4068,11 +4105,11 @@ fn registry_current_identity(
         return 40;
     }
 
-    i64 p[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+    string p = "./raz.toml";
     i64 i = 0;
 
     while (i<10) {
-        raz_compiler_rt_arena_set(mp, i, p[i]);
+        raz_compiler_rt_arena_set(mp, i, compiler_literal_byte(p, i));
         i += 1;
     }
 
@@ -4082,11 +4119,11 @@ fn registry_current_identity(
         return 57;
     }
 
-    i64 nk[4] = [110, 97, 109, 101];
-    i64 vk[7] = [118, 101, 114, 115, 105, 111, 110];
+    string nk = "name";
+    string vk = "version";
 
-    *nl = package_manifest_field(manifest, length, &nk, 4, name, name_cap);
-    *vl = package_manifest_field(manifest, length, &vk, 7, version, version_cap);
+    *nl = package_manifest_field_literal(manifest, length, nk, name, name_cap);
+    *vl = package_manifest_field_literal(manifest, length, vk, version, version_cap);
     raz_compiler_rt_arena_destroy(mp);
     raz_compiler_rt_arena_destroy(manifest);
     if (*nl <= 0 || *vl <= 0) {
@@ -4116,16 +4153,14 @@ fn registry_hash_hex(i64 value, i64 output, i64 capacity) -> i64 {
 fn registry_default_archive_path(i64 name, i64 nl, i64 version, i64 vl, i64 output, i64 capacity) -> i64 {
     i64 c = 0;
 
+    // `raz pack` is a distributable/release operation. Keep the default archive
+    // with the rest of the release-profile artifacts instead of leaving a .dpk
+    // in the project root. An explicit output argument still wins unchanged.
+    package_append_string_literal(output, capacity, &mut c, "target/release/packages/");
     package_append(output, capacity, &mut c, name, 0, nl);
-
-    i64 raz[1] = [45];
-
-    package_append_literal(output, capacity, &mut c, &raz, 1);
+    package_append_string_literal(output, capacity, &mut c, "-");
     package_append(output, capacity, &mut c, version, 0, vl);
-
-    i64 ext[4] = [46, 100, 112, 107];
-
-    package_append_literal(output, capacity, &mut c, &ext, 4);
+    package_append_string_literal(output, capacity, &mut c, ".dpk");
     return c;
 }
 
@@ -4134,9 +4169,9 @@ fn registry_dependency_path_publishable(i64 path, i64 length) -> bool {
         return false;
     }
 
-    i64 registry_prefix[9] = [114, 101, 103, 105, 115, 116, 114, 121, 58];
+    string registry_prefix = "registry:";
 
-    if (length> 9 && registry_path_prefix(path, length, &registry_prefix, 9)) {
+    if (length> 9 && registry_path_prefix_literal(path, length, registry_prefix)) {
         return true;
     }
 
@@ -4149,18 +4184,18 @@ fn registry_dependency_path_publishable(i64 path, i64 length) -> bool {
         return false;
     }
 
-    i64 local_cache[5] = [46, 114, 97, 122, 47];
+    string local_cache = ".raz/";
 
-    if (registry_path_prefix(path, length, &local_cache, 5)) {
+    if (registry_path_prefix_literal(path, length, local_cache)) {
         return false;
     }
 
-    i64 target_cache[7] = [116, 97, 114, 103, 101, 116, 47];
-    i64 target_cache_dot[9] = [46, 47, 116, 97, 114, 103, 101, 116, 47];
+    string target_cache = "target/";
+    string target_cache_dot = "./target/";
 
     if (
-        registry_path_prefix(path, length, &target_cache, 7) ||
-        registry_path_prefix(path, length, &target_cache_dot, 9)
+        registry_path_prefix_literal(path, length, target_cache) ||
+        registry_path_prefix_literal(path, length, target_cache_dot)
     ) {
         return false;
     }
@@ -4202,11 +4237,11 @@ fn registry_package_dependencies_publishable() -> i64 {
         return 40;
     }
 
-    i64 mp[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+    string mp = "./raz.toml";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(path, i, mp[i]);
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(mp, i));
         i += 1;
     }
 
@@ -4309,6 +4344,24 @@ fn package_pack_command(i64 argc) -> i64 {
     if (argc == 3) {
         ol = raz_compiler_rt_process_arg(2, output, 8192);
     } else {
+        i64 package_dir = raz_compiler_rt_arena_create(24);
+        if (package_dir == 0) { return 40; }
+        string package_dir_text = "target/release/packages";
+        i64 package_dir_length = compiler_literal_length(package_dir_text);
+        i64 package_dir_index = 0;
+        while (package_dir_index < package_dir_length) {
+            raz_compiler_rt_arena_set(
+                package_dir,
+                package_dir_index,
+                compiler_literal_byte(package_dir_text, package_dir_index),
+            );
+            package_dir_index += 1;
+        }
+        if (raz_compiler_rt_create_dir_ascii(package_dir, package_dir_length) != 0) {
+            raz_compiler_rt_arena_destroy(package_dir);
+            return 65;
+        }
+        raz_compiler_rt_arena_destroy(package_dir);
         ol = registry_default_archive_path(name, nl, version, vl, output, 8192);
     }
     raz_compiler_rt_remove_path_ascii(output, ol);
@@ -4333,19 +4386,13 @@ fn package_pack_command(i64 argc) -> i64 {
 
     registry_hash_hex(hash, hex, 16);
 
-    i64 msg[7] = [80, 97, 99, 107, 101, 100, 32];
-
-    cli_write(&msg, 7);
+    cli_write_literal("Packed ");
     cli_write_arena(output, ol);
 
-    i64 sep[6] = [32, 104, 97, 115, 104, 32];
-
-    cli_write(&sep, 6);
+    cli_write_literal(" hash ");
     cli_write_arena(hex, 16);
 
-    i64 e[1] = [10];
-
-    cli_write(&e, 1);
+    cli_write_literal("\n");
     raz_compiler_rt_arena_destroy(name);
     raz_compiler_rt_arena_destroy(version);
     raz_compiler_rt_arena_destroy(output);
@@ -4385,14 +4432,11 @@ fn registry_publish_index_local(
         raz_compiler_rt_arena_get(index, c - 1) != 47 &&
         raz_compiler_rt_arena_get(index, c - 1) != 92
     ) {
-        i64 slash[1] = [47];
 
-        package_append_literal(index, 8192, &mut c, &slash, 1);
+        package_append_string_literal(index, 8192, &mut c, "/");
     }
 
-    i64 idx[9] = [105, 110, 100, 101, 120, 46, 116, 120, 116];
-
-    package_append_literal(index, 8192, &mut c, &idx, 9);
+    package_append_string_literal(index, 8192, &mut c, "index.txt");
 
     i64 oldl = raz_compiler_rt_read_ascii(index, c, old, 4194304);
 
@@ -4433,54 +4477,41 @@ fn registry_publish_index_local(
         if (!same) {
             package_append(out, 4194304, &mut oc, old, st, en - st);
 
-            i64 e[1] = [10];
-
-            package_append_literal(out, 4194304, &mut oc, &e, 1);
+            package_append_string_literal(out, 4194304, &mut oc, "\n");
         }
     }
     package_append(out, 4194304, &mut oc, name, 0, nl);
 
-    i64 sp[1] = [32];
-
-    package_append_literal(out, 4194304, &mut oc, &sp, 1);
+    package_append_string_literal(out, 4194304, &mut oc, " ");
     package_append(out, 4194304, &mut oc, version, 0, vl);
-    package_append_literal(out, 4194304, &mut oc, &sp, 1);
+    package_append_string_literal(out, 4194304, &mut oc, " ");
     package_append(out, 4194304, &mut oc, directory, 0, dl);
     if (
         dl> 0 &&
         raz_compiler_rt_arena_get(directory, dl - 1) != 47 &&
         raz_compiler_rt_arena_get(directory, dl - 1) != 92
     ) {
-        i64 root_slash[1] = [47];
 
-        package_append_literal(out, 4194304, &mut oc, &root_slash, 1);
+        package_append_string_literal(out, 4194304, &mut oc, "/");
     }
 
-    i64 pp[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
-
-    package_append_literal(out, 4194304, &mut oc, &pp, 9);
+    package_append_string_literal(out, 4194304, &mut oc, "packages/");
     package_append(out, 4194304, &mut oc, name, 0, nl);
 
-    i64 slash[1] = [47];
-
-    package_append_literal(out, 4194304, &mut oc, &slash, 1);
+    package_append_string_literal(out, 4194304, &mut oc, "/");
     package_append(out, 4194304, &mut oc, version, 0, vl);
 
-    i64 ext[4] = [46, 100, 112, 107];
-
-    package_append_literal(out, 4194304, &mut oc, &ext, 4);
-    package_append_literal(out, 4194304, &mut oc, &sp, 1);
+    package_append_string_literal(out, 4194304, &mut oc, ".dpk");
+    package_append_string_literal(out, 4194304, &mut oc, " ");
     package_append(out, 4194304, &mut oc, checksum, 0, cl);
     if (kidl> 0 && sl> 0) {
-        package_append_literal(out, 4194304, &mut oc, &sp, 1);
+        package_append_string_literal(out, 4194304, &mut oc, " ");
         package_append(out, 4194304, &mut oc, key_id, 0, kidl);
-        package_append_literal(out, 4194304, &mut oc, &sp, 1);
+        package_append_string_literal(out, 4194304, &mut oc, " ");
         package_append(out, 4194304, &mut oc, signature, 0, sl);
     }
 
-    i64 e[1] = [10];
-
-    package_append_literal(out, 4194304, &mut oc, &e, 1);
+    package_append_string_literal(out, 4194304, &mut oc, "\n");
 
     i64 wr = raz_compiler_rt_write_ascii(index, c, out, oc);
 
@@ -4500,10 +4531,10 @@ fn registry_official_publish_requested() -> bool {
         return false;
     }
 
-    i64 publish_key[24] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 80, 85, 66, 76, 73, 83, 72, 95, 68, 73, 82];
-    i64 registry_key[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
-    i64 local = registry_env_ascii(&publish_key, 24, value, 8192);
-    i64 remote = registry_env_ascii(&registry_key, 16, value, 8192);
+    string publish_key = "RAZ_REGISTRY_PUBLISH_DIR";
+    string registry_key = "RAZ_REGISTRY_URL";
+    i64 local = registry_env_ascii_literal(publish_key, value, 8192);
+    i64 remote = registry_env_ascii_literal(registry_key, value, 8192);
 
     raz_compiler_rt_arena_destroy(value);
     return local <= 0 && remote <= 0;
@@ -4520,11 +4551,11 @@ fn registry_official_publish_metadata() -> i64 {
         return 40;
     }
 
-    i64 mp[10] = [46, 47, 114, 97, 122, 46, 116, 111, 109, 108];
+    string mp = "./raz.toml";
     i64 i = 0;
 
     while (i < 10) {
-        raz_compiler_rt_arena_set(manifest_path, i, mp[i]);
+        raz_compiler_rt_arena_set(manifest_path, i, compiler_literal_byte(mp, i));
         i += 1;
     }
 
@@ -4534,18 +4565,18 @@ fn registry_official_publish_metadata() -> i64 {
         return 57;
     }
 
-    i64 kk[4] = [107, 105, 110, 100];
-    i64 dk[11] = [100, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110];
-    i64 lk[7] = [108, 105, 99, 101, 110, 115, 101];
-    i64 kl = package_manifest_field(manifest, length, &kk, 4, kind, 64);
-    i64 dl = package_manifest_field(manifest, length, &dk, 11, description, 256);
-    i64 ll = package_manifest_field(manifest, length, &lk, 7, license, 128);
-    i64 library[7] = [108, 105, 98, 114, 97, 114, 121];
+    string kk = "kind";
+    string dk = "description";
+    string lk = "license";
+    i64 kl = package_manifest_field_literal(manifest, length, kk, kind, 64);
+    i64 dl = package_manifest_field_literal(manifest, length, dk, description, 256);
+    i64 ll = package_manifest_field_literal(manifest, length, lk, license, 128);
+    string library = "library";
     bool library_kind = kl == 7;
 
     i = 0;
     while (library_kind && i < 7) {
-        if (raz_compiler_rt_arena_get(kind, i) != library[i]) {
+        if (raz_compiler_rt_arena_get(kind, i) != compiler_literal_byte(library, i)) {
             library_kind = false;
         }
         i += 1;
@@ -4561,19 +4592,19 @@ fn registry_official_publish_metadata() -> i64 {
         return 40;
     }
 
-    i64 rb[11] = [46, 47, 82, 69, 65, 68, 77, 69, 46, 109, 100];
+    string rb = "./README.md";
 
     i = 0;
     while (i < 11) {
-        raz_compiler_rt_arena_set(readme, i, rb[i]);
+        raz_compiler_rt_arena_set(readme, i, compiler_literal_byte(rb, i));
         i += 1;
     }
 
-    i64 lb[9] = [46, 47, 76, 73, 67, 69, 78, 83, 69];
+    string lb = "./LICENSE";
 
     i = 0;
     while (i < 9) {
-        raz_compiler_rt_arena_set(license_path, i, lb[i]);
+        raz_compiler_rt_arena_set(license_path, i, compiler_literal_byte(lb, i));
         i += 1;
     }
     if (
@@ -4671,8 +4702,8 @@ fn package_publish_command() -> i64 {
     }
 
     i64 local = raz_compiler_rt_arena_create(8192);
-    i64 lkey[24] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 80, 85, 66, 76, 73, 83, 72, 95, 68, 73, 82];
-    i64 ll = registry_env_ascii(&lkey, 24, local, 8192);
+    string lkey = "RAZ_REGISTRY_PUBLISH_DIR";
+    i64 ll = registry_env_ascii_literal(lkey, local, 8192);
     bool prepared_submission = false;
     bool github_publish = false;
 
@@ -4683,8 +4714,8 @@ fn package_publish_command() -> i64 {
     // tree so any user can submit the same archive in a pull request.
     if (ll <= 0) {
         i64 remote = raz_compiler_rt_arena_create(8192);
-        i64 rkey[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
-        i64 rl = registry_env_ascii(&rkey, 16, remote, 8192);
+        string rkey = "RAZ_REGISTRY_URL";
+        i64 rl = registry_env_ascii_literal(rkey, remote, 8192);
 
         raz_compiler_rt_arena_destroy(remote);
         if (rl <= 0) {
@@ -4698,11 +4729,11 @@ fn package_publish_command() -> i64 {
             if (token_length > 0) {
                 github_publish = true;
             } else {
-                i64 staging[14] = [116, 97, 114, 103, 101, 116, 47, 112, 117, 98, 108, 105, 115, 104];
+                string staging = "target/publish";
                 i64 si = 0;
 
                 while (si < 14) {
-                    raz_compiler_rt_arena_set(local, si, staging[si]);
+                    raz_compiler_rt_arena_set(local, si, compiler_literal_byte(staging, si));
                     si += 1;
                 }
                 ll = 14;
@@ -4721,11 +4752,11 @@ fn package_publish_command() -> i64 {
             // official registry. Fall back to a PR-ready tree instead of
             // turning that ordinary contributor case into a publish failure.
 
-            i64 staging[14] = [116, 97, 114, 103, 101, 116, 47, 112, 117, 98, 108, 105, 115, 104];
+            string staging = "target/publish";
             i64 si = 0;
 
             while (si < 14) {
-                raz_compiler_rt_arena_set(local, si, staging[si]);
+                raz_compiler_rt_arena_set(local, si, compiler_literal_byte(staging, si));
                 si += 1;
             }
             ll = 14;
@@ -4747,14 +4778,11 @@ fn package_publish_command() -> i64 {
             raz_compiler_rt_arena_get(package_dir, pc - 1) != 47 &&
             raz_compiler_rt_arena_get(package_dir, pc - 1) != 92
         ) {
-            i64 slash[1] = [47];
 
-            package_append_literal(package_dir, 8192, &mut pc, &slash, 1);
+            package_append_string_literal(package_dir, 8192, &mut pc, "/");
         }
 
-        i64 packages[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
-
-        package_append_literal(package_dir, 8192, &mut pc, &packages, 9);
+        package_append_string_literal(package_dir, 8192, &mut pc, "packages/");
         package_append(package_dir, 8192, &mut pc, name, 0, nl);
         if (raz_compiler_rt_create_dir_ascii(package_dir, pc) != 0) {
             return 65;
@@ -4764,14 +4792,12 @@ fn package_publish_command() -> i64 {
 
         package_append(target, 8192, &mut tc, package_dir, 0, pc);
 
-        i64 slash[1] = [47];
-
-        package_append_literal(target, 8192, &mut tc, &slash, 1);
+        package_append_string_literal(target, 8192, &mut tc, "/");
         package_append(target, 8192, &mut tc, version, 0, vl);
 
-        i64 ext[4] = [46, 100, 112, 107];
+        string ext = ".dpk";
 
-        package_append_literal(target, 8192, &mut tc, &ext, 4);
+        package_append_string_literal(target, 8192, &mut tc, ext);
         if (raz_compiler_rt_write_ascii(target, tc, archive, al) != al) {
             return 65;
         }
@@ -4796,8 +4822,8 @@ fn package_publish_command() -> i64 {
         }
     } else if (!github_publish) {
         i64 base = raz_compiler_rt_arena_create(8192);
-        i64 key[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
-        i64 bl = registry_env_ascii(&key, 16, base, 8192);
+        string key = "RAZ_REGISTRY_URL";
+        i64 bl = registry_env_ascii_literal(key, base, 8192);
 
         if (bl <= 0) {
             return 60;
@@ -4806,27 +4832,25 @@ fn package_publish_command() -> i64 {
         i64 suffix = raz_compiler_rt_arena_create(8192);
         i64 url = raz_compiler_rt_arena_create(16384);
         i64 sc = 0;
-        i64 pp[9] = [112, 97, 99, 107, 97, 103, 101, 115, 47];
+        string pp = "packages/";
 
-        package_append_literal(suffix, 8192, &mut sc, &pp, 9);
+        package_append_string_literal(suffix, 8192, &mut sc, pp);
         package_append(suffix, 8192, &mut sc, name, 0, nl);
 
-        i64 slash[1] = [47];
-
-        package_append_literal(suffix, 8192, &mut sc, &slash, 1);
+        package_append_string_literal(suffix, 8192, &mut sc, "/");
         package_append(suffix, 8192, &mut sc, version, 0, vl);
 
-        i64 ext[4] = [46, 100, 112, 107];
+        string ext = ".dpk";
 
-        package_append_literal(suffix, 8192, &mut sc, &ext, 4);
+        package_append_string_literal(suffix, 8192, &mut sc, ext);
 
         i64 ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
         i64 ct = raz_compiler_rt_arena_create(24);
-        i64 ctb[22] = [97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 120, 45, 114, 97, 122, 45, 100, 112, 107, 49];
+        string ctb = "application/x-raz-dpk1";
         i64 i = 0;
 
         while (i<22) {
-            raz_compiler_rt_arena_set(ct, i, ctb[i]);
+            raz_compiler_rt_arena_set(ct, i, compiler_literal_byte(ctb, i));
             i += 1;
         }
         if (registry_http_put(url, ul, archive, al, ct, 22) < 0) {
@@ -4834,11 +4858,9 @@ fn package_publish_command() -> i64 {
         }
         sc = 0;
 
-        i64 ep[8] = [101, 110, 116, 114, 105, 101, 115, 47];
-
-        package_append_literal(suffix, 8192, &mut sc, &ep, 8);
+        package_append_string_literal(suffix, 8192, &mut sc, "entries/");
         package_append(suffix, 8192, &mut sc, name, 0, nl);
-        package_append_literal(suffix, 8192, &mut sc, &slash, 1);
+        package_append_string_literal(suffix, 8192, &mut sc, "/");
         package_append(suffix, 8192, &mut sc, version, 0, vl);
         ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
 
@@ -4847,31 +4869,29 @@ fn package_publish_command() -> i64 {
 
         package_append(entry, 16384, &mut ec, name, 0, nl);
 
-        i64 sp[1] = [32];
-
-        package_append_literal(entry, 16384, &mut ec, &sp, 1);
+        package_append_string_literal(entry, 16384, &mut ec, " ");
         package_append(entry, 16384, &mut ec, version, 0, vl);
-        package_append_literal(entry, 16384, &mut ec, &sp, 1);
-        package_append_literal(entry, 16384, &mut ec, &pp, 9);
+        package_append_string_literal(entry, 16384, &mut ec, " ");
+        package_append_string_literal(entry, 16384, &mut ec, pp);
         package_append(entry, 16384, &mut ec, name, 0, nl);
-        package_append_literal(entry, 16384, &mut ec, &slash, 1);
+        package_append_string_literal(entry, 16384, &mut ec, "/");
         package_append(entry, 16384, &mut ec, version, 0, vl);
-        package_append_literal(entry, 16384, &mut ec, &ext, 4);
-        package_append_literal(entry, 16384, &mut ec, &sp, 1);
+        package_append_string_literal(entry, 16384, &mut ec, ext);
+        package_append_string_literal(entry, 16384, &mut ec, " ");
         package_append(entry, 16384, &mut ec, checksum, 0, 16);
         if (kidl> 0 && sl > 0) {
-            package_append_literal(entry, 16384, &mut ec, &sp, 1);
+            package_append_string_literal(entry, 16384, &mut ec, " ");
             package_append(entry, 16384, &mut ec, key_id, 0, kidl);
-            package_append_literal(entry, 16384, &mut ec, &sp, 1);
+            package_append_string_literal(entry, 16384, &mut ec, " ");
             package_append(entry, 16384, &mut ec, signature, 0, sl);
         }
 
         i64 textct = raz_compiler_rt_arena_create(10);
-        i64 tx[10] = [116, 101, 120, 116, 47, 112, 108, 97, 105, 110];
+        string tx = "text/plain";
 
         i = 0;
         while (i<10) {
-            raz_compiler_rt_arena_set(textct, i, tx[i]);
+            raz_compiler_rt_arena_set(textct, i, compiler_literal_byte(tx, i));
             i += 1;
         }
         if (registry_http_put(url, ul, entry, ec, textct, 10) < 0) {
@@ -4885,29 +4905,21 @@ fn package_publish_command() -> i64 {
         raz_compiler_rt_arena_destroy(textct);
     }
     if (prepared_submission) {
-        i64 msg[9] = [80, 114, 101, 112, 97, 114, 101, 100, 32];
 
-        cli_write(&msg, 9);
+        cli_write_literal("Prepared ");
     } else {
-        i64 msg[10] = [80, 117, 98, 108, 105, 115, 104, 101, 100, 32];
 
-        cli_write(&msg, 10);
+        cli_write_literal("Published ");
     }
     cli_write_arena(name, nl);
 
-    i64 at[1] = [64];
-
-    cli_write(&at, 1);
+    cli_write_literal("@");
     cli_write_arena(version, vl);
 
-    i64 sp[1] = [32];
-
-    cli_write(&sp, 1);
+    cli_write_literal(" ");
     cli_write_arena(checksum, 16);
 
-    i64 e[1] = [10];
-
-    cli_write(&e, 1);
+    cli_write_literal("\n");
     raz_compiler_rt_arena_destroy(name);
     raz_compiler_rt_arena_destroy(version);
     raz_compiler_rt_arena_destroy(archive);

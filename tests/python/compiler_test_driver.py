@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -21,9 +22,11 @@ def prepare_seed_project(root: Path, project: Path) -> None:
     for optional_backend in ("wasm", "rxe"):
         shutil.rmtree(project / "src" / "backend" / optional_backend, ignore_errors=True)
 
+    sys.path.insert(0, str(root / "tools"))
+    from compiler_sources import relative_sources
     legacy_order = [
         item
-        for item in (project / "host-source-order.txt").read_text(encoding="utf-8").splitlines()
+        for item in relative_sources(root)
         if not item.startswith("src/backend/wasm/") and not item.startswith("src/backend/rxe/")
     ]
 
@@ -84,7 +87,7 @@ def build_test_compiler(root: Path, work: Path, host_compiler: str, linker: str,
     )
     if p.returncode != 0:
         raise RuntimeError(f"could not build compiler candidate test compiler\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}")
-    compiler = project / "target" / "host" / "debug" / ("raz-compiler.exe" if os.name == "nt" else "raz-compiler")
+    compiler = project / "target" / "debug" / ("raz-compiler.exe" if os.name == "nt" else "raz-compiler")
     if not compiler.is_file():
         raise RuntimeError(f"test compiler was not produced: {compiler}")
     return compiler

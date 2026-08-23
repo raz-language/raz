@@ -6,13 +6,74 @@ namespace raz_compiler_backend_forge_codegen;
 public import raz_compiler_backend_forge_function_codegen;
 
 // Forge async lowering and final module orchestration.
+
+fn backend_build_function_reachability(HirModule& hir, MirModule& mir, i64 main_index) -> i64 {
+    i64 reachable = raz_compiler_rt_arena_create(hir.function_count);
+    if (reachable == 0) { return 0; }
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        raz_compiler_rt_arena_set(reachable, function_index, 0);
+        if (
+            function_index == main_index ||
+            raz_compiler_rt_arena_get(hir.function_drop_structs, function_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.function_clone_structs, function_index) >= 0
+        ) {
+            raz_compiler_rt_arena_set(reachable, function_index, 1);
+        }
+        function_index += 1;
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        function_index = 0;
+        while (function_index < hir.function_count) {
+            if (raz_compiler_rt_arena_get(reachable, function_index) != 0) {
+                i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+                i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+                while (ip < end) {
+                    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+                    i64 target = -1;
+                    if (opcode == 8 || opcode == 43 || opcode == 50) {
+                        target = raz_compiler_rt_arena_get(mir.op_a, ip);
+                    }
+                    if (
+                        target >= 0 && target < hir.function_count &&
+                        raz_compiler_rt_arena_get(reachable, target) == 0
+                    ) {
+                        raz_compiler_rt_arena_set(reachable, target, 1);
+                        changed = true;
+                    }
+                    ip += 1;
+                }
+            }
+            function_index += 1;
+        }
+    }
+    return reachable;
+}
+
+fn forge_write_emit_failure(Source& source, HirModule& hir, i64 function_index) {
+    ForgeWriter diagnostic;
+
+    writer_init(&mut diagnostic);
+    writer_literal(&mut diagnostic, "error: Forge backend could not emit function ");
+    if (function_index >= 0 && function_index < hir.function_count) {
+        writer_function_name(&mut diagnostic, source, hir, function_index);
+    } else {
+        writer_decimal(&mut diagnostic, function_index);
+    }
+    writer_newline(&mut diagnostic);
+    raz_compiler_rt_stdio_write_ascii(2, diagnostic.data, diagnostic.length);
+    writer_destroy(&mut diagnostic);
+}
+
 // Scalar/function helpers live in forge_function_codegen.rz.
 fn writer_async_cleanup_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 structure) {
-    i64 prefix[20] = [64, 95, 95, 114, 97, 122, 95, 97, 115, 121, 110, 99, 95, 99, 108, 101, 97, 110, 117, 112];
+    string prefix = "@__raz_async_cleanup";
     i64 index = 0;
 
     while (index < 20) {
-        writer_put(out, prefix[index]);
+        writer_put(out, compiler_literal_byte(prefix, index));
         index += 1;
     }
     writer_put(out, 95);
@@ -414,14 +475,7 @@ fn emit_async_scalar_instruction(
         writer_async_emit_const_i64(out, zero, 0);
         writer_async_emit_const_i64(out, one, 1);
         writer_instruction_prefix(out, ip);
-
-        i64 t[7] = [115, 101, 108, 101, 99, 116, 32];
-        i64 ti = 0;
-
-        while (ti < 7) {
-            writer_put(out, t[ti]);
-            ti += 1;
-        }
+        writer_literal(out, "select ");
         writer_i64(out);
         writer_space(out);
         writer_register(out, cmp);
@@ -449,14 +503,7 @@ fn emit_async_scalar_instruction(
         writer_register(out, zero);
         writer_newline(out);
         writer_instruction_prefix(out, ip);
-
-        i64 t[7] = [115, 101, 108, 101, 99, 116, 32];
-        i64 ti = 0;
-
-        while (ti < 7) {
-            writer_put(out, t[ti]);
-            ti += 1;
-        }
+        writer_literal(out, "select ");
         writer_i64(out);
         writer_space(out);
         writer_register(out, cmp);
@@ -771,16 +818,36 @@ fn emit_async_scalar_instruction(
     }
     if (opcode == 30) {
         i64 count_reg = writer_synthetic_register(240, ip);
+        i64 aggregate_marker = raz_compiler_rt_arena_get(mir.op_b, ip);
+        i64 element_type = raz_compiler_rt_arena_get(mir.op_d, ip);
 
         writer_async_emit_const_i64(out, count_reg, raz_compiler_rt_arena_get(mir.op_a, ip));
+        i64 width_reg = -1;
+        i64 width_bytes = 0;
+        bool typed_array = aggregate_marker == 2 && primitive_type_width(element_type) > 0 && primitive_type_width(element_type) <= 64;
+        if (typed_array) {
+            width_reg = writer_synthetic_register(241, ip);
+            width_bytes = (primitive_type_width(element_type) + 7) / 8;
+            writer_async_emit_const_i64(out, width_reg, width_bytes);
+        }
         writer_instruction_prefix(out, ip);
         writer_async_call_text(out);
         writer_i64(out);
         writer_space(out);
-        writer_runtime_name(out, 1);
-        writer_put(out, 40);
-        writer_register(out, count_reg);
-        writer_put(out, 41);
+        if (typed_array) {
+            writer_runtime_name(out, 17);
+            writer_put(out, 40);
+            writer_register(out, count_reg);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_register(out, width_reg);
+            writer_put(out, 41);
+        } else {
+            writer_runtime_name(out, 1);
+            writer_put(out, 40);
+            writer_register(out, count_reg);
+            writer_put(out, 41);
+        }
         writer_newline(out);
         return true;
     }
@@ -887,11 +954,11 @@ fn emit_forge_async_function(
     writer_instruction_prefix(out, frame_reg);
     writer_async_call_text(out);
 
-    i64 ptrtxt[4] = [112, 116, 114, 32];
+    string ptrtxt = "ptr ";
     i64 pi = 0;
 
     while (pi < 4) {
-        writer_put(out, ptrtxt[pi]);
+        writer_put(out, compiler_literal_byte(ptrtxt, pi));
         pi += 1;
     }
     writer_async_function_name(out, source, hir, function_index, 1);
@@ -970,11 +1037,11 @@ fn emit_forge_async_function(
     writer_put(out, 62);
     writer_space(out);
 
-    i64 ptrret[3] = [112, 116, 114];
+    string ptrret = "ptr";
 
     pi = 0;
     while (pi < 3) {
-        writer_put(out, ptrret[pi]);
+        writer_put(out, compiler_literal_byte(ptrret, pi));
         pi += 1;
     }
     writer_space(out);
@@ -992,7 +1059,7 @@ fn emit_forge_async_function(
     writer_async_call_text(out);
     pi = 0;
     while (pi < 3) {
-        writer_put(out, ptrret[pi]);
+        writer_put(out, compiler_literal_byte(ptrret, pi));
         pi += 1;
     }
     writer_space(out);
@@ -1069,7 +1136,7 @@ fn emit_forge_async_function(
     writer_space(out);
     pi = 0;
     while (pi < 3) {
-        writer_put(out, ptrret[pi]);
+        writer_put(out, compiler_literal_byte(ptrret, pi));
         pi += 1;
     }
     writer_put(out, 41);
@@ -1129,11 +1196,11 @@ fn emit_forge_async_function(
         if (state < cancelled_state) {
             writer_async_state_label(out, state + 1, 4);
         } else {
-            i64 inv[13] = [105, 110, 118, 97, 108, 105, 100, 46, 115, 116, 97, 116, 101];
+            string inv = "invalid.state";
             i64 ii = 0;
 
             while (ii < 13) {
-                writer_put(out, inv[ii]);
+                writer_put(out, compiler_literal_byte(inv, ii));
                 ii += 1;
             }
         }
@@ -1155,11 +1222,11 @@ fn emit_forge_async_function(
         writer_instruction_prefix(out, cancelled);
         writer_async_call_text(out);
 
-        i64 i1txt[3] = [105, 49, 32];
+        string i1txt = "i1 ";
 
         pi = 0;
         while (pi < 3) {
-            writer_put(out, i1txt[pi]);
+            writer_put(out, compiler_literal_byte(i1txt, pi));
             pi += 1;
         }
         writer_async_runtime_name(out, 10);
@@ -1261,7 +1328,7 @@ fn emit_forge_async_function(
             writer_put(out, 115);
             writer_put(out, 115);
             writer_space(out);
-            writer_ptr(out);
+            writer_i64(out);
             writer_space(out);
             writer_string_global_name(out, ip);
             writer_newline(out);
@@ -1544,7 +1611,7 @@ fn emit_forge_async_function(
     writer_space(out);
     pi = 0;
     while (pi < 3) {
-        writer_put(out, ptrret[pi]);
+        writer_put(out, compiler_literal_byte(ptrret, pi));
         pi += 1;
     }
     writer_put(out, 41);
@@ -1595,6 +1662,7 @@ fn write_forge_output(ForgeWriter&mut writer, i64 output_path, i64 output_path_l
     if (output_path != 0 && output_path_length > 0) {
         written = raz_compiler_rt_write_ascii(output_path, output_path_length, writer.data, writer.length);
     } else {
+        // intentional-byte-array: raw fallback FIR path for raz_rt_write_ascii_i64.
         i64 path[17] = [115, 116, 97, 103, 101, 49, 45, 111, 117, 116, 112, 117, 116, 46, 102, 105, 114];
 
         written = raz_rt_write_ascii_i64(&mut path[0], 17, writer.data, writer.length);
@@ -1637,27 +1705,52 @@ fn emit_forge_module(
     // C-API path first; textual FIR is retained only as a compatibility fallback
     // for MIR families that have not migrated yet.
 
-    i64 structured_main = -1;
+    i64 structured_main = find_main_function(hir, source);
     i64 structured_support_code = -1;
+    i64 structured_image_pointer_values = raz_compiler_rt_arena_create(mir.instruction_count + 1);
 
-    if (forge_native) {
-        structured_main = find_main_function(hir, source);
-        structured_support_code = forge_native_support_failure_code(hir, mir, structured_main);
-        if (structured_support_code == 0) {
-            return emit_forge_native_scalar_module(
-                source,
-                hir,
-                mir,
-                structured_main,
-                output_path,
-                output_path_length,
-                optimization_level,
-            );
+    if (
+        structured_image_pointer_values != 0 &&
+        forge_native_build_image_pointer_values(hir, mir, structured_image_pointer_values)
+    ) {
+        structured_support_code = forge_native_support_failure_code_cached(
+            hir,
+            mir,
+            structured_main,
+            structured_image_pointer_values,
+        );
+    }
+
+    if (structured_support_code == 0) {
+        bool structured_emitted = emit_forge_native_scalar_module(
+            source,
+            hir,
+            mir,
+            structured_main,
+            output_path,
+            output_path_length,
+            optimization_level,
+            !forge_native,
+            structured_image_pointer_values,
+        );
+        if (structured_image_pointer_values != 0) {
+            raz_compiler_rt_arena_destroy(structured_image_pointer_values);
+            structured_image_pointer_values = 0;
         }
-        if (forge_structured_only) {
-            forge_native_write_support_diagnostic_code(structured_support_code);
-            return false;
+        // Native compilation has no reason to rebuild the same module through
+        // the legacy textual path after structured validation succeeded. Text
+        // emission retains the compatibility fallback if serialization fails.
+        if (forge_native || structured_emitted) {
+            return structured_emitted;
         }
+    } else if (structured_image_pointer_values != 0) {
+        raz_compiler_rt_arena_destroy(structured_image_pointer_values);
+        structured_image_pointer_values = 0;
+    }
+
+    if (forge_native && forge_structured_only) {
+        forge_native_write_support_diagnostic(source, hir, mir, structured_main);
+        return false;
     }
 
     ForgeWriter writer;
@@ -1696,6 +1789,7 @@ fn emit_forge_module(
     emit_forge_function_signatures(&mut writer, hir);
     emit_compiler_runtime_declarations(&mut writer);
     emit_compiler_f64_runtime_declarations(&mut writer);
+    emit_stage1_legacy_runtime_declarations(&mut writer);
     emit_compiler_process_runtime_declarations(&mut writer);
 
     bool has_async = false;
@@ -1740,24 +1834,30 @@ fn emit_forge_module(
         extern_index += 1;
     }
 
+    i64 main_index = find_main_function(hir, source);
+    i64 reachable_functions = backend_build_function_reachability(hir, mir, main_index);
+    if (reachable_functions == 0) { writer_destroy(&mut writer); return false; }
     i64 function_index = 0;
 
     while (function_index < hir.function_count) {
-        if (raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0 &&
+            raz_compiler_rt_arena_get(reachable_functions, function_index) != 0
+        ) {
             if (raz_compiler_rt_arena_get(hir.function_is_async, function_index) != 0) {
                 if (!emit_forge_async_function(&mut writer, source, hir, mir, function_index)) {
                     return false;
                 }
             } else if (!emit_forge_function(&mut writer, source, hir, mir, function_index)) {
+                forge_write_emit_failure(source, hir, function_index);
                 return false;
             }
         }
         function_index += 1;
     }
 
-    i64 main_index = find_main_function(hir, source);
-
     if (main_index < 0 || raz_compiler_rt_arena_get(hir.function_parameter_counts, main_index) != 0) {
+        raz_compiler_rt_arena_destroy(reachable_functions);
         return false;
     }
     writer_space(&mut writer);
@@ -1798,11 +1898,11 @@ fn emit_forge_module(
         writer_async_call_void_prefix(&mut writer);
         writer_put(&mut writer, 64);
 
-        i64 init_name[18] = [95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 105, 110, 105, 116];
+        string init_name = "__raz_globals_init";
         i64 name_cursor = 0;
 
         while (name_cursor < 18) {
-            writer_put(&mut writer, init_name[name_cursor]);
+            writer_put(&mut writer, compiler_literal_byte(init_name, name_cursor));
             name_cursor += 1;
         }
         writer_put(&mut writer, 40);
@@ -1825,11 +1925,11 @@ fn emit_forge_module(
         writer_async_call_void_prefix(&mut writer);
         writer_put(&mut writer, 64);
 
-        i64 fini_name[18] = [95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 102, 105, 110, 105];
+        string fini_name = "__raz_globals_fini";
         i64 name_cursor = 0;
 
         while (name_cursor < 18) {
-            writer_put(&mut writer, fini_name[name_cursor]);
+            writer_put(&mut writer, compiler_literal_byte(fini_name, name_cursor));
             name_cursor += 1;
         }
         writer_put(&mut writer, 40);
@@ -1929,6 +2029,7 @@ fn emit_forge_module(
         return false;
     }
 
+    raz_compiler_rt_arena_destroy(reachable_functions);
     bool success = write_forge_output(&mut writer, output_path, output_path_length);
 
     if (success && forge_native) {
@@ -2208,6 +2309,7 @@ fn emit_forge_cfg_qualification() -> bool {
     writer_put(&mut out, 125);
     writer_newline(&mut out);
 
+    // intentional-byte-array: raw CFG dump path for raz_rt_write_ascii_i64.
     i64 path[21] = [115, 116, 97, 103, 101, 49, 45, 99, 102, 103, 45, 111, 117, 116, 112, 117, 116, 46, 102, 105, 114];
     i64 written = raz_rt_write_ascii_i64(&mut path[0], 21, out.data, out.length);
     i64 expected = out.length;

@@ -24,6 +24,15 @@ EXE = ".exe" if IS_WINDOWS else ""
 OBJ = ".obj" if IS_WINDOWS else ".o"
 
 
+def normalized_host_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        return "x86_64"
+    if machine in {"aarch64", "arm64"}:
+        return "aarch64"
+    return machine or "unknown"
+
+
 def load_bootstrap_config() -> dict[str, object]:
     """Load optional repository-local bootstrap.toml settings.
 
@@ -116,6 +125,43 @@ def read_cache(build: Path, key: str, required: bool = True) -> str:
     if required:
         raise RuntimeError(f"{key} was not found in {cache}.")
     return ""
+
+
+def load_runtime_link_dependencies(host_build: Path) -> list[str]:
+    """Return native libraries required by raz_runtime for recursive links.
+
+    CMake exports both the exact link inputs and an authoritative feature bit.
+    Do not infer OpenSSL enablement from FindOpenSSL implementation details:
+    OPENSSL_INCLUDE_DIR can be cached on Windows after only the headers were
+    discovered, even though no usable SSL/Crypto library pair was selected.
+    """
+    runtime_deps: list[str] = []
+    runtime_deps_manifest = host_build / "raz-runtime-link-deps.txt"
+    if runtime_deps_manifest.is_file():
+        for raw in runtime_deps_manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            value = raw.strip()
+            if not value:
+                continue
+            dep = Path(value)
+            if not dep.is_file():
+                raise RuntimeError(f"CMake resolved a runtime link dependency that does not exist: {dep}")
+            runtime_deps.append(str(dep))
+
+    openssl_state = read_cache(host_build, "RAZ_RUNTIME_OPENSSL_ENABLED", required=False).upper()
+    true_values = {"1", "ON", "TRUE", "YES"}
+    false_values = {"0", "OFF", "FALSE", "NO"}
+    if openssl_state not in true_values | false_values:
+        raise RuntimeError(
+            "CMake did not export RAZ_RUNTIME_OPENSSL_ENABLED. "
+            "Reconfigure the host build before recursive compiler linking."
+        )
+    if openssl_state in true_values and len(runtime_deps) < 2:
+        raise RuntimeError(
+            "OpenSSL is enabled for raz_runtime, but CMake did not export both "
+            "OpenSSL link dependencies. Reconfigure the host build instead of "
+            "attempting a broken reproducibility-build link."
+        )
+    return runtime_deps
 
 
 def repair_future_timestamps(root: Path) -> int:
@@ -387,10 +433,12 @@ def choose_compiler(build: Path, env: dict[str, str], scratch: Path) -> tuple[st
         cached = read_cache(build, "CMAKE_CXX_COMPILER")
         compiler = _resolve_executable(cached, env)
         if not compiler:
-            raise RuntimeError(
-                f"The existing CMake cache refers to a missing compiler: {cached}. "
-                "Run bootstrap.bat -Clean once to regenerate the host build."
+            print(
+                f"Discarding stale host CMake cache; cached compiler is unavailable: {cached}",
+                flush=True,
             )
+            shutil.rmtree(build, ignore_errors=True)
+            return choose_compiler(build, env, scratch)
         print(f"Validating cached C++ compiler: {compiler}")
         ok, diagnostic = _test_cxx20_toolchain(compiler, scratch, env)
         if not ok:
@@ -433,17 +481,60 @@ def find_artifact(root: Path, names: list[str]) -> Path:
     raise RuntimeError(f"Could not find any of {names} below {root}.")
 
 
-def source_order() -> list[str]:
-    order = []
-    for raw in (ROOT / "compiler" / "host-source-order.txt").read_text(encoding="utf-8").splitlines():
-        item = raw.strip().replace("\\", "/")
-        if item and not item.startswith("#"):
-            if not item.startswith("src/"):
-                raise RuntimeError(f"Invalid compiler source-order entry: {item}")
-            order.append(item)
-    if not order or order[-1] != "src/main.rz":
-        raise RuntimeError("compiler/host-source-order.txt must be non-empty and end with src/main.rz.")
-    return order
+def find_optional_artifact(root: Path, names: list[str]) -> Path | None:
+    try:
+        return find_artifact(root, names)
+    except RuntimeError:
+        return None
+
+
+def compiler_modules() -> list[Path]:
+    """Discover the canonical Raz compiler source set without ordering metadata.
+
+    Semantic imports, not physical file order, define the production compiler.
+    Keep this helper intentionally boring: it exists for status/reporting and
+    reproducibility workspace population only, never to impose compilation order.
+    """
+    source_root = ROOT / "compiler" / "src"
+    modules = sorted(source_root.rglob("*.rz"))
+    entry = source_root / "main.rz"
+    if not modules or entry not in modules:
+        raise RuntimeError("compiler/src/main.rz is missing from the production compiler source set.")
+    return modules
+
+
+def cached_stage0_artifacts(host_build: Path) -> dict[str, Path] | None:
+    """Return a complete reusable Stage-0 artifact set, or None if incomplete.
+
+    Stage 0 is deliberately frozen compatibility machinery. Re-running CMake/Ninja
+    on every self-host cycle adds latency without improving the Raz-owned compiler.
+    A normal bootstrap therefore reuses an existing Stage-0 build verbatim.
+    `--clean` or `--rebuild-stage0` is the explicit opt-in path for rebuilding it.
+    """
+    cache = host_build / "CMakeCache.txt"
+    if not cache.is_file():
+        return None
+    required: dict[str, list[str]] = {
+        "driver": [f"raz-stage0{EXE}"],
+        "compat": [f"razc-stage0{EXE}"],
+        "runtime": ["raz_runtime.lib", "libraz_runtime.a"],
+        "bridge": ["raz_forge_bridge.lib", "libraz_forge_bridge.a"],
+        "forge": ["forge.lib", "libforge.a"],
+    }
+    if IS_WINDOWS:
+        required["oblink"] = [f"oblink{EXE}"]
+    found: dict[str, Path] = {}
+    for key, names in required.items():
+        artifact = find_optional_artifact(host_build, names)
+        if artifact is None or not artifact.is_file():
+            return None
+        found[key] = artifact
+
+    # Runtime link metadata is part of the cached ABI contract. Without it a
+    # later reproducibility link could silently omit provider libraries.
+    if not (host_build / "raz-runtime-link-deps.txt").is_file():
+        return None
+    return found
 
 
 def _link_or_copy_stage_source(source: str, destination: str) -> str:
@@ -455,26 +546,121 @@ def _link_or_copy_stage_source(source: str, destination: str) -> str:
         return shutil.copy2(source, destination)
 
 
-def prepare_reproducibility_build(build_dir: Path, order: list[str]) -> None:
+def _compiler_source_digest() -> str:
+    """Fingerprint canonical compiler inputs independently of project caches."""
+    root = ROOT / "compiler"
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file() and "target" not in p.parts and ".raz" not in p.parts):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "little"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _refresh_bootstrap_input_cache(build_dir: Path, current_digest: str) -> None:
+    """Invalidate only whole-project cache layers when compiler inputs changed.
+
+    Module fingerprint/MIR state remains valuable after an edit, but project.source
+    and completed native artifacts describe the previous source tree and must not
+    survive a body-only change. Keeping those files was able to make bootstrap
+    report a false Fresh result after backend implementation edits.
+    """
+    cache = build_dir / "target" / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    stamp = cache / "bootstrap-input.sha256"
+    previous = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+    if previous and previous != current_digest:
+        for name in ("project.source", "project.meta", "build.key", "artifact.bin", "check.key"):
+            (cache / name).unlink(missing_ok=True)
+    stamp.write_text(current_digest + "\n", encoding="utf-8")
+
+
+def prepare_seed_compiler_project(build_dir: Path) -> None:
+    """Refresh seed sources while preserving Raz's project-local incremental cache.
+
+    The Stage-0 -> seed build is part of normal developer bootstrap and should not
+    throw away `target/cache` on every invocation.  Remove the previous source
+    view so deleted/renamed modules cannot linger, but retain target/ so the Raz
+    build driver can reuse exact unchanged module/HIR/MIR/native artifacts.
+    """
+    build_dir.mkdir(parents=True, exist_ok=True)
+    for child in build_dir.iterdir():
+        if child.name == "target":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+    shutil.copytree(
+        ROOT / "compiler",
+        build_dir,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".raz", "target"),
+    )
+    _refresh_bootstrap_input_cache(build_dir, _compiler_source_digest())
+
+
+def prepare_self_host_build(build_dir: Path, seed_project: Path, reset_cache: bool) -> None:
+    """Refresh the normal self-host workspace while retaining safe incremental state.
+
+    The normal bootstrap performs one Raz-owned rebuild.  Keeping its target/cache
+    makes repeated bootstraps cheap: unchanged input can restore the native artifact,
+    while changed compiler sources invalidate through Raz's normal fingerprints.
+    A Stage-0/native-toolchain rebuild clears the workspace because backend/runtime
+    inputs may have changed without changing Raz source text.
+    """
+    current_digest = _compiler_source_digest()
+    if reset_cache and build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    for child in build_dir.iterdir():
+        if child.name == "target":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+    shutil.copytree(
+        ROOT / "compiler",
+        build_dir,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".raz", "target"),
+        copy_function=_link_or_copy_stage_source,
+    )
+
+    # Seed only the assembled-project input cache on a first self-host build.
+    # This avoids re-walking/re-reading 100+ unchanged modules but deliberately
+    # does not copy native artifacts, MIR state, or semantic output from Stage 0.
+    source_cache = seed_project / "target" / "cache"
+    target_cache = build_dir / "target" / "cache"
+    if source_cache.is_dir():
+        target_cache.mkdir(parents=True, exist_ok=True)
+        for name in ("project.meta", "project.source"):
+            src = source_cache / name
+            dst = target_cache / name
+            if src.is_file() and not dst.is_file():
+                shutil.copy2(src, dst)
+    _refresh_bootstrap_input_cache(build_dir, current_digest)
+
+
+def prepare_reproducibility_verification(build_dir: Path) -> None:
+    """Create an independent second generation for explicit reproducibility checks."""
     if build_dir.exists():
         shutil.rmtree(build_dir)
-    # Reproducibility stages only read the canonical compiler sources. Hard-link
-    # those immutable inputs instead of copying the complete compiler tree for
-    # every generation. Generated target/ state (and legacy .raz/ state) remains stage-local.
     shutil.copytree(
         ROOT / "compiler",
         build_dir,
         ignore=shutil.ignore_patterns(".raz", "target"),
         copy_function=_link_or_copy_stage_source,
     )
-    (build_dir / "source-order.txt").write_text("\n".join(order) + "\n", encoding="ascii")
 
 
-def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str], interval: int) -> None:
+def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str], interval: int, env: dict[str, str] | None = None) -> None:
     print(f"[RUN] {label}\n      {compiler} {' '.join(args)}", flush=True)
     diagnostic = build_dir / "compiler-diagnostic.txt"
     diagnostic.unlink(missing_ok=True)
-    proc = subprocess.Popen([str(compiler), *args], cwd=build_dir)
+    proc = subprocess.Popen([str(compiler), *args], cwd=build_dir, env=env)
     started = time.monotonic()
     last_diag = ""
     last_report = 0.0
@@ -523,9 +709,11 @@ def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Pat
     elif IS_WINDOWS:
         args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-lws2_32", "-lbcrypt", "-lcrypt32"]
     else:
-        args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output), "-pthread"]
+        args = [compiler, str(obj), str(runtime), str(bridge), str(forge), *runtime_deps, "-o", str(output)]
         if sys.platform.startswith("linux"):
-            args.append("-ldl")
+            args.extend(["-pthread", "-ldl"])
+        elif not sys.platform.startswith("darwin"):
+            args.append("-pthread")
     run(f"Link {output.name}", args, cwd=output.parent, env=env)
 
 
@@ -543,6 +731,12 @@ def main() -> int:
     parser.add_argument("--bootstrap-profile", "-BootstrapProfile", choices=("debug", "release"), default=str(config.get("bootstrap-profile", "debug")))
     parser.add_argument("--host-preset", "-HostPreset", choices=("debug", "release"), default=str(config.get("host-preset", "release")))
     parser.add_argument(
+        "--seed-opt",
+        choices=("0", "1", "2", "3"),
+        default=str(config.get("seed-opt", "1")),
+        help="Forge optimization level for the disposable compatibility-host seed compiler (default: 1)",
+    )
+    parser.add_argument(
         "--repro-opt",
         choices=("0", "1", "2", "3", "s", "z"),
         default=None,
@@ -551,7 +745,24 @@ def main() -> int:
     parser.add_argument("--jobs", "-Jobs", type=int, default=int(config.get("jobs", max(1, os.cpu_count() or 1))))
     parser.add_argument("--status-interval", type=int, default=int(config.get("status-interval", 15)))
     parser.add_argument("--clean", "-Clean", action="store_true", default=bool(config.get("clean", False)))
+    parser.add_argument(
+        "--rebuild-stage0",
+        action="store_true",
+        default=bool(config.get("rebuild-stage0", False)),
+        help="force regeneration of the cached C++ Stage-0 toolchain",
+    )
     parser.add_argument("--run-tests", "-RunTests", action="store_true", default=bool(config.get("run-tests", False)))
+    parser.add_argument(
+        "--verify-reproducibility",
+        action="store_true",
+        default=bool(config.get("verify-reproducibility", False)),
+        help="build a second independent self-host generation and verify deterministic fixed-point output",
+    )
+    parser.add_argument(
+        "--stage0",
+        default=str(config.get("stage0", os.environ.get("RAZ_STAGE0_COMPILER", ""))),
+        help="compatible prebuilt Raz compiler used to seed AArch64/macOS LLVM bootstrap (or set RAZ_STAGE0_COMPILER)",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
@@ -567,6 +778,10 @@ def main() -> int:
         parser.error("--repro-opt/bootstrap.repro-opt must be one of 0, 1, 2, 3, s, z")
 
     env = import_visual_studio_environment(os.environ.copy())
+    host_arch = normalized_host_arch()
+    if host_arch not in {"x86_64", "aarch64"}:
+        raise RuntimeError(f"Unsupported bootstrap host architecture: {host_arch}")
+    llvm_seed_bootstrap = host_arch == "aarch64" or sys.platform.startswith("darwin")
     repair_future_timestamps(ROOT)
     cmake = require_command("cmake", env)
     require_command("ninja", env)
@@ -579,138 +794,186 @@ def main() -> int:
         shutil.rmtree(qualification, ignore_errors=True)
     qualification.mkdir(parents=True, exist_ok=True)
 
-    banner(f"Configure and build host toolchain ({platform.system()})")
-    compiler, fresh = choose_compiler(host_build, env, build_root / ".toolchain-preflight")
-    print(f"C++ compiler: {compiler}\nJobs        : {args.jobs}")
-    configure = [cmake, "--preset", args.host_preset]
-    if fresh:
-        configure.append(f"-DCMAKE_CXX_COMPILER={compiler}")
-    run("Configure host toolchain", configure, env=env)
-    run("Build host compiler/runtime/Forge", [cmake, "--build", "--preset", args.host_preset, "--parallel", str(args.jobs), "--target", "raz_host", "razc_host", "raz_runtime", "raz_forge_bridge", "forge", "oblink"], env=env)
-    compiler = read_cache(host_build, "CMAKE_CXX_COMPILER")
+    cached_stage0 = None if args.rebuild_stage0 else cached_stage0_artifacts(host_build)
+    stage0_rebuilt = cached_stage0 is None
+    if cached_stage0 is not None:
+        banner(f"Reuse cached Stage-0 toolchain ({platform.system()})")
+        compiler = read_cache(host_build, "CMAKE_CXX_COMPILER")
+        resolved_compiler = _resolve_executable(compiler, env)
+        if resolved_compiler:
+            compiler = resolved_compiler
+        print(f"Stage-0 compiler: {cached_stage0['driver']}")
+        print(f"C++ linker fallback: {compiler}")
+        print("Stage-0 cache: hit (use --rebuild-stage0 or -Clean to regenerate)")
+    else:
+        if args.rebuild_stage0 and host_build.exists():
+            print("Stage-0 rebuild requested; discarding cached host toolchain.", flush=True)
+            shutil.rmtree(host_build, ignore_errors=True)
+        banner(f"Configure and build Stage-0 toolchain ({platform.system()})")
+        compiler, fresh = choose_compiler(host_build, env, build_root / ".toolchain-preflight")
+        print(f"C++ compiler: {compiler}\nJobs        : {args.jobs}")
+        configure = [cmake, "--preset", args.host_preset]
+        if fresh:
+            configure.append(f"-DCMAKE_CXX_COMPILER={compiler}")
+        run("Configure Stage-0 toolchain", configure, env=env)
+        run("Build Stage-0 compiler/runtime/Forge", [cmake, "--build", "--preset", args.host_preset, "--parallel", str(args.jobs), "--target", "raz_host", "razc_host", "raz_runtime", "raz_forge_bridge", "forge", "oblink"], env=env)
+        compiler = read_cache(host_build, "CMAKE_CXX_COMPILER")
+        cached_stage0 = cached_stage0_artifacts(host_build)
+        if cached_stage0 is None:
+            raise RuntimeError("Stage-0 build completed without producing the complete reusable artifact set.")
     if IS_WINDOWS:
         env["RAZ_EXTERNAL_LINKER"] = compiler
         env.pop("RAZ_LINKER", None)  # Bundled ObLink is the Windows default.
     else:
         env["RAZ_LINKER"] = compiler
 
-    host_driver = find_artifact(host_build, [f"raz-host{EXE}"])
-    # Built above alongside the host toolchain. ObLink emits PE32+ only, so it
+    host_driver = cached_stage0["driver"]
+    # Built alongside Stage 0. ObLink emits PE32+ only, so it
     # is the bundled linker on Windows and nowhere else yet; elsewhere, and when
     # the bundled build is disabled, link_stage falls back to the C++ driver.
-    oblink: Path | None = None
-    if IS_WINDOWS:
-        try:
-            oblink = find_artifact(host_build, [f"oblink{EXE}"])
-        except RuntimeError:
-            oblink = None
-    runtime = find_artifact(host_build, ["raz_runtime.lib", "libraz_runtime.a"])
-    bridge = find_artifact(host_build, ["raz_forge_bridge.lib", "libraz_forge_bridge.a"])
-    forge = find_artifact(host_build, ["forge.lib", "libforge.a"])
+    oblink: Path | None = cached_stage0.get("oblink") if IS_WINDOWS else None
+    runtime = cached_stage0["runtime"]
+    bridge = cached_stage0["bridge"]
+    forge = cached_stage0["forge"]
 
     # raz_runtime is a static archive. Any provider libraries used while
     # building it must be repeated at the final reproducibility-build link boundary.
-    # CMake exports the exact imported target files it selected into a manifest;
-    # do not guess OpenSSL cache variable names because they vary by package and
-    # platform configuration.
-    runtime_deps: list[str] = []
-    runtime_deps_manifest = host_build / "raz-runtime-link-deps.txt"
-    if runtime_deps_manifest.is_file():
-        for raw in runtime_deps_manifest.read_text(encoding="utf-8", errors="replace").splitlines():
-            value = raw.strip()
-            if not value:
-                continue
-            dep = Path(value)
-            if not dep.is_file():
-                raise RuntimeError(f"CMake resolved a runtime link dependency that does not exist: {dep}")
-            runtime_deps.append(str(dep))
-
-    openssl_enabled = read_cache(host_build, "OPENSSL_FOUND", required=False).upper() in {"1", "ON", "TRUE", "YES"}
-    if not openssl_enabled:
-        # FindOpenSSL commonly exposes OPENSSL_INCLUDE_DIR even when it does not
-        # cache OPENSSL_FOUND. The runtime compile command is the final fallback
-        # signal because RAZ_HAVE_OPENSSL is only defined when OpenSSL_FOUND.
-        openssl_enabled = bool(read_cache(host_build, "OPENSSL_INCLUDE_DIR", required=False))
-    if openssl_enabled and len(runtime_deps) < 2:
-        raise RuntimeError(
-            "OpenSSL is enabled for raz_runtime, but CMake did not export both "
-            "OpenSSL link dependencies. Reconfigure the host build instead of "
-            "attempting a broken reproducibility-build link."
-        )
+    runtime_deps = load_runtime_link_dependencies(host_build)
 
     if runtime_deps:
         print("Runtime link dependencies:")
         for dep in runtime_deps:
             print(f"  {dep}")
 
-    order = source_order()
-    print(f"Production compiler source: {len(order)} Raz modules")
+    modules = compiler_modules()
+    print(f"Production compiler source: {len(modules)} Raz modules")
 
     banner("Construct production Raz compiler")
-    compiler_project = qualification / "compiler-project"
-    shutil.rmtree(compiler_project, ignore_errors=True)
-    shutil.copytree(ROOT / "compiler", compiler_project, ignore=shutil.ignore_patterns(".raz", "target"))
-    # The compatibility-pinned host compiler predates semantic-module interfaces. Construct the production compiler from a
-    # disposable legacy view: strip compiler-only module namespace/import edges
-    # and materialize source-order.txt only in this temporary copy.
-    #
-    # RXE and WebAssembly are production backends, but the host construction path only
-    # needs Forge/LLVM to construct the production compiler. Keeping the optional backends out of
-    # this one host-compatible compiler candidate prevents the compatibility-pinned native host frontend from
-    # crossing its peak-memory ceiling as the Raz-owned compiler grows. The production compiler and every reproducibility build compile the complete canonical source tree.
-    for optional_backend in ("wasm", "rxe"):
-        shutil.rmtree(compiler_project / "src" / "backend" / optional_backend, ignore_errors=True)
-    legacy_order = [
-        item for item in (compiler_project / "host-source-order.txt").read_text(encoding="utf-8").splitlines()
-        if not item.startswith("src/backend/wasm/") and not item.startswith("src/backend/rxe/")
-    ]
-    host_backend = compiler_project / "src" / "driver" / "backend.rz"
-    backend_text = host_backend.read_text(encoding="utf-8")
-    backend_text = backend_text.replace(
-        "public import raz_compiler_backend_rxe_codegen;",
-        "public import raz_compiler_backend_llvm_codegen;",
-    )
+    if llvm_seed_bootstrap:
+        stage0_text = args.stage0.strip()
+        if not stage0_text:
+            raise RuntimeError(
+                "This host requires a compatible prebuilt Raz stage-0 compiler for LLVM bootstrap. "
+                "Pass --stage0 /path/to/raz-compiler or set RAZ_STAGE0_COMPILER. "
+                "The stage-0 compiler is used only to produce the first LLVM-native compiler object for this host."
+            )
+        stage0 = Path(stage0_text).expanduser().resolve()
+        if not stage0.is_file():
+            raise RuntimeError(f"LLVM stage-0 compiler not found: {stage0}")
+        run("Validate LLVM stage-0 compiler", [str(stage0), "--version"], env=env)
 
-    # Build the compatibility-host view by syntax landmarks, not indentation.
-    # `raz fmt` is free to change whitespace, so bootstrap construction must not
-    # depend on an exact pretty-printed spelling of these optional backend blocks.
-    backend_text, option_replacements = re.subn(
-        r"(?ms)^[ \t]*// --backend=wasm\r?\n.*?(?=^[ \t]*return -1;)",
-        "",
-        backend_text,
-        count=1,
-    )
-    if option_replacements != 1:
-        raise RuntimeError("Could not prepare host-compatible backend option view.")
-
-    for backend_kind, emitter in ((2, "emit_wasm_module"), (3, "emit_rxe_module")):
-        pattern = (
-            rf"(?ms)^[ \t]*if \(backend == {backend_kind}\) \{{\r?\n"
-            rf"[ \t]*return {emitter}\([^;]*\);\r?\n"
-            rf"[ \t]*\}}\r?\n"
+        compiler_project = qualification / "compiler-project"
+        prepare_seed_compiler_project(compiler_project)
+        stage_target = compiler_project / "target" / args.bootstrap_profile
+        stage_target.mkdir(parents=True, exist_ok=True)
+        stage_object = stage_target / f"compiler{OBJ}"
+        invoke_compiler(
+            "LLVM stage-0 -> production compiler object",
+            stage0,
+            compiler_project,
+            [
+                "build",
+                "--backend=llvm",
+                "--emit=obj",
+                f"--opt={repro_opt}",
+                "raz.toml",
+                stage_object.relative_to(compiler_project).as_posix(),
+            ],
+            args.status_interval,
         )
-        backend_text, replacements = re.subn(pattern, "", backend_text, count=1)
-        if replacements != 1:
-            raise RuntimeError(f"Could not remove compatibility-host {emitter} dispatch.")
+        if not stage_object.is_file() or stage_object.stat().st_size < 100_000:
+            raise RuntimeError(f"LLVM production compiler object is missing or unexpectedly small: {stage_object}")
 
-    if "emit_wasm_module(" in backend_text or "emit_rxe_module(" in backend_text:
-        raise RuntimeError("Optional backend dispatch leaked into compatibility-host compiler view.")
-    host_backend.write_text(backend_text, encoding="utf-8")
-    for source in (compiler_project / "src").rglob("*.rz"):
-        lines = source.read_text(encoding="utf-8").splitlines()
-        lines = [line for line in lines if not line.startswith("namespace raz_compiler_") and not line.startswith("public import raz_compiler_") and not line.startswith("import raz_compiler_")]
-        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (compiler_project / "source-order.txt").write_text("\n".join(legacy_order) + "\n", encoding="ascii")
-    run("Host compiler -> production compiler", [str(host_driver), "build", str(compiler_project), "--profile", args.bootstrap_profile, "--force"], env=env)
-    built = compiler_project / "target" / args.bootstrap_profile / f"raz-compiler{EXE}"
-    if not built.is_file():
-        raise RuntimeError(f"Production compiler was not produced: {built}")
-    candidate_dir = qualification / "candidate"
-    candidate_dir.mkdir(parents=True, exist_ok=True)
-    candidate_compiler = candidate_dir / f"raz-compiler{EXE}"
-    shutil.copy2(built, candidate_compiler)
-    if not IS_WINDOWS:
-        candidate_compiler.chmod(candidate_compiler.stat().st_mode | 0o111)
+        candidate_dir = qualification / "candidate"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_compiler = candidate_dir / f"raz-compiler{EXE}"
+        link_stage(compiler, stage_object, runtime, bridge, forge, candidate_compiler, env, runtime_deps, oblink)
+        run("Validate LLVM production compiler", [str(candidate_compiler), "--version"], env=env)
+        if not IS_WINDOWS:
+            candidate_compiler.chmod(candidate_compiler.stat().st_mode | 0o111)
+    else:
+        compiler_project = qualification / "compiler-project"
+        prepare_seed_compiler_project(compiler_project)
+        # Build the production seed through the normal semantic module graph.
+        # The canonical compiler is intentionally order-independent: preserve namespace/import
+        # edges so the host build driver can materialize each module's semantic prerequisites.
+        # Never recreate the old source-order.txt concatenation path here.
+        #
+        # RXE and WebAssembly are production backends, but the host construction path only
+        # needs Forge/LLVM to construct the production compiler. Keeping the optional backends out of
+        # this one host-compatible compiler candidate prevents the compatibility-pinned native host frontend from
+        # crossing its peak-memory ceiling as the Raz-owned compiler grows. The production compiler and every reproducibility build compile the complete canonical source tree.
+        for optional_backend in ("wasm", "rxe"):
+            shutil.rmtree(compiler_project / "src" / "backend" / optional_backend, ignore_errors=True)
+        host_backend = compiler_project / "src" / "driver" / "backend.rz"
+        backend_text = host_backend.read_text(encoding="utf-8")
+        backend_text = backend_text.replace(
+            "public import raz_compiler_backend_rxe_codegen;",
+            "public import raz_compiler_backend_llvm_codegen;",
+        )
+
+        # Build the compatibility-host view by syntax landmarks, not indentation.
+        # `raz fmt` is free to change whitespace, so bootstrap construction must not
+        # depend on an exact pretty-printed spelling of these optional backend blocks.
+        backend_text, option_replacements = re.subn(
+            r"(?ms)^[ \t]*// --backend=wasm\r?\n.*?(?=^[ \t]*return -1;)",
+            "",
+            backend_text,
+            count=1,
+        )
+        if option_replacements != 1:
+            raise RuntimeError("Could not prepare host-compatible backend option view.")
+
+        for backend_kind, emitter in ((2, "emit_wasm_module"), (3, "emit_rxe_module")):
+            pattern = (
+                rf"(?ms)^[ \t]*if \(backend == {backend_kind}\) \{{\r?\n"
+                rf"[ \t]*return {emitter}\([^;]*\);\r?\n"
+                rf"[ \t]*\}}\r?\n"
+            )
+            backend_text, replacements = re.subn(pattern, "", backend_text, count=1)
+            if replacements != 1:
+                raise RuntimeError(f"Could not remove compatibility-host {emitter} dispatch.")
+
+        if "emit_wasm_module(" in backend_text or "emit_rxe_module(" in backend_text:
+            raise RuntimeError("Optional backend dispatch leaked into compatibility-host compiler view.")
+        host_backend.write_text(backend_text, encoding="utf-8")
+        # The compatibility-host compiler is only a seed for the Raz-owned
+        # recursive generations. Building that seed at O2 has historically spent
+        # minutes in Forge before self-hosting even starts, while an O0 seed makes
+        # the 113-module canonical compiler unnecessarily slow to analyze. Use a
+        # dedicated fast O1-by-default profile here: final reproducibility builds
+        # still use --repro-opt and therefore retain the requested release policy.
+        seed_profile = "bootstrap-seed"
+        seed_manifest = compiler_project / "raz.toml"
+        with seed_manifest.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                f"\n[profile.{seed_profile}]\n"
+                f"optimization = {args.seed_opt}\n"
+                "debug = false\n"
+                "incremental = true\n"
+            )
+        seed_command = [str(host_driver), "build", str(compiler_project), "--profile", seed_profile]
+        # A newly regenerated Stage 0 is a different bootstrap implementation;
+        # force one seed rebuild so an artifact produced by an older Stage 0 can
+        # never be accepted solely because the Raz source fingerprint is unchanged.
+        # With the persistent Stage-0 cache, normal bootstraps omit --force and
+        # reuse the seed project's own incremental cache.
+        if stage0_rebuilt:
+            seed_command.append("--force")
+        run(
+            f"Stage-0 compiler -> Raz seed (O{args.seed_opt})",
+            seed_command,
+            env=env,
+        )
+        built = compiler_project / "target" / seed_profile / f"raz-compiler{EXE}"
+        if not built.is_file():
+            raise RuntimeError(f"Production compiler was not produced: {built}")
+        candidate_dir = qualification / "candidate"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_compiler = candidate_dir / f"raz-compiler{EXE}"
+        shutil.copy2(built, candidate_compiler)
+        if not IS_WINDOWS:
+            candidate_compiler.chmod(candidate_compiler.stat().st_mode | 0o111)
 
     # Qualify the language server in the compiler users actually receive. The
     # C++ host remains a bootstrap boundary; editor protocol behavior belongs to
@@ -736,6 +999,11 @@ def main() -> int:
         env=env,
     )
     run(
+        "Production command help",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-cli-command-help.py"), "--raz", str(candidate_compiler)],
+        env=env,
+    )
+    run(
         "Production C bindgen",
         [sys.executable, str(ROOT / "tests" / "python" / "check-bindgen.py"), "--raz", str(candidate_compiler)],
         env=env,
@@ -747,52 +1015,97 @@ def main() -> int:
     )
 
     generated: list[tuple[int, Path, Path, str]] = []
-    previous = candidate_compiler
-    for generation in range(1, 4):
-        banner(f"Reproducibility build {generation}")
-        directory = qualification / f"repro-{generation}"
-        prepare_reproducibility_build(directory, order)
 
-        # A reproducibility workspace is still a Raz project.  Keep *all*
-        # generated native state below that project's target/ tree instead of
-        # dropping compiler.obj / raz-compiler beside raz.toml and src/.  This
-        # preserves the project-wide invariant that source roots stay clean and
-        # `target/` is the only project-local build-artifact root.
-        stage_target = directory / "target" / args.bootstrap_profile
-        stage_target.mkdir(parents=True, exist_ok=True)
-        obj = stage_target / f"compiler{OBJ}"
-        obj_argument = obj.relative_to(directory).as_posix()
+    # Normal bootstrap performs exactly one Raz-owned self-host generation.
+    # That proves the production compiler can compile itself while keeping the
+    # common developer path fast. A second *independent* generation is available
+    # only when deterministic fixed-point verification is explicitly requested.
+    self_host_dir = qualification / "repro-1"
+    prepare_self_host_build(self_host_dir, compiler_project, stage0_rebuilt)
+    banner("Raz self-host build")
+    stage_target = self_host_dir / "target" / args.bootstrap_profile
+    stage_target.mkdir(parents=True, exist_ok=True)
+    obj = stage_target / f"compiler{OBJ}"
+    obj_argument = obj.relative_to(self_host_dir).as_posix()
+    if llvm_seed_bootstrap:
+        generation_args = [
+            "build",
+            "--backend=llvm",
+            "--emit=obj",
+            f"--opt={repro_opt}",
+            "raz.toml",
+            obj_argument,
+        ]
+    else:
+        generation_args = [
+            "build",
+            "--backend=forge",
+            "--forge-native",
+            "--forge-structured-only",
+            f"--opt={repro_opt}",
+            "raz.toml",
+            obj_argument,
+        ]
+    compile_env = dict(env)
+    compile_env.setdefault("RAZ_COMPILER_PHASE_TRACE", "1")
+    invoke_compiler(
+        "Compile Raz self-host generation",
+        candidate_compiler,
+        self_host_dir,
+        generation_args,
+        args.status_interval,
+        compile_env,
+    )
+    minimum_object_size = 100_000 if llvm_seed_bootstrap else 500_000
+    if not obj.is_file() or obj.stat().st_size < minimum_object_size:
+        raise RuntimeError(f"Self-host compiler object is missing or unexpectedly small: {obj}")
+    self_host_compiler = stage_target / f"raz-compiler{EXE}"
+    link_stage(compiler, obj, runtime, bridge, forge, self_host_compiler, env, runtime_deps, oblink)
+    run("Validate Raz self-host compiler", [str(self_host_compiler), "--version"], cwd=self_host_dir, env=env)
+    generated.append((1, obj, self_host_compiler, digest(obj)))
+
+    verification_hash = ""
+    verification_size = 0
+    deterministic_convergence = "not requested"
+    if args.verify_reproducibility:
+        banner("Reproducibility verification generation")
+        verify_dir = qualification / "repro-2"
+        prepare_reproducibility_verification(verify_dir)
+        verify_target = verify_dir / "target" / args.bootstrap_profile
+        verify_target.mkdir(parents=True, exist_ok=True)
+        verify_obj = verify_target / f"compiler{OBJ}"
+        verify_argument = verify_obj.relative_to(verify_dir).as_posix()
+        if llvm_seed_bootstrap:
+            verify_args = [
+                "build", "--backend=llvm", "--emit=obj", f"--opt={repro_opt}",
+                "raz.toml", verify_argument,
+            ]
+        else:
+            verify_args = [
+                "build", "--backend=forge", "--forge-native", "--forge-structured-only",
+                f"--opt={repro_opt}", "raz.toml", verify_argument,
+            ]
         invoke_compiler(
-            f"Compile reproducibility generation {generation}",
-            previous,
-            directory,
-            [
-                "build",
-                "--backend=forge",
-                "--forge-native",
-                "--forge-structured-only",
-                f"--opt={repro_opt}",
-                "raz.toml",
-                obj_argument,
-            ],
+            "Compile independent reproducibility generation",
+            self_host_compiler,
+            verify_dir,
+            verify_args,
             args.status_interval,
+            compile_env,
         )
-        if not obj.is_file() or obj.stat().st_size < 500_000:
-            raise RuntimeError(f"Reproducibility object is missing or unexpectedly small: {obj}")
-        exe = stage_target / f"raz-compiler{EXE}"
-        link_stage(compiler, obj, runtime, bridge, forge, exe, env, runtime_deps, oblink)
-        run(f"Validate reproducibility build {generation}", [str(exe), "--version"], cwd=directory, env=env)
-        generated.append((generation, obj, exe, digest(obj)))
-        previous = exe
-
-    banner("Verify deterministic compiler reproducibility")
-    sizes = {item[1].stat().st_size for item in generated}
-    hashes = {item[3] for item in generated}
-    if len(sizes) != 1 or len(hashes) != 1:
-        raise RuntimeError("Compiler reproducibility failed: generated native objects differ.")
-    fixed_hash = generated[0][3]
-    fixed_size = generated[0][1].stat().st_size
-    print(f"Reproducibility verified ({fixed_size} object bytes)\nSHA-256: {fixed_hash}")
+        if not verify_obj.is_file() or verify_obj.stat().st_size < minimum_object_size:
+            raise RuntimeError(f"Reproducibility object is missing or unexpectedly small: {verify_obj}")
+        verify_compiler = verify_target / f"raz-compiler{EXE}"
+        link_stage(compiler, verify_obj, runtime, bridge, forge, verify_compiler, env, runtime_deps, oblink)
+        run("Validate reproducibility compiler", [str(verify_compiler), "--version"], cwd=verify_dir, env=env)
+        verify_digest = digest(verify_obj)
+        generated.append((2, verify_obj, verify_compiler, verify_digest))
+        if obj.stat().st_size != verify_obj.stat().st_size or generated[0][3] != verify_digest:
+            raise RuntimeError("Compiler fixed-point verification failed: self-host and verification generations differ.")
+        verification_hash = verify_digest
+        verification_size = verify_obj.stat().st_size
+        deterministic_convergence = "yes"
+        print(f"Reproducibility verified ({verification_size} object bytes)\nSHA-256: {verification_hash}")
 
     if args.run_tests:
         banner("Run CTest qualification")
@@ -800,13 +1113,14 @@ def main() -> int:
 
     summary = qualification / "BUILD-SUMMARY.txt"
     summary.write_text(
-        "Raz compiler construction and reproducibility qualification succeeded.\n\n"
-        f"Platform: {platform.platform()}\nHost preset: {args.host_preset}\nBootstrap profile: {args.bootstrap_profile}\nRepro optimization: {repro_opt}\nC++ compiler: {compiler}\n\n"
-        + "\n".join(f"Reproducibility build {generation}: {exe}" for generation, _, exe, _ in generated)
-        + f"\n\nFixed-point object bytes: {fixed_size}\nFixed-point SHA-256: {fixed_hash}\nDeterministic convergence: yes\n",
+        "Raz compiler construction and self-host qualification succeeded.\n\n"
+        f"Platform: {platform.platform()}\nHost architecture: {host_arch}\nHost preset: {args.host_preset}\nBootstrap profile: {args.bootstrap_profile}\nSeed optimization: {args.seed_opt if not llvm_seed_bootstrap else 'stage0/LLVM'}\nSelf-host optimization: {repro_opt}\nSelf-host backend: {'LLVM' if llvm_seed_bootstrap else 'Forge'}\nC++ compiler: {compiler}\n\n"
+        + "\n".join(f"Self-host generation {generation}: {exe}" for generation, _, exe, _ in generated)
+        + f"\n\nSelf-host object bytes: {generated[0][1].stat().st_size}\nSelf-host SHA-256: {generated[0][3]}\nDeterministic convergence: {deterministic_convergence}\n"
+        + ((f"Verified fixed-point object bytes: {verification_size}\nVerified fixed-point SHA-256: {verification_hash}\n") if args.verify_reproducibility else ""),
         encoding="utf-8",
     )
-    banner("COMPILER QUALIFICATION COMPLETE")
+    banner("COMPILER SELF-HOST QUALIFICATION COMPLETE")
     print(f"Artifacts: {qualification}\nSummary  : {summary}")
     return 0
 

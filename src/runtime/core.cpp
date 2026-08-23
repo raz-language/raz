@@ -20,9 +20,94 @@ constexpr std::array<std::uint32_t, 256> raz_make_crc32_ieee_table() {
 }
 
 constexpr auto raz_crc32_ieee_table = raz_make_crc32_ieee_table();
+
+// Stage-1 aggregate storage for the LLVM backend. Aggregates lower to a handle
+// into a flat array of i64 cells, and the backend inttoptr's that handle and
+// dereferences it directly ("the arena handle is the payload address" --
+// compiler/src/backend/llvm/codegen.rz), so the handle must BE the address of
+// the cells. The 24-byte header therefore sits behind the handle and matches
+// the compiler's own arena ABI: magic at -24, cell count at -16.
+constexpr std::int64_t raz_stage1_arena_magic = 4923358263036431937LL;
+constexpr std::int64_t raz_stage1_arena_header = 24;
+
+std::int64_t* raz_stage1_arena_cells(std::int64_t handle) {
+  if (handle == 0) return nullptr;
+  auto* cells = reinterpret_cast<std::int64_t*>(static_cast<std::uintptr_t>(handle));
+  const auto* header = reinterpret_cast<const std::int64_t*>(
+      reinterpret_cast<const char*>(cells) - raz_stage1_arena_header);
+  return header[0] == raz_stage1_arena_magic ? cells : nullptr;
+}
+
+std::int64_t raz_stage1_arena_count(std::int64_t handle) {
+  if (handle == 0) return 0;
+  const auto* header = reinterpret_cast<const std::int64_t*>(
+      reinterpret_cast<const char*>(static_cast<std::uintptr_t>(handle)) - raz_stage1_arena_header);
+  return header[0] == raz_stage1_arena_magic ? header[1] : 0;
+}
+
+std::int64_t raz_stage1_arena_element_bytes(std::int64_t handle) {
+  if (handle == 0) return 0;
+  const auto* header = reinterpret_cast<const std::int64_t*>(
+      reinterpret_cast<const char*>(static_cast<std::uintptr_t>(handle)) - raz_stage1_arena_header);
+  if (header[0] != raz_stage1_arena_magic) return 0;
+  const auto width = header[2];
+  return width == 1 || width == 2 || width == 4 || width == 8 ? width : 8;
+}
 }
 
 extern "C" {
+
+void raz_rt_abort() {
+  std::abort();
+}
+
+std::int64_t raz_rt_cstr_len(const char* value) {
+  if (value == nullptr) return 0;
+  return static_cast<std::int64_t>(std::strlen(value));
+}
+
+std::uintptr_t raz_rt_cstr_ptr(const char* value) {
+  return reinterpret_cast<std::uintptr_t>(value);
+}
+
+std::int64_t raz_rt_cstr_equal(const char* left, std::int64_t left_length, const char* right) {
+  if (left_length < 0 || right == nullptr) return 0;
+  const auto right_length = static_cast<std::int64_t>(std::strlen(right));
+  if (left_length != right_length) return 0;
+  if (left_length == 0) return 1;
+  return left != nullptr && std::memcmp(left, right, static_cast<std::size_t>(left_length)) == 0 ? 1 : 0;
+}
+
+std::int64_t raz_rt_cstr_find(const char* data, std::int64_t length, const char* needle) {
+  if (length < 0 || (length > 0 && data == nullptr) || needle == nullptr) return -1;
+  const auto needle_length = static_cast<std::int64_t>(std::strlen(needle));
+  if (needle_length == 0) return 0;
+  if (needle_length > length) return -1;
+  for (std::int64_t i = 0; i <= length - needle_length; ++i) {
+    if (std::memcmp(data + i, needle, static_cast<std::size_t>(needle_length)) == 0) return i;
+  }
+  return -1;
+}
+
+std::int64_t raz_rt_cstr_rfind(const char* data, std::int64_t length, const char* needle) {
+  if (length < 0 || (length > 0 && data == nullptr) || needle == nullptr) return -1;
+  const auto needle_length = static_cast<std::int64_t>(std::strlen(needle));
+  if (needle_length == 0) return length;
+  if (needle_length > length) return -1;
+  for (std::int64_t i = length - needle_length; i >= 0; --i) {
+    if (std::memcmp(data + i, needle, static_cast<std::size_t>(needle_length)) == 0) return i;
+  }
+  return -1;
+}
+
+std::int64_t raz_rt_f64_format(double value, void* output, std::int64_t capacity) {
+  if (output == nullptr || capacity <= 0) return -1;
+  auto* begin = static_cast<char*>(output);
+  auto* end = begin + capacity;
+  const auto result = std::to_chars(begin, end, value, std::chars_format::general);
+  if (result.ec != std::errc{}) return -1;
+  return static_cast<std::int64_t>(result.ptr - begin);
+}
 std::int64_t raz_rt_abi_pointer_size() { return static_cast<std::int64_t>(sizeof(void*)); }
 std::int64_t raz_rt_abi_pointer_alignment() { return static_cast<std::int64_t>(alignof(void*)); }
 std::int64_t raz_rt_abi_bool_size() { return static_cast<std::int64_t>(sizeof(bool)); }
@@ -443,6 +528,58 @@ std::int64_t raz_rt_store_u8(std::uintptr_t address, std::int64_t value) {
   return 1;
 }
 
+std::int64_t raz_rt_load_scalar(std::uintptr_t address, std::int64_t bytes, std::int64_t signed_value) {
+  if (address == 0) return 0;
+  if (bytes == 1) {
+    std::uint8_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return signed_value != 0 ? static_cast<std::int64_t>(static_cast<std::int8_t>(value))
+                             : static_cast<std::int64_t>(value);
+  }
+  if (bytes == 2) {
+    std::uint16_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return signed_value != 0 ? static_cast<std::int64_t>(static_cast<std::int16_t>(value))
+                             : static_cast<std::int64_t>(value);
+  }
+  if (bytes == 4) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return signed_value != 0 ? static_cast<std::int64_t>(static_cast<std::int32_t>(value))
+                             : static_cast<std::int64_t>(value);
+  }
+  if (bytes == 8) {
+    std::int64_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value;
+  }
+  return 0;
+}
+
+std::int64_t raz_rt_store_scalar(std::uintptr_t address, std::int64_t bytes, std::int64_t value) {
+  if (address == 0) return 0;
+  if (bytes == 1) {
+    const auto narrowed = static_cast<std::uint8_t>(value);
+    std::memcpy(reinterpret_cast<void*>(address), &narrowed, sizeof(narrowed));
+    return 1;
+  }
+  if (bytes == 2) {
+    const auto narrowed = static_cast<std::uint16_t>(value);
+    std::memcpy(reinterpret_cast<void*>(address), &narrowed, sizeof(narrowed));
+    return 1;
+  }
+  if (bytes == 4) {
+    const auto narrowed = static_cast<std::uint32_t>(value);
+    std::memcpy(reinterpret_cast<void*>(address), &narrowed, sizeof(narrowed));
+    return 1;
+  }
+  if (bytes == 8) {
+    std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    return 1;
+  }
+  return 0;
+}
+
 std::int64_t raz_rt_bytes_equal(std::uintptr_t left, std::uintptr_t right, std::int64_t size) {
   if (size < 0 || (size > 0 && (left == 0 || right == 0))) return 0;
   if (size == 0) return 1;
@@ -571,6 +708,125 @@ void raz_rt_rwlock_read_unlock(void* lock) { if (lock != nullptr) static_cast<Ra
 void raz_rt_rwlock_write_lock(void* lock) { if (lock != nullptr) static_cast<RazRwLock*>(lock)->mutex.lock(); }
 std::int64_t raz_rt_rwlock_try_write(void* lock) { return lock != nullptr && static_cast<RazRwLock*>(lock)->mutex.try_lock() ? 1 : 0; }
 void raz_rt_rwlock_write_unlock(void* lock) { if (lock != nullptr) static_cast<RazRwLock*>(lock)->mutex.unlock(); }
+
+std::int64_t raz_rt_stage1_arena_create(std::int64_t count) {
+  if (count <= 0 || count > (INT64_MAX - raz_stage1_arena_header) / 8) return 0;
+  const std::int64_t bytes = raz_stage1_arena_header + count * 8;
+  void* allocation = raz_rt_alloc_aligned(bytes, 8);
+  if (allocation == nullptr) return 0;
+  std::memset(allocation, 0, static_cast<std::size_t>(bytes));
+  auto* header = static_cast<std::int64_t*>(allocation);
+  header[0] = raz_stage1_arena_magic;
+  header[1] = count;
+  header[2] = 8;
+  return static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(
+      static_cast<char*>(allocation) + raz_stage1_arena_header));
+}
+
+std::int64_t raz_rt_stage1_array_create(std::int64_t count, std::int64_t element_bytes) {
+  if (count <= 0 || (element_bytes != 1 && element_bytes != 2 && element_bytes != 4 && element_bytes != 8)) return 0;
+  if (count > (INT64_MAX - raz_stage1_arena_header) / element_bytes) return 0;
+  const std::int64_t bytes = raz_stage1_arena_header + count * element_bytes;
+  void* allocation = raz_rt_alloc_aligned(bytes, 8);
+  if (allocation == nullptr) return 0;
+  std::memset(allocation, 0, static_cast<std::size_t>(bytes));
+  auto* header = static_cast<std::int64_t*>(allocation);
+  header[0] = raz_stage1_arena_magic;
+  header[1] = count;
+  header[2] = element_bytes;
+  return static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(
+      static_cast<char*>(allocation) + raz_stage1_arena_header));
+}
+
+std::int64_t raz_rt_stage1_arena_get(std::int64_t handle, std::int64_t index) {
+  if (raz_stage1_arena_cells(handle) == nullptr || index < 0 || index >= raz_stage1_arena_count(handle)) return 0;
+  const auto width = raz_stage1_arena_element_bytes(handle);
+  const auto* base = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(handle));
+  const auto* p = base + static_cast<std::size_t>(index * width);
+  if (width == 1) return *p;
+  if (width == 2) { std::uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
+  if (width == 4) { std::uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
+  std::int64_t v = 0; std::memcpy(&v, p, 8); return v;
+}
+
+void raz_rt_stage1_arena_set(std::int64_t handle, std::int64_t index, std::int64_t value) {
+  if (raz_stage1_arena_cells(handle) == nullptr || index < 0 || index >= raz_stage1_arena_count(handle)) return;
+  const auto width = raz_stage1_arena_element_bytes(handle);
+  auto* base = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(handle));
+  auto* p = base + static_cast<std::size_t>(index * width);
+  if (width == 1) { *p = static_cast<std::uint8_t>(value); return; }
+  if (width == 2) { const auto v = static_cast<std::uint16_t>(value); std::memcpy(p, &v, 2); return; }
+  if (width == 4) { const auto v = static_cast<std::uint32_t>(value); std::memcpy(p, &v, 4); return; }
+  std::memcpy(p, &value, 8);
+}
+
+void raz_rt_stage1_arena_destroy(std::int64_t handle) {
+  if (raz_stage1_arena_cells(handle) == nullptr) return;
+  auto* allocation = reinterpret_cast<char*>(static_cast<std::uintptr_t>(handle)) - raz_stage1_arena_header;
+  auto* header = reinterpret_cast<std::int64_t*>(allocation);
+  header[0] = 0;
+  header[1] = 0;
+  header[2] = 0;
+  raz_rt_dealloc_aligned(allocation, 8);
+}
+
+// Legacy textual Forge uses stage-1 frame storage when a function cannot yet
+// stay on the structured-native path. References are direct addresses into the
+// arena payload, so this compatibility ABI needs no compiler-private reference
+// table and no per-reference allocation.
+double raz_rt_stage1_arena_get_f64(std::int64_t handle, std::int64_t index) {
+  std::int64_t* cells = raz_stage1_arena_cells(handle);
+  if (cells == nullptr || index < 0 || index >= raz_stage1_arena_count(handle)) return 0.0;
+  double value = 0.0;
+  std::memcpy(&value, &cells[index], sizeof(value));
+  return value;
+}
+
+void raz_rt_stage1_arena_set_f64(std::int64_t handle, std::int64_t index, double value) {
+  std::int64_t* cells = raz_stage1_arena_cells(handle);
+  if (cells == nullptr || index < 0 || index >= raz_stage1_arena_count(handle)) return;
+  std::memcpy(&cells[index], &value, sizeof(value));
+}
+
+std::int64_t raz_rt_stage1_ref_create(std::int64_t frame, std::int64_t slot) {
+  std::int64_t* cells = raz_stage1_arena_cells(frame);
+  if (cells == nullptr || slot < 0 || slot >= raz_stage1_arena_count(frame)) return 0;
+  return static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(&cells[slot]));
+}
+
+std::int64_t raz_rt_stage1_array_ref_create(std::int64_t frame, std::int64_t slot) {
+  if (raz_stage1_arena_cells(frame) == nullptr || slot < 0 || slot >= raz_stage1_arena_count(frame)) return 0;
+  const auto width = raz_stage1_arena_element_bytes(frame);
+  auto* base = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(frame));
+  return static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(
+      base + static_cast<std::size_t>(slot * width)));
+}
+
+std::int64_t raz_rt_stage1_ref_create_address(void* address) {
+  return static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(address));
+}
+
+std::int64_t raz_rt_stage1_ref_get(std::int64_t reference) {
+  if (reference == 0) return 0;
+  return *reinterpret_cast<const std::int64_t*>(static_cast<std::uintptr_t>(reference));
+}
+
+void raz_rt_stage1_ref_set(std::int64_t reference, std::int64_t value) {
+  if (reference == 0) return;
+  *reinterpret_cast<std::int64_t*>(static_cast<std::uintptr_t>(reference)) = value;
+}
+
+double raz_rt_stage1_ref_get_f64(std::int64_t reference) {
+  if (reference == 0) return 0.0;
+  double value = 0.0;
+  std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(reference)), sizeof(value));
+  return value;
+}
+
+void raz_rt_stage1_ref_set_f64(std::int64_t reference, double value) {
+  if (reference == 0) return;
+  std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(reference)), &value, sizeof(value));
+}
 
 
 }

@@ -37,4 +37,9 @@ if(OBLINK_BUILD_TESTS)
   add_executable(oblink-link-tests tests/link_tests.cpp)
   target_link_libraries(oblink-link-tests PRIVATE oblink_core)
   add_test(NAME oblink-link-tests COMMAND oblink-link-tests)
+
+  # Keep CLI response-file support qualified: Raz uses it automatically for
+  # compiler-sized Windows links to stay below cmd.exe's command-line limit.
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/oblink-help.rsp" "--help\n")
+  add_test(NAME oblink-response-file COMMAND oblink "@${CMAKE_CURRENT_BINARY_DIR}/oblink-help.rsp")
 endif()

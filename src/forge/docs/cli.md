@@ -9,6 +9,7 @@ Primary driver for verification, optimization, and native object compilation.
 ```sh
 forge verify input.fir
 forge compile input.fir -O2 --format=elf -o output.o
+forge compile input.fir -O2 --arch=aarch64 --format=elf -o output-aarch64.o
 ```
 
 ## `forge-opt`
@@ -30,7 +31,7 @@ forge-dis module.fbc -o module.fir
 
 ## `forge-codegen`
 
-Displays machine lowering, allocation, encoder statistics, and code-quality metrics.
+Displays machine lowering, allocation, encoder statistics, and code-quality metrics. `--arch=aarch64` selects the correctness-first AArch64 encoder; physical-allocation reporting is currently x86-64-only.
 
 ## `forge-run`
 

@@ -45,6 +45,42 @@ fn c_header_append_range(i64 out, i64 capacity, i64 cursor, i64 data, i64 start,
     return cursor;
 }
 
+fn c_header_append_string_literal(i64 out, i64 capacity, i64 cursor, string text) -> i64 {
+    i64 length = compiler_literal_length(text);
+    i64 i = 0;
+    while (i < length) {
+        cursor = c_header_append_byte(out, capacity, cursor, compiler_literal_byte(text, i));
+        if (cursor < 0) { return -1; }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn c_header_equal_string(i64 data, i64 start, i64 end, string text) -> bool {
+    i64 length = compiler_literal_length(text);
+    start = c_header_skip(data, start, end);
+    end = c_header_trim(data, start, end);
+    if (end - start != length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(text, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn c_header_starts_string(i64 data, i64 start, i64 end, string text) -> bool {
+    i64 length = compiler_literal_length(text);
+    start = c_header_skip(data, start, end);
+    if (end - start < length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(text, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
 fn c_header_append_literal(i64 out, i64 capacity, i64 cursor, i64[] text, i64 length) -> i64 {
     i64 i = 0;
     while (i < length) {
@@ -102,6 +138,26 @@ fn c_header_find_matching(i64 data, i64 open, i64 end, i64 left, i64 right) -> i
     return -1;
 }
 
+fn c_header_find_token_string(i64 data, i64 start, i64 end, string token) -> i64 {
+    i64 length = compiler_literal_length(token);
+    i64 i = start;
+    while (i + length <= end) {
+        bool same = true;
+        i64 j = 0;
+        while (j < length && same) {
+            if (raz_compiler_rt_arena_get(data, i + j) != compiler_literal_byte(token, j)) { same = false; }
+            j += 1;
+        }
+        if (same) {
+            bool left_ok = i == start || !c_header_ident(raz_compiler_rt_arena_get(data, i - 1));
+            bool right_ok = i + length == end || !c_header_ident(raz_compiler_rt_arena_get(data, i + length));
+            if (left_ok && right_ok) { return i; }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
 fn c_header_find_token(i64 data, i64 start, i64 end, i64[] token, i64 length) -> i64 {
     i64 i = start;
     while (i + length <= end) {
@@ -124,23 +180,23 @@ fn c_header_find_token(i64 data, i64 start, i64 end, i64[] token, i64 length) ->
 fn c_header_emit_base_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
     start = c_header_skip(data, start, end);
     end = c_header_trim(data, start, end);
-    i64 i8t[2]=[105,56]; i64 u8t[2]=[117,56]; i64 i16t[3]=[105,49,54]; i64 u16t[3]=[117,49,54];
-    i64 i32t[3]=[105,51,50]; i64 u32t[3]=[117,51,50]; i64 i64t[3]=[105,54,52]; i64 u64t[3]=[117,54,52];
-    i64 isizet[5]=[105,115,105,122,101]; i64 usizet[5]=[117,115,105,122,101]; i64 f32t[3]=[102,51,50]; i64 f64t[3]=[102,54,52];
-    i64 boolt[4]=[98,111,111,108]; i64 voidt[4]=[118,111,105,100];
-    i64 ci8[6]=[105,110,116,56,95,116]; i64 cu8[7]=[117,105,110,116,56,95,116];
-    i64 ci16[7]=[105,110,116,49,54,95,116]; i64 cu16[8]=[117,105,110,116,49,54,95,116];
-    i64 ci32[7]=[105,110,116,51,50,95,116]; i64 cu32[8]=[117,105,110,116,51,50,95,116];
-    i64 ci64[7]=[105,110,116,54,52,95,116]; i64 cu64[8]=[117,105,110,116,54,52,95,116];
-    i64 cintptr[8]=[105,110,116,112,116,114,95,116]; i64 cuintptr[9]=[117,105,110,116,112,116,114,95,116];
-    i64 cfloat[5]=[102,108,111,97,116]; i64 cdouble[6]=[100,111,117,98,108,101]; i64 cbool[4]=[98,111,111,108]; i64 cvoid[4]=[118,111,105,100];
-    if(c_header_equal(data,start,end,&i8t,2)){return c_header_append_literal(out,capacity,cursor,&ci8,6);} if(c_header_equal(data,start,end,&u8t,2)){return c_header_append_literal(out,capacity,cursor,&cu8,7);}
-    if(c_header_equal(data,start,end,&i16t,3)){return c_header_append_literal(out,capacity,cursor,&ci16,7);} if(c_header_equal(data,start,end,&u16t,3)){return c_header_append_literal(out,capacity,cursor,&cu16,8);}
-    if(c_header_equal(data,start,end,&i32t,3)){return c_header_append_literal(out,capacity,cursor,&ci32,7);} if(c_header_equal(data,start,end,&u32t,3)){return c_header_append_literal(out,capacity,cursor,&cu32,8);}
-    if(c_header_equal(data,start,end,&i64t,3)){return c_header_append_literal(out,capacity,cursor,&ci64,7);} if(c_header_equal(data,start,end,&u64t,3)){return c_header_append_literal(out,capacity,cursor,&cu64,8);}
-    if(c_header_equal(data,start,end,&isizet,5)){return c_header_append_literal(out,capacity,cursor,&cintptr,8);} if(c_header_equal(data,start,end,&usizet,5)){return c_header_append_literal(out,capacity,cursor,&cuintptr,9);}
-    if(c_header_equal(data,start,end,&f32t,3)){return c_header_append_literal(out,capacity,cursor,&cfloat,5);} if(c_header_equal(data,start,end,&f64t,3)){return c_header_append_literal(out,capacity,cursor,&cdouble,6);}
-    if(c_header_equal(data,start,end,&boolt,4)){return c_header_append_literal(out,capacity,cursor,&cbool,4);} if(c_header_equal(data,start,end,&voidt,4)){return c_header_append_literal(out,capacity,cursor,&cvoid,4);}
+    string i8t = "i8"; string u8t = "u8"; string i16t = "i16"; string u16t = "u16";
+    string i32t = "i32"; string u32t = "u32"; string i64t = "i64"; string u64t = "u64";
+    string isizet = "isize"; string usizet = "usize"; string f32t = "f32"; string f64t = "f64";
+    string boolt = "bool"; string voidt = "void";
+    string ci8 = "int8_t"; string cu8 = "uint8_t";
+    string ci16 = "int16_t"; string cu16 = "uint16_t";
+    string ci32 = "int32_t"; string cu32 = "uint32_t";
+    string ci64 = "int64_t"; string cu64 = "uint64_t";
+    string cintptr = "intptr_t"; string cuintptr = "uintptr_t";
+    string cfloat = "float"; string cdouble = "double"; string cbool = "bool"; string cvoid = "void";
+    if(c_header_equal_string(data,start,end, i8t)){return c_header_append_string_literal(out,capacity,cursor, ci8);} if(c_header_equal_string(data,start,end, u8t)){return c_header_append_string_literal(out,capacity,cursor, cu8);}
+    if(c_header_equal_string(data,start,end, i16t)){return c_header_append_string_literal(out,capacity,cursor, ci16);} if(c_header_equal_string(data,start,end, u16t)){return c_header_append_string_literal(out,capacity,cursor, cu16);}
+    if(c_header_equal_string(data,start,end, i32t)){return c_header_append_string_literal(out,capacity,cursor, ci32);} if(c_header_equal_string(data,start,end, u32t)){return c_header_append_string_literal(out,capacity,cursor, cu32);}
+    if(c_header_equal_string(data,start,end, i64t)){return c_header_append_string_literal(out,capacity,cursor, ci64);} if(c_header_equal_string(data,start,end, u64t)){return c_header_append_string_literal(out,capacity,cursor, cu64);}
+    if(c_header_equal_string(data,start,end, isizet)){return c_header_append_string_literal(out,capacity,cursor, cintptr);} if(c_header_equal_string(data,start,end, usizet)){return c_header_append_string_literal(out,capacity,cursor, cuintptr);}
+    if(c_header_equal_string(data,start,end, f32t)){return c_header_append_string_literal(out,capacity,cursor, cfloat);} if(c_header_equal_string(data,start,end, f64t)){return c_header_append_string_literal(out,capacity,cursor, cdouble);}
+    if(c_header_equal_string(data,start,end, boolt)){return c_header_append_string_literal(out,capacity,cursor, cbool);} if(c_header_equal_string(data,start,end, voidt)){return c_header_append_string_literal(out,capacity,cursor, cvoid);}
     // Named @repr(C) aggregates are emitted with their Raz spelling.  The
     // generated header defines those names as typedefs before function use.
     if (end > start) { return c_header_append_range(out, capacity, cursor, data, start, end); }
@@ -149,12 +205,12 @@ fn c_header_emit_base_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 star
 
 fn c_header_emit_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i64 end) -> i64 {
     start=c_header_skip(data,start,end); end=c_header_trim(data,start,end);
-    i64 ptr_const[6]=[42,99,111,110,115,116]; i64 ptr_mut[4]=[42,109,117,116];
-    if(end-start>=6 && c_header_equal(data,end-6,end,&ptr_const,6)){
-        i64 base_end=c_header_trim(data,start,end-6); i64 cconst[7]=[99,111,110,115,116,32,0];
-        cursor=c_header_append_literal(out,capacity,cursor,&cconst,6); cursor=c_header_emit_type(out,capacity,cursor,data,start,base_end); return c_header_append_byte(out,capacity,cursor,42);
+    string ptr_const = "*const"; string ptr_mut = "*mut";
+    if(end-start>=6 && c_header_equal_string(data,end-6,end, ptr_const)){
+        i64 base_end=c_header_trim(data,start,end-6); string cconst = "const ";
+        cursor=c_header_append_string_literal(out,capacity,cursor, cconst); cursor=c_header_emit_type(out,capacity,cursor,data,start,base_end); return c_header_append_byte(out,capacity,cursor,42);
     }
-    if(end-start>=4 && c_header_equal(data,end-4,end,&ptr_mut,4)){
+    if(end-start>=4 && c_header_equal_string(data,end-4,end, ptr_mut)){
         i64 base_end=c_header_trim(data,start,end-4); cursor=c_header_emit_type(out,capacity,cursor,data,start,base_end); return c_header_append_byte(out,capacity,cursor,42);
     }
     return c_header_emit_base_type(out,capacity,cursor,data,start,end);
@@ -162,13 +218,13 @@ fn c_header_emit_type(i64 out, i64 capacity, i64 cursor, i64 data, i64 start, i6
 
 fn c_header_emit_callback_decl(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end,i64 name_start,i64 name_end)->i64{
     start=c_header_skip(data,start,end); end=c_header_trim(data,start,end);
-    i64 fn_word[2]=[102,110]; if(!c_header_starts(data,start,end,&fn_word,2)){return -1;}
+    string fn_word = "fn"; if(!c_header_starts_string(data,start,end, fn_word)){return -1;}
     i64 open=c_header_find(data,start,end,40); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,end,40,41); if(close<0){return -1;}
     i64 arrow=-1; i64 q=close+1; while(q+1<end){if(raz_compiler_rt_arena_get(data,q)==45&&raz_compiler_rt_arena_get(data,q+1)==62){arrow=q;break;}q+=1;}
-    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);cursor=c_header_emit_type(out,capacity,cursor,data,rs,end);}else{i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);} if(cursor<0){return -1;}
-    i64 ptr[3]=[32,40,42];cursor=c_header_append_literal(out,capacity,cursor,&ptr,3);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);i64 cp[2]=[41,40];cursor=c_header_append_literal(out,capacity,cursor,&cp,2);
-    i64 p=open+1; i64 item=p; i64 count=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(p==close||ch==44){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){i64 comma[2]=[44,32];cursor=c_header_append_literal(out,capacity,cursor,&comma,2);}cursor=c_header_emit_type(out,capacity,cursor,data,a,b);if(cursor<0){return -1;}count+=1;}item=p+1;}p+=1;}
-    if(count==0){i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);}return c_header_append_byte(out,capacity,cursor,41);
+    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);cursor=c_header_emit_type(out,capacity,cursor,data,rs,end);}else{string cv = "void";cursor=c_header_append_string_literal(out,capacity,cursor, cv);} if(cursor<0){return -1;}
+    string ptr = " (*";cursor=c_header_append_string_literal(out,capacity,cursor, ptr);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);string cp = ")(";cursor=c_header_append_string_literal(out,capacity,cursor, cp);
+    i64 p=open+1; i64 item=p; i64 count=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(p==close||ch==44){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){string comma = ", ";cursor=c_header_append_string_literal(out,capacity,cursor, comma);}cursor=c_header_emit_type(out,capacity,cursor,data,a,b);if(cursor<0){return -1;}count+=1;}item=p+1;}p+=1;}
+    if(count==0){string cv = "void";cursor=c_header_append_string_literal(out,capacity,cursor, cv);}return c_header_append_byte(out,capacity,cursor,41);
 }
 
 fn c_header_emit_field(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end)->i64{
@@ -178,53 +234,52 @@ fn c_header_emit_field(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 en
     i64 name_end=semi; if(array_open>=0){name_end=c_header_trim(data,start,array_open);} i64 name_start=name_end;
     while(name_start>start && c_header_ident(raz_compiler_rt_arena_get(data,name_start-1))){name_start-=1;}
     if(name_start==name_end){return -1;} i64 type_end=c_header_trim(data,start,name_start);
-    i64 indent[4]=[32,32,32,32]; cursor=c_header_append_literal(out,capacity,cursor,&indent,4); i64 fn_word[2]=[102,110]; if(c_header_starts(data,start,type_end,&fn_word,2)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,start,type_end,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,start,type_end); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}
+    string indent = "    "; cursor=c_header_append_string_literal(out,capacity,cursor, indent); string fn_word = "fn"; if(c_header_starts_string(data,start,type_end, fn_word)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,start,type_end,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,start,type_end); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}
     if(array_open>=0 && array_close>array_open){cursor=c_header_append_range(out,capacity,cursor,data,array_open,array_close+1);} cursor=c_header_append_byte(out,capacity,cursor,59); cursor=c_header_append_byte(out,capacity,cursor,10); return cursor;
 }
 
 fn c_header_emit_struct(i64 out,i64 capacity,i64 cursor,i64 data,i64 decl_start,i64 decl_end)->i64{
-    i64 struct_word[6]=[115,116,114,117,99,116]; i64 s=c_header_find_token(data,decl_start,decl_end,&struct_word,6); if(s<0){return -1;}
+    string struct_word = "struct"; i64 s=c_header_find_token_string(data,decl_start,decl_end, struct_word); if(s<0){return -1;}
     i64 ns=c_header_skip(data,s+6,decl_end); i64 ne=ns; while(ne<decl_end && c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;} if(ne==ns){return -1;}
     i64 open=c_header_find(data,ne,decl_end,123); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,decl_end,123,125); if(close<0){return -1;}
-    i64 td[15]=[116,121,112,101,100,101,102,32,115,116,114,117,99,116,32]; cursor=c_header_append_literal(out,capacity,cursor,&td,15); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ob[3]=[32,123,10]; cursor=c_header_append_literal(out,capacity,cursor,&ob,3);
+    string td = "typedef struct "; cursor=c_header_append_string_literal(out,capacity,cursor, td); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); string ob = " {\n"; cursor=c_header_append_string_literal(out,capacity,cursor, ob);
     i64 line=open+1; while(line<close){i64 e=c_header_find(data,line,close,10); if(e<0){e=close;} cursor=c_header_emit_field(out,capacity,cursor,data,line,e); if(cursor<0){return -1;} line=e+1;}
-    i64 tail[3]=[125,32,0]; cursor=c_header_append_literal(out,capacity,cursor,&tail,2); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ender[3]=[59,10,10]; return c_header_append_literal(out,capacity,cursor,&ender,3);
+    string tail = "} "; cursor=c_header_append_string_literal(out,capacity,cursor, tail); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); string ender = ";\n\n"; return c_header_append_string_literal(out,capacity,cursor, ender);
 }
 
 fn c_header_emit_enum(i64 out,i64 capacity,i64 cursor,i64 data,i64 decl_start,i64 decl_end)->i64{
-    i64 enum_word[4]=[101,110,117,109]; i64 s=c_header_find_token(data,decl_start,decl_end,&enum_word,4); if(s<0){return -1;} i64 ns=c_header_skip(data,s+4,decl_end); i64 ne=ns; while(ne<decl_end && c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;} if(ne==ns){return -1;}
+    string enum_word = "enum"; i64 s=c_header_find_token_string(data,decl_start,decl_end, enum_word); if(s<0){return -1;} i64 ns=c_header_skip(data,s+4,decl_end); i64 ne=ns; while(ne<decl_end && c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;} if(ne==ns){return -1;}
     i64 open=c_header_find(data,ne,decl_end,123); if(open<0){return -1;} i64 close=c_header_find_matching(data,open,decl_end,123,125); if(close<0){return -1;}
-    i64 td[12]=[116,121,112,101,100,101,102,32,101,110,117,109]; cursor=c_header_append_literal(out,capacity,cursor,&td,12); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); i64 ob[3]=[32,123,10]; cursor=c_header_append_literal(out,capacity,cursor,&ob,3);
-    i64 p=open+1; i64 item=p; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);} if(p==close||ch==44||ch==10){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){i64 ind[4]=[32,32,32,32];cursor=c_header_append_literal(out,capacity,cursor,&ind,4);cursor=c_header_append_range(out,capacity,cursor,data,a,b);cursor=c_header_append_byte(out,capacity,cursor,44);cursor=c_header_append_byte(out,capacity,cursor,10);}item=p+1;}p+=1;}
-    i64 tail[3]=[125,32,0];cursor=c_header_append_literal(out,capacity,cursor,&tail,2);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);i64 ender[3]=[59,10,10];return c_header_append_literal(out,capacity,cursor,&ender,3);
+    string td = "typedef enum"; cursor=c_header_append_string_literal(out,capacity,cursor, td); cursor=c_header_append_byte(out,capacity,cursor,32); cursor=c_header_append_range(out,capacity,cursor,data,ns,ne); string ob = " {\n"; cursor=c_header_append_string_literal(out,capacity,cursor, ob);
+    i64 p=open+1; i64 item=p; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);} if(p==close||ch==44||ch==10){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){string ind = "    ";cursor=c_header_append_string_literal(out,capacity,cursor, ind);cursor=c_header_append_range(out,capacity,cursor,data,a,b);cursor=c_header_append_byte(out,capacity,cursor,44);cursor=c_header_append_byte(out,capacity,cursor,10);}item=p+1;}p+=1;}
+    string tail = "} ";cursor=c_header_append_string_literal(out,capacity,cursor, tail);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);string ender = ";\n\n";return c_header_append_string_literal(out,capacity,cursor, ender);
 }
 
 fn c_header_emit_function(i64 out,i64 capacity,i64 cursor,i64 data,i64 start,i64 end)->i64{
-    i64 fn_word[2]=[102,110]; i64 f=c_header_find_token(data,start,end,&fn_word,2); if(f<0){return -1;} i64 ns=c_header_skip(data,f+2,end); i64 ne=ns;while(ne<end&&c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;}if(ne==ns){return -1;}
+    string fn_word = "fn"; i64 f=c_header_find_token_string(data,start,end, fn_word); if(f<0){return -1;} i64 ns=c_header_skip(data,f+2,end); i64 ne=ns;while(ne<end&&c_header_ident(raz_compiler_rt_arena_get(data,ne))){ne+=1;}if(ne==ns){return -1;}
     i64 open=c_header_find(data,ne,end,40);if(open<0){return -1;}i64 close=c_header_find_matching(data,open,end,40,41);if(close<0){return -1;}
     i64 arrow=-1;i64 i=close+1;while(i+1<end){if(raz_compiler_rt_arena_get(data,i)==45&&raz_compiler_rt_arena_get(data,i+1)==62){arrow=i;break;}i+=1;}
-    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);i64 re=rs;while(re<end&&raz_compiler_rt_arena_get(data,re)!=123&&raz_compiler_rt_arena_get(data,re)!=59&&raz_compiler_rt_arena_get(data,re)!=10){re+=1;}re=c_header_trim(data,rs,re);cursor=c_header_emit_type(out,capacity,cursor,data,rs,re);}else{i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);} cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);cursor=c_header_append_byte(out,capacity,cursor,40);
-    i64 p=open+1; i64 item=p; i64 count=0; i64 depth=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(ch==40){depth+=1;}else if(ch==41&&depth>0){depth-=1;}bool boundary=p==close||(ch==44&&depth==0);if(boundary){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){i64 comma[2]=[44,32];cursor=c_header_append_literal(out,capacity,cursor,&comma,2);}i64 name_end=b; i64 name_start=name_end;while(name_start>a&&c_header_ident(raz_compiler_rt_arena_get(data,name_start-1))){name_start-=1;}if(name_start==name_end){return -1;}i64 te=c_header_trim(data,a,name_start);i64 fn_type[2]=[102,110];if(c_header_starts(data,a,te,&fn_type,2)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,a,te,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,a,te);cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}count+=1;}item=p+1;}p+=1;}
-    if(count==0){i64 cv[4]=[118,111,105,100];cursor=c_header_append_literal(out,capacity,cursor,&cv,4);}i64 tail[4]=[41,59,10,10];return c_header_append_literal(out,capacity,cursor,&tail,4);
+    if(arrow>=0){i64 rs=c_header_skip(data,arrow+2,end);i64 re=rs;while(re<end&&raz_compiler_rt_arena_get(data,re)!=123&&raz_compiler_rt_arena_get(data,re)!=59&&raz_compiler_rt_arena_get(data,re)!=10){re+=1;}re=c_header_trim(data,rs,re);cursor=c_header_emit_type(out,capacity,cursor,data,rs,re);}else{string cv = "void";cursor=c_header_append_string_literal(out,capacity,cursor, cv);} cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,ns,ne);cursor=c_header_append_byte(out,capacity,cursor,40);
+    i64 p=open+1; i64 item=p; i64 count=0; i64 depth=0; while(p<=close){i64 ch=0;if(p<close){ch=raz_compiler_rt_arena_get(data,p);}if(ch==40){depth+=1;}else if(ch==41&&depth>0){depth-=1;}bool boundary=p==close||(ch==44&&depth==0);if(boundary){i64 a=c_header_skip(data,item,p);i64 b=c_header_trim(data,a,p);if(b>a){if(count>0){string comma = ", ";cursor=c_header_append_string_literal(out,capacity,cursor, comma);}i64 name_end=b; i64 name_start=name_end;while(name_start>a&&c_header_ident(raz_compiler_rt_arena_get(data,name_start-1))){name_start-=1;}if(name_start==name_end){return -1;}i64 te=c_header_trim(data,a,name_start);string fn_type = "fn";if(c_header_starts_string(data,a,te, fn_type)){cursor=c_header_emit_callback_decl(out,capacity,cursor,data,a,te,name_start,name_end);}else{cursor=c_header_emit_type(out,capacity,cursor,data,a,te);cursor=c_header_append_byte(out,capacity,cursor,32);cursor=c_header_append_range(out,capacity,cursor,data,name_start,name_end);}count+=1;}item=p+1;}p+=1;}
+    if(count==0){string cv = "void";cursor=c_header_append_string_literal(out,capacity,cursor, cv);}string tail = ");\n\n";return c_header_append_string_literal(out,capacity,cursor, tail);
 }
 
 fn c_header_generate(i64 input,i64 length,i64 output,i64 capacity)->i64{
-    i64 header[99]=[47,42,32,71,101,110,101,114,97,116,101,100,32,98,121,32,114,97,122,32,99,45,104,101,97,100,101,114,46,32,68,111,32,110,111,116,32,101,100,105,116,46,32,42,47,10,35,112,114,97,103,109,97,32,111,110,99,101,10,35,105,110,99,108,117,100,101,32,60,115,116,100,105,110,116,46,104,62,10,35,105,110,99,108,117,100,101,32,60,115,116,100,100,101,102,46,104,62,10];
-    i64 cursor=c_header_append_literal(output,capacity,0,&header,99);if(cursor<0){return -1;}
-    i64 repr[8]=[64,114,101,112,114,40,67,41]; i64 abi[7]=[64,97,98,105,40,67,41]; i64 public_word[6]=[112,117,98,108,105,99]; i64 structw[6]=[115,116,114,117,99,116]; i64 enumw[4]=[101,110,117,109]; i64 externw[6]=[101,120,116,101,114,110];
+        i64 cursor=c_header_append_string_literal(output,capacity,0, "/* Generated by raz c-header. Do not edit. */\n#pragma once\n#include <stdint.h>\n#include <stddef.h>\n");if(cursor<0){return -1;}
+    string repr = "@repr(C)"; string abi = "@abi(C)"; string public_word = "public"; string structw = "struct"; string enumw = "enum"; string externw = "extern";
     i64 pos=0; bool pending_repr=false; bool pending_abi=false;
     while(pos<length){i64 line_end=c_header_find(input,pos,length,10);if(line_end<0){line_end=length;}i64 a=c_header_skip(input,pos,line_end);i64 b=c_header_trim(input,a,line_end);
-        if(a<b&&c_header_starts(input,a,b,&repr,8)){pending_repr=true;}
-        if(a<b&&c_header_starts(input,a,b,&abi,7)){pending_abi=true;}
-        bool has_public=c_header_find_token(input,a,b,&public_word,6)>=0;
-        if(pending_repr&&has_public&&(c_header_find_token(input,a,b,&structw,6)>=0||c_header_find_token(input,a,b,&enumw,4)>=0)){
+        if(a<b&&c_header_starts_string(input,a,b, repr)){pending_repr=true;}
+        if(a<b&&c_header_starts_string(input,a,b, abi)){pending_abi=true;}
+        bool has_public=c_header_find_token_string(input,a,b, public_word)>=0;
+        if(pending_repr&&has_public&&(c_header_find_token_string(input,a,b, structw)>=0||c_header_find_token_string(input,a,b, enumw)>=0)){
             i64 open=c_header_find(input,a,length,123);if(open<0){return -1;}i64 close=c_header_find_matching(input,open,length,123,125);if(close<0){return -1;}i64 decl_end=close+1;
-            if(c_header_find_token(input,a,open,&structw,6)>=0){cursor=c_header_emit_struct(output,capacity,cursor,input,a,decl_end);}else{cursor=c_header_emit_enum(output,capacity,cursor,input,a,decl_end);}if(cursor<0){return -1;}pos=decl_end;pending_repr=false;continue;
+            if(c_header_find_token_string(input,a,open, structw)>=0){cursor=c_header_emit_struct(output,capacity,cursor,input,a,decl_end);}else{cursor=c_header_emit_enum(output,capacity,cursor,input,a,decl_end);}if(cursor<0){return -1;}pos=decl_end;pending_repr=false;continue;
         }
-        if(pending_abi&&has_public&&c_header_find_token(input,a,b,&externw,6)<0){
+        if(pending_abi&&has_public&&c_header_find_token_string(input,a,b, externw)<0){
             i64 open=c_header_find(input,a,length,40);if(open>=0){i64 close=c_header_find_matching(input,open,length,40,41);if(close>=0){i64 decl_end=close+1;while(decl_end<length&&raz_compiler_rt_arena_get(input,decl_end)!=10){decl_end+=1;}cursor=c_header_emit_function(output,capacity,cursor,input,a,decl_end);if(cursor<0){return -1;}pending_abi=false;}}
         }
-        if(a<b&&!c_header_starts(input,a,b,&repr,8)&&!c_header_starts(input,a,b,&abi,7)){pending_repr=false;pending_abi=false;}
+        if(a<b&&!c_header_starts_string(input,a,b, repr)&&!c_header_starts_string(input,a,b, abi)){pending_repr=false;pending_abi=false;}
         pos=line_end+1;
     }
     return cursor;

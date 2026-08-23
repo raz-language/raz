@@ -135,7 +135,7 @@ struct EncodedFunction {
 struct ExternalRelocation { std::string symbol; std::size_t address_offset{}; };
 enum class DataSection : std::uint8_t { read_only, writable, tls };
 struct GlobalRelocation { std::size_t address_offset{}; DataSection section{}; std::size_t data_offset{}; };
-struct EncodedGlobal { std::string name; DataSection section{}; std::size_t data_offset{}; };
+struct EncodedGlobal { std::string name; DataSection section{}; std::size_t data_offset{}; bool is_internal{}; };
 struct ExternalGlobalRelocation { std::string symbol; std::size_t address_offset{}; };
 
 struct EncodedModuleImage {

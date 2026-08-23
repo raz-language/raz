@@ -16,6 +16,7 @@ FORBIDDEN_ROOT_FILES = {
 }
 FORBIDDEN_SUFFIXES = {".inc", ".xy", ".xyft", ".raz"}
 FORBIDDEN_DIR_NAMES = {"build", ".raz", "__pycache__"}
+FORBIDDEN_SOURCE_ARTIFACT_NAMES = {"host-source-order.txt", "compiler-query-profile.txt", "forge-structured-failure.txt"}
 SEMANTIC_TARGETS = {
     Path("src/forge/include/forge/target"),
     Path("src/forge/src/target"),
@@ -48,6 +49,8 @@ def main() -> int:
         )
         if generated:
             continue
+        if path.is_file() and path.name in FORBIDDEN_SOURCE_ARTIFACT_NAMES:
+            problems.append(f"generated/legacy compiler metadata outside target/: {rel}")
         if path.is_file() and path.name == "stage1-diagnostic.txt":
             problems.append(f"legacy stage diagnostic artifact: {rel}")
         if path.is_file() and path.suffix.lower() in FORBIDDEN_SUFFIXES:

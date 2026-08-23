@@ -155,6 +155,8 @@ public struct HirModule {
     i64 global_count;
     i64 global_name_offsets;
     i64 global_name_lengths;
+    // Lazy Forge symbol-collision decision: 0 unknown, 1 no suffix, 2 suffix.
+    i64 global_identity_suffix_cache;
     i64 global_type_structs;
     i64 global_types;
     i64 global_array_extents;
@@ -174,6 +176,10 @@ public struct HirModule {
     i64 constant_source_offsets;
     i64 struct_name_offsets;
     i64 struct_name_lengths;
+    // 0 = unknown, 1 = no identity suffix, 2 = identity suffix required.
+    // Forge names the same concrete structures repeatedly; cache the collision
+    // decision so symbol emission does not rescan the whole structure table.
+    i64 struct_identity_suffix_cache;
     i64 struct_field_starts;
     i64 struct_field_counts;
     i64 struct_tuple_flags;
@@ -278,20 +284,40 @@ public struct HirModule {
     i64 enum_generic_argument_type_structs;
     i64 enum_generic_argument_types;
     i64 enum_payload_types;
+    // Preserve source enum identity even for fieldless/C-style enums whose
+    // runtime HIR type remains the historical integer ABI kind.
+    i64 enum_payload_enum_indices;
     i64 enum_payload_type_structs;
     i64 enum_payload_array_extents;
     i64 match_arm_count;
     i64 match_binding_count;
     i64 match_arm_values;
     i64 match_arm_blocks;
+    i64 match_arm_guards;
     i64 match_arm_wildcards;
     i64 match_arm_enum_indices;
     i64 match_arm_member_indices;
     i64 match_arm_binding_starts;
     i64 match_arm_binding_counts;
+    i64 match_arm_nested_test_starts;
+    i64 match_arm_nested_test_counts;
+    i64 match_nested_test_count;
+    i64 match_nested_test_outer_indices;
+    i64 match_nested_test_path_indices;
+    i64 match_nested_test_values;
     i64 match_binding_local_slots;
+    i64 match_binding_outer_indices;
+    i64 match_binding_inner_indices;
+    i64 match_binding_path_indices;
+    i64 match_binding_payload_indices;
+    i64 match_binding_modes;
+    i64 match_path_count;
+    i64 match_path_parents;
+    i64 match_path_payload_indices;
     i64 function_name_offsets;
     i64 function_name_lengths;
+    // Lazy Forge symbol-collision decision: 0 unknown, 1 no suffix, 2 suffix.
+    i64 function_identity_suffix_cache;
     i64 function_declaration_offsets;
     i64 function_parameter_starts;
     i64 function_parameter_counts;
@@ -388,6 +414,9 @@ public struct HirModule {
     i64 parameter_function_types;
     i64 local_name_offsets;
     i64 local_name_lengths;
+    // Source position where each local becomes lexically live. This is distinct
+    // from name offsets because compiler-generated locals have no source name.
+    i64 local_declaration_offsets;
     i64 local_slots;
     i64 local_previous_function_locals;
     i64 local_function_indices;
@@ -441,6 +470,24 @@ public struct HirModule {
     i64 block_parent_indices;
     i64 block_loop_depths;
     i64 block_unsafe_depths;
+
+    // Deferred blocks are parsed after their surrounding generic materializer
+    // may have restored its caller context. Preserve the complete generic
+    // environment at capture time so nested match/if/loop bodies keep T/U/etc.
+
+    i64 block_generic_active;
+    i64 block_generic_template_indices;
+    i64 block_generic_type_name_offsets;
+    i64 block_generic_type_name_lengths;
+    i64 block_generic_type_structures;
+    i64 block_generic_type_kinds;
+    i64 block_generic_signature_only;
+    i64 block_generic_reparse_function_indices;
+    i64 block_generic_substitution_counts;
+    i64 block_generic_substitution_name_offsets;
+    i64 block_generic_substitution_name_lengths;
+    i64 block_generic_substitution_type_structures;
+    i64 block_generic_substitution_types;
     i64 block_defer_starts;
     i64 block_defer_counts;
     i64 block_defer_contexts;
@@ -449,6 +496,10 @@ public struct HirModule {
     i64 statement_kinds;
     i64 statement_block_indices;
     i64 statement_function_indices;
+    // Source position immediately after the statement. Deferred blocks are
+    // parsed out of order, so cleanup must use lexical source order rather than
+    // HIR allocation order when deciding which locals are live on an exit edge.
+    i64 statement_source_offsets;
     i64 statement_a;
     i64 statement_b;
     i64 statement_c;
@@ -671,6 +722,13 @@ public struct HirBuilder {
     i64 symbol_cache_results;
     i64 symbol_cache_hits;
     i64 symbol_cache_misses;
+
+
+    // Name-hash buckets narrow ordinary function resolution to exact-name
+    // candidates before namespace/import/accessibility checks run.
+    i64 function_lookup_bucket_heads;
+    i64 function_lookup_next;
+
     i64 top_level_name_used;
     i64 top_level_name_packages;
     i64 top_level_name_namespaces;
@@ -962,6 +1020,7 @@ fn init_hir(HirModule&mut out) -> bool {
     out.incremental_affected_module_count = 0;
     out.struct_name_offsets = raz_compiler_rt_arena_create(256);
     out.struct_name_lengths = raz_compiler_rt_arena_create(256);
+    out.struct_identity_suffix_cache = raz_compiler_rt_arena_create(256);
     out.struct_field_starts = raz_compiler_rt_arena_create(256);
     out.struct_field_counts = raz_compiler_rt_arena_create(256);
     out.struct_tuple_flags = raz_compiler_rt_arena_create(256);
@@ -1075,6 +1134,7 @@ fn init_hir(HirModule&mut out) -> bool {
     out.enum_marker_trait_counts = raz_compiler_rt_arena_create(256);
     out.enum_marker_traits = raz_compiler_rt_arena_create(8192);
     out.enum_payload_types = raz_compiler_rt_arena_create(8192);
+    out.enum_payload_enum_indices = raz_compiler_rt_arena_create(8192);
     out.enum_payload_type_structs = raz_compiler_rt_arena_create(8192);
     out.enum_payload_array_extents = raz_compiler_rt_arena_create(8192);
     out.enum_generic_template_indices = raz_compiler_rt_arena_create(256);
@@ -1091,6 +1151,7 @@ fn init_hir(HirModule&mut out) -> bool {
     out.generic_enum_derive_clone_flags = raz_compiler_rt_arena_create(256);
     out.global_name_offsets = raz_compiler_rt_arena_create(4096);
     out.global_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.global_identity_suffix_cache = raz_compiler_rt_arena_create(4096);
     out.global_type_structs = raz_compiler_rt_arena_create(4096);
     out.global_types = raz_compiler_rt_arena_create(4096);
     out.global_array_extents = raz_compiler_rt_arena_create(4096);
@@ -1110,14 +1171,30 @@ fn init_hir(HirModule&mut out) -> bool {
     out.constant_source_offsets = raz_compiler_rt_arena_create(4096);
     out.match_arm_values = raz_compiler_rt_arena_create(8192);
     out.match_arm_blocks = raz_compiler_rt_arena_create(8192);
+    out.match_arm_guards = raz_compiler_rt_arena_create(8192);
     out.match_arm_wildcards = raz_compiler_rt_arena_create(8192);
     out.match_arm_enum_indices = raz_compiler_rt_arena_create(8192);
     out.match_arm_member_indices = raz_compiler_rt_arena_create(8192);
     out.match_arm_binding_starts = raz_compiler_rt_arena_create(8192);
     out.match_arm_binding_counts = raz_compiler_rt_arena_create(8192);
+    out.match_arm_nested_test_starts = raz_compiler_rt_arena_create(8192);
+    out.match_arm_nested_test_counts = raz_compiler_rt_arena_create(8192);
+    out.match_nested_test_count = 0;
+    out.match_nested_test_outer_indices = raz_compiler_rt_arena_create(16384);
+    out.match_nested_test_path_indices = raz_compiler_rt_arena_create(16384);
+    out.match_nested_test_values = raz_compiler_rt_arena_create(16384);
     out.match_binding_local_slots = raz_compiler_rt_arena_create(16384);
+    out.match_binding_outer_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_inner_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_path_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_payload_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_modes = raz_compiler_rt_arena_create(16384);
+    out.match_path_count = 0;
+    out.match_path_parents = raz_compiler_rt_arena_create(16384);
+    out.match_path_payload_indices = raz_compiler_rt_arena_create(16384);
     out.function_name_offsets = raz_compiler_rt_arena_create(16384);
     out.function_name_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_identity_suffix_cache = raz_compiler_rt_arena_create(16384);
     out.function_declaration_offsets = raz_compiler_rt_arena_create(16384);
     out.function_parameter_starts = raz_compiler_rt_arena_create(16384);
     out.function_parameter_counts = raz_compiler_rt_arena_create(16384);
@@ -1225,6 +1302,7 @@ fn init_hir(HirModule&mut out) -> bool {
     out.parameter_function_types = raz_compiler_rt_arena_create(32768);
     out.local_name_offsets = raz_compiler_rt_arena_create(32768);
     out.local_name_lengths = raz_compiler_rt_arena_create(32768);
+    out.local_declaration_offsets = raz_compiler_rt_arena_create(32768);
     out.local_slots = raz_compiler_rt_arena_create(32768);
     out.local_previous_function_locals = raz_compiler_rt_arena_create(32768);
     out.local_function_indices = raz_compiler_rt_arena_create(32768);
@@ -1276,6 +1354,19 @@ fn init_hir(HirModule&mut out) -> bool {
     out.block_parent_indices = raz_compiler_rt_arena_create(16384);
     out.block_loop_depths = raz_compiler_rt_arena_create(16384);
     out.block_unsafe_depths = raz_compiler_rt_arena_create(16384);
+    out.block_generic_active = raz_compiler_rt_arena_create(16384);
+    out.block_generic_template_indices = raz_compiler_rt_arena_create(16384);
+    out.block_generic_type_name_offsets = raz_compiler_rt_arena_create(16384);
+    out.block_generic_type_name_lengths = raz_compiler_rt_arena_create(16384);
+    out.block_generic_type_structures = raz_compiler_rt_arena_create(16384);
+    out.block_generic_type_kinds = raz_compiler_rt_arena_create(16384);
+    out.block_generic_signature_only = raz_compiler_rt_arena_create(16384);
+    out.block_generic_reparse_function_indices = raz_compiler_rt_arena_create(16384);
+    out.block_generic_substitution_counts = raz_compiler_rt_arena_create(16384);
+    out.block_generic_substitution_name_offsets = raz_compiler_rt_arena_create(524288);
+    out.block_generic_substitution_name_lengths = raz_compiler_rt_arena_create(524288);
+    out.block_generic_substitution_type_structures = raz_compiler_rt_arena_create(524288);
+    out.block_generic_substitution_types = raz_compiler_rt_arena_create(524288);
     out.block_defer_starts = raz_compiler_rt_arena_create(16384);
     out.block_defer_counts = raz_compiler_rt_arena_create(16384);
     out.block_defer_contexts = raz_compiler_rt_arena_create(16384);
@@ -1283,6 +1374,7 @@ fn init_hir(HirModule&mut out) -> bool {
     out.statement_kinds = raz_compiler_rt_arena_create(65536);
     out.statement_block_indices = raz_compiler_rt_arena_create(65536);
     out.statement_function_indices = raz_compiler_rt_arena_create(65536);
+    out.statement_source_offsets = raz_compiler_rt_arena_create(65536);
     out.statement_a = raz_compiler_rt_arena_create(65536);
     out.statement_b = raz_compiler_rt_arena_create(65536);
     out.statement_c = raz_compiler_rt_arena_create(65536);
@@ -1296,7 +1388,7 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.struct_name_offsets == 0) {
         return false;
     }
-    if (out.struct_name_lengths == 0) {
+    if (out.struct_name_lengths == 0 || out.struct_identity_suffix_cache == 0) {
         return false;
     }
     if (out.struct_field_starts == 0) {
@@ -1510,7 +1602,7 @@ fn init_hir(HirModule&mut out) -> bool {
     ) {
         return false;
     }
-    if (out.enum_payload_types == 0) {
+    if (out.enum_payload_types == 0 || out.enum_payload_enum_indices == 0) {
         return false;
     }
     if (out.enum_payload_type_structs == 0 || out.enum_payload_array_extents == 0) {
@@ -1559,6 +1651,9 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.match_arm_blocks == 0) {
         return false;
     }
+    if (out.match_arm_guards == 0) {
+        return false;
+    }
     if (out.match_arm_wildcards == 0) {
         return false;
     }
@@ -1574,12 +1669,32 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.match_arm_binding_counts == 0) {
         return false;
     }
-    if (out.match_binding_local_slots == 0) {
+    if (out.match_arm_nested_test_starts == 0 || out.match_arm_nested_test_counts == 0) {
+        return false;
+    }
+    if (
+        out.match_nested_test_outer_indices == 0 ||
+        out.match_nested_test_path_indices == 0 ||
+        out.match_nested_test_values == 0
+    ) {
+        return false;
+    }
+    if (
+        out.match_binding_local_slots == 0 ||
+        out.match_binding_outer_indices == 0 ||
+        out.match_binding_inner_indices == 0 ||
+        out.match_binding_path_indices == 0 ||
+        out.match_binding_payload_indices == 0 ||
+        out.match_binding_modes == 0 ||
+        out.match_path_parents == 0 ||
+        out.match_path_payload_indices == 0
+    ) {
         return false;
     }
     if (
         out.global_name_offsets == 0 ||
         out.global_name_lengths == 0 ||
+        out.global_identity_suffix_cache == 0 ||
         out.global_type_structs == 0 ||
         out.global_types == 0 ||
         out.global_array_extents == 0 ||
@@ -1596,7 +1711,7 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.function_name_offsets == 0) {
         return false;
     }
-    if (out.function_name_lengths == 0 || out.function_declaration_offsets == 0) {
+    if (out.function_name_lengths == 0 || out.function_identity_suffix_cache == 0 || out.function_declaration_offsets == 0) {
         return false;
     }
     if (out.function_parameter_starts == 0) {
@@ -1762,7 +1877,12 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.local_name_offsets == 0) {
         return false;
     }
-    if (out.local_name_lengths == 0 || out.local_slots == 0 || out.local_previous_function_locals == 0) {
+    if (
+        out.local_name_lengths == 0 ||
+        out.local_declaration_offsets == 0 ||
+        out.local_slots == 0 ||
+        out.local_previous_function_locals == 0
+    ) {
         return false;
     }
     if (out.local_function_indices == 0) {
@@ -1870,6 +1990,23 @@ fn init_hir(HirModule&mut out) -> bool {
     if (out.block_loop_depths == 0 || out.block_unsafe_depths == 0) {
         return false;
     }
+    if (
+        out.block_generic_active == 0 ||
+        out.block_generic_template_indices == 0 ||
+        out.block_generic_type_name_offsets == 0 ||
+        out.block_generic_type_name_lengths == 0 ||
+        out.block_generic_type_structures == 0 ||
+        out.block_generic_type_kinds == 0 ||
+        out.block_generic_signature_only == 0 ||
+        out.block_generic_reparse_function_indices == 0 ||
+        out.block_generic_substitution_counts == 0 ||
+        out.block_generic_substitution_name_offsets == 0 ||
+        out.block_generic_substitution_name_lengths == 0 ||
+        out.block_generic_substitution_type_structures == 0 ||
+        out.block_generic_substitution_types == 0
+    ) {
+        return false;
+    }
     if (out.block_defer_starts == 0) {
         return false;
     }
@@ -1889,6 +2026,9 @@ fn init_hir(HirModule&mut out) -> bool {
         return false;
     }
     if (out.statement_function_indices == 0) {
+        return false;
+    }
+    if (out.statement_source_offsets == 0) {
         return false;
     }
     if (out.statement_a == 0) {
@@ -1961,6 +2101,7 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.incremental_module_cache_kinds);
     raz_compiler_rt_arena_destroy(out.struct_name_offsets);
     raz_compiler_rt_arena_destroy(out.struct_name_lengths);
+    raz_compiler_rt_arena_destroy(out.struct_identity_suffix_cache);
     raz_compiler_rt_arena_destroy(out.struct_field_starts);
     raz_compiler_rt_arena_destroy(out.struct_field_counts);
     raz_compiler_rt_arena_destroy(out.struct_tuple_flags);
@@ -2072,6 +2213,7 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.enum_marker_trait_counts);
     raz_compiler_rt_arena_destroy(out.enum_marker_traits);
     raz_compiler_rt_arena_destroy(out.enum_payload_types);
+    raz_compiler_rt_arena_destroy(out.enum_payload_enum_indices);
     raz_compiler_rt_arena_destroy(out.enum_payload_type_structs);
     raz_compiler_rt_arena_destroy(out.enum_payload_array_extents);
     raz_compiler_rt_arena_destroy(out.enum_generic_template_indices);
@@ -2088,6 +2230,7 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.generic_enum_derive_clone_flags);
     raz_compiler_rt_arena_destroy(out.global_name_offsets);
     raz_compiler_rt_arena_destroy(out.global_name_lengths);
+    raz_compiler_rt_arena_destroy(out.global_identity_suffix_cache);
     raz_compiler_rt_arena_destroy(out.global_type_structs);
     raz_compiler_rt_arena_destroy(out.global_types);
     raz_compiler_rt_arena_destroy(out.global_array_extents);
@@ -2107,14 +2250,28 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.constant_source_offsets);
     raz_compiler_rt_arena_destroy(out.match_arm_values);
     raz_compiler_rt_arena_destroy(out.match_arm_blocks);
+    raz_compiler_rt_arena_destroy(out.match_arm_guards);
     raz_compiler_rt_arena_destroy(out.match_arm_wildcards);
     raz_compiler_rt_arena_destroy(out.match_arm_enum_indices);
     raz_compiler_rt_arena_destroy(out.match_arm_member_indices);
     raz_compiler_rt_arena_destroy(out.match_arm_binding_starts);
     raz_compiler_rt_arena_destroy(out.match_arm_binding_counts);
+    raz_compiler_rt_arena_destroy(out.match_arm_nested_test_starts);
+    raz_compiler_rt_arena_destroy(out.match_arm_nested_test_counts);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_outer_indices);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_path_indices);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_values);
     raz_compiler_rt_arena_destroy(out.match_binding_local_slots);
+    raz_compiler_rt_arena_destroy(out.match_binding_outer_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_inner_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_path_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_payload_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_modes);
+    raz_compiler_rt_arena_destroy(out.match_path_parents);
+    raz_compiler_rt_arena_destroy(out.match_path_payload_indices);
     raz_compiler_rt_arena_destroy(out.function_name_offsets);
     raz_compiler_rt_arena_destroy(out.function_name_lengths);
+    raz_compiler_rt_arena_destroy(out.function_identity_suffix_cache);
     raz_compiler_rt_arena_destroy(out.function_declaration_offsets);
     raz_compiler_rt_arena_destroy(out.function_parameter_starts);
     raz_compiler_rt_arena_destroy(out.function_parameter_counts);
@@ -2222,6 +2379,7 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.parameter_function_types);
     raz_compiler_rt_arena_destroy(out.local_name_offsets);
     raz_compiler_rt_arena_destroy(out.local_name_lengths);
+    raz_compiler_rt_arena_destroy(out.local_declaration_offsets);
     raz_compiler_rt_arena_destroy(out.local_slots);
     raz_compiler_rt_arena_destroy(out.local_previous_function_locals);
     raz_compiler_rt_arena_destroy(out.local_function_indices);
@@ -2272,6 +2430,19 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.block_parent_indices);
     raz_compiler_rt_arena_destroy(out.block_loop_depths);
     raz_compiler_rt_arena_destroy(out.block_unsafe_depths);
+    raz_compiler_rt_arena_destroy(out.block_generic_active);
+    raz_compiler_rt_arena_destroy(out.block_generic_template_indices);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_structures);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_kinds);
+    raz_compiler_rt_arena_destroy(out.block_generic_signature_only);
+    raz_compiler_rt_arena_destroy(out.block_generic_reparse_function_indices);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_counts);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_name_offsets);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_name_lengths);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_type_structures);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_types);
     raz_compiler_rt_arena_destroy(out.block_defer_starts);
     raz_compiler_rt_arena_destroy(out.block_defer_counts);
     raz_compiler_rt_arena_destroy(out.block_defer_contexts);
@@ -2279,6 +2450,7 @@ fn destroy_hir(HirModule&mut out) {
     raz_compiler_rt_arena_destroy(out.statement_kinds);
     raz_compiler_rt_arena_destroy(out.statement_block_indices);
     raz_compiler_rt_arena_destroy(out.statement_function_indices);
+    raz_compiler_rt_arena_destroy(out.statement_source_offsets);
     raz_compiler_rt_arena_destroy(out.statement_a);
     raz_compiler_rt_arena_destroy(out.statement_b);
     raz_compiler_rt_arena_destroy(out.statement_c);

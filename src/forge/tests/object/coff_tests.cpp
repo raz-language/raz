@@ -34,12 +34,29 @@ bool contains_ascii(const std::vector<std::byte>& bytes, std::string_view text) 
     }
     return false;
 }
+std::uint8_t coff_storage_class(const std::vector<std::byte>& bytes, std::string_view short_symbol) {
+    const auto table = u32(bytes, 8U);
+    const auto count = u32(bytes, 12U);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto offset = static_cast<std::size_t>(table) + static_cast<std::size_t>(index) * 18U;
+        if (offset + 18U > bytes.size()) break;
+        bool equal = short_symbol.size() <= 8U;
+        for (std::size_t char_index = 0; equal && char_index < 8U; ++char_index) {
+            const auto expected = char_index < short_symbol.size() ? static_cast<unsigned char>(short_symbol[char_index]) : 0U;
+            equal = std::to_integer<unsigned char>(bytes[offset + char_index]) == expected;
+        }
+        if (equal) return std::to_integer<std::uint8_t>(bytes[offset + 16U]);
+    }
+    return 0xffU;
+}
+
 }
 
 int main() {
     const std::string source = R"(
 module @coff_test {
   global @counter: i64 = 7
+  internal global @hidden: i64 = 11
   extern func @host_add(%left: i64, %right: i64) -> i64
   func @entry(%value: i64) -> i64 {
   entry:
@@ -65,6 +82,7 @@ module @coff_test {
     const auto text_relocations = u16(object.bytes, 20 + 32);
     if (text_relocations < 2) return 8;
     if (object.stats.section_count != 3 || object.stats.relocation_count < 2 || object.stats.external_symbol_count != 1) return 9;
+    if (coff_storage_class(object.bytes, "hidden") != 3U) return 17;
     const auto duplicate = forge::object::emit_coff_x86_64(*lowered.module);
     if (!duplicate.ok() || duplicate.bytes != object.bytes) return 10;
     auto bad = *lowered.module;

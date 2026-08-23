@@ -13,7 +13,7 @@ invalidation = (root / 'compiler/src/hir/query/invalidation.rz').read_text(encod
 resolution = (root / 'compiler/src/hir/query/resolution.rz').read_text(encoding='utf-8')
 traits = (root / 'compiler/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
 reflection = (root / 'compiler/src/hir/semantic/reflection.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 lexer = (root / 'compiler/src/frontend/lexer.rz').read_text(encoding='utf-8')
 
 checks = {

@@ -238,6 +238,7 @@ fn hir_parse_function(HirBuilder&mut builder) -> bool {
     raz_compiler_rt_arena_set(builder.module.function_defer_counts, function_index, 0);
     if (!reparsing_generic) {
         builder.module.function_count += 1;
+        hir_function_lookup_insert(builder, function_index);
     }
     builder.current_function = function_index;
     hir_advance(builder);
@@ -918,7 +919,11 @@ fn hir_materialize_generic_inherent_function(HirBuilder&mut builder, i64 functio
     // needs deferred materialization so `Self` can be rebound to the concrete
     // implementation type.  Only ordinary generic inherent methods require a
     // target template.
-    if (target_template < 0 && default_trait_method < 0) {
+    // -1 means there is no generic template. Generic enum templates use the
+    // negative encoding -2-template_index, so a broad `< 0` check incorrectly
+    // rejected every materialized inherent method on Option<T>, Result<T, E>,
+    // and other generic enums.
+    if (target_template == -1 && default_trait_method < 0) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
         return false;
     }
@@ -1145,8 +1150,10 @@ fn hir_materialize_generic_inherent_function(HirBuilder&mut builder, i64 functio
             hir_fail(builder, DiagnosticCode::UnknownType);
             return false;
         }
+        // The impl's own parameter binding is the innermost one and must win over
+        // a same-named parameter already installed by the struct template.
         if (
-            !hir_add_generic_substitution(
+            !hir_set_generic_substitution(
                 builder,
                 raz_compiler_rt_arena_get(builder.module.generic_trait_type_name_offsets, trait_generic),
                 raz_compiler_rt_arena_get(builder.module.generic_trait_type_name_lengths, trait_generic),
@@ -1438,6 +1445,7 @@ fn hir_parse_extern_function(HirBuilder&mut builder) -> bool {
         );
     }
     builder.module.function_count += 1;
+    hir_function_lookup_insert(builder, function_index);
     builder.current_function = function_index;
     hir_advance(builder);
     if (!hir_expect(builder, TokenKind::LeftParen)) {
@@ -2612,6 +2620,18 @@ fn hir_parse_enum_declaration(HirBuilder&mut builder) -> bool {
                     i64 payload_reference = 0;
                     i64 payload_slice = 0;
                     i64 payload_slice_mutable = 0;
+                    // `hir_parse_type_spec` intentionally lowers fieldless enums to
+                    // the historical integer ABI type. Retain the source enum
+                    // identity separately so nested patterns can still reason about
+                    // its finite variant set.
+                    i64 payload_decl_enum = -1;
+                    if (builder.current.kind == TokenKind::Identifier) {
+                        payload_decl_enum = hir_find_enum(
+                            builder,
+                            builder.current.offset,
+                            builder.current.length,
+                        );
+                    }
 
                     if (
                         !hir_parse_type_spec(
@@ -2662,6 +2682,11 @@ fn hir_parse_enum_declaration(HirBuilder&mut builder) -> bool {
                         payload_structure,
                     );
                     raz_compiler_rt_arena_set(builder.module.enum_payload_types, payload, payload_type);
+                    i64 payload_enum = payload_decl_enum;
+                    if (hir_type_is_enum(payload_type)) {
+                        payload_enum = hir_type_enum_index(payload_type);
+                    }
+                    raz_compiler_rt_arena_set(builder.module.enum_payload_enum_indices, payload, payload_enum);
                     raz_compiler_rt_arena_set(
                         builder.module.enum_payload_array_extents,
                         payload,

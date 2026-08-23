@@ -6,12 +6,12 @@ from pathlib import Path
 import re
 root=Path(__file__).resolve().parents[2]
 backend=(root/'compiler/src/driver/backend.rz').read_text()
-order=(root/'compiler/host-source-order.txt').read_text()
+order={path.relative_to(root/'compiler').as_posix() for path in (root/'compiler/src').rglob('*.rz')}
 required=['isa.rz','model.rz','lowering.rz','dataflow.rz','registers.rz','optimize.rz','blocks.rz','verify.rz','disasm.rz','reference.rz','writer.rz','decoder.rz','codegen.rz']
 for name in required:
     p=root/'compiler/src/backend/rxe'/name
     assert p.is_file(), f'missing {p}'
-    assert f'src/backend/rxe/{name}' in order, f'{name} absent from source-order'
+    assert f'src/backend/rxe/{name}' in order, f'{name} absent from semantic compiler source graph'
 assert '--backend=rxe' in backend
 assert 'return 2;' in backend
 assert 'emit_rxe_module' in backend

@@ -13,12 +13,54 @@ std::uint64_t hash_file(const std::filesystem::path& path, std::string_view salt
 std::string hex(std::uint64_t value) { std::ostringstream out; out << std::hex << value; return out.str(); }
 
 // The native host is the default build target and does not need a redundant
-// filesystem namespace.  Keep target/<profile>/ as the canonical host layout,
-// while explicit alternate targets retain target/<target>/<profile>/ isolation.
+// filesystem namespace. Keep target/<profile>/ as the canonical host root,
+// then separate user-facing and intermediate artifacts by kind beneath it.
+// Explicit alternate targets retain target/<target>/<profile>/ isolation.
 std::filesystem::path project_output_root(const ProjectGraph& graph, const Options& options) {
   const auto target_root = graph.manifest.root / "target";
   if (options.target == "host") return target_root / options.profile;
   return target_root / options.target / options.profile;
+}
+
+
+std::filesystem::path project_bin_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "bin";
+}
+
+std::filesystem::path project_library_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "lib";
+}
+
+std::filesystem::path project_object_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "obj";
+}
+
+std::filesystem::path project_ir_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "ir";
+}
+
+std::filesystem::path project_module_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "modules";
+}
+
+std::filesystem::path project_package_root(const ProjectGraph& graph, const Options& options) {
+  return project_output_root(graph, options) / "packages";
+}
+
+
+bool ensure_project_output_layout(const ProjectGraph& graph, const Options& options) {
+  std::error_code error;
+  for (const auto& path : {
+           project_bin_root(graph, options), project_library_root(graph, options),
+           project_object_root(graph, options), project_ir_root(graph, options),
+           project_module_root(graph, options), project_package_root(graph, options)}) {
+    std::filesystem::create_directories(path, error);
+    if (error) {
+      cli_error("failed to create target profile layout: " + path.string());
+      return false;
+    }
+  }
+  return true;
 }
 
 std::filesystem::path project_cache_root(const ProjectGraph& graph, const Options& options) {
@@ -33,9 +75,51 @@ std::uint64_t hash_text(std::string_view text, std::uint64_t seed = 146959810393
   return hash;
 }
 
+std::string strip_line_comment(std::string line) {
+  bool string = false;
+  bool character = false;
+  bool escaped = false;
+  for (std::size_t i = 0; i + 1 < line.size(); ++i) {
+    const char ch = line[i];
+    if (escaped) { escaped = false; continue; }
+    if ((string || character) && ch == '\\') { escaped = true; continue; }
+    if (!character && ch == '"') { string = !string; continue; }
+    if (!string && ch == '\'') { character = !character; continue; }
+    if (!string && !character && ch == '/' && line[i + 1] == '/') {
+      line.resize(i);
+      break;
+    }
+  }
+  return line;
+}
+
+int source_brace_delta(std::string_view line, bool& block_comment) {
+  bool string = false;
+  bool character = false;
+  bool escaped = false;
+  int delta = 0;
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    const char ch = line[i];
+    const char next = i + 1 < line.size() ? line[i + 1] : '\0';
+    if (block_comment) {
+      if (ch == '*' && next == '/') { block_comment = false; ++i; }
+      continue;
+    }
+    if (escaped) { escaped = false; continue; }
+    if ((string || character) && ch == '\\') { escaped = true; continue; }
+    if (!character && ch == '"') { string = !string; continue; }
+    if (!string && ch == '\'') { character = !character; continue; }
+    if (string || character) continue;
+    if (ch == '/' && next == '/') break;
+    if (ch == '/' && next == '*') { block_comment = true; ++i; continue; }
+    if (ch == '{') ++delta;
+    else if (ch == '}') --delta;
+  }
+  return delta;
+}
+
 std::string canonical_declaration(std::string line) {
-  const auto comment = line.find("//");
-  if (comment != std::string::npos) line.resize(comment);
+  line = strip_line_comment(std::move(line));
   std::string out;
   bool space = false;
   for (const unsigned char ch : line) {
@@ -184,12 +268,13 @@ std::vector<std::string> semantic_declarations(const std::filesystem::path& path
 
   std::vector<std::string> items;
   int outer_depth = 0;
+  bool outer_block_comment = false;
   for (std::size_t line_index = 0; line_index < lines.size();) {
     const auto& line = lines[line_index];
     if (line.empty()) { ++line_index; continue; }
 
     if (outer_depth != 0) {
-      for (const char ch : line) { if (ch == '{') ++outer_depth; else if (ch == '}') --outer_depth; }
+      outer_depth += source_brace_delta(line, outer_block_comment);
       ++line_index;
       continue;
     }
@@ -207,15 +292,15 @@ std::vector<std::string> semantic_declarations(const std::filesystem::path& path
       std::string declaration;
       int depth = 0;
       bool opened = false;
+      bool declaration_block_comment = false;
       std::size_t cursor = line_index;
       for (; cursor < lines.size(); ++cursor) {
         if (!lines[cursor].empty()) {
           if (!declaration.empty()) declaration.push_back(' ');
           declaration += lines[cursor];
-          for (const char ch : lines[cursor]) {
-            if (ch == '{') { ++depth; opened = true; }
-            else if (ch == '}') --depth;
-          }
+          const int delta = source_brace_delta(lines[cursor], declaration_block_comment);
+          if (delta > 0) opened = true;
+          depth += delta;
         }
         if (opened && depth == 0) { ++cursor; break; }
         if (!opened && declaration.ends_with(';')) { ++cursor; break; }
@@ -256,8 +341,11 @@ std::vector<std::string> semantic_declarations(const std::filesystem::path& path
       // declarations as module API.
       int depth = 0;
       bool opened = false;
+      bool function_block_comment = false;
       for (std::size_t i = line_index; i < lines.size(); ++i) {
-        for (const char ch : lines[i]) { if (ch == '{') { ++depth; opened = true; } else if (ch == '}') --depth; }
+        const int delta = source_brace_delta(lines[i], function_block_comment);
+        if (delta > 0) opened = true;
+        depth += delta;
         if (opened && depth == 0) { cursor = std::max(cursor, i + 1); break; }
         if (!opened && lines[i].find(';') != std::string::npos) break;
       }
@@ -277,7 +365,7 @@ std::vector<std::string> semantic_declarations(const std::filesystem::path& path
       continue;
     }
 
-    for (const char ch : line) { if (ch == '{') ++outer_depth; else if (ch == '}') --outer_depth; }
+    outer_depth += source_brace_delta(line, outer_block_comment);
     ++line_index;
   }
 
@@ -571,10 +659,58 @@ std::string native_linker() {
 #endif
 }
 
+#if defined(_WIN32)
+std::filesystem::path resolve_windows_external_tool(std::string name) {
+  if (name.empty()) return {};
+  std::replace(name.begin(), name.end(), '\\', '/');
+  const std::filesystem::path requested(name);
+  std::error_code error;
+  if (requested.has_parent_path() || requested.has_root_name())
+    return std::filesystem::is_regular_file(requested, error) ? requested : std::filesystem::path{};
+
+  auto search_path = [&](const char* extension) -> std::filesystem::path {
+    const DWORD required = SearchPathA(nullptr, name.c_str(), extension, 0, nullptr, nullptr);
+    if (required == 0) return {};
+    std::string buffer(static_cast<std::size_t>(required) + 1U, '\0');
+    const DWORD written = SearchPathA(nullptr, name.c_str(), extension,
+                                     static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+    if (written == 0 || written >= buffer.size()) return {};
+    buffer.resize(written);
+    return std::filesystem::path(buffer);
+  };
+  if (auto found = search_path(".exe"); !found.empty()) return found;
+  if (auto found = search_path(nullptr); !found.empty()) return found;
+
+  if (requested.extension().empty()) name += ".exe";
+  auto under = [&](const char* variable, const std::filesystem::path& suffix) -> std::filesystem::path {
+    const char* root = std::getenv(variable);
+    if (root == nullptr || *root == '\0') return {};
+    const auto candidate = std::filesystem::path(root) / suffix / name;
+    std::error_code local_error;
+    return std::filesystem::is_regular_file(candidate, local_error) && !local_error
+        ? candidate : std::filesystem::path{};
+  };
+  if (auto found = under("RAZ_LLVM_BIN", {}); !found.empty()) return found;
+  if (auto found = under("LLVM_HOME", "bin"); !found.empty()) return found;
+  if (auto found = under("LLVM_ROOT", "bin"); !found.empty()) return found;
+  if (auto found = under("ProgramFiles", std::filesystem::path("LLVM") / "bin"); !found.empty()) return found;
+  if (auto found = under("ProgramFiles(x86)", std::filesystem::path("LLVM") / "bin"); !found.empty()) return found;
+  if (auto found = under("VSINSTALLDIR", std::filesystem::path("VC") / "Tools" / "Llvm" / "x64" / "bin"); !found.empty()) return found;
+  if (auto found = under("VCINSTALLDIR", std::filesystem::path("Tools") / "Llvm" / "x64" / "bin"); !found.empty()) return found;
+  return {};
+}
+#endif
+
 std::string native_external_linker() {
   const std::string configured = environment_value("RAZ_EXTERNAL_LINKER");
 #if defined(_WIN32)
-  return configured.empty() ? "clang-cl" : configured;
+  if (!configured.empty()) {
+    if (const auto resolved = resolve_windows_external_tool(configured); !resolved.empty()) return resolved.string();
+    return configured;
+  }
+  if (const auto clang = resolve_windows_external_tool("clang-cl"); !clang.empty()) return clang.string();
+  if (const auto msvc = resolve_windows_external_tool("cl"); !msvc.empty()) return msvc.string();
+  return {};
 #else
   return configured.empty() ? "c++" : configured;
 #endif
@@ -630,12 +766,57 @@ std::string windows_native_library_environment(std::string value) {
   return result;
 }
 
-int execute_windows_msvc_fallback(const std::string& command) {
+std::string windows_link_command_with_response_file(const std::string& command,
+                                                    const std::filesystem::path& output) {
+  // cmd.exe imposes an ~8 KiB command-line limit even though CreateProcess can
+  // accept much more. A compiler-sized package can easily contain hundreds of
+  // native module objects, so keep the process command tiny and place the link
+  // arguments in a response file understood by ObLink, cl.exe, and clang-cl.
+  constexpr std::size_t response_threshold = 7000U;
+  if (command.size() < response_threshold) return command;
+
+  std::size_t arguments_begin = std::string::npos;
+  if (!command.empty() && command.front() == '"') {
+    const auto executable_end = command.find('"', 1U);
+    if (executable_end != std::string::npos) arguments_begin = executable_end + 1U;
+  } else {
+    arguments_begin = command.find_first_of(" \t");
+  }
+  if (arguments_begin == std::string::npos) return command;
+  while (arguments_begin < command.size() &&
+         (command[arguments_begin] == ' ' || command[arguments_begin] == '\t'))
+    ++arguments_begin;
+
+  auto response = output;
+  response += ".link.rsp";
+  std::ofstream file(response, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    cli_error("unable to create native-link response file: " + response.string());
+    return command;
+  }
+  file << command.substr(arguments_begin) << '\n';
+  if (!file) {
+    cli_error("unable to write native-link response file: " + response.string());
+    return command;
+  }
+
+  std::string executable = command.substr(0, arguments_begin);
+  while (!executable.empty() && (executable.back() == ' ' || executable.back() == '\t')) executable.pop_back();
+  return executable + " @" + shell_quote(response);
+}
+
+int execute_windows_native_link(const std::string& command,
+                                const std::filesystem::path& output) {
+  return execute_shell_command(windows_link_command_with_response_file(command, output));
+}
+
+int execute_windows_msvc_fallback(const std::string& command,
+                                  const std::filesystem::path& output) {
   const std::string prior_lib = environment_value("LIB");
   const std::string prior_libpath = environment_value("LIBPATH");
   _putenv_s("LIB", windows_native_library_environment(prior_lib).c_str());
   _putenv_s("LIBPATH", windows_native_library_environment(prior_libpath).c_str());
-  const int status = execute_shell_command(command);
+  const int status = execute_windows_native_link(command, output);
   _putenv_s("LIB", prior_lib.c_str());
   _putenv_s("LIBPATH", prior_libpath.c_str());
   return status;
@@ -654,18 +835,25 @@ bool execute_native_link_command(const std::string& primary_command,
                                  bool shared = false,
                                  const std::vector<std::string>& native_libraries = {},
                                  const std::vector<std::filesystem::path>& native_library_paths = {}) {
+#if defined(_WIN32)
+  if (execute_windows_native_link(primary_command, output) == 0) return true;
+#else
   if (execute_shell_command(primary_command) == 0) return true;
+#endif
 #if defined(_WIN32)
   if (!oblink_driver(native_linker())) return false;
   const std::string fallback = native_external_linker();
-  if (fallback.empty()) return false;
+  if (fallback.empty()) {
+    cli_error("ObLink could not complete this image and no Windows fallback linker was found; install LLVM or set RAZ_EXTERNAL_LINKER");
+    return false;
+  }
   const std::string prior = environment_value("RAZ_LINKER");
   _putenv_s("RAZ_LINKER", fallback.c_str());
   const std::string fallback_command = native_link_command(inputs, output, shared, native_libraries, native_library_paths);
   _putenv_s("RAZ_LINKER", prior.c_str());
   cli_status("Link", "ObLink could not complete this image; using configured bootstrap fallback " + fallback, raz::terminal::yellow);
-  if (windows_msvc_style_driver(fallback)) return execute_windows_msvc_fallback(fallback_command) == 0;
-  return execute_shell_command(fallback_command) == 0;
+  if (windows_msvc_style_driver(fallback)) return execute_windows_msvc_fallback(fallback_command, output) == 0;
+  return execute_windows_native_link(fallback_command, output) == 0;
 #else
   return false;
 #endif
@@ -802,14 +990,12 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
       command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
 #endif
     }
-    if (compiler_link_artifact(output)) {
 #ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
+    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
 #endif
 #ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
+    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
 #endif
-    }
     command << "ws2_32.lib bcrypt.lib crypt32.lib /Fe:" << shell_quote(output);
     if (!shared) {
       // The self-hosted compiler recursively walks large syntax/HIR trees and
@@ -874,6 +1060,15 @@ void print_forge_diagnostics(const forge::Diagnostics& diagnostics) {
 
 bool emit_native_object(const std::filesystem::path& ir_path, const std::filesystem::path& object_path,
                         unsigned optimization_level) {
+#if (defined(__APPLE__) && !defined(__aarch64__) && !defined(_M_ARM64)) || \
+    (defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))) || \
+    (!defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && !defined(_M_ARM64))
+  (void)ir_path;
+  (void)object_path;
+  (void)optimization_level;
+  cli_error("Forge native object emission is unavailable for this host/object-format pair; use the LLVM backend");
+  return false;
+#else
   std::ifstream input(ir_path, std::ios::binary);
   std::ostringstream source;
   source << input.rdbuf();
@@ -889,9 +1084,18 @@ bool emit_native_object(const std::filesystem::path& ir_path, const std::filesys
   forge::pass::build_standard_pipeline(pipeline, level);
   try { (void)pipeline.run(*parsed.module, false); }
   catch (const std::exception& error) { cli_errorf("Forge optimization failed: ", error.what()); return false; }
-  auto lowered = forge::machine::lower_module(*parsed.module);
+#if defined(__aarch64__) || defined(_M_ARM64)
+  constexpr auto architecture = forge::machine::TargetArchitecture::aarch64;
+#else
+  constexpr auto architecture = forge::machine::TargetArchitecture::x86_64;
+#endif
+  auto lowered = forge::machine::lower_module(*parsed.module, {architecture});
   if (!lowered.ok()) { print_forge_diagnostics(lowered.diagnostics); return false; }
-#if defined(_WIN32)
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+  auto object = forge::object::emit_macho64_aarch64(*lowered.module);
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  auto object = forge::object::emit_elf64_aarch64(*lowered.module);
+#elif defined(_WIN32)
   auto object = forge::object::emit_coff_x86_64(*lowered.module, forge::codegen::x86_64::Abi::windows);
 #else
   auto object = forge::object::emit_elf64_x86_64(*lowered.module, forge::codegen::x86_64::Abi::system_v);
@@ -901,6 +1105,7 @@ bool emit_native_object(const std::filesystem::path& ir_path, const std::filesys
     cli_errorf("failed to write native object ", object_path); return false;
   }
   return true;
+#endif
 }
 
 std::string package_namespace(const ProjectGraph& graph) {
@@ -1071,15 +1276,18 @@ void append_legacy_sources(const ProjectGraph& graph, std::ofstream& output) {
 }
 
 std::filesystem::path native_artifact_path(const ProjectGraph& graph, const Options& options) {
-  const auto root = project_output_root(graph, options);
 #if defined(_WIN32)
-  if (graph.manifest.kind == raz::compiler::PackageKind::executable) return root / (graph.manifest.name + ".exe");
-  if (graph.manifest.kind == raz::compiler::PackageKind::static_library) return root / (graph.manifest.name + ".lib");
-  return root / (graph.manifest.name + ".dll");
+  if (graph.manifest.kind == raz::compiler::PackageKind::executable)
+    return project_bin_root(graph, options) / (graph.manifest.name + ".exe");
+  if (graph.manifest.kind == raz::compiler::PackageKind::static_library)
+    return project_library_root(graph, options) / (graph.manifest.name + ".lib");
+  return project_library_root(graph, options) / (graph.manifest.name + ".dll");
 #else
-  if (graph.manifest.kind == raz::compiler::PackageKind::executable) return root / graph.manifest.name;
-  if (graph.manifest.kind == raz::compiler::PackageKind::static_library) return root / ("lib" + graph.manifest.name + ".a");
-  return root / ("lib" + graph.manifest.name + ".so");
+  if (graph.manifest.kind == raz::compiler::PackageKind::executable)
+    return project_bin_root(graph, options) / graph.manifest.name;
+  if (graph.manifest.kind == raz::compiler::PackageKind::static_library)
+    return project_library_root(graph, options) / ("lib" + graph.manifest.name + ".a");
+  return project_library_root(graph, options) / ("lib" + graph.manifest.name + ".so");
 #endif
 }
 
@@ -1428,17 +1636,20 @@ NativeIrOwnership prepare_native_ir_ownership(
 
 bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& options,
                                      const BuildProfile& profile) {
-  const auto output_root = project_output_root(graph, options);
-  const auto native_root = output_root / "native" / "aggregate";
-  std::filesystem::create_directories(native_root);
-  const auto combined_source = native_root / "package.rz";
-  const auto combined_ir = native_root / "package.fir";
+  const auto aggregate_object_root = project_object_root(graph, options) / "aggregate";
+  const auto aggregate_ir_root = project_ir_root(graph, options) / "aggregate";
+  const auto aggregate_state_root = project_cache_root(graph, options) / "aggregate";
+  std::filesystem::create_directories(aggregate_object_root);
+  std::filesystem::create_directories(aggregate_ir_root);
+  std::filesystem::create_directories(aggregate_state_root);
+  const auto combined_source = aggregate_ir_root / "package.rz";
+  const auto combined_ir = aggregate_ir_root / "package.fir";
 #if defined(_WIN32)
-  const auto object = native_root / "package.obj";
+  const auto object = aggregate_object_root / "package.obj";
 #else
-  const auto object = native_root / "package.o";
+  const auto object = aggregate_object_root / "package.o";
 #endif
-  const auto compile_state = native_root / "compile.fingerprint";
+  const auto compile_state = aggregate_state_root / "compile.fingerprint";
   {
     std::ofstream output(combined_source, std::ios::trunc);
     if (std::filesystem::is_regular_file(graph.manifest.root / "source-order.txt")) {
@@ -1469,6 +1680,7 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
     state << compile_fingerprint << '\n';
   }
   const auto artifact = native_artifact_path(graph, options);
+  std::filesystem::create_directories(artifact.parent_path());
   if (graph.manifest.kind == raz::compiler::PackageKind::static_library) {
     const std::vector<std::filesystem::path> aggregate_objects{object};
     auto archive = forge::object::emit_static_archive_from_files(aggregate_objects);
@@ -1478,7 +1690,7 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
   std::vector<std::filesystem::path> inputs{object};
   const auto aggregate_command = native_link_command(
       inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library);
-  const auto link_input_state_path = native_root / "link-inputs.state";
+  const auto link_input_state_path = aggregate_state_root / "link-inputs.state";
   auto link_input_cache = read_link_input_cache(link_input_state_path);
   auto link_hash = hash_text("raz-aggregate-link-v4");
   link_hash = hash_text(aggregate_command, link_hash);
@@ -1500,7 +1712,7 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
 #endif
   const auto link_fingerprint = hex(link_hash);
   write_link_input_cache(link_input_state_path, link_input_cache);
-  const auto link_state_path = native_root / "link.fingerprint";
+  const auto link_state_path = aggregate_state_root / "link.fingerprint";
   std::string previous_link;
   { std::ifstream input(link_state_path); input >> previous_link; }
   if (!options.force && previous_link == link_fingerprint && std::filesystem::is_regular_file(artifact)) {
@@ -1523,25 +1735,28 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
     cli_error("native emission currently supports only the automatic host target; cross-target project layout remains available");
     return false;
   }
-  const auto output_root = project_output_root(graph, options);
-  const auto module_root = output_root / "modules";
-  const auto native_root = output_root / "native";
-  const auto object_root = native_root / "modules";
+  const auto module_root = project_module_root(graph, options);
+  const auto ir_root = project_ir_root(graph, options) / "modules";
+  const auto object_root = project_object_root(graph, options) / "modules";
+  const auto native_state_root = project_cache_root(graph, options) / "native";
+  std::filesystem::create_directories(module_root);
+  std::filesystem::create_directories(ir_root);
   std::filesystem::create_directories(object_root);
+  std::filesystem::create_directories(native_state_root);
 
   std::vector<std::filesystem::path> ir_paths;
   std::vector<std::string> stems;
   if (std::filesystem::is_regular_file(graph.manifest.root / "source-order.txt")) {
-    ir_paths.push_back(module_root / "ordered-package.fir");
+    ir_paths.push_back(ir_root / "ordered-package.fir");
     stems.push_back("ordered-package");
   } else {
     for (const auto& module : graph.modules) {
-      ir_paths.push_back(module_root / (sanitize(module.logical_name) + ".fir"));
+      ir_paths.push_back(ir_root / (sanitize(module.logical_name) + ".fir"));
       stems.push_back(sanitize(module.logical_name));
     }
   }
 
-  const auto ownership = prepare_native_ir_ownership(ir_paths, stems, native_root / "owned-ir");
+  const auto ownership = prepare_native_ir_ownership(ir_paths, stems, project_ir_root(graph, options) / "owned");
   if (!ownership.ok) {
     cli_error("unable to prepare native module symbol ownership");
     return false;
@@ -1599,11 +1814,12 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
   }
 
   const auto artifact = native_artifact_path(graph, options);
+  std::filesystem::create_directories(artifact.parent_path());
   if (graph.manifest.kind == raz::compiler::PackageKind::static_library) {
     auto archive_hash = hash_text("raz-native-archive-v1");
     for (const auto& fingerprint : object_fingerprints) archive_hash = hash_text(fingerprint, archive_hash);
     const auto archive_fingerprint = hex(archive_hash);
-    const auto archive_state_path = native_root / "archive.fingerprint";
+    const auto archive_state_path = native_state_root / "archive.fingerprint";
     std::string previous_archive;
     { std::ifstream input(archive_state_path); input >> previous_archive; }
     if (!options.force && !any_object_changed && previous_archive == archive_fingerprint &&
@@ -1640,7 +1856,7 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
   const std::string command = native_link_command(
       link_inputs, artifact, graph.manifest.kind == raz::compiler::PackageKind::shared_library,
       native_libraries, native_library_paths);
-  const auto link_input_state_path = native_root / "link-inputs.state";
+  const auto link_input_state_path = native_state_root / "link-inputs.state";
   auto link_input_cache = read_link_input_cache(link_input_state_path);
   auto link_hash = hash_text("raz-native-link-v4");
   link_hash = hash_text(command, link_hash);
@@ -1664,7 +1880,7 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
 #endif
   const auto link_fingerprint = hex(link_hash);
   write_link_input_cache(link_input_state_path, link_input_cache);
-  const auto link_fingerprint_path = native_root / "link.fingerprint";
+  const auto link_fingerprint_path = native_state_root / "link.fingerprint";
   std::string previous_link;
   { std::ifstream input(link_fingerprint_path); input >> previous_link; }
   if (!options.force && previous_link == link_fingerprint &&
@@ -1755,7 +1971,7 @@ void collect_dependency_semantics(const ProjectGraph& graph, const Options& opti
                                   std::vector<std::string>& declarations) {
   for (const auto& dependency : graph.dependencies) {
     collect_dependency_semantics(dependency, options, declarations);
-    const auto module_root = project_output_root(dependency, options) / "modules";
+    const auto module_root = project_module_root(dependency, options);
     for (const auto& module : dependency.modules) {
       const auto interface_path = module_root / (sanitize(module.logical_name) + ".dmi");
       const auto imported = read_semantic_interface(interface_path);
@@ -1770,7 +1986,7 @@ void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Opti
                                            std::ofstream& output) {
   for (const auto& dependency : graph.dependencies) {
     write_namespaced_dependency_semantics(dependency, options, output);
-    const auto module_root = project_output_root(dependency, options) / "modules";
+    const auto module_root = project_module_root(dependency, options);
     for (const auto& dependency_module : dependency.modules) {
       const auto interface_path = module_root / (sanitize(dependency_module.logical_name) + ".dmi");
       const auto declarations = read_semantic_interface(interface_path);
@@ -1902,12 +2118,13 @@ std::string build_package_display(const ProjectGraph& graph) {
 bool build_ordered_compilation_unit(const ProjectGraph& graph, const Options& options,
                                     const BuildProfile& profile,
                                     const std::filesystem::path& module_root,
+                                    const std::filesystem::path& ir_root,
                                     const std::filesystem::path& cache_root,
                                     std::uint64_t package_interface_hash, bool check_only,
                                     std::size_t& compiled, std::size_t& fresh,
                                     std::vector<std::string>* diagnostic_reports) {
   const auto source_path = cache_root / "ordered-package.rz";
-  const auto ir_path = module_root / "ordered-package.fir";
+  const auto ir_path = ir_root / "ordered-package.fir";
   const auto fingerprint_path = cache_root / "ordered-package.fingerprint";
 
   if (!write_ordered_semantic_source(graph, options, source_path)) {
@@ -2014,10 +2231,12 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
   }
 
   const BuildProfile& profile = profile_it->second;
-  const auto output_root = project_output_root(graph, options);
-  const auto module_root = output_root / "modules";
+  if (!check_only && !ensure_project_output_layout(graph, options)) return false;
+  const auto module_root = project_module_root(graph, options);
+  const auto ir_root = project_ir_root(graph, options) / "modules";
   const auto cache_root = project_cache_root(graph, options);
   std::filesystem::create_directories(module_root);
+  std::filesystem::create_directories(ir_root);
   std::filesystem::create_directories(cache_root);
 
   const auto package_interface_hash = public_interface_fingerprint(graph);
@@ -2025,7 +2244,7 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
       std::filesystem::is_regular_file(graph.manifest.root / "source-order.txt");
 
   if (ordered_compilation_unit) {
-    if (!build_ordered_compilation_unit(graph, options, profile, module_root, cache_root,
+    if (!build_ordered_compilation_unit(graph, options, profile, module_root, ir_root, cache_root,
                                         package_interface_hash, check_only, compiled, fresh, diagnostic_reports)) {
       return false;
     }
@@ -2078,7 +2297,7 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
 
     for (const auto& module : graph.modules) {
       const auto stem = sanitize(module.logical_name);
-      const auto ir_path = module_root / (stem + ".fir");
+      const auto ir_path = ir_root / (stem + ".fir");
       const auto interface_path = module_root / (stem + ".dmi");
       const auto fingerprint_path = cache_root / (stem + ".fingerprint");
       const auto stage_cache_path = cache_root / (stem + ".incremental");
@@ -2141,7 +2360,8 @@ bool build_graph_impl(const ProjectGraph& graph, const Options& options, bool ch
   }
 
   if (!check_only) {
-    const auto artifact = output_root / (graph.manifest.name + ".razpkg");
+    const auto artifact = project_package_root(graph, options) / (graph.manifest.name + ".razpkg");
+    std::filesystem::create_directories(artifact.parent_path());
     std::ofstream output(artifact, std::ios::trunc);
     if (!output) {
       cli_error("failed to create package artifact");

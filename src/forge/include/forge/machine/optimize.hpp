@@ -124,4 +124,9 @@ struct OptimizationStats {
 [[nodiscard]] OptimizationStats optimize_function(Function& function, const SlpCostModel& slp_cost_model = SlpCostModel::x86_64_sse2());
 [[nodiscard]] OptimizationStats optimize_module(Module& module, const SlpCostModel& slp_cost_model = SlpCostModel::x86_64_sse2());
 
+// Architecture-neutral combines used by AArch64 before target-specific
+// instruction selection grows its own immediate/address/vector pseudos.
+[[nodiscard]] OptimizationStats optimize_aarch64_canonical_function(Function& function);
+[[nodiscard]] OptimizationStats optimize_aarch64_canonical_module(Module& module);
+
 } // namespace forge::machine

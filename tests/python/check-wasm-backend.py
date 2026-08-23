@@ -10,7 +10,7 @@ writer = (root / "compiler/src/backend/wasm/writer.rz").read_text(encoding="utf-
 cfg = (root / "compiler/src/backend/wasm/cfg.rz").read_text(encoding="utf-8")
 dispatch = (root / "compiler/src/driver/backend.rz").read_text(encoding="utf-8")
 cli = (root / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
-order = (root / "compiler/host-source-order.txt").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 required_backend = [
     "fn emit_wasm_module(",
@@ -32,7 +32,7 @@ for needle in ["fn wasm_u32(", "fn wasm_i64(", "i64 header[8] = [0, 97, 115, 109
 assert "--backend=wasm" in dispatch
 assert "return 2;" in dispatch
 assert "emit_wasm_module" in dispatch
-assert "wasm_word[6]" in cli
+assert 'cli_arg_equals_literal(value, length, "--wasm")' in cli
 assert "src/backend/wasm/writer.rz" in order
 assert "src/backend/wasm/cfg.rz" in order
 assert "src/backend/wasm/codegen.rz" in order
@@ -61,8 +61,8 @@ print("wasm-backend: PASS (direct Raz-owned wasm backend with structured MIR CFG
 
 # Phase 2 linear-memory qualification.
 memory = (root / 'compiler/src/backend/wasm/memory.rz').read_text()
-order = (root / 'compiler/host-source-order.txt').read_text()
-assert 'src/backend/wasm/memory.rz' in order, 'wasm memory module absent from production compiler source order'
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+assert 'src/backend/wasm/memory.rz' in order, 'wasm memory module absent from production compiler source graph'
 assert 'wasm_memory_emit_allocate' in memory, 'missing wasm aggregate allocator'
 assert 'wasm_memory_emit_load' in memory and 'wasm_memory_emit_store' in memory, 'missing wasm aggregate memory operations'
 assert 'wasm_emit_memory_section' in memory, 'missing wasm memory section'

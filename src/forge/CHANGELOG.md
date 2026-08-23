@@ -1,4 +1,25 @@
 ## Unreleased
+- Added full-width AArch64 Q-register allocation/spilling: call-local vectors use `v16`-`v23`, while 128-bit vectors live across calls receive 16-byte aligned spill homes because AAPCS64 preserves only the low 64 bits of `v8`-`v15`.
+- Added native `i32`/`i64` contiguous add reductions using NEON `ADDV`/`ADDP`, explicit packed chain/postfix-DAG execution, and automatic reduction recognition from ordinary contiguous scalar load/add trees.
+- Fixed AArch64 machine-optimizer alias resolution ordering so rewritten operands are resolved before virtual-register compaction, preventing a compacted ID from being interpreted through a stale alias table.
+- Added vector pressure, vector-live-across-call, reduction-result identity, chain, DAG, and native-instruction regression coverage.
+- Began AArch64 Advanced SIMD/NEON lowering for 128-bit packed integer map pseudos (`i32`/`i64` in-place, scalar-map, two-source map, and three-source chained map), with scalar tail handling and native vector-operation accounting.
+- Made packed-vector verifier diagnostics target-neutral and corrected AArch64 immediate-selection stats aggregation.
+
+### AArch64 native backend
+
+- Added deterministic Mach-O arm64 relocatable object emission with Darwin leading-underscore symbols, `LC_BUILD_VERSION`, `LC_SYMTAB`/`LC_DYSYMTAB`, `__TEXT,__text`, `__DATA,__data`, and native `__thread_data`/`__thread_vars` TLV descriptors.
+- Added Darwin arm64 `BRANCH26`, `PAGE21`, `PAGEOFF12`, `TLVP_LOAD_PAGE21`, `TLVP_LOAD_PAGEOFF12`, and `UNSIGNED` relocation emission plus `__tlv_bootstrap` TLS calls.
+- Added `--format=macho`, `forge-codegen --emit-macho`, and C API v16 `FORGE_ABI_DARWIN_ARM64`; Apple AArch64 auto-format now selects Mach-O.
+- Upgraded the AArch64 allocator with copy coalescing, CFG-hole-aware physical-register recovery, spill-slot coloring/reuse, and frame-byte savings accounting.
+- Added native AArch64 ADD/SUB/CMP/shift immediate selection with dead constant-materialization elision and changed scalar encoding to use allocated registers directly.
+- Added a correctness-first AArch64 machine encoder and deterministic ELF64 `EM_AARCH64` object writer with AAPCS64 scalar calling, stack overflow arguments, direct/indirect calls, aggregate register returns, x8 indirect results, global/function address relocations, and Linux initial-exec TLS.
+- Added AAPCS64 aggregate classification including one-to-four-member homogeneous `f32`/`f64` aggregates and explicit register-piece widths.
+- Made machine lowering target-aware so AArch64 cross-compilation cannot inherit the host x86 ABI. AArch64 currently bypasses the x86-specific machine-optimizer pseudo forms until instruction selection and allocation are target-aware.
+- Added `forge compile --arch=aarch64`, AArch64 support to `forge-codegen`, and C API v16 `FORGE_ABI_AAPCS64`/`FORGE_ABI_DARWIN_ARM64` object emission/classification.
+- Added AArch64 encoder, ELF relocation, TLS, >8-argument AAPCS64, deterministic-object, and C-API regression coverage.
+- Added a native AArch64 linear-scan register allocator using AAPCS64 callee-saved `x19`-`x28` and `v8`-`v15`, deterministic spill slots, frame save/restore emission, and register-pressure regression coverage.
+- Added an AArch64 canonical machine-combine pass for copy propagation, zero-offset pointer canonicalization, and redundant-width-cast cleanup while keeping x86-only pseudos isolated.
 
 - Added non-duplicating edge-specialized branch threading for tiny pure predicate blocks. The pass evaluates conditions per predecessor edge, bypasses the shared control block only when successor dataflow is dominance-safe, and rejects side effects, trapping/unsupported operations, escaping block-local SSA values, and any case that would require code cloning.
 - Extended SCCP/CFG cleanup with edge-sensitive predecessor elimination and safe straight-line block merging. `SimplifyCFGPass` now substitutes single-predecessor block parameters from unconditional jump arguments and splices the continuation into its predecessor, with interpreter regression coverage proving a phi becomes constant only after an impossible predecessor edge is removed.
@@ -43,6 +64,7 @@
 
 # Changelog
 
+- Added non-duplicating loop-invariant guard hoisting for canonical natural loops: a runtime-invariant header branch can move to the unique preheader while the loop header becomes an unconditional in-loop jump, with strict dominance/exit-payload legality checks and interpreter coverage for both guard outcomes.
 - C API v13 adds aggregate-element named arrays (`struct @T[N]` / `array @A[N]`) with recursive layout, ABI classification, verifier, printer/parser, and binary IR v23 support.
 All notable changes to Forge are documented here. Forge follows [Semantic Versioning](https://semver.org/).
 

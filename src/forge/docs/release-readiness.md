@@ -27,7 +27,7 @@ Forge 2.0.0, released July 29, 2026, is a stable release of the documented compi
 - x86-64 JIT on supported hosts
 - System V AMD64 and Windows x64 scalar/pointer calls
 - ELF64 and COFF AMD64 object generation
-- C++ SDK and opaque C API v14
+- C++ SDK and opaque C API v16
 - Incremental fingerprints, dependency planning, native function artifacts, object assembly, and final-binary caching
 - Installed CMake package through `Forge::forge`
 
@@ -37,7 +37,7 @@ Forge 2.0.0, released July 29, 2026, is a stable release of the documented compi
 - True variadic function definitions
 - Unwind and debug metadata
 - Segmented live-range register allocation
-- Architectures other than x86-64
+- Production-parity architectures other than x86-64; AArch64 ELF is currently an experimental cross/native object backend
 
 A release must not claim these capabilities until implementation, semantic tests, platform tests, and release gates are complete.
 

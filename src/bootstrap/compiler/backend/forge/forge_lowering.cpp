@@ -397,8 +397,14 @@ std::string ForgeLowering::lower_and_print(const MirModule& input) {
               result = builder.create_copy(target_type, operand(0));
               break;
             }
-            if ((source_builtin.kind == TypeKind::signed_integer || source_builtin.kind == TypeKind::unsigned_integer) &&
-                (target_builtin.kind == TypeKind::signed_integer || target_builtin.kind == TypeKind::unsigned_integer)) {
+            const auto integer_like = [](TypeKind kind) {
+              return kind == TypeKind::bool_type || kind == TypeKind::signed_integer || kind == TypeKind::unsigned_integer;
+            };
+            const auto unsigned_like = [](TypeKind kind) {
+              // bool is represented as i1 and extends as 0/1.
+              return kind == TypeKind::bool_type || kind == TypeKind::unsigned_integer;
+            };
+            if (integer_like(source_builtin.kind) && integer_like(target_builtin.kind)) {
               const auto width = [](forge::ir::Type type) -> unsigned {
                 using forge::ir::TypeKind;
                 switch (type.kind()) {
@@ -407,7 +413,7 @@ std::string ForgeLowering::lower_and_print(const MirModule& input) {
                 }
               };
               if (width(source_type) < width(target_type)) {
-                const auto opcode = source_builtin.kind == TypeKind::unsigned_integer ? forge::ir::Opcode::zero_extend : forge::ir::Opcode::sign_extend;
+                const auto opcode = unsigned_like(source_builtin.kind) ? forge::ir::Opcode::zero_extend : forge::ir::Opcode::sign_extend;
                 result = builder.create_cast(opcode, target_type, operand(0));
               } else if (width(source_type) > width(target_type)) {
                 result = builder.create_cast(forge::ir::Opcode::truncate, target_type, operand(0));
@@ -416,15 +422,13 @@ std::string ForgeLowering::lower_and_print(const MirModule& input) {
               }
               break;
             }
-            if ((source_builtin.kind == TypeKind::signed_integer || source_builtin.kind == TypeKind::unsigned_integer) &&
-                target_builtin.kind == TypeKind::floating_point) {
-              result = builder.create_cast(source_builtin.kind == TypeKind::unsigned_integer ?
+            if (integer_like(source_builtin.kind) && target_builtin.kind == TypeKind::floating_point) {
+              result = builder.create_cast(unsigned_like(source_builtin.kind) ?
                   forge::ir::Opcode::int_to_float_unsigned : forge::ir::Opcode::int_to_float_signed, target_type, operand(0));
               break;
             }
-            if (source_builtin.kind == TypeKind::floating_point &&
-                (target_builtin.kind == TypeKind::signed_integer || target_builtin.kind == TypeKind::unsigned_integer)) {
-              result = builder.create_cast(target_builtin.kind == TypeKind::unsigned_integer ?
+            if (source_builtin.kind == TypeKind::floating_point && integer_like(target_builtin.kind)) {
+              result = builder.create_cast(unsigned_like(target_builtin.kind) ?
                   forge::ir::Opcode::float_to_int_unsigned : forge::ir::Opcode::float_to_int_signed, target_type, operand(0));
               break;
             }

@@ -733,7 +733,23 @@ std::int64_t raz_rt_stdio_is_terminal(std::int64_t stream) {
   auto* file = raz_stdio_stream(stream);
   if (file == nullptr) return 0;
 #if defined(_WIN32)
-  return _isatty(_fileno(file)) != 0 ? 1 : 0;
+  const int descriptor = _fileno(file);
+  if (descriptor < 0 || _isatty(descriptor) == 0) return 0;
+
+  // Production Raz emits ANSI styling for human-facing status/diagnostic
+  // output. Direct self-hosted compiler invocations do not pass through the C++
+  // CLI shim, so enable VT processing here as part of successful terminal
+  // detection as well. Older/non-console handles simply keep their existing
+  // mode; terminal detection itself remains authoritative.
+  const intptr_t os_handle = _get_osfhandle(descriptor);
+  if (os_handle != -1) {
+    HANDLE handle = reinterpret_cast<HANDLE>(os_handle);
+    DWORD mode = 0;
+    if (GetConsoleMode(handle, &mode) != 0) {
+      SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+  }
+  return 1;
 #else
   return ::isatty(fileno(file)) != 0 ? 1 : 0;
 #endif

@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[2]
 wasi = (root / 'compiler/src/backend/wasm/wasi.rz').read_text(encoding='utf-8')
 codegen = (root / 'compiler/src/backend/wasm/codegen.rz').read_text(encoding='utf-8')
 closures = (root / 'compiler/src/backend/wasm/closures.rz').read_text(encoding='utf-8')
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 assert 'src/backend/wasm/wasi.rz' in order
 for needle in [

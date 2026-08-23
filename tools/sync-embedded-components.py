@@ -39,8 +39,10 @@ def source_files(root: Path) -> list[Path]:
         if not path.is_file():
             continue
         relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in IGNORED_ROOT_PARTS:
-            continue
+        if relative.parts:
+            root_part = relative.parts[0]
+            if root_part in IGNORED_ROOT_PARTS or root_part.startswith("build-") or root_part.startswith("cmake-build-"):
+                continue
         if any(part in IGNORED_ANY_PARTS for part in relative.parts):
             continue
         if path.suffix in IGNORED_SUFFIXES:

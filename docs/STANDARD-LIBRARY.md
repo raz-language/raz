@@ -1091,7 +1091,7 @@ Operating-system, networking, concurrency, and application APIs.
 | [`std::env`](#stdenv) | 4 |
 | [`std::env::owned`](#stdenvowned) | 6 |
 | [`std::env::path`](#stdenvpath) | 1 |
-| [`std::fmt`](#stdfmt) | 8 |
+| [`std::fmt`](#stdfmt) | 14 |
 | [`std::fs`](#stdfs) | 22 |
 | [`std::fs::async_fs`](#stdfsasync_fs) | 4 |
 | [`std::fs::bytes`](#stdfsbytes) | 3 |
@@ -1106,7 +1106,7 @@ Operating-system, networking, concurrency, and application APIs.
 | [`std::io::buffer`](#stdiobuffer) | 37 |
 | [`std::io::buffered`](#stdiobuffered) | 20 |
 | [`std::io::error`](#stdioerror) | 4 |
-| [`std::io::stdio`](#stdiostdio) | 10 |
+| [`std::io::stdio`](#stdiostdio) | 20 |
 | [`std::log`](#stdlog) | 15 |
 | [`std::net`](#stdnet) | 78 |
 | [`std::net::address`](#stdnetaddress) | 16 |
@@ -1153,6 +1153,7 @@ Operating-system, networking, concurrency, and application APIs.
 | [`std::thread::task`](#stdthreadtask) | 13 |
 | [`std::thread::timer`](#stdthreadtimer) | 6 |
 | [`std::time`](#stdtime) | 18 |
+| [`std::testing`](#stdtesting) | 4 |
 
 ### std::cli::parser
 
@@ -1426,6 +1427,12 @@ fn drop(Encoder&mut self)
 | `fn format_i64(i64 value) -> String` |  |
 | `fn format_u64(u64 value) -> String` |  |
 | `fn format_hex_u64(u64 value, bool upper) -> String` |  |
+| `fn append_binary_u64(String&mut output, u64 value) -> bool` | Append an unsigned value in base 2. |
+| `fn append_octal_u64(String&mut output, u64 value) -> bool` | Append an unsigned value in base 8. |
+| `fn append_padded_u64(String&mut output, u64 value, i64 width, i64 fill) -> bool` | Append an unsigned decimal value with left padding. |
+| `fn format_bool(bool value) -> String` | Format a boolean into owned text. |
+| `fn format_binary_u64(u64 value) -> String` | Format an unsigned value in base 2. |
+| `fn format_octal_u64(u64 value) -> String` | Format an unsigned value in base 8. |
 
 ### std::fs
 
@@ -1843,6 +1850,16 @@ fn drop(BufWriter&mut self)
 | `fn write_stderr(usize data, i64 size) -> bool` |  |
 | `fn flush(i64 stream) -> bool` |  |
 | `fn is_terminal(i64 stream) -> bool` |  |
+| `fn print_string(String& value) -> bool` | Write an owned UTF-8 string to stdout without adding a newline. |
+| `fn println_string(String& value) -> bool` | Write an owned UTF-8 string followed by a newline. |
+| `fn print_i64(i64 value) -> bool` | Format and write a signed integer. |
+| `fn println_i64(i64 value) -> bool` | Format and write a signed integer followed by a newline. |
+| `fn print_u64(u64 value) -> bool` | Format and write an unsigned integer. |
+| `fn println_u64(u64 value) -> bool` | Format and write an unsigned integer followed by a newline. |
+| `fn print_bool(bool value) -> bool` | Format and write a boolean. |
+| `fn println_bool(bool value) -> bool` | Format and write a boolean followed by a newline. |
+| `fn eprint_string(String& value) -> bool` | Write an owned UTF-8 string to stderr. |
+| `fn eprintln_string(String& value) -> bool` | Write an owned UTF-8 string followed by a newline to stderr. |
 
 ### std::log
 
@@ -3253,4 +3270,21 @@ fn drop(SpscI64&mut self)
 | `fn instant_add(Instant& instant, Duration& duration) -> Instant` |  |
 | `fn remaining(Instant& deadline) -> Duration` |  |
 | `fn reached(Instant& deadline) -> bool` |  |
+
+
+
+### std::testing
+
+`library/std/testing/testing.rz`
+
+Status-returning expectations for compiler-owned `test_` functions. A zero result means success; failures return `1` and emit a concise value-aware diagnostic to stderr.
+
+**Functions**
+
+| Function | Description |
+|---|---|
+| `fn expect(bool condition) -> i64` | Require a condition to be true. |
+| `fn expect_i64_eq(i64 actual, i64 expected) -> i64` | Compare signed integers and report both values on failure. |
+| `fn expect_u64_eq(u64 actual, u64 expected) -> i64` | Compare unsigned integers and report both values on failure. |
+| `fn expect_bool_eq(bool actual, bool expected) -> i64` | Compare booleans and report both values on failure. |
 

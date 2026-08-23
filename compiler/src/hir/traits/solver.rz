@@ -1108,47 +1108,11 @@ fn hir_parse_generic_inherent_impl_template(HirBuilder&mut builder) -> bool {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
         return false;
     }
-    // Two unconstrained inherent templates over the same generic aggregate
-    // overlap regardless of parameter spelling. Trait-backed templates share
-    // the storage table but are excluded from this check.
+    // Multiple inherent impl blocks for the same generic aggregate are legal.
+    // Coherence is enforced at the method level when templates materialize,
+    // so separate impl blocks can organize disjoint APIs without being treated
+    // as overlapping type implementations.
 
-    i64 existing_impl = 0;
-
-    while (existing_impl < builder.module.generic_inherent_impl_count) {
-        if (
-            raz_compiler_rt_arena_get(
-                builder.module.generic_inherent_struct_templates,
-                existing_impl,
-            ) == generic_target
-        ) {
-            i64 existing_source = raz_compiler_rt_arena_get(
-                builder.module.generic_inherent_source_offsets,
-                existing_impl,
-            );
-
-            bool trait_backed = false;
-            i64 trait_candidate = 0;
-
-            while (trait_candidate < builder.module.generic_trait_impl_count) {
-                if (
-                    raz_compiler_rt_arena_get(
-                        builder.module.generic_trait_source_offsets,
-                        trait_candidate,
-                    ) == existing_source
-                ) {
-                    trait_backed = true;
-                    trait_candidate = builder.module.generic_trait_impl_count;
-                } else {
-                    trait_candidate += 1;
-                }
-            }
-            if (!trait_backed) {
-                hir_fail(builder, DiagnosticCode::DuplicateName);
-                return false;
-            }
-        }
-        existing_impl += 1;
-    }
     hir_advance(builder);
     if (!hir_expect(builder, TokenKind::Less)) {
         return false;
@@ -1243,15 +1207,26 @@ fn hir_parse_inherent_impl(HirBuilder&mut builder) -> bool {
 
     i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
     i64 enumeration = -1;
+    i64 target_type = 0;
     i64 inherent_target = structure;
 
     if (structure < 0) {
         enumeration = hir_find_enum(builder, builder.current.offset, builder.current.length);
-        if (enumeration < 0) {
+        if (enumeration >= 0) {
+            inherent_target = -2 - enumeration;
+        } else if (
+            token_is_scalar_type(&builder.scan.input, builder.current.offset, builder.current.length)
+        ) {
+            target_type = primitive_type_kind(
+                &builder.scan.input,
+                builder.current.offset,
+                builder.current.length,
+            );
+            inherent_target = hir_scalar_method_target(target_type);
+        } else {
             hir_fail(builder, DiagnosticCode::UnknownType);
             return false;
         }
-        inherent_target = -2 - enumeration;
     }
     hir_advance(builder);
     if (!hir_expect(builder, TokenKind::LeftBrace)) {
@@ -1274,12 +1249,11 @@ fn hir_parse_inherent_impl(HirBuilder&mut builder) -> bool {
         } else {
             builder.pending_effect_flags = 0;
         }
-        if (
-            builder.current.kind != TokenKind::Identifier ||
-            !token_is_fn(&builder.scan.input, &builder.current) ||
-            builder.module.inherent_method_count >= 8192
-        ) {
-            hir_fail(builder, DiagnosticCode::ExpectedToken);
+        // `hir_parse_function` owns function-prefix validation. Inherent
+        // methods may use the same visibility/async/unsafe prefixes as normal
+        // functions, so do not require the first token to be literally `fn`.
+        if (builder.module.inherent_method_count >= 8192) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
             return false;
         }
 
@@ -1312,22 +1286,32 @@ fn hir_parse_inherent_impl(HirBuilder&mut builder) -> bool {
                 builder.module.function_parameter_starts,
                 function_index,
             );
-            bool receiver_type_matches = raz_compiler_rt_arena_get(
-                builder.module.parameter_type_structs,
-                first_parameter,
-            ) == structure;
-            if (enumeration >= 0) {
+
+            bool receiver_type_matches = false;
+
+            if (structure >= 0) {
+                receiver_type_matches = raz_compiler_rt_arena_get(
+                    builder.module.parameter_type_structs,
+                    first_parameter,
+                ) == structure;
+            } else if (enumeration >= 0) {
                 receiver_type_matches =
                     raz_compiler_rt_arena_get(builder.module.parameter_type_structs, first_parameter) < 0 &&
                     raz_compiler_rt_arena_get(
                         builder.module.parameter_types,
                         first_parameter,
                     ) == hir_enum_value_type_kind(builder, enumeration);
+            } else {
+                receiver_type_matches =
+                    raz_compiler_rt_arena_get(builder.module.parameter_type_structs, first_parameter) < 0 &&
+                    raz_compiler_rt_arena_get(
+                        builder.module.parameter_types,
+                        first_parameter,
+                    ) == target_type;
             }
-            if (
-                receiver_type_matches &&
-                raz_compiler_rt_arena_get(builder.module.parameter_references, first_parameter) != 0
-            ) {
+            // A receiver may be borrowed or consumed by value. Call binding
+            // applies the parameter's reference semantics.
+            if (receiver_type_matches) {
                 receiver = 1;
             }
         }
@@ -1896,6 +1880,7 @@ fn hir_parse_trait_impl(HirBuilder&mut builder) -> bool {
 
     i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
     i64 target_type = 0;
+    i64 semantic_target_type = 0;
     i64 method_target = structure;
 
     if (structure < 0) {
@@ -1903,12 +1888,25 @@ fn hir_parse_trait_impl(HirBuilder&mut builder) -> bool {
             hir_fail(builder, DiagnosticCode::UnknownType);
             return false;
         }
+        bool semantic_bool =
+            builder.current.length == 4 &&
+            source_byte(&builder.scan.input, builder.current.offset) == 98 &&
+            source_byte(&builder.scan.input, builder.current.offset + 1) == 111 &&
+            source_byte(&builder.scan.input, builder.current.offset + 2) == 111 &&
+            source_byte(&builder.scan.input, builder.current.offset + 3) == 108;
         target_type = primitive_type_kind(
             &builder.scan.input,
             builder.current.offset,
             builder.current.length
         );
-        method_target = hir_scalar_method_target(target_type);
+        semantic_target_type = target_type;
+        if (semantic_bool && target_type == 0) {
+            // bool shares i64's runtime representation, but it is a distinct
+            // semantic type for impl identity and trait solving. Marker 16 is
+            // already used by generic substitution for this exact purpose.
+            semantic_target_type = 16;
+        }
+        method_target = hir_scalar_method_target(semantic_target_type);
     }
     if (
         hir_find_trait_impl(builder, trait_index, method_target) >= 0 ||
@@ -1917,7 +1915,7 @@ fn hir_parse_trait_impl(HirBuilder&mut builder) -> bool {
         hir_fail(builder, DiagnosticCode::DuplicateName);
         return false;
     }
-    if (!hir_validate_supertraits_for_structure(builder, trait_index, structure, target_type)) {
+    if (!hir_validate_supertraits_for_structure(builder, trait_index, structure, semantic_target_type)) {
         return false;
     }
     hir_advance(builder);
@@ -2116,10 +2114,8 @@ fn hir_parse_trait_impl(HirBuilder&mut builder) -> bool {
                             first_parameter
                         ) == target_type;
                 }
-                if (
-                    receiver_type_matches &&
-                    raz_compiler_rt_arena_get(builder.module.parameter_references, first_parameter) != 0
-                ) {
+                // Consuming/by-value `self` is still an instance receiver.
+                if (receiver_type_matches) {
                     receiver = 1;
                 }
             }

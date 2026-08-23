@@ -73,7 +73,10 @@ bool implicit_numeric_family_compatible(const std::string& actual, const std::st
 }
 
 bool native_cast_type(const std::string& type) {
-  return type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
+  // Explicit `as` casts treat bool as the one-bit integer scalar used by the
+  // production compiler. Keep bool out of ordinary implicit numeric coercion:
+  // this only expands the explicit cast surface required to bootstrap Raz.
+  return type == "bool" || type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
          type == "isize" || type == "int" || type == "u8" || type == "u16" ||
          type == "u32" || type == "u64" || type == "usize" || type == "uint" ||
          type == "byte" || type == "f32" || type == "f64";

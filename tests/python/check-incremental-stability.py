@@ -51,7 +51,7 @@ def main() -> int:
         for field in ('source=', 'imports=', 'interface=', 'semantic=', 'hir=', 'mir=', 'forge_ir=', 'build='):
             if field not in text: raise SystemExit(f'missing {field} in {stage}')
 
-    native = work / 'target/debug/native/modules'
+    native = work / 'target/debug/obj/modules'
     main_obj = native / ('main.obj' if __import__('os').name == 'nt' else 'main.o')
     util_obj = native / ('util__math.obj' if __import__('os').name == 'nt' else 'util__math.o')
     if not main_obj.is_file() or not util_obj.is_file(): raise SystemExit('missing per-module native objects')
@@ -66,7 +66,7 @@ def main() -> int:
     # preserve both the object and final executable timestamps and skip linking.
     util_state = native / 'util__math.object.fingerprint'
     if not util_state.is_file(): raise SystemExit('missing util native object cache state')
-    artifact = work / 'target/debug' / ('hello-package.exe' if __import__('os').name == 'nt' else 'hello-package')
+    artifact = work / 'target/debug/bin' / ('hello-package.exe' if __import__('os').name == 'nt' else 'hello-package')
     if not artifact.is_file(): raise SystemExit('missing native executable')
     object_stamp_before = util_obj.stat().st_mtime_ns
     artifact_stamp_before = artifact.stat().st_mtime_ns

@@ -3,6 +3,8 @@
 
 #include "forge/diagnostics/format.hpp"
 #include "forge/codegen/x86_64/encoder.hpp"
+#include "forge/codegen/aarch64/encoder.hpp"
+#include "forge/codegen/aarch64/register_allocation.hpp"
 #include "forge/ir/parser.hpp"
 #include "forge/ir/verifier.hpp"
 #include "forge/machine/lower.hpp"
@@ -10,6 +12,7 @@
 #include "forge/machine/register_allocation.hpp"
 #include "forge/object/coff.hpp"
 #include "forge/object/elf.hpp"
+#include "forge/object/macho.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -25,7 +28,7 @@ void print_diagnostics(const forge::Diagnostics& diagnostics) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: forge-codegen <input.fir> [--machine-ir] [--allocation] [--stats] [--image] [--emit-elf=<output.o>] [--emit-coff=<output.obj>] [--abi=sysv|windows]\n";
+        std::cerr << "usage: forge-codegen <input.fir> [--machine-ir] [--allocation] [--stats] [--image] [--emit-elf=<output.o>] [--emit-coff=<output.obj>] [--emit-macho=<output.o>] [--arch=x86_64|aarch64] [--abi=sysv|windows|aapcs64]\n";
         return 2;
     }
     bool print_machine = false;
@@ -35,11 +38,13 @@ int main(int argc, char** argv) {
     bool verify_only = false;
     std::optional<std::string> elf_output;
     std::optional<std::string> coff_output;
+    std::optional<std::string> macho_output;
 #if defined(_WIN32)
     auto abi = forge::codegen::x86_64::Abi::windows;
 #else
     auto abi = forge::codegen::x86_64::Abi::system_v;
 #endif
+    auto architecture = forge::machine::TargetArchitecture::x86_64;
     for (int index = 2; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--machine-ir") print_machine = true;
@@ -49,8 +54,12 @@ int main(int argc, char** argv) {
         else if (argument == "--verify-only") verify_only = true;
         else if (argument.rfind("--emit-elf=", 0) == 0) elf_output = argument.substr(11);
         else if (argument.rfind("--emit-coff=", 0) == 0) coff_output = argument.substr(12);
+        else if (argument.rfind("--emit-macho=", 0) == 0) macho_output = argument.substr(13);
         else if (argument == "--abi=sysv") abi = forge::codegen::x86_64::Abi::system_v;
         else if (argument == "--abi=windows") abi = forge::codegen::x86_64::Abi::windows;
+        else if (argument == "--abi=aapcs64") architecture = forge::machine::TargetArchitecture::aarch64;
+        else if (argument == "--arch=x86_64") architecture = forge::machine::TargetArchitecture::x86_64;
+        else if (argument == "--arch=aarch64") architecture = forge::machine::TargetArchitecture::aarch64;
         else {
             std::cerr << "unknown option: " << argument << '\n';
             return 2;
@@ -72,21 +81,43 @@ int main(int argc, char** argv) {
         std::cout << "VERIFIED  " << parsed.module->functions().size() << " functions\n";
         return 0;
     }
-    auto lowered = forge::machine::lower_module(*parsed.module);
+    auto lowered = forge::machine::lower_module(*parsed.module, {architecture});
     if (!lowered.ok()) { print_diagnostics(lowered.diagnostics); return 1; }
     if (print_machine) std::cout << forge::machine::print_module(*lowered.module) << '\n';
-    if (elf_output && coff_output) { std::cerr << "choose only one object format\n"; return 2; }
+    if (static_cast<unsigned>(elf_output.has_value()) + static_cast<unsigned>(coff_output.has_value()) + static_cast<unsigned>(macho_output.has_value()) > 1U) { std::cerr << "choose only one object format\n"; return 2; }
     if (elf_output) {
-        auto object = forge::object::emit_elf64_x86_64(*lowered.module, abi);
+        auto object = architecture == forge::machine::TargetArchitecture::aarch64
+            ? forge::object::emit_elf64_aarch64(*lowered.module)
+            : forge::object::emit_elf64_x86_64(*lowered.module, abi);
         if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
         std::ofstream output(*elf_output, std::ios::binary);
         if (!output) { std::cerr << "unable to create " << *elf_output << '\n'; return 1; }
         output.write(reinterpret_cast<const char*>(object.bytes.data()), static_cast<std::streamsize>(object.bytes.size()));
         if (!output) { std::cerr << "unable to write " << *elf_output << '\n'; return 1; }
-        std::cout << "OBJECT  ELF64 x86-64  " << object.bytes.size() << " bytes  " << *elf_output << '\n';
+        std::cout << "OBJECT  ELF64 "
+                  << (architecture == forge::machine::TargetArchitecture::aarch64 ? "AArch64  " : "x86-64  ")
+                  << object.bytes.size() << " bytes  " << *elf_output << '\n';
+    }
+
+    if (macho_output) {
+        if (architecture != forge::machine::TargetArchitecture::aarch64) {
+            std::cerr << "Mach-O emission is currently implemented for arm64 only\n";
+            return 2;
+        }
+        auto object = forge::object::emit_macho64_aarch64(*lowered.module);
+        if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
+        std::ofstream output(*macho_output, std::ios::binary);
+        if (!output) { std::cerr << "unable to create " << *macho_output << '\n'; return 1; }
+        output.write(reinterpret_cast<const char*>(object.bytes.data()), static_cast<std::streamsize>(object.bytes.size()));
+        if (!output) { std::cerr << "unable to write " << *macho_output << '\n'; return 1; }
+        std::cout << "OBJECT  Mach-O arm64  " << object.bytes.size() << " bytes  " << *macho_output << '\n';
     }
 
     if (coff_output) {
+        if (architecture == forge::machine::TargetArchitecture::aarch64) {
+            std::cerr << "AArch64 COFF emission is not implemented; use --emit-elf\n";
+            return 2;
+        }
         auto object = forge::object::emit_coff_x86_64(*lowered.module, forge::codegen::x86_64::Abi::windows);
         if (!object.ok()) { print_diagnostics(object.diagnostics); return 1; }
         std::ofstream output(*coff_output, std::ios::binary);
@@ -98,22 +129,75 @@ int main(int argc, char** argv) {
 
     if (print_allocation) {
         for (const auto& function : lowered.module->functions) {
-            const auto allocation = forge::machine::allocate_linear_scan(function);
-            if (!allocation.ok()) { print_diagnostics(allocation.diagnostics); return 1; }
-            std::cout << "ALLOC  @" << function.name
-                      << "  physical=" << allocation.physical_count
-                      << "  spills=" << allocation.spill_count
-                      << "  slots=" << allocation.spill_slot_count
-                      << "  reused-slots=" << allocation.reused_spill_slot_count
-                      << "  frame-before=" << allocation.frame_size_before_slot_reuse
-                      << "  frame=" << allocation.frame_size
-                      << "  frame-saved=" << allocation.frame_bytes_saved
-                      << "  rematerialized=" << allocation.rematerialized_value_count
-                      << "  rematerialized-uses=" << allocation.rematerialized_use_count << "\n";
+            if (architecture == forge::machine::TargetArchitecture::aarch64) {
+                const auto allocation = forge::codegen::aarch64::allocate_registers(function);
+                if (!allocation.ok()) { print_diagnostics(allocation.diagnostics); return 1; }
+                std::cout << "ALLOC  @" << function.name
+                          << "  arch=aarch64"
+                          << "  physical=" << allocation.physical_value_count
+                          << "  vector-physical=" << allocation.vector_register_value_count
+                          << "  spills=" << allocation.spilled_value_count
+                          << "  vector-spills=" << allocation.vector_spilled_value_count
+                          << "  spill-bytes=" << allocation.spill_bytes
+                          << "  slots=" << allocation.spill_slot_count
+                          << "  reused-slots=" << allocation.reused_spill_slot_count
+                          << "  frame-saved=" << allocation.frame_bytes_saved
+                          << "  coalesced-copies=" << allocation.coalesced_copy_count
+                          << "  hole-reuse=" << allocation.hole_aware_register_reuse_count << "\n";
+            } else {
+                const auto allocation = forge::machine::allocate_linear_scan(function);
+                if (!allocation.ok()) { print_diagnostics(allocation.diagnostics); return 1; }
+                std::cout << "ALLOC  @" << function.name
+                          << "  physical=" << allocation.physical_count
+                          << "  spills=" << allocation.spill_count
+                          << "  slots=" << allocation.spill_slot_count
+                          << "  reused-slots=" << allocation.reused_spill_slot_count
+                          << "  frame-before=" << allocation.frame_size_before_slot_reuse
+                          << "  frame=" << allocation.frame_size
+                          << "  frame-saved=" << allocation.frame_bytes_saved
+                          << "  rematerialized=" << allocation.rematerialized_value_count
+                          << "  rematerialized-uses=" << allocation.rematerialized_use_count << "\n";
+            }
         }
     }
 
-    if ((elf_output || coff_output) && !image_mode && !print_machine && !print_allocation && !print_stats) return 0;
+    if ((elf_output || coff_output || macho_output) && !image_mode && !print_machine && !print_allocation && !print_stats) return 0;
+    if (architecture == forge::machine::TargetArchitecture::aarch64) {
+        if (image_mode) {
+            auto encoded = forge::codegen::aarch64::encode_image(*lowered.module);
+            if (!encoded.ok()) { print_diagnostics(encoded.diagnostics); return 1; }
+            std::cout << "IMAGE  AArch64  " << encoded.image.code.size() << " bytes\n";
+            for (const auto& entry : encoded.image.entries)
+                std::cout << "ENTRY  @" << entry.first << " +" << entry.second << "\n";
+            for (const auto& relocation : encoded.image.relocations)
+                std::cout << "RELOC  @" << relocation.symbol << " +" << relocation.offset << "\n";
+            std::cout << forge::codegen::aarch64::format_hex(encoded.image.code) << '\n';
+        } else {
+            auto encoded = forge::codegen::aarch64::encode(*lowered.module);
+            if (!encoded.ok()) { print_diagnostics(encoded.diagnostics); return 1; }
+            for (const auto& function : encoded.functions) {
+                if (print_stats)
+                    std::cout << "STATS  @" << function.name
+                              << "  bytes=" << function.code.size()
+                              << "  frame=" << function.frame_size
+                              << "  register-values=" << function.register_allocated_value_count
+                              << "  vector-register-values=" << function.vector_register_allocated_value_count
+                              << "  spills=" << function.spilled_value_count
+                              << "  vector-spills=" << function.vector_spilled_value_count
+                              << "  spill-bytes=" << function.spill_bytes
+                              << "  frame-saved=" << function.frame_bytes_saved
+                              << "  callee-saved=" << function.callee_saved_register_count
+                              << "  immediate-forms=" << function.immediate_form_count
+                              << "  dead-constants-elided=" << function.elided_dead_constant_count
+                              << "  neon-ops=" << function.neon_vector_operation_count
+                              << "  abi-register-args=" << function.abi_register_argument_count
+                              << "  abi-stack-args=" << function.abi_stack_argument_count << '\n';
+                std::cout << '@' << function.name << "  " << function.code.size() << " bytes\n"
+                          << forge::codegen::aarch64::format_hex(function.code) << '\n';
+            }
+        }
+        return 0;
+    }
     if (image_mode) {
         auto encoded = forge::codegen::x86_64::encode_image(*lowered.module, abi);
         if (!encoded.ok()) { print_diagnostics(encoded.diagnostics); return 1; }

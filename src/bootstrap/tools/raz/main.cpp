@@ -14,6 +14,7 @@
 #include <forge/object/archive.hpp>
 #include <forge/object/coff.hpp>
 #include <forge/object/elf.hpp>
+#include <forge/object/macho.hpp>
 #include <forge/pass/pipeline.hpp>
 
 #include <algorithm>
@@ -61,14 +62,12 @@ raz::terminal::ColorMode g_color_mode = raz::terminal::ColorMode::auto_;
 bool g_quiet = false;
 
 
-// Command implementation is grouped by responsibility; main.cpp remains the entry point.
+// Stage-0 keeps only the bootstrap build/check driver. Production commands live in Raz.
 #include "detail/cli_options.hpp"
+#include "detail/stage0_io.hpp"
 #include "detail/build_driver.hpp"
-#include "detail/project_commands.hpp"
-#include "detail/lsp_semantics.hpp"
-#include "detail/auxiliary_commands.hpp"
-#include "detail/lsp_server.hpp"
-#include "detail/dispatch_helpers.hpp"
+
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc > 0 && argv[0] != nullptr) g_self_executable = std::filesystem::path(argv[0]);
@@ -112,72 +111,18 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (options.command == "version") {
-    std::cout << "raz 1.0.0\n";
+    std::cout << "raz-stage0 1.0.0\n";
     return 0;
   }
 
-  if (options.command == "new") return create_project(options);
-  if (options.command == "init") return create_project(options, true);
-  if (options.command == "lsp") return run_lsp();
-  if (options.command == "diagnostics") return diagnostic_catalog(options);
-  if (options.command == "doctor") return doctor_toolchain(options);
   ProjectGraph graph;
   ProjectError error;
-  if (!raz::compiler::discover_project(options.project, graph, error)) { cli_error(error.message); return 1; }
-  const auto workspace_state_path = graph.manifest.root / "target" / "cache" / "workspace-v1.state";
-  const auto previous_workspace = WorkspaceGraph::load(workspace_state_path);
-  const auto current_workspace = raz::compiler::build_workspace_graph(graph);
-  const auto workspace_delta = previous_workspace.has_value()
-      ? previous_workspace->compare(current_workspace)
-      : raz::compiler::WorkspaceDelta{.added = [&] { std::set<std::string> values; for (const auto& [key, _] : current_workspace.modules) values.insert(key); return values; }(),
-                                       .dirty = [&] { std::set<std::string> values; for (const auto& [key, _] : current_workspace.modules) values.insert(key); return values; }()};
-  if (options.verbose && !workspace_delta.empty()) {
-    cli_status("Workspace", std::to_string(workspace_delta.dirty.size()) + " dirty module(s), graph " +
-        hex(current_workspace.structure_fingerprint), raz::terminal::magenta);
+  if (!raz::compiler::discover_project(options.project, graph, error)) {
+    cli_error(error.message);
+    return 1;
   }
 
-  if (options.command == "metadata") return metadata(graph);
-  if (options.command == "graph") return dependency_graph(graph);
-  if (options.command == "cache") return cache_project(graph, options);
-  if (options.command == "lock") return write_lockfile(graph);
-  if (options.command == "verify") return verify_project(graph);
-  if (options.command == "sbom") return generate_sbom(graph, false);
-  if (options.command == "audit") return generate_sbom(graph, true);
-  if (options.command == "bench") return benchmark_project(graph, options);
-  if (options.command == "profile") return profile_project(graph);
-  if (options.command == "coverage") return coverage_project(graph);
-  if (options.command == "fuzz") return fuzz_project(graph, options);
-  if (options.command == "package") return package_project(graph, options);
-  if (options.command == "publish") return publish_project(graph, options);
-  if (options.command == "install") return install_project(graph, options, false);
-  if (options.command == "uninstall") return install_project(graph, options, true);
-  if (options.command == "fmt") return format_project(graph, options);
-  if (options.command == "lint") {
-    SessionOptions session; session.input = graph.manifest.entry; session.check_only = true;
-    if (Compiler{}.run(Session(std::move(session))) != 0) return 1;
-    return lint_project(graph, options);
-  }
-
-  if (options.command == "doc") return document_project(graph);
-  if (options.command == "spec") return emit_language_spec(graph);
-  if (options.command == "clean") {
-    std::error_code clean_error;
-    const auto target_removed = std::filesystem::remove_all(graph.manifest.root / "target", clean_error);
-    if (clean_error) { cli_errorf("could not clean build artifacts: ", clean_error.message()); return 1; }
-    // target/ is the complete project-local generated-state root. Also remove
-    // the legacy pre-R19 .raz/ directory so upgraded projects converge on the
-    // canonical layout after their first clean.
-    const auto legacy_removed = std::filesystem::remove_all(graph.manifest.root / ".raz", clean_error);
-    if (clean_error) { cli_errorf("could not clean legacy project state: ", clean_error.message()); return 1; }
-    cli_status("Cleaned", graph.manifest.name + " (" + std::to_string(target_removed + legacy_removed) + " entries removed)", raz::terminal::green);
-    return 0;
-  }
-
-  if (write_lockfile(graph, true) != 0) return 1;
   const bool check_only = options.command == "check";
-  if (!check_only && options.command != "build" && options.command != "run" && options.command != "test") {
-    cli_errorf("unknown command: ", options.command); usage(); return 2;
-  }
   const auto start = std::chrono::steady_clock::now();
   std::set<std::filesystem::path> built;
   std::size_t compiled = 0, fresh = 0;
@@ -185,104 +130,31 @@ int main(int argc, char** argv) {
   auto* diagnostic_sink = check_only && options.diagnostic_format == DiagnosticFormat::json
       ? &diagnostic_reports : nullptr;
   const bool build_ok = build_graph(graph, options, check_only, built, compiled, fresh, diagnostic_sink);
+
   if (check_only && options.diagnostic_format == DiagnosticFormat::json) {
-    std::cout << "{\"schema\":\"raz-project-diagnostics-v1\",\"package\":\""
+    std::cout << "{\"schema\":\"raz-stage0-diagnostics-v1\",\"package\":\""
               << json_escape(graph.manifest.name) << "\",\"success\":" << (build_ok ? "true" : "false")
               << ",\"reports\":[";
     for (std::size_t i = 0; i < diagnostic_reports.size(); ++i) {
       if (i != 0) std::cout << ',';
-      const auto report = trim_copy(diagnostic_reports[i]);
+      const auto report = diagnostic_reports[i];
       std::cout << (report.empty() ? "{\"schema\":\"raz-diagnostics-v1\",\"error_count\":0,\"diagnostics\":[]}" : report);
     }
     std::cout << "]}\n";
-    if (build_ok && !current_workspace.save(workspace_state_path)) return 1;
     return build_ok ? 0 : 1;
   }
 
   if (!build_ok) {
-    if (options.diagnostic_format != DiagnosticFormat::json)
-      cli_errorf("could not ", check_only ? "check" : "compile", " package '", graph.manifest.name, "'");
-    return 1;
-  }
-  if (!current_workspace.save(workspace_state_path)) {
-    cli_errorf("failed to persist workspace graph ", workspace_state_path);
+    cli_errorf("could not ", check_only ? "check" : "compile", " package '", graph.manifest.name, "'");
     return 1;
   }
 
-  if (options.command == "test") {
-    const auto tests = graph.manifest.root / "tests";
-    std::vector<std::filesystem::path> discovered_tests;
-    if (std::filesystem::is_directory(tests)) {
-      for (const auto& candidate : std::filesystem::recursive_directory_iterator(tests))
-        if (candidate.is_regular_file() && candidate.path().extension() == ".rz") discovered_tests.push_back(candidate.path());
-      std::sort(discovered_tests.begin(), discovered_tests.end());
-      if (options.list_tests) { for (const auto& test : discovered_tests) std::cout << test.lexically_relative(graph.manifest.root).generic_string() << '\n'; return 0; }
-      struct TestResult { std::string name; long long elapsed_ms; bool passed; };
-      std::vector<TestResult> test_results;
-      for (const auto& test_path : discovered_tests) {
-        const auto& entry_path = test_path;
-        const auto test_root = project_output_root(graph, options) / "tests" / entry_path.stem();
-        std::filesystem::create_directories(test_root);
-        const auto test_ir = test_root / "test.fir";
-#if defined(_WIN32)
-        const auto test_object = test_root / "test.obj";
-        const auto test_binary = test_root / "test.exe";
-#else
-        const auto test_object = test_root / "test.o";
-        const auto test_binary = test_root / "test";
-#endif
-        SessionOptions session; session.input = entry_path; session.emit_forge_ir = true; session.output = test_ir;
-        if (Compiler{}.run(Session(std::move(session))) != 0) return 1;
-        const auto& profile = graph.manifest.profiles.at(options.profile);
-        if (!emit_native_object(test_ir, test_object, profile.optimization_level)) return 1;
-        const std::string command = native_link_command(test_object, test_binary);
-        if (execute_shell_command(command) != 0) return 1;
-        const auto test_start = std::chrono::steady_clock::now();
-        const bool passed = execute_shell_command(shell_quote(test_binary)) == 0;
-        const auto test_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - test_start).count();
-        test_results.push_back({entry_path.lexically_relative(graph.manifest.root).generic_string(), test_ms, passed});
-        if (!g_quiet || !passed) cli_status(passed ? "PASS" : "FAIL", test_results.back().name + " (" + std::to_string(test_ms) + " ms)", passed ? raz::terminal::green : raz::terminal::red);
-      }
-      const auto result_root = graph.manifest.root / "target" / "test-results"; std::filesystem::create_directories(result_root);
-      std::ostringstream json; json << "{\n  \"tests\": [\n";
-      std::ostringstream junit; junit << "<?xml version=\"1.0\"?><testsuite tests=\"" << test_results.size() << "\">";
-      bool all_passed = true;
-      for (std::size_t i=0;i<test_results.size();++i) { const auto& r=test_results[i]; all_passed &= r.passed;
-        json << "    {\"name\":\"" << json_escape(r.name) << "\",\"passed\":" << (r.passed?"true":"false") << ",\"elapsed_ms\":" << r.elapsed_ms << "}" << (i+1==test_results.size()?"":",") << '\n';
-        junit << "<testcase name=\"" << html_escape(r.name) << "\" time=\"" << (r.elapsed_ms/1000.0) << "\">" << (r.passed?"":"<failure/>") << "</testcase>"; }
-      json << "  ]\n}\n"; junit << "</testsuite>\n";
-      write_text_file(result_root / "results.json", json.str()); write_text_file(result_root / "junit.xml", junit.str());
-      if (!options.report_path.empty()) write_text_file(options.report_path, json.str());
-      if (!all_passed) return 1;
-    }
-  }
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start).count();
   if (!g_quiet) {
-    // Match the production driver's completion line: the package name is
-    // already on the Compiling line, so this one reports the profile that was
-    // built and how long it took. The compiled/fresh counts stay because they
-    // say something the profile does not.
-    std::ostringstream summary;
-    summary << '`' << options.profile << "` profile ["
-            << (options.profile == "release" ? "optimized" : "unoptimized + debuginfo")
-            << "] target(s) (" << compiled << " compiled, " << fresh << " fresh) in "
-            << (elapsed / 1000) << '.' << std::setfill('0') << std::setw(2) << ((elapsed % 1000) / 10)
-            << 's';
-    cli_status(check_only ? "Checked" : "Finished", summary.str(), raz::terminal::green);
-  }
-
-  if (options.command == "run") {
-    if (graph.manifest.kind != raz::compiler::PackageKind::executable) {
-      cli_error("only executable packages can be run");
-      return 2;
-    }
-    const auto artifact = native_artifact_path(graph, options);
-    cli_status("Running", artifact.string(), raz::terminal::green);
-    std::ostringstream command;
-    command << shell_quote(artifact);
-    for (const auto& argument : options.program_args)
-      command << ' ' << shell_quote(std::filesystem::path(argument));
-    return execute_shell_command(command.str());
+    std::cout << "    Finished `" << options.profile << "` profile ["
+              << compiled << " compiled, " << fresh << " fresh] in "
+              << std::fixed << std::setprecision(2) << (elapsed / 1000.0) << "s\n";
   }
   return 0;
 }

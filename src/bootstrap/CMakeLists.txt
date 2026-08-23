@@ -30,7 +30,8 @@ add_library(Raz::forge_bridge ALIAS raz_forge_bridge)
 target_link_libraries(raz_forge_bridge PUBLIC Forge::forge)
 target_compile_features(raz_forge_bridge PUBLIC cxx_std_20)
 target_compile_definitions(raz_forge_bridge PRIVATE
-  RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>")
+  RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>"
+  RAZ_RUNTIME_LINK_DEPS_MANIFEST_PATH="${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt")
 if(TARGET oblink)
   target_compile_definitions(raz_forge_bridge PRIVATE RAZ_OBLINK_PATH="$<TARGET_FILE:oblink>")
   add_dependencies(raz_forge_bridge oblink)
@@ -39,12 +40,12 @@ endif()
 # them in src/runtime's directory scope, where imported targets stay by default.
 # Testing for them here without finding them first is always false, which left
 # the bridge -- and so every `raz build` -- unable to name the OpenSSL archives
-# the runtime was compiled against. raz_host's block below finds them the same way.
+# the runtime was compiled against. The stage-0 driver's block below finds them the same way.
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
   target_compile_definitions(raz_forge_bridge PRIVATE
-    RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::SSL>"
-    RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::Crypto>")
+    RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_LINKER_FILE:OpenSSL::SSL>"
+    RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_LINKER_FILE:OpenSSL::Crypto>")
 endif()
 add_dependencies(raz_forge_bridge raz_runtime)
 
@@ -106,18 +107,18 @@ foreach(RAZ_DIAGNOSTIC_CODE IN LISTS RAZ_DIAGNOSTIC_CODES)
   file(APPEND "${RAZ_DIAGNOSTIC_CATALOG_TEMP}" "\"${RAZ_DIAGNOSTIC_CODE}\",\n")
 endforeach()
 # configure_file(COPYONLY) updates the destination only when contents differ.
-# Avoid touching raz_host's generated include on every no-op configure.
+# Avoid touching the stage-0 driver's generated include on every no-op configure.
 configure_file("${RAZ_DIAGNOSTIC_CATALOG_TEMP}" "${RAZ_DIAGNOSTIC_CATALOG_FILE}" COPYONLY)
 file(REMOVE "${RAZ_DIAGNOSTIC_CATALOG_TEMP}")
 
 if(RAZ_BUILD_TOOLS)
   add_executable(razc_host tools/razc/main.cpp)
   target_link_libraries(razc_host PRIVATE Raz::bootstrap_compiler)
-  set_target_properties(razc_host PROPERTIES OUTPUT_NAME "razc-host")
+  set_target_properties(razc_host PROPERTIES OUTPUT_NAME "razc-stage0")
 
   add_executable(raz_host tools/raz/main.cpp)
   target_link_libraries(raz_host PRIVATE Raz::bootstrap_compiler)
-  set_target_properties(raz_host PROPERTIES OUTPUT_NAME "raz-host")
+  set_target_properties(raz_host PROPERTIES OUTPUT_NAME "raz-stage0")
   target_include_directories(raz_host PRIVATE "${RAZ_DIAGNOSTIC_CATALOG_DIR}")
 
   # The production compiler intentionally uses recursive syntax/HIR lowering.
@@ -140,8 +141,8 @@ if(RAZ_BUILD_TOOLS)
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
     target_compile_definitions(raz_host PRIVATE
-      RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::SSL>"
-      RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_FILE:OpenSSL::Crypto>")
+      RAZ_OPENSSL_SSL_LIBRARY_PATH="$<TARGET_LINKER_FILE:OpenSSL::SSL>"
+      RAZ_OPENSSL_CRYPTO_LIBRARY_PATH="$<TARGET_LINKER_FILE:OpenSSL::Crypto>")
   endif()
   add_dependencies(raz_host raz_runtime raz_forge_bridge forge)
 endif()

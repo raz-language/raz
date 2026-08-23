@@ -4,9 +4,9 @@
 
 """Compare one Raz program across Forge, LLVM, and WebAssembly/WASI.
 
-This executable qualification harness is intentionally opt-in because it needs
-an already-built compiler Raz compiler, Forge runner, native runtime object,
-and Node.js with WASI support.
+Exit status, stdout, and stderr must all match. This executable qualification
+harness is intentionally opt-in because it needs an already-built toolchain and
+a Node.js runtime with WASI support.
 """
 from __future__ import annotations
 import argparse
@@ -87,11 +87,17 @@ def main() -> int:
             fail('WASM compilation', wasm_compile)
 
         runner = tmp / 'run-wasi.mjs'
+        wasm_stdout = tmp / 'wasm.stdout'
+        wasm_stderr = tmp / 'wasm.stderr'
         runner.write_text(
             "import fs from 'node:fs';\n"
             "import { WASI } from 'node:wasi';\n"
             "const path = process.argv[2];\n"
-            "const wasi = new WASI({ version: 'preview1', args: [], env: {}, preopens: {}, returnOnExit: true });\n"
+            "const outPath = process.argv[3];\n"
+            "const errPath = process.argv[4];\n"
+            "const stdout = fs.openSync(outPath, 'w');\n"
+            "const stderr = fs.openSync(errPath, 'w');\n"
+            "const wasi = new WASI({ version: 'preview1', args: [], env: {}, preopens: {}, stdout, stderr, returnOnExit: true });\n"
             "const bytes = fs.readFileSync(path);\n"
             "const module = await WebAssembly.compile(bytes);\n"
             "const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi.wasiImport });\n"
@@ -99,9 +105,11 @@ def main() -> int:
             "if (instance.exports._start) code = wasi.start(instance);\n"
             "else if (instance.exports.main) code = Number(instance.exports.main());\n"
             "else throw new Error('module exports neither _start nor main');\n"
+            "fs.closeSync(stdout);\n"
+            "fs.closeSync(stderr);\n"
             "console.log(JSON.stringify({exit: Number(code)}));\n"
         )
-        wasm_exec = run([str(args.node), '--no-warnings', str(runner), str(wasm)])
+        wasm_exec = run([str(args.node), '--no-warnings', str(runner), str(wasm), str(wasm_stdout), str(wasm_stderr)])
         if wasm_exec.returncode != 0:
             fail('WASM/WASI execution', wasm_exec)
         try:
@@ -111,11 +119,28 @@ def main() -> int:
             print(wasm_exec.stderr, end='')
             raise SystemExit(f'backend-differential-wasm: invalid WASI runner result: {exc}')
 
+        wasm_stdout_text = wasm_stdout.read_text(errors='replace')
+        wasm_stderr_text = wasm_stderr.read_text(errors='replace')
         values = {'Forge': forge_exec.returncode, 'LLVM': llvm_exec.returncode, 'WASM': wasm_exit}
+        mismatches: list[str] = []
         if len(set(values.values())) != 1:
-            print('backend-differential-wasm: FAIL ' + ' '.join(f'{k}={v}' for k, v in values.items()))
+            mismatches.append('exit ' + ' '.join(f'{k}={v}' for k, v in values.items()))
+        if forge_exec.stdout != llvm_exec.stdout or forge_exec.stdout != wasm_stdout_text:
+            mismatches.append('stdout differs')
+        if forge_exec.stderr != llvm_exec.stderr or forge_exec.stderr != wasm_stderr_text:
+            mismatches.append('stderr differs')
+        if mismatches:
+            print('backend-differential-wasm: FAIL ' + '; '.join(mismatches))
+            if 'stdout differs' in mismatches:
+                print('--- Forge stdout ---'); print(forge_exec.stdout, end='')
+                print('--- LLVM stdout ---'); print(llvm_exec.stdout, end='')
+                print('--- WASM stdout ---'); print(wasm_stdout_text, end='')
+            if 'stderr differs' in mismatches:
+                print('--- Forge stderr ---'); print(forge_exec.stderr, end='')
+                print('--- LLVM stderr ---'); print(llvm_exec.stderr, end='')
+                print('--- WASM stderr ---'); print(wasm_stderr_text, end='')
             return 1
-        print(f'backend-differential-wasm: PASS exit={wasm_exit}')
+        print(f'backend-differential-wasm: PASS exit={wasm_exit} stdout={len(wasm_stdout_text)}B stderr={len(wasm_stderr_text)}B')
         return 0
 
 

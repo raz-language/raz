@@ -15,7 +15,7 @@ build_driver = (ROOT / 'src/bootstrap/tools/raz/detail/build_driver.hpp').read_t
 checks = {
     'local index retains configured/default package base': all(x in transport for x in [
         'A local index is often used as a deterministic resolver snapshot',
-        'registry_env_ascii(&pkey, 16, base, base_capacity)',
+        'registry_env_ascii_literal(pkey, base, base_capacity)',
         'registry_default_base(base, base_capacity)',
     ]),
     'Windows TLS imports system ROOT store': all(x in runtime for x in [

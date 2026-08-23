@@ -3,39 +3,10 @@
 
 namespace raz_compiler_driver_signing;
 
-public import raz_compiler_driver_package;
+public import raz_compiler_driver_package_support;
 
 // Ed25519 package signing and trust policy. Cryptographic primitives are a
 // permanent OpenSSL-backed runtime boundary; key policy and metadata stay in Raz.
-extern fn raz_rt_ed25519_keygen(
-    usize private_key,
-    i64 private_capacity,
-    usize public_key,
-    i64 public_capacity,
-) -> i64;
-extern fn raz_rt_ed25519_public(
-    usize private_key,
-    i64 private_length,
-    usize public_key,
-    i64 public_capacity,
-) -> i64;
-extern fn raz_rt_ed25519_sign(
-    usize private_key,
-    i64 private_length,
-    usize message,
-    i64 message_length,
-    usize signature,
-    i64 signature_capacity,
-) -> i64;
-extern fn raz_rt_ed25519_verify(
-    usize public_key,
-    i64 public_length,
-    usize message,
-    i64 message_length,
-    usize signature,
-    i64 signature_length,
-) -> i64;
-
 fn raz_compiler_rt_ed25519_keygen_ascii(
     i64 private_key,
     i64 private_capacity,
@@ -251,7 +222,8 @@ fn signing_decode_hex(i64 input, i64 length, i64 output, i64 capacity) -> i64 {
     return length / 2;
 }
 
-fn signing_env(i64[]key, i64 key_length, i64 output, i64 capacity) -> i64 {
+fn signing_env(string key, i64 output, i64 capacity) -> i64 {
+    i64 key_length = compiler_literal_length(key);
     i64 name = raz_compiler_rt_arena_create(key_length);
 
     if (name == 0) {
@@ -261,7 +233,7 @@ fn signing_env(i64[]key, i64 key_length, i64 output, i64 capacity) -> i64 {
     i64 i = 0;
 
     while (i < key_length) {
-        raz_compiler_rt_arena_set(name, i, key[i]);
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(key, i));
         i += 1;
     }
 
@@ -348,9 +320,7 @@ fn signing_load_private(i64 output, i64 capacity) -> i64 {
     if (path == 0 || text == 0) {
         return -1;
     }
-
-    i64 key[15] = [82, 65, 90, 95, 83, 73, 71, 78, 73, 78, 71, 95, 75, 69, 89];
-    i64 pl = signing_env(&key, 15, path, 8192);
+    i64 pl = signing_env("RAZ_SIGNING_KEY", path, 8192);
 
     if (pl <= 0) {
         raz_compiler_rt_arena_destroy(path);
@@ -447,9 +417,7 @@ fn signing_find_trusted_key(i64 key_id, i64 key_id_length, i64 public_key, i64 p
     if (path == 0 || data == 0) {
         return -1;
     }
-
-    i64 key[16] = [82, 65, 90, 95, 84, 82, 85, 83, 84, 69, 68, 95, 75, 69, 89, 83];
-    i64 pl = signing_env(&key, 16, path, 8192);
+    i64 pl = signing_env("RAZ_TRUSTED_KEYS", path, 8192);
 
     if (pl <= 0) {
         return 0;
@@ -558,9 +526,7 @@ fn signing_require_signatures() -> bool {
     if (value == 0) {
         return false;
     }
-
-    i64 key[22] = [82, 65, 90, 95, 82, 69, 81, 85, 73, 82, 69, 95, 83, 73, 71, 78, 65, 84, 85, 82, 69, 83];
-    i64 len = signing_env(&key, 22, value, 16);
+    i64 len = signing_env("RAZ_REQUIRE_SIGNATURES", value, 16);
     bool result = false;
 
     if (len> 0) {
@@ -658,11 +624,11 @@ fn signing_keygen_command(i64 argc) -> i64 {
     if (argc == 3) {
         pl = raz_compiler_rt_process_arg(2, prefix, 4096);
     } else {
-        i64 d[3] = [114, 97, 122];
+        string d = "raz";
         i64 i = 0;
 
         while (i<3) {
-            raz_compiler_rt_arena_set(prefix, i, d[i]);
+            raz_compiler_rt_arena_set(prefix, i, compiler_literal_byte(d, i));
             i += 1;
         }
         pl = 3;
@@ -676,19 +642,19 @@ fn signing_keygen_command(i64 argc) -> i64 {
         i += 1;
     }
 
-    i64 priv_tail[12] = [46, 112, 114, 105, 118, 97, 116, 101, 46, 107, 101, 121];
+    string priv_tail = ".private.key";
 
     i = 0;
     while (i<12) {
-        raz_compiler_rt_arena_set(private_path, pl + i, priv_tail[i]);
+        raz_compiler_rt_arena_set(private_path, pl + i, compiler_literal_byte(priv_tail, i));
         i += 1;
     }
 
-    i64 pub_tail[11] = [46, 112, 117, 98, 108, 105, 99, 46, 107, 101, 121];
+    string pub_tail = ".public.key";
 
     i = 0;
     while (i<11) {
-        raz_compiler_rt_arena_set(public_path, pl + i, pub_tail[i]);
+        raz_compiler_rt_arena_set(public_path, pl + i, compiler_literal_byte(pub_tail, i));
         i += 1;
     }
     if (raz_compiler_rt_ed25519_keygen_ascii(private_key, 32, public_key, 32) != 32) {
@@ -705,13 +671,9 @@ fn signing_keygen_command(i64 argc) -> i64 {
         return 65;
     }
 
-    i64 msg[18] = [71, 101, 110, 101, 114, 97, 116, 101, 100, 32, 69, 100, 50, 53, 53, 49, 57, 32];
-
-    cli_write(&msg, 18);
+    cli_write_literal("Generated Ed25519 ");
     cli_write_arena(public_path, pl + 11);
 
-    i64 e[1] = [10];
-
-    cli_write(&e, 1);
+    cli_write_literal("\n");
     return 0;
 }

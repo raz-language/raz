@@ -430,28 +430,25 @@ fn work(i64 value) -> i64 {
 
 ## 8. Pattern matching
 
-`match` is exhaustive for supported enum patterns unless a wildcard arm covers the remaining cases.
+`match` is exhaustive for enum patterns unless an unguarded wildcard arm covers the remaining cases. Patterns may recursively destructure enum payloads and named struct fields. A terminal `..` ignores the remaining payloads or fields at the current destructuring level.
 
 ```raz
-fn evaluate(Message message) -> i64 {
-    match message {
-        Message.Quit => {
-            return 0;
+fn evaluate(Packet packet) -> i64 {
+    match packet {
+        Packet::Message(Header { mode: Mode::Ready(ref value), .. }) if *value > 0 => {
+            return *value;
         },
-        Message.Number(value) => {
+        Packet::Message(Header { mode: Mode::Ready(value), .. }) => {
             return value;
         },
-        Message.Pair(left, enabled) => {
-            if (enabled) {
-                return left;
-            }
+        Packet::Message(Header { mode: Mode::Idle, .. }) => {
             return 0;
         },
     }
 }
 ```
 
-Payload bindings are scoped to their arm.
+Payload bindings are scoped to their arm. Plain bindings and `move name` bind by value. `ref name` creates a shared borrow of the matched place, while `ref mut name` creates an exclusive borrow and permits mutation through `*name`. Pattern borrows use the same path-sensitive loan rules as expression borrows: disjoint payload or struct-field paths may be borrowed independently, while overlapping mutable/shared paths conflict. Guarded arms do not contribute to exhaustiveness because their condition is evaluated at runtime.
 
 ### 8.1 Absence and recoverable errors
 
@@ -716,8 +713,13 @@ Informative summary of the stable surface syntax. `<x>` is a nonterminal, `[x]` 
 <while>         ::= "while" "(" <expression> ")" <block>
 <for>           ::= "for" <identifier> "in" <expression> <block>
 <match>         ::= "match" <expression> "{" <match-arm>... "}"
-<match-arm>     ::= <pattern> "=>" (<block> | <expression>) [","]
-<pattern>       ::= <path> ["(" <binding> ("," <binding>)... ")"] | "_"
+<match-arm>     ::= <pattern> ["if" <expression>] "=>" (<block> | <expression>) [","]
+<pattern>       ::= <path> ["(" <pattern-item> ("," <pattern-item>)* ["," ".."] ")"] | "_"
+<pattern-item>  ::= <binding> | <pattern> | <struct-pattern> | "_"
+<struct-pattern>::= <path> "{" <struct-pattern-field> ("," <struct-pattern-field>)* ["," ".."] "}"
+<struct-pattern-field> ::= ["move" | "ref" ["mut"]] <identifier>
+                       | <identifier> ":" <pattern-item>
+<binding>       ::= ["move" | "ref" ["mut"]] <identifier>
 <return>        ::= "return" [<expression>] ";"
 <defer>         ::= "defer" <statement>
 <comptime>      ::= "comptime" <block>

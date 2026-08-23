@@ -6,7 +6,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[2]
 simd = (root / "compiler/src/backend/wasm/simd.rz").read_text()
 codegen = (root / "compiler/src/backend/wasm/codegen.rz").read_text()
-order = (root / "compiler/host-source-order.txt").read_text()
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 core = (root / "library/core/simd/simd.rz").read_text()
 native = (root / "src/runtime/platform_threads_crypto.cpp").read_text()
 
@@ -86,5 +86,5 @@ for token in opcode_paths:
 if "wasm_simd_emit_runtime_body" not in codegen:
     raise SystemExit("SIMD runtime body is not wired into wasm codegen")
 if "src/backend/wasm/simd.rz" not in order:
-    raise SystemExit("SIMD module missing from bootstrap source order")
+    raise SystemExit("SIMD module missing from semantic compiler source graph")
 print(f"wasm-simd: PASS ({len(new_runtime_names)} expanded runtime operations + legacy i64x4/f64x2)")

@@ -9,7 +9,7 @@ root = Path(__file__).resolve().parents[2]
 codegen = (root / "compiler/src/backend/wasm/codegen.rz").read_text(encoding="utf-8")
 async_src = (root / "compiler/src/backend/wasm/async.rz").read_text(encoding="utf-8")
 globals_src = (root / "compiler/src/backend/wasm/globals.rz").read_text(encoding="utf-8")
-order = (root / "compiler/host-source-order.txt").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 required_async = (
     "fn wasm_async_emit_wrapper_body",
@@ -28,7 +28,7 @@ for marker in required_async:
         raise SystemExit(f"wasm-async: missing resumable-state marker: {marker}")
 
 if "src/backend/wasm/async.rz" not in order:
-    raise SystemExit("wasm-async: async.rz missing from bootstrap source order")
+    raise SystemExit("wasm-async: async.rz missing from semantic compiler source graph")
 if "wasm_globals_async_count" not in globals_src or "mir.global_count + 2 + wasm_globals_async_count(hir)" not in globals_src:
     raise SystemExit("wasm-async: current-frame global is not appended to the global section")
 

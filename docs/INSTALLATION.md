@@ -49,6 +49,16 @@ Machine PATH changes require an elevated PowerShell session.
 The installed copy includes `uninstall.ps1`, which removes the Raz PATH entry recorded by the portable installer and then removes the installed files.
 
 
+## Linux portable archive
+
+Native Linux archives use `raz-<version>-linux-x86_64.tar.gz` or `raz-<version>-linux-aarch64.tar.gz`. Extract the archive and run `./install.sh`, or execute the tools directly from `bin/`. The archive platform must match the machine architecture.
+
+AArch64 source builds use the LLVM backend and currently require a compatible prebuilt Raz stage-0 compiler for the first self-hosted compiler object. See [Compiler Bootstrap](COMPILER-BOOTSTRAP.md) and [Platform Support](PLATFORM-SUPPORT.md).
+
+## macOS arm64
+
+The compiler/runtime support macOS arm64 through LLVM/Clang and Mach-O object emission. Source bootstrap currently requires a compatible prebuilt stage-0 Raz compiler; automated macOS binary publication is separate release-engineering work and is not implied by the Linux/Windows archive instructions above.
+
 ## Razup toolchain manager
 
 `razup` manages versioned Raz toolchains independently of the package manager.

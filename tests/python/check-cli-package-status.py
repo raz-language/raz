@@ -13,10 +13,17 @@ checks = {
     'status detail reads manifest contents': 'raz_compiler_rt_read_ascii(detail, detail_length, manifest, 65536)' in cli,
     'status detail renders package name': 'manifest_package_name(manifest, manifest_length, name, 4096)' in cli,
     'status detail renders package version': 'manifest_package_version(manifest, manifest_length, version, 256)' in cli,
-    'status detail emits cargo-style v marker': 'i64 marker[2] = [32, 118];' in cli,
+    'status detail emits cargo-style v marker': 'cli_write_literal_stream(1, " v");' in cli,
     'status path falls back for direct source input': 'cli_write_arena_stream(1, detail, detail_length);' in cli,
     'project parser has package-version reader': 'fn manifest_package_version(' in project,
     'generic status routes through package-aware detail': 'cli_print_status_detail(detail, detail_length);' in cli,
+    'dependency package status resolves identity marker': 'cli_find_package_identity(input, name, name_length' in cli,
+    'dependency package status prints version': 'cli_write_arena_stream(1, version, version_length);' in cli,
+    'project emits package version provenance': 'fn append_package_version_marker(' in project,
+    'project emits source provenance': 'fn append_source_origin_marker_range(' in project,
+    'update prints resolved package versions': 'cli_print_status_name_version(11, name, nl, version, vl);' in (ROOT / 'compiler/src/driver/registry.rz').read_text(encoding='utf-8'),
+    'update has a completion status helper': 'fn package_registry_update_finish(i64 status)' in (ROOT / 'compiler/src/driver/registry.rz').read_text(encoding='utf-8'),
+    'build has a linking status': 'cli_print_status(12, cli_manifest_path, cli_manifest_length);' in (ROOT / 'compiler/src/main.rz').read_text(encoding='utf-8'),
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

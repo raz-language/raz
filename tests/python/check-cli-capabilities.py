@@ -35,7 +35,7 @@ def main() -> int:
     env = os.environ.copy()
     env['RAZ_LINKER'] = ns.linker
     run([ns.raz, 'build', str(project), '--profile', 'debug', '--force'], cwd=root, env=env)
-    compiler = project / 'target' / 'host' / 'debug' / ('raz-compiler.exe' if os.name == 'nt' else 'raz-compiler')
+    compiler = project / 'target' / 'debug' / ('raz-compiler.exe' if os.name == 'nt' else 'raz-compiler')
     if not compiler.is_file():
         raise RuntimeError(f'missing production compiler: {compiler}')
 
@@ -46,7 +46,7 @@ def main() -> int:
     backends = run([str(compiler), 'backends'], cwd=work, env=env).stdout
     require(backends, 'forge', 'llvm', 'built-in')
     targets = run([str(compiler), 'targets'], cwd=work, env=env).stdout
-    require(targets, 'Forge:', 'LLVM:', 'x86_64-pc-windows-msvc')
+    require(targets, 'Forge native:', 'LLVM native:', 'x86_64-pc-windows-msvc', 'aarch64-unknown-linux-gnu', 'arm64-apple-macos')
     doctor = run([str(compiler), 'doctor'], cwd=work, env=env).stdout
     require(doctor, 'Raz compiler', 'Forge backend', 'LLVM backend', 'Host:')
     version = run([str(compiler), '--version'], cwd=work, env=env).stdout
@@ -63,6 +63,31 @@ def main() -> int:
     run([str(compiler), 'llvm', '--emit=llvm', str(source), str(ll)], cwd=work, env=env)
     if not ll.is_file() or 'define' not in ll.read_text(encoding='utf-8', errors='replace'):
         raise RuntimeError('LLVM CLI did not emit LLVM IR')
+
+    clang = shutil.which('clang')
+    if clang:
+        linux_arm = work / 'cli-smoke-aarch64-linux.o'
+        run([str(compiler), 'llvm', '--emit=obj', '--target=aarch64-unknown-linux-gnu', str(source), str(linux_arm)], cwd=work, env=env)
+        linux_bytes = linux_arm.read_bytes()
+        if len(linux_bytes) < 20 or linux_bytes[:4] != b'\x7fELF' or int.from_bytes(linux_bytes[18:20], 'little') != 183:
+            raise RuntimeError('LLVM AArch64/Linux output is not an ELF64 AArch64 object')
+
+        mac_arm = work / 'cli-smoke-arm64-macos.o'
+        run([str(compiler), 'llvm', '--emit=obj', '--target=arm64-apple-macos', str(source), str(mac_arm)], cwd=work, env=env)
+        mac_bytes = mac_arm.read_bytes()
+        if len(mac_bytes) < 8 or mac_bytes[:4] != b'\xcf\xfa\xed\xfe' or int.from_bytes(mac_bytes[4:8], 'little') != 0x0100000C:
+            raise RuntimeError('LLVM macOS arm64 output is not a Mach-O arm64 object')
+
+        cross_exe = work / 'cli-smoke-aarch64-linux'
+        rejected = run(
+            [str(compiler), 'llvm', '--emit=exe', '--target=aarch64-unknown-linux-gnu', str(source), str(cross_exe)],
+            cwd=work,
+            env=env,
+            expect=2,
+        )
+        require(rejected.stderr, 'cross-target LLVM executable emission requires --runtime=<target-runtime>')
+    else:
+        print('CLI capabilities: clang unavailable; cross-object execution checks skipped')
     print('CLI capabilities: PASS')
     return 0
 

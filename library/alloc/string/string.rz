@@ -1,11 +1,13 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
-
 namespace alloc::string;
 
-
 import core::utf8;
+import core::iter::iterator;
+import core::option;
+import core::result;
+
 // Owned UTF-8 storage. String growth follows the same geometric policy as
 // RawVec so appending small chunks does not repeatedly call realloc.
 extern fn raz_rt_alloc(i64 size) -> usize;
@@ -19,6 +21,11 @@ extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
 extern fn raz_rt_bytes_equal(usize left, usize right, i64 size) -> i64;
 extern fn raz_rt_bytes_find(usize data, i64 size, i64 value) -> i64;
 extern fn raz_rt_bytes_rfind(usize data, i64 size, i64 value) -> i64;
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+extern fn raz_rt_cstr_equal(usize data, i64 length, string value) -> i64;
+extern fn raz_rt_cstr_find(usize data, i64 length, string value) -> i64;
+extern fn raz_rt_cstr_rfind(usize data, i64 length, string value) -> i64;
 
 public struct String {
     usize data;
@@ -27,15 +34,11 @@ public struct String {
 }
 
 fn load_byte(usize address) -> i64 {
-    unsafe {
-        return (*(address as u8*const))as i64;
-    }
+    return raz_rt_load_u8(address);
 }
 
 fn store_byte(usize address, i64 value) {
-    unsafe {
-        *(address as u8*mut) = (value & 255)as u8;
-    }
+    raz_rt_store_u8(address, value & 255);
 }
 
 fn write_terminator(String&mut value) {
@@ -602,6 +605,7 @@ public fn utf8_char_width_at(String& value, i64 index) -> i64 {
     }
 
     DecodeResult decoded = core::utf8::decode(value.data, value.length, index);
+
     if (decoded.width == 0) {
         return -1;
     }
@@ -610,6 +614,1281 @@ public fn utf8_char_width_at(String& value, i64 index) -> i64 {
 
 public fn is_valid_utf8(String& value) -> bool {
     return core::utf8::validate(value.data, value.length);
+}
+
+/// Borrowed raw byte view of string storage.
+@derive(Copy, Clone)public struct StringBytesView {
+    usize data;
+    i64 length;
+}
+
+/// Borrowed UTF-8 view. Str never owns or frees its storage.
+@derive(Copy, Clone)public struct Str {
+    usize data;
+    i64 length;
+}
+
+@derive(Copy, Clone)public struct StrPair {
+    Str left;
+    Str right;
+}
+
+@derive(Copy, Clone)public struct CharIndex {
+    i64 index;
+    i64 scalar;
+}
+
+@derive(Copy, Clone)public enum ParseError {
+    Empty,
+    InvalidDigit,
+    Overflow,
+    InvalidValue,
+}
+
+public struct Bytes {
+    Str value;
+    i64 cursor;
+    i64 current_value;
+}
+
+public struct Chars {
+    Str value;
+    i64 cursor;
+    i64 current_value;
+}
+
+public struct CharIndices {
+    Str value;
+    i64 cursor;
+    CharIndex current_value;
+}
+
+public struct Split {
+    Str value;
+    Str separator;
+    i64 cursor;
+    bool finished;
+    Str current_value;
+}
+
+public struct SplitTerminator {
+    Split inner;
+    Str current_value;
+}
+
+public struct SplitWhitespace {
+    Str value;
+    i64 cursor;
+    Str current_value;
+}
+
+public struct Lines {
+    Str value;
+    i64 cursor;
+    Str current_value;
+}
+
+public fn new() -> String {
+    return with_capacity(0);
+}
+
+/// Creates an owned String from immutable Raz literal/C-string storage.
+public fn from_literal(string source) -> String {
+    i64 length = raz_rt_cstr_len(source);
+    String output = with_capacity(length);
+
+    if (length > 0 && output.data != 0) {
+        raz_rt_copy(output.data, raz_rt_cstr_ptr(source), length);
+        output.length = length;
+        write_terminator(&mut output);
+    }
+    return output;
+}
+
+/// Borrows immutable literal storage without allocating.
+public fn str_from_literal(string source) -> Str {
+    return Str {
+        data: raz_rt_cstr_ptr(source),
+        length: raz_rt_cstr_len(source)
+    };
+}
+
+public fn as_str(String& value) -> Str {
+    return Str {
+        data: value.data,
+        length: value.length
+    };
+}
+
+public fn str_len(Str& value) -> i64 {
+    return value.length;
+}
+
+public fn str_is_empty(Str& value) -> bool {
+    return value.length == 0;
+}
+
+public fn str_valid(Str& value) -> bool {
+    return value.length >= 0 &&
+        (value.length == 0 || value.data != 0) &&
+        core::utf8::validate(value.data, value.length);
+}
+
+public fn str_as_bytes(Str& value) -> StringBytesView {
+    return StringBytesView {
+        data: value.data,
+        length: value.length
+    };
+}
+
+public fn string_as_bytes(String& value) -> StringBytesView {
+    return StringBytesView {
+        data: value.data,
+        length: value.length
+    };
+}
+
+public fn str_as_ptr(Str& value) -> usize {
+    return value.data;
+}
+
+public fn str_byte_at(Str& value, i64 index) -> i64 {
+    if (index < 0 || index >= value.length || value.data == 0) {
+        return -1;
+    }
+    return load_byte(value.data + index);
+}
+
+public fn str_is_char_boundary(Str& value, i64 index) -> bool {
+    if (index < 0 || index > value.length) {
+        return false;
+    }
+    if (index == 0 || index == value.length) {
+        return true;
+    }
+
+    i64 byte = load_byte(value.data + index);
+
+    return byte < 128 || byte >= 192;
+}
+
+public fn is_char_boundary(String& value, i64 index) -> bool {
+    Str view = as_str(value);
+
+    return str_is_char_boundary(&view, index);
+}
+
+public fn str_slice(Str& value, i64 start, i64 length) -> Option<Str> {
+    if (length < 0 || start < 0 || start > value.length || length > value.length - start) {
+        return Option<Str>::None;
+    }
+    if (!str_is_char_boundary(value, start) || !str_is_char_boundary(value, start + length)) {
+        return Option<Str>::None;
+    }
+    return Option<Str>::Some(Str {
+        data: value.data + start,
+        length: length
+    }
+    );
+}
+
+public fn str_split_at(Str& value, i64 index) -> Option<StrPair> {
+    if (!str_is_char_boundary(value, index)) {
+        return Option<StrPair>::None;
+    }
+    return Option<StrPair>::Some(StrPair {
+        left: Str {
+            data: value.data,
+            length: index
+        },
+        right: Str {
+            data: value.data + index,
+            length: value.length - index
+        }
+    }
+    );
+}
+
+public fn str_char_at(Str& value, i64 byte_index) -> Option<i64> {
+    if (!str_is_char_boundary(value, byte_index) || byte_index == value.length) {
+        return Option<i64>::None;
+    }
+
+    DecodeResult decoded = core::utf8::decode(value.data, value.length, byte_index);
+
+    if (decoded.width == 0) {
+        return Option<i64>::None;
+    }
+    return Option<i64>::Some(decoded.scalar);
+}
+
+public fn push_char(String&mut value, i64 scalar) -> bool {
+    i64 width = core::utf8::scalar_width(scalar);
+
+    if (width == 0 || value.length > 9223372036854775807 - width) {
+        return false;
+    }
+    if (!reserve(value, value.length + width)) {
+        return false;
+    }
+
+    i64 written = core::utf8::encode(scalar, value.data + value.length, value.capacity - value.length);
+
+    if (written != width) {
+        return false;
+    }
+    value.length += width;
+    write_terminator(value);
+    return true;
+}
+
+public fn pop_char(String&mut value) -> Option<i64> {
+    if (value.length <= 0) {
+        return Option<i64>::None;
+    }
+
+    i64 start = value.length - 1;
+
+    while (start > 0) {
+        i64 byte = load_byte(value.data + start);
+
+        if (byte < 128 || byte >= 192) {
+            break;
+        }
+        start -= 1;
+    }
+
+    DecodeResult decoded = core::utf8::decode(value.data, value.length, start);
+
+    if (decoded.width == 0 || start + decoded.width != value.length) {
+        return Option<i64>::None;
+    }
+    value.length = start;
+    write_terminator(value);
+    return Option<i64>::Some(decoded.scalar);
+}
+
+public fn insert_char(String&mut value, i64 index, i64 scalar) -> bool {
+    if (!is_char_boundary(value, index)) {
+        return false;
+    }
+
+    i64 width = core::utf8::scalar_width(scalar);
+
+    if (width == 0 || value.length > 9223372036854775807 - width) {
+        return false;
+    }
+    if (!reserve(value, value.length + width)) {
+        return false;
+    }
+
+    i64 tail = value.length - index;
+
+    if (tail > 0) {
+        raz_rt_move(value.data + index + width, value.data + index, tail);
+    }
+    if (core::utf8::encode(scalar, value.data + index, width) != width) {
+        return false;
+    }
+    value.length += width;
+    write_terminator(value);
+    return true;
+}
+
+public fn remove_char(String&mut value, i64 index) -> Option<i64> {
+    if (!is_char_boundary(value, index) || index == value.length) {
+        return Option<i64>::None;
+    }
+
+    DecodeResult decoded = core::utf8::decode(value.data, value.length, index);
+
+    if (decoded.width == 0) {
+        return Option<i64>::None;
+    }
+
+    i64 tail = value.length - index - decoded.width;
+
+    if (tail > 0) {
+        raz_rt_move(value.data + index, value.data + index + decoded.width, tail);
+    }
+    value.length -= decoded.width;
+    write_terminator(value);
+    return Option<i64>::Some(decoded.scalar);
+}
+
+public fn append_literal(String&mut value, string source) -> bool {
+    i64 length = raz_rt_cstr_len(source);
+
+    return append_bytes(value, raz_rt_cstr_ptr(source), length);
+}
+
+public fn str_equals(Str& left, Str& right) -> bool {
+    return left.length == right.length && raz_rt_bytes_equal(left.data, right.data, left.length) == 1;
+}
+
+public fn str_equals_literal(Str& value, string other) -> bool {
+    return raz_rt_cstr_equal(value.data, value.length, other) == 1;
+}
+
+public fn str_find_literal(Str& value, string needle) -> i64 {
+    return raz_rt_cstr_find(value.data, value.length, needle);
+}
+
+public fn str_rfind_literal(Str& value, string needle) -> i64 {
+    return raz_rt_cstr_rfind(value.data, value.length, needle);
+}
+
+public fn str_contains_literal(Str& value, string needle) -> bool {
+    return str_find_literal(value, needle) >= 0;
+}
+
+public fn str_starts_with(Str& value, Str& prefix) -> bool {
+    if (prefix.length < 0 || prefix.length > value.length) {
+        return false;
+    }
+    return raz_rt_bytes_equal(value.data, prefix.data, prefix.length) == 1;
+}
+
+public fn str_ends_with(Str& value, Str& suffix) -> bool {
+    if (suffix.length < 0 || suffix.length > value.length) {
+        return false;
+    }
+    return raz_rt_bytes_equal(value.data + value.length - suffix.length, suffix.data, suffix.length) == 1;
+}
+
+public fn str_starts_with_literal(Str& value, string prefix) -> bool {
+    Str p = str_from_literal(prefix);
+
+    return str_starts_with(value, &p);
+}
+
+public fn str_ends_with_literal(Str& value, string suffix) -> bool {
+    Str p = str_from_literal(suffix);
+
+    return str_ends_with(value, &p);
+}
+
+public fn str_strip_prefix(Str& value, Str& prefix) -> Option<Str> {
+    if (!str_starts_with(value, prefix)) {
+        return Option<Str>::None;
+    }
+    return Option<Str>::Some(Str {
+        data: value.data + prefix.length,
+        length: value.length - prefix.length
+    }
+    );
+}
+
+public fn str_strip_suffix(Str& value, Str& suffix) -> Option<Str> {
+    if (!str_ends_with(value, suffix)) {
+        return Option<Str>::None;
+    }
+    return Option<Str>::Some(Str {
+        data: value.data,
+        length: value.length - suffix.length
+    }
+    );
+}
+
+public fn str_strip_prefix_literal(Str& value, string prefix) -> Option<Str> {
+    Str p = str_from_literal(prefix);
+
+    return str_strip_prefix(value, &p);
+}
+
+public fn str_strip_suffix_literal(Str& value, string suffix) -> Option<Str> {
+    Str p = str_from_literal(suffix);
+
+    return str_strip_suffix(value, &p);
+}
+
+fn ascii_space(i64 byte) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12;
+}
+
+public fn str_trim_start(Str& value) -> Str {
+    i64 start = 0;
+
+    while (start < value.length && ascii_space(load_byte(value.data + start))) {
+        start += 1;
+    }
+    return Str {
+        data: value.data + start,
+        length: value.length - start
+    };
+}
+
+public fn str_trim_end(Str& value) -> Str {
+    i64 end = value.length;
+
+    while (end > 0 && ascii_space(load_byte(value.data + end - 1))) {
+        end -= 1;
+    }
+    return Str {
+        data: value.data,
+        length: end
+    };
+}
+
+public fn str_trim(Str& value) -> Str {
+    Str left = str_trim_start(value);
+
+    return str_trim_end(&left);
+}
+
+public fn str_trim_start_matches(Str& value, Str& pattern) -> Str {
+    if (pattern.length <= 0) {
+        return *value;
+    }
+
+    i64 start = 0;
+
+    while (start <= value.length - pattern.length) {
+        Str remaining = Str {
+            data: value.data + start,
+            length: value.length - start
+        };
+        if (!str_starts_with(&remaining, pattern)) {
+            break;
+        }
+        start += pattern.length;
+    }
+    return Str {
+        data: value.data + start,
+        length: value.length - start
+    };
+}
+
+public fn str_trim_end_matches(Str& value, Str& pattern) -> Str {
+    if (pattern.length <= 0) {
+        return *value;
+    }
+
+    i64 end = value.length;
+
+    while (end >= pattern.length) {
+        Str remaining = Str {
+            data: value.data,
+            length: end
+        };
+        if (!str_ends_with(&remaining, pattern)) {
+            break;
+        }
+        end -= pattern.length;
+    }
+    return Str {
+        data: value.data,
+        length: end
+    };
+}
+
+public fn str_trim_matches(Str& value, Str& pattern) -> Str {
+    Str left = str_trim_start_matches(value, pattern);
+
+    return str_trim_end_matches(&left, pattern);
+}
+
+public fn str_trim_matches_literal(Str& value, string pattern) -> Str {
+    Str p = str_from_literal(pattern);
+
+    return str_trim_matches(value, &p);
+}
+
+public fn str_to_string(Str& value) -> String {
+    return from_bytes(value.data, value.length);
+}
+
+public fn split(Str& value, Str& separator) -> Split {
+    return Split {
+        value:*value,
+        separator:*separator,
+        cursor: 0,
+        finished: false,
+        current_value: Str {
+            data: 0,
+            length: 0
+        }
+    };
+}
+
+public fn split_literal(Str& value, string separator) -> Split {
+    Str sep = str_from_literal(separator);
+
+    return split(value, &sep);
+}
+
+public fn split_terminator(Str& value, Str& separator) -> SplitTerminator {
+    return SplitTerminator {
+        inner: split(value, separator),
+        current_value: Str {
+            data: 0,
+            length: 0
+        }
+    };
+}
+
+public fn split_whitespace(Str& value) -> SplitWhitespace {
+    return SplitWhitespace {
+        value:*value,
+        cursor: 0,
+        current_value: Str {
+            data: 0,
+            length: 0
+        }
+    };
+}
+
+public fn lines(Str& value) -> Lines {
+    return Lines {
+        value:*value,
+        cursor: 0,
+        current_value: Str {
+            data: 0,
+            length: 0
+        }
+    };
+}
+
+public fn bytes(Str& value) -> Bytes {
+    return Bytes {
+        value:*value,
+        cursor: 0,
+        current_value: 0
+    };
+}
+
+public fn chars(Str& value) -> Chars {
+    return Chars {
+        value:*value,
+        cursor: 0,
+        current_value: 0
+    };
+}
+
+public fn char_indices(Str& value) -> CharIndices {
+    return CharIndices {
+        value:*value,
+        cursor: 0,
+        current_value: CharIndex {
+            index: 0,
+            scalar: 0
+        }
+    };
+}
+
+impl Iterator for Bytes {
+    type Item = i64;
+
+    fn next(Bytes&mut self) -> bool {
+        if (self.cursor >= self.value.length) {
+            return false;
+        }
+        self.current_value = load_byte(self.value.data + self.cursor);
+        self.cursor += 1;
+        return true;
+    }
+    fn current(Bytes& self) -> i64 {
+        return self.current_value;
+    }
+}
+
+impl Iterator for Chars {
+    type Item = i64;
+
+    fn next(Chars&mut self) -> bool {
+        if (self.cursor >= self.value.length) {
+            return false;
+        }
+
+        DecodeResult d = core::utf8::decode(self.value.data, self.value.length, self.cursor);
+
+        if (d.width == 0) {
+            return false;
+        }
+        self.current_value = d.scalar;
+        self.cursor += d.width;
+        return true;
+    }
+    fn current(Chars& self) -> i64 {
+        return self.current_value;
+    }
+}
+
+impl Iterator for CharIndices {
+    type Item = CharIndex;
+
+    fn next(CharIndices&mut self) -> bool {
+        if (self.cursor >= self.value.length) {
+            return false;
+        }
+
+        i64 index = self.cursor;
+        DecodeResult d = core::utf8::decode(self.value.data, self.value.length, self.cursor);
+
+        if (d.width == 0) {
+            return false;
+        }
+        self.current_value = CharIndex {
+            index: index,
+            scalar: d.scalar
+        };
+        self.cursor += d.width;
+        return true;
+    }
+    fn current(CharIndices& self) -> CharIndex {
+        return self.current_value;
+    }
+}
+
+impl Iterator for Split {
+    type Item = Str;
+
+    fn next(Split&mut self) -> bool {
+        if (self.finished) {
+            return false;
+        }
+        if (self.separator.length == 0) {
+            if (self.cursor >= self.value.length) {
+                self.finished = true;
+                return false;
+            }
+
+            DecodeResult d = core::utf8::decode(self.value.data, self.value.length, self.cursor);
+
+            if (d.width == 0) {
+                self.finished = true;
+                return false;
+            }
+            self.current_value = Str {
+                data: self.value.data + self.cursor,
+                length: d.width
+            };
+            self.cursor += d.width;
+            return true;
+        }
+        Str remaining = Str {
+            data: self.value.data + self.cursor,
+            length: self.value.length - self.cursor
+        };
+
+        i64 found = -1;
+
+        if (self.separator.length <= remaining.length) {
+            i64 scan = 0;
+
+            while (scan <= remaining.length - self.separator.length) {
+                if (
+                    raz_rt_bytes_equal(remaining.data + scan, self.separator.data, self.separator.length) == 1
+                ) {
+                    found = scan;
+                    break;
+                }
+                scan += 1;
+            }
+        }
+        if (found < 0) {
+            self.current_value = remaining;
+            self.finished = true;
+            return true;
+        }
+        self.current_value = Str {
+            data: remaining.data,
+            length: found
+        };
+        self.cursor += found + self.separator.length;
+        return true;
+    }
+    fn current(Split& self) -> Str {
+        return self.current_value;
+    }
+}
+
+impl Iterator for SplitTerminator {
+    type Item = Str;
+
+    fn next(SplitTerminator&mut self) -> bool {
+        if (!self.inner.next()) {
+            return false;
+        }
+
+        Str item = self.inner.current();
+
+        if (self.inner.finished && item.length == 0) {
+            return false;
+        }
+        self.current_value = item;
+        return true;
+    }
+    fn current(SplitTerminator& self) -> Str {
+        return self.current_value;
+    }
+}
+
+impl Iterator for SplitWhitespace {
+    type Item = Str;
+
+    fn next(SplitWhitespace&mut self) -> bool {
+        while (self.cursor < self.value.length && ascii_space(load_byte(self.value.data + self.cursor))) {
+            self.cursor += 1;
+        }
+        if (self.cursor >= self.value.length) {
+            return false;
+        }
+
+        i64 start = self.cursor;
+
+        while (self.cursor < self.value.length && !ascii_space(load_byte(self.value.data + self.cursor))) {
+            self.cursor += 1;
+        }
+        self.current_value = Str {
+            data: self.value.data + start,
+            length: self.cursor - start
+        };
+        return true;
+    }
+    fn current(SplitWhitespace& self) -> Str {
+        return self.current_value;
+    }
+}
+
+impl Iterator for Lines {
+    type Item = Str;
+
+    fn next(Lines&mut self) -> bool {
+        if (self.cursor >= self.value.length) {
+            return false;
+        }
+
+        i64 start = self.cursor;
+
+        while (self.cursor < self.value.length && load_byte(self.value.data + self.cursor) != 10) {
+            self.cursor += 1;
+        }
+
+        i64 end = self.cursor;
+
+        if (end > start && load_byte(self.value.data + end - 1) == 13) {
+            end -= 1;
+        }
+        if (self.cursor < self.value.length) {
+            self.cursor += 1;
+        }
+        self.current_value = Str {
+            data: self.value.data + start,
+            length: end - start
+        };
+        return true;
+    }
+    fn current(Lines& self) -> Str {
+        return self.current_value;
+    }
+}
+
+fn radix_digit(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) {
+        return byte - 48;
+    }
+    if (byte >= 65 && byte <= 90) {
+        return byte - 65 + 10;
+    }
+    if (byte >= 97 && byte <= 122) {
+        return byte - 97 + 10;
+    }
+    return -1;
+}
+
+public fn parse_i64_radix(Str& value, i64 radix) -> Result<i64, ParseError> {
+    if (radix < 2 || radix > 36) {
+        return Result<i64, ParseError>::Error(ParseError::InvalidValue);
+    }
+    if (value.length <= 0) {
+        return Result<i64, ParseError>::Error(ParseError::Empty);
+    }
+
+    i64 index = 0;
+    bool negative = false;
+    i64 first = load_byte(value.data);
+
+    if (first == 43 || first == 45) {
+        negative = first == 45;
+        index = 1;
+        if (index == value.length) {
+            return Result<i64, ParseError>::Error(ParseError::InvalidDigit);
+        }
+    }
+
+    i64 minimum = -9223372036854775807;
+
+    minimum -= 1;
+
+    i64 limit = -9223372036854775807;
+
+    if (negative) {
+        limit = minimum;
+    }
+
+    i64 output = 0;
+
+    while (index < value.length) {
+        i64 digit = radix_digit(load_byte(value.data + index));
+
+        if (digit < 0 || digit >= radix) {
+            return Result<i64, ParseError>::Error(ParseError::InvalidDigit);
+        }
+
+        i64 quotient = limit / radix;
+        i64 remainder = -(limit % radix);
+
+        if (output < quotient || (output == quotient && digit > remainder)) {
+            return Result<i64, ParseError>::Error(ParseError::Overflow);
+        }
+        output = output * radix - digit;
+        index += 1;
+    }
+    if (negative) {
+        return Result<i64, ParseError>::Ok(output);
+    }
+    return Result<i64, ParseError>::Ok(-output);
+}
+
+public fn parse_u64_radix(Str& value, i64 radix) -> Result<u64, ParseError> {
+    if (radix < 2 || radix > 36) {
+        return Result<u64, ParseError>::Error(ParseError::InvalidValue);
+    }
+    if (value.length <= 0) {
+        return Result<u64, ParseError>::Error(ParseError::Empty);
+    }
+
+    i64 index = 0;
+    i64 first = load_byte(value.data);
+
+    if (first == 43) {
+        index = 1;
+    } else if (first == 45) {
+        return Result<u64, ParseError>::Error(ParseError::InvalidDigit);
+    }
+    if (index == value.length) {
+        return Result<u64, ParseError>::Error(ParseError::InvalidDigit);
+    }
+
+    u64 maximum = 0;
+
+    maximum -= 1;
+
+    u64 output = 0;
+    u64 base = radix as u64;
+
+    while (index < value.length) {
+        i64 parsed = radix_digit(load_byte(value.data + index));
+
+        if (parsed < 0 || parsed >= radix) {
+            return Result<u64, ParseError>::Error(ParseError::InvalidDigit);
+        }
+
+        u64 digit = parsed as u64;
+
+        if (output > (maximum - digit) / base) {
+            return Result<u64, ParseError>::Error(ParseError::Overflow);
+        }
+        output = output * base + digit;
+        index += 1;
+    }
+    return Result<u64, ParseError>::Ok(output);
+}
+
+public fn parse_i64(Str& value) -> Result<i64, ParseError> {
+    return parse_i64_radix(value, 10);
+}
+
+public fn parse_u64(Str& value) -> Result<u64, ParseError> {
+    return parse_u64_radix(value, 10);
+}
+
+public fn parse_bool(Str& value) -> Result<bool, ParseError> {
+    if (str_equals_literal(value, "true")) {
+        return Result<bool, ParseError>::Ok(true);
+    }
+    if (str_equals_literal(value, "false")) {
+        return Result<bool, ParseError>::Ok(false);
+    }
+    if (value.length == 0) {
+        return Result<bool, ParseError>::Error(ParseError::Empty);
+    }
+    return Result<bool, ParseError>::Error(ParseError::InvalidValue);
+}
+
+impl Str {
+    fn from(string value) -> Str {
+        return str_from_literal(value);
+    }
+    fn len(Str& self) -> i64 {
+        return self.length;
+    }
+    fn is_empty(Str& self) -> bool {
+        return self.length == 0;
+    }
+    fn valid(Str& self) -> bool {
+        return str_valid(self);
+    }
+    fn as_ptr(Str& self) -> usize {
+        return self.data;
+    }
+    fn as_bytes(Str& self) -> StringBytesView {
+        return str_as_bytes(self);
+    }
+    fn get(Str& self, i64 start, i64 length) -> Option<Str> {
+        return str_slice(self, start, length);
+    }
+    fn split_at(Str& self, i64 index) -> Option<StrPair> {
+        return str_split_at(self, index);
+    }
+    fn is_char_boundary(Str& self, i64 index) -> bool {
+        return str_is_char_boundary(self, index);
+    }
+    fn char_at(Str& self, i64 index) -> Option<i64> {
+        return str_char_at(self, index);
+    }
+    fn trim(Str& self) -> Str {
+        return str_trim(self);
+    }
+    fn trim_start(Str& self) -> Str {
+        return str_trim_start(self);
+    }
+    fn trim_end(Str& self) -> Str {
+        return str_trim_end(self);
+    }
+    fn trim_matches(Str& self, string pattern) -> Str {
+        return str_trim_matches_literal(self, pattern);
+    }
+    fn contains(Str& self, string needle) -> bool {
+        return str_contains_literal(self, needle);
+    }
+    fn find(Str& self, string needle) -> i64 {
+        return str_find_literal(self, needle);
+    }
+    fn rfind(Str& self, string needle) -> i64 {
+        return str_rfind_literal(self, needle);
+    }
+    fn starts_with(Str& self, string prefix) -> bool {
+        return str_starts_with_literal(self, prefix);
+    }
+    fn ends_with(Str& self, string suffix) -> bool {
+        return str_ends_with_literal(self, suffix);
+    }
+    fn strip_prefix(Str& self, string prefix) -> Option<Str> {
+        return str_strip_prefix_literal(self, prefix);
+    }
+    fn strip_suffix(Str& self, string suffix) -> Option<Str> {
+        return str_strip_suffix_literal(self, suffix);
+    }
+    fn equals(Str& self, string other) -> bool {
+        return str_equals_literal(self, other);
+    }
+    fn to_string(Str& self) -> String {
+        return str_to_string(self);
+    }
+    fn to_owned(Str& self) -> String {
+        return str_to_string(self);
+    }
+    fn bytes(Str& self) -> Bytes {
+        return bytes(self);
+    }
+    fn chars(Str& self) -> Chars {
+        return chars(self);
+    }
+    fn char_indices(Str& self) -> CharIndices {
+        return char_indices(self);
+    }
+    fn split(Str& self, string separator) -> Split {
+        return split_literal(self, separator);
+    }
+    fn split_terminator(Str& self, string separator) -> SplitTerminator {
+        Str sep = str_from_literal(separator);
+
+        return split_terminator(self, &sep);
+    }
+    fn split_whitespace(Str& self) -> SplitWhitespace {
+        return split_whitespace(self);
+    }
+    fn lines(Str& self) -> Lines {
+        return lines(self);
+    }
+    fn parse_i64(Str& self) -> Result<i64, ParseError> {
+        return parse_i64(self);
+    }
+    fn parse_i64_radix(Str& self, i64 radix) -> Result<i64, ParseError> {
+        return parse_i64_radix(self, radix);
+    }
+    fn parse_u64(Str& self) -> Result<u64, ParseError> {
+        return parse_u64(self);
+    }
+    fn parse_u64_radix(Str& self, i64 radix) -> Result<u64, ParseError> {
+        return parse_u64_radix(self, radix);
+    }
+    fn parse_bool(Str& self) -> Result<bool, ParseError> {
+        return parse_bool(self);
+    }
+}
+
+impl String {
+    fn new() -> String {
+        return new();
+    }
+    fn with_capacity(i64 capacity) -> String {
+        return with_capacity(capacity);
+    }
+    fn from(string value) -> String {
+        return from_literal(value);
+    }
+    fn clone(String& self) -> String {
+        return clone_string(self);
+    }
+    fn len(String& self) -> i64 {
+        return self.length;
+    }
+    fn is_empty(String& self) -> bool {
+        return self.length == 0;
+    }
+    fn capacity(String& self) -> i64 {
+        return self.capacity;
+    }
+    fn as_str(String& self) -> Str {
+        return as_str(self);
+    }
+    fn as_bytes(String& self) -> StringBytesView {
+        return string_as_bytes(self);
+    }
+    fn as_ptr(String& self) -> usize {
+        return self.data;
+    }
+    fn reserve(String&mut self, i64 capacity) -> bool {
+        return reserve(self, capacity);
+    }
+    fn reserve_exact(String&mut self, i64 capacity) -> bool {
+        return reserve_exact(self, capacity);
+    }
+    fn shrink_to_fit(String&mut self) -> bool {
+        return shrink_to_fit(self);
+    }
+    fn clear(String&mut self) {
+        clear(self);
+    }
+    fn push(String&mut self, i64 scalar) -> bool {
+        return push_char(self, scalar);
+    }
+    fn push_str(String&mut self, string other) -> bool {
+        return append_literal(self, other);
+    }
+    fn push_string(String&mut self, String& other) -> bool {
+        return append_string(self, other);
+    }
+    fn pop(String&mut self) -> Option<i64> {
+        return pop_char(self);
+    }
+    fn insert(String&mut self, i64 index, i64 scalar) -> bool {
+        return insert_char(self, index, scalar);
+    }
+    fn remove(String&mut self, i64 index) -> Option<i64> {
+        return remove_char(self, index);
+    }
+    fn contains(String& self, string needle) -> bool {
+        Str v = as_str(self);
+
+        return str_contains_literal(&v, needle);
+    }
+    fn find(String& self, string needle) -> i64 {
+        Str v = as_str(self);
+
+        return str_find_literal(&v, needle);
+    }
+    fn rfind(String& self, string needle) -> i64 {
+        Str v = as_str(self);
+
+        return str_rfind_literal(&v, needle);
+    }
+    fn starts_with(String& self, string prefix) -> bool {
+        Str v = as_str(self);
+
+        return str_starts_with_literal(&v, prefix);
+    }
+    fn ends_with(String& self, string suffix) -> bool {
+        Str v = as_str(self);
+
+        return str_ends_with_literal(&v, suffix);
+    }
+    fn trim(String& self) -> Str {
+        Str v = as_str(self);
+
+        return str_trim(&v);
+    }
+    fn split(String& self, string separator) -> Split {
+        Str v = as_str(self);
+
+        return split_literal(&v, separator);
+    }
+    fn split_whitespace(String& self) -> SplitWhitespace {
+        Str v = as_str(self);
+
+        return split_whitespace(&v);
+    }
+    fn lines(String& self) -> Lines {
+        Str v = as_str(self);
+
+        return lines(&v);
+    }
+    fn chars(String& self) -> Chars {
+        Str v = as_str(self);
+
+        return chars(&v);
+    }
+    fn char_indices(String& self) -> CharIndices {
+        Str v = as_str(self);
+
+        return char_indices(&v);
+    }
+    fn parse_i64(String& self) -> Result<i64, ParseError> {
+        Str v = as_str(self);
+
+        return parse_i64(&v);
+    }
+    fn parse_u64(String& self) -> Result<u64, ParseError> {
+        Str v = as_str(self);
+
+        return parse_u64(&v);
+    }
+    fn parse_bool(String& self) -> Result<bool, ParseError> {
+        Str v = as_str(self);
+
+        return parse_bool(&v);
+    }
+}
+
+/// Convenience methods for immutable Raz `string` literals. Read-only methods
+/// borrow literal storage; ownership is created only by to_string/to_owned.
+impl string {
+    fn len(string& self) -> i64 {
+        return raz_rt_cstr_len(*self);
+    }
+    fn is_empty(string& self) -> bool {
+        return raz_rt_cstr_len(*self) == 0;
+    }
+    fn as_str(string& self) -> Str {
+        return str_from_literal(*self);
+    }
+    fn as_ptr(string& self) -> usize {
+        return raz_rt_cstr_ptr(*self);
+    }
+    fn to_string(string& self) -> String {
+        return from_literal(*self);
+    }
+    fn to_owned(string& self) -> String {
+        return from_literal(*self);
+    }
+    fn trim(string& self) -> Str {
+        Str v = str_from_literal(*self);
+
+        return str_trim(&v);
+    }
+    fn trim_start(string& self) -> Str {
+        Str v = str_from_literal(*self);
+
+        return str_trim_start(&v);
+    }
+    fn trim_end(string& self) -> Str {
+        Str v = str_from_literal(*self);
+
+        return str_trim_end(&v);
+    }
+    fn trim_matches(string& self, string pattern) -> Str {
+        Str v = str_from_literal(*self);
+
+        return str_trim_matches_literal(&v, pattern);
+    }
+    fn contains(string& self, string needle) -> bool {
+        Str v = str_from_literal(*self);
+
+        return str_contains_literal(&v, needle);
+    }
+    fn find(string& self, string needle) -> i64 {
+        Str v = str_from_literal(*self);
+
+        return str_find_literal(&v, needle);
+    }
+    fn rfind(string& self, string needle) -> i64 {
+        Str v = str_from_literal(*self);
+
+        return str_rfind_literal(&v, needle);
+    }
+    fn starts_with(string& self, string prefix) -> bool {
+        Str v = str_from_literal(*self);
+
+        return str_starts_with_literal(&v, prefix);
+    }
+    fn ends_with(string& self, string suffix) -> bool {
+        Str v = str_from_literal(*self);
+
+        return str_ends_with_literal(&v, suffix);
+    }
+    fn strip_prefix(string& self, string prefix) -> Option<Str> {
+        Str v = str_from_literal(*self);
+
+        return str_strip_prefix_literal(&v, prefix);
+    }
+    fn strip_suffix(string& self, string suffix) -> Option<Str> {
+        Str v = str_from_literal(*self);
+
+        return str_strip_suffix_literal(&v, suffix);
+    }
+    fn split(string& self, string separator) -> Split {
+        Str v = str_from_literal(*self);
+
+        return split_literal(&v, separator);
+    }
+    fn split_whitespace(string& self) -> SplitWhitespace {
+        Str v = str_from_literal(*self);
+
+        return split_whitespace(&v);
+    }
+    fn lines(string& self) -> Lines {
+        Str v = str_from_literal(*self);
+
+        return lines(&v);
+    }
+    fn chars(string& self) -> Chars {
+        Str v = str_from_literal(*self);
+
+        return chars(&v);
+    }
+    fn char_indices(string& self) -> CharIndices {
+        Str v = str_from_literal(*self);
+
+        return char_indices(&v);
+    }
+    fn parse_i64(string& self) -> Result<i64, ParseError> {
+        Str v = str_from_literal(*self);
+
+        return parse_i64(&v);
+    }
+    fn parse_i64_radix(string& self, i64 radix) -> Result<i64, ParseError> {
+        Str v = str_from_literal(*self);
+
+        return parse_i64_radix(&v, radix);
+    }
+    fn parse_u64(string& self) -> Result<u64, ParseError> {
+        Str v = str_from_literal(*self);
+
+        return parse_u64(&v);
+    }
+    fn parse_u64_radix(string& self, i64 radix) -> Result<u64, ParseError> {
+        Str v = str_from_literal(*self);
+
+        return parse_u64_radix(&v, radix);
+    }
+    fn parse_bool(string& self) -> Result<bool, ParseError> {
+        Str v = str_from_literal(*self);
+
+        return parse_bool(&v);
+    }
 }
 
 impl Drop for String {

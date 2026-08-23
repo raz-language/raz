@@ -164,9 +164,9 @@ NativeFunctionArtifactResult compile_native_function_artifact(const machine::Fun
     }
 
     for (const auto& name : globals)
-        module.globals.push_back({name, 0, 1, false, true, false, {}});
+        module.globals.push_back({name, 0, 1, false, true, false, false, {}});
     for (const auto& name : tls_globals)
-        module.globals.push_back({name, 0, 1, false, true, true, {}});
+        module.globals.push_back({name, 0, 1, false, true, true, false, {}});
     auto encoded = codegen::x86_64::encode_image(module, abi);
     if (!encoded.ok()) {
         result.diagnostics = std::move(encoded.diagnostics);
@@ -204,9 +204,11 @@ IncrementalObjectResult assemble_native_object_artifacts(std::span<const ir::Fun
         functions.push_back(std::move(function));
     }
 
-    std::sort(functions.begin(), functions.end(), [](const auto& left, const auto& right) {
-        return left.name < right.name;
-    });
+    // Preserve the caller's function order. The monolithic object path emits
+    // machine functions in module order, and incremental callers that require a
+    // canonical lexical order already provide artifacts in that order. Keeping
+    // input order here makes cached and monolithic objects byte-identical for
+    // frontends such as Raz without weakening deterministic cache keys.
     auto image = codegen::x86_64::assemble_image(std::move(functions), globals);
     if (!image.ok()) {
         result.diagnostics = std::move(image.diagnostics);

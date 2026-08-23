@@ -218,6 +218,115 @@ fn hir_parse_named_struct_literal(HirBuilder&mut builder, i64 structure, i64&mut
     return true;
 }
 
+fn hir_parse_temporary_method_chain(HirBuilder&mut builder, i64 base, i64&mut out) -> bool {
+    // Literal and other immediate scalar primaries used to return before the
+    // normal postfix loop. Keep method syntax uniform for `"text".trim()` and
+    // `42.method()`; MIR materializes temporary storage for `&self` as needed.
+    while (builder.current.kind == TokenKind::Dot || builder.current.kind == TokenKind::ColonColon) {
+        hir_advance(builder);
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+
+        Lexer member_scan = builder.scan;
+        Token member_next;
+
+        next_token(&mut member_scan, &mut member_next);
+
+        i64 structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, base);
+        i64 base_type = raz_compiler_rt_arena_get(builder.module.node_types, base);
+
+        if (member_next.kind != TokenKind::LeftParen) {
+            if (structure < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 field = hir_find_struct_field(
+                builder,
+                structure,
+                builder.current.offset,
+                builder.current.length
+            );
+            if (field < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 member = -1;
+
+            if (!hir_add_node(builder, 16, base, field, 0, 0, &mut member)) {
+                return false;
+            }
+            raz_compiler_rt_arena_set(
+                builder.module.node_type_structs,
+                member,
+                hir_struct_field_type(builder, structure, field),
+            );
+            i64 field_metadata =
+                raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure) + field;
+            hir_set_node_type(
+                builder,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_types, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_references,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_references, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_slices,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_slice_mutable,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_array_extents,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field_metadata),
+            );
+            base = member;
+            hir_advance(builder);
+            continue;
+        }
+
+        i64 method_target = structure;
+
+        if (structure < 0 && hir_type_is_enum(base_type)) {
+            method_target = -2 - hir_type_enum_index(base_type);
+        } else if (structure < 0) {
+            method_target = hir_scalar_method_target(base_type);
+        }
+        i64 method = hir_find_inherent_method(
+            builder,
+            method_target,
+            builder.current.offset,
+            builder.current.length
+        );
+        if (method < 0 || raz_compiler_rt_arena_get(builder.module.inherent_method_receivers, method) == 0) {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+            return false;
+        }
+
+        i64 target = raz_compiler_rt_arena_get(builder.module.inherent_method_functions, method);
+
+        hir_advance(builder);
+
+        i64 called = -1;
+
+        if (!hir_parse_inherent_call(builder, target, base, 1, &mut called)) {
+            return false;
+        }
+        base = called;
+    }
+    *out = base;
+    return true;
+}
+
 fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
     if (
         builder.current.kind == TokenKind::Identifier &&
@@ -393,8 +502,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             return false;
         }
         if (!raw_storage_move && hir_path_is_moved(builder, root_kind, root_index, path)) {
-            hir_fail(builder, DiagnosticCode::UseAfterMove);
-            return false;
+            // Whole-value move order is validated by the CFG ownership pass.
+            // Sibling deferred branches are parsed sequentially, so a move in
+            // one branch must not poison another mutually exclusive branch at
+            // parse time. Partial-path moves remain immediately ordered here.
+            if (!hir_root_is_whole_moved(builder, root_kind, root_index)) {
+                hir_fail(builder, DiagnosticCode::UseAfterMove);
+                return false;
+            }
         }
         if (!raw_storage_move && hir_has_active_borrow(builder, root_kind, root_index, path, 2)) {
             hir_fail(builder, DiagnosticCode::BorrowConflict);
@@ -614,6 +729,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
                 );
                 hir_advance(builder);
                 first_value = projected;
+            }
+            if (builder.current.kind == TokenKind::Dot || builder.current.kind == TokenKind::ColonColon) {
+                i64 chained = -1;
+
+                if (!hir_parse_temporary_method_chain(builder, first_value, &mut chained)) {
+                    return false;
+                }
+                first_value = chained;
             }
             *out = first_value;
             return true;
@@ -933,8 +1056,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         }
         hir_set_node_type(builder, literal, 13);
         hir_advance(builder);
-        *out = literal;
-        return true;
+        return hir_parse_temporary_method_chain(builder, literal, out);
     }
     if (builder.current.kind == TokenKind::Character) {
         i64 value = parse_character_value(&builder.scan.input, &builder.current);
@@ -945,8 +1067,7 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         }
         hir_set_node_type(builder, literal, 10);
         hir_advance(builder);
-        *out = literal;
-        return true;
+        return hir_parse_temporary_method_chain(builder, literal, out);
     }
     if (builder.current.kind == TokenKind::Float) {
         i64 literal = -1;
@@ -956,14 +1077,17 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
         }
         hir_set_node_type(builder, literal, 1);
         hir_advance(builder);
-        *out = literal;
-        return true;
+        return hir_parse_temporary_method_chain(builder, literal, out);
     }
     if (builder.current.kind == TokenKind::Integer) {
         i64 value = parse_integer_value(&builder.scan.input, &builder.current);
+        i64 literal = -1;
 
         hir_advance(builder);
-        return hir_add_node(builder, 1, 0, 0, 0, value, out);
+        if (!hir_add_node(builder, 1, 0, 0, 0, value, &mut literal)) {
+            return false;
+        }
+        return hir_parse_temporary_method_chain(builder, literal, out);
     }
     if (
         builder.current.kind == TokenKind::Identifier &&
@@ -978,13 +1102,16 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             value = 1;
         }
         hir_advance(builder);
-        if (!hir_add_node(builder, 1, 0, 0, 1, value, out)) {
+
+        i64 literal = -1;
+
+        if (!hir_add_node(builder, 1, 0, 0, 1, value, &mut literal)) {
             return false;
         }
         // bool currently shares the scalar ABI kind with i64. Preserve its
         // source-level identity in node_c so semantic argument checks can keep
         // language types distinct without perturbing MIR/Forge ABI typing.
-        return true;
+        return hir_parse_temporary_method_chain(builder, literal, out);
     }
     if (builder.current.kind != TokenKind::Identifier) {
         hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -1016,7 +1143,6 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             builder.current_package_hash,
             root_hash,
         );
-
         if (dependency_package >= 0) {
             qualified_package = dependency_package;
         }
@@ -2186,6 +2312,14 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
             hir_advance(builder);
             call = propagated;
         }
+        if (builder.current.kind == TokenKind::Dot || builder.current.kind == TokenKind::ColonColon) {
+            i64 chained = -1;
+
+            if (!hir_parse_temporary_method_chain(builder, call, &mut chained)) {
+                return false;
+            }
+            call = chained;
+        }
         *out = call;
         return true;
     }
@@ -2679,17 +2813,24 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
                     );
                     hir_advance(builder);
 
-                    i64 argument_start = builder.module.argument_count;
                     i64 argument_count = 0;
+                    i64 pending_arguments = 0;
 
                     if (payload_count > 0) {
+                        pending_arguments = raz_compiler_rt_arena_create(payload_count);
+                        if (pending_arguments == 0) {
+                            hir_fail(builder, DiagnosticCode::TooManyItems);
+                            return false;
+                        }
                         if (!hir_expect(builder, TokenKind::LeftParen)) {
+                            raz_compiler_rt_arena_destroy(pending_arguments);
                             return false;
                         }
                         while (argument_count < payload_count) {
                             i64 argument = -1;
 
                             if (!hir_parse_expression(builder, &mut argument)) {
+                                raz_compiler_rt_arena_destroy(pending_arguments);
                                 return false;
                             }
 
@@ -2714,11 +2855,13 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
                                     argument,
                                 ) != payload_array_extent
                             ) {
+                                raz_compiler_rt_arena_destroy(pending_arguments);
                                 hir_fail(builder, DiagnosticCode::ExpectedToken);
                                 return false;
                             }
                             if (payload_structure >= 0) {
                                 if (argument_structure != payload_structure) {
+                                    raz_compiler_rt_arena_destroy(pending_arguments);
                                     hir_fail(builder, DiagnosticCode::ExpectedToken);
                                     return false;
                                 }
@@ -2729,31 +2872,48 @@ fn hir_parse_primary(HirBuilder&mut builder, i64&mut out) -> bool {
                                     raz_compiler_rt_arena_get(builder.module.enum_payload_types, payload),
                                 )
                             ) {
+                                raz_compiler_rt_arena_destroy(pending_arguments);
                                 return false;
                             }
-                            if (builder.module.argument_count >= 262144) {
-                                hir_fail(builder, DiagnosticCode::TooManyItems);
-                                return false;
-                            }
-                            raz_compiler_rt_arena_set(
-                                builder.module.arguments,
-                                builder.module.argument_count,
-                                argument,
-                            );
-                            builder.module.argument_count += 1;
+                            raz_compiler_rt_arena_set(pending_arguments, argument_count, argument);
                             argument_count += 1;
                             if (argument_count < payload_count) {
                                 if (!hir_expect(builder, TokenKind::Comma)) {
+                                    raz_compiler_rt_arena_destroy(pending_arguments);
                                     return false;
                                 }
                             }
                         }
                         if (!hir_expect(builder, TokenKind::RightParen)) {
+                            raz_compiler_rt_arena_destroy(pending_arguments);
                             return false;
                         }
                     } else if (builder.current.kind == TokenKind::LeftParen) {
                         hir_fail(builder, DiagnosticCode::WrongArgumentCount);
                         return false;
+                    }
+
+                    i64 argument_start = builder.module.argument_count;
+
+                    if (argument_count > 0) {
+                        if (builder.module.argument_count + argument_count >= 262144) {
+                            raz_compiler_rt_arena_destroy(pending_arguments);
+                            hir_fail(builder, DiagnosticCode::TooManyItems);
+                            return false;
+                        }
+
+                        i64 staged = 0;
+
+                        while (staged < argument_count) {
+                            raz_compiler_rt_arena_set(
+                                builder.module.arguments,
+                                builder.module.argument_count,
+                                raz_compiler_rt_arena_get(pending_arguments, staged),
+                            );
+                            builder.module.argument_count += 1;
+                            staged += 1;
+                        }
+                        raz_compiler_rt_arena_destroy(pending_arguments);
                     }
                     if (raz_compiler_rt_arena_get(builder.module.enum_has_payload, enumeration) != 0) {
                         i64 constructed = -1;
@@ -3087,6 +3247,7 @@ fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
         i64 source_type = raz_compiler_rt_arena_get(builder.module.node_types, value);
         i64 source_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, value);
         i64 source_reference = raz_compiler_rt_arena_get(builder.module.node_references, value);
+        bool source_borrow = source_reference == 1;
         bool source_raw = source_reference == 2 || source_reference == 3;
         bool target_raw = target_reference == 2 || target_reference == 3;
 
@@ -3098,11 +3259,18 @@ fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
             target_reference == 0 &&
             target_structure < 0 &&
             (target_type == 0 || target_type == 8 || target_type == 9);
+        // Taking the numeric address of an existing borrow does not itself
+        // dereference raw memory, so it is safe.  This is the systems-level
+        // bridge used by FFI, atomics, buffers, and native package APIs.
+        bool borrow_address_cast = source_borrow && target_word;
         bool raw_cast =
             (source_raw && target_raw) ||
             (source_raw && target_word) ||
             (target_raw && source_word);
-        if (raw_cast) {
+        if (borrow_address_cast) {
+            // Keep the borrow's lifetime/ownership checks, but lower the value
+            // as its machine-word address below.
+        } else if (raw_cast) {
             if (builder.unsafe_depth == 0) {
                 hir_fail(builder, DiagnosticCode::ExpectedToken);
                 return false;

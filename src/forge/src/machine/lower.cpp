@@ -150,12 +150,26 @@ struct StackAddress {
     std::uint32_t offset{};
 };
 
+constexpr TargetArchitecture host_architecture() noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return TargetArchitecture::aarch64;
+#else
+    return TargetArchitecture::x86_64;
+#endif
+}
+
 constexpr target::NativeAbi host_native_abi() noexcept {
 #if defined(_WIN32)
     return target::NativeAbi::windows_x64;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return target::NativeAbi::aapcs64;
 #else
     return target::NativeAbi::system_v_x86_64;
 #endif
+}
+
+constexpr TargetArchitecture resolved_architecture(TargetArchitecture architecture) noexcept {
+    return architecture == TargetArchitecture::host ? host_architecture() : architecture;
 }
 
 bool uses_native_aggregate_abi(const ir::Function& function) noexcept {
@@ -164,11 +178,16 @@ bool uses_native_aggregate_abi(const ir::Function& function) noexcept {
            function.calling_convention == ir::CallingConvention::windows_x64;
 }
 
-target::NativeAbi function_native_abi(const ir::Function& function) noexcept {
+target::NativeAbi function_native_abi(const ir::Function& function, TargetArchitecture architecture) noexcept {
     if (function.calling_convention == ir::CallingConvention::windows_x64)
         return target::NativeAbi::windows_x64;
     if (function.calling_convention == ir::CallingConvention::system_v)
         return target::NativeAbi::system_v_x86_64;
+    const auto resolved = resolved_architecture(architecture);
+    if (resolved == TargetArchitecture::aarch64 &&
+        (function.calling_convention == ir::CallingConvention::platform ||
+         function.calling_convention == ir::CallingConvention::c))
+        return target::NativeAbi::aapcs64;
     return host_native_abi();
 }
 
@@ -183,8 +202,10 @@ RegisterClass abi_register_class(target::AbiValueClass value) noexcept {
 
 std::uint32_t encode_aggregate_return(const target::AggregateAbiClassification& classification) noexcept {
     std::uint32_t encoded = classification.register_count;
-    for (std::size_t index = 0; index < classification.register_count; ++index)
+    for (std::size_t index = 0; index < classification.register_count; ++index) {
         if (classification.classes[index] == target::AbiValueClass::sse) encoded |= 1U << (8U + index);
+        if (classification.piece_widths[index] == 4U) encoded |= 1U << (16U + index);
+    }
     return encoded;
 }
 
@@ -200,7 +221,8 @@ unsigned integer_width(ir::Type type) {
 }
 }
 
-LowerResult lower_module(const ir::Module& source) {
+LowerResult lower_module(const ir::Module& source, LowerOptions options) {
+    const auto target_architecture = resolved_architecture(options.architecture);
     LowerResult result;
     Module output;
     output.name = source.name();
@@ -279,7 +301,7 @@ LowerResult lower_module(const ir::Module& source) {
         }
         const auto alignment = global.alignment != 0 ? global.alignment
             : (global.is_named_aggregate() ? static_cast<std::uint32_t>(*named_alignment) : (aggregate ? 1U : size));
-        output.globals.push_back({global.name, size, alignment, global.is_constant, global.is_external, global.is_thread_local, std::move(bytes)});
+        output.globals.push_back({global.name, size, alignment, global.is_constant, global.is_external, global.is_thread_local, global.linkage == ir::SymbolLinkage::internal, std::move(bytes)});
     }
 
     std::unordered_map<std::string, const ir::Function*> function_table;
@@ -304,29 +326,29 @@ LowerResult lower_module(const ir::Module& source) {
         Function lowered;
         lowered.name = function.name;
         lowered.target_feature = function.target_feature;
-#if defined(__x86_64__) || defined(_M_X64)
-        if (lowered.target_feature == "neon") {
+        if (target_architecture == TargetArchitecture::x86_64 && lowered.target_feature == "neon") {
             error(result.diagnostics, "function @" + function.name + " requires neon on an x86-64 target");
             continue;
         }
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        if (lowered.target_feature == "sse2" || lowered.target_feature == "avx2") {
+        if (target_architecture == TargetArchitecture::aarch64 &&
+            (lowered.target_feature == "sse2" || lowered.target_feature == "avx2")) {
             error(result.diagnostics, "function @" + function.name + " requires x86 SIMD on an AArch64 target");
             continue;
         }
-#endif
         std::vector<AggregateParameterLowering> aggregate_parameters(function.parameters.size());
         std::optional<target::AggregateAbiClassification> aggregate_return;
         bool direct_native_return = false;
         if (function.return_owned) {
             aggregate_return = target::classify_aggregate(source, function.return_aggregate_kind,
-                function.return_aggregate_name, function_native_abi(function), host_layout);
+                function.return_aggregate_name, function_native_abi(function, target_architecture), host_layout);
             if (!aggregate_return) {
                 error(result.diagnostics, "cannot classify aggregate return in @" + function.name);
                 continue;
             }
             direct_native_return = uses_native_aggregate_abi(function) && aggregate_return->register_passed() &&
                                    !aggregate_return->returned_indirectly;
+            lowered.indirect_result_parameter = !direct_native_return &&
+                function_native_abi(function, target_architecture) == target::NativeAbi::aapcs64;
             if (!direct_native_return) {
                 lowered.argument_widths.push_back(8U);
                 lowered.argument_classes.push_back(RegisterClass::integer);
@@ -336,7 +358,7 @@ LowerResult lower_module(const ir::Module& source) {
             const auto& parameter = function.parameters[parameter_index];
             if (parameter.is_aggregate()) {
                 const auto classified = target::classify_aggregate(source, parameter.aggregate_kind,
-                    parameter.aggregate_name, function_native_abi(function), host_layout);
+                    parameter.aggregate_name, function_native_abi(function, target_architecture), host_layout);
                 if (!classified) {
                     error(result.diagnostics, "cannot classify aggregate parameter " + parameter.name + " in @" + function.name);
                     failed = true;
@@ -344,7 +366,11 @@ LowerResult lower_module(const ir::Module& source) {
                 }
                 aggregate_parameters[parameter_index].classification = *classified;
                 aggregate_parameters[parameter_index].direct = uses_native_aggregate_abi(function) && classified->register_passed();
-                if (classified->register_passed()) {
+                // Internal Raz aggregate ABI passes aggregate values by pointer.
+                // Only native-ABI direct aggregates should be decomposed into
+                // register classes; otherwise Result<f64, E> can incorrectly
+                // consume an XMM argument slot while the callee expects a pointer.
+                if (aggregate_parameters[parameter_index].direct) {
                     for (std::size_t piece = 0; piece < classified->register_count; ++piece) {
                         lowered.argument_widths.push_back(8U);
                         lowered.argument_classes.push_back(abi_register_class(classified->classes[piece]));
@@ -495,13 +521,21 @@ LowerResult lower_module(const ir::Module& source) {
                 const auto destination = registers.at(parameter.name);
                 entry.instructions.push_back({Opcode::load_stack_address, destination, {},
                     -static_cast<std::int64_t>(base + allocated), 0, {}, {}});
+                std::uint32_t piece_offset = 0;
                 for (std::size_t piece = 0; piece < aggregate.classification.register_count; ++piece) {
                     const bool floating = aggregate.classification.classes[piece] == target::AbiValueClass::sse;
-                    const auto value = allocate_register(floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64));
-                    entry.instructions.push_back({floating ? Opcode::load_argument_f64 : Opcode::load_argument_i64,
+                    const auto width = aggregate.classification.piece_widths[piece] == 0U
+                        ? std::uint8_t{8} : aggregate.classification.piece_widths[piece];
+                    const auto value_type = floating && width == 4U ? ir::Type(ir::TypeKind::f32)
+                        : floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64);
+                    const auto value = allocate_register(value_type);
+                    entry.instructions.push_back({floating ? (width == 4U ? Opcode::load_argument_f32 : Opcode::load_argument_f64)
+                                                                : Opcode::load_argument_i64,
                         value, {}, 0, argument_index++, {}, {}});
-                    entry.instructions.push_back({floating ? Opcode::store_ptr_f64 : Opcode::store_ptr_i64,
-                        0, {value, destination}, static_cast<std::int64_t>(piece * 8U), 0, {}, {}});
+                    entry.instructions.push_back({floating ? (width == 4U ? Opcode::store_ptr_f32 : Opcode::store_ptr_f64)
+                                                               : Opcode::store_ptr_i64,
+                        0, {value, destination}, static_cast<std::int64_t>(piece_offset), 0, {}, {}});
+                    piece_offset += width;
                 }
                 continue;
             }
@@ -685,7 +719,7 @@ LowerResult lower_module(const ir::Module& source) {
                              !append_control_successors(operation, instruction) ||
                              instruction.inputs.size() != 1 || instruction.successors.size() != 2;
                 } else if (operation.opcode == "global.address") {
-                    if (operation.type != ir::Type(ir::TypeKind::ptr) || operation.result.empty() ||
+                    if ((operation.type != ir::Type(ir::TypeKind::ptr) && operation.type != ir::Type(ir::TypeKind::i64)) || operation.result.empty() ||
                         operation.operands.size() != 1 || !operation.operands[0].starts_with("@")) {
                         error(result.diagnostics, "invalid global address in @" + function.name);
                         failed = true;
@@ -805,6 +839,8 @@ LowerResult lower_module(const ir::Module& source) {
                                     machine_block.instructions.push_back({Opcode::load_stack_address, destination, {}, -static_cast<std::int64_t>(base + allocated), 0, {}, {}});
                                     instruction.opcode = Opcode::call_indirect_void;
                                     instruction.inputs.push_back(destination);
+                                    if (function_native_abi(signature, target_architecture) == target::NativeAbi::aapcs64)
+                                        instruction.indirect_result = true;
                                     failed = !append_indirect_arguments(2);
                                 }
                             } else {
@@ -852,18 +888,25 @@ LowerResult lower_module(const ir::Module& source) {
                             if (target && index < target->parameters.size() && target->parameters[index].is_aggregate()) {
                                 const auto& aggregate_parameter = target->parameters[index];
                                 const auto classified = target::classify_aggregate(source, aggregate_parameter.aggregate_kind,
-                                    aggregate_parameter.aggregate_name, function_native_abi(*target), host_layout);
+                                    aggregate_parameter.aggregate_name, function_native_abi(*target, target_architecture), host_layout);
                                 if (!classified) {
                                     error(result.diagnostics, "cannot classify aggregate call argument in @" + function.name);
                                     return false;
                                 }
                                 if (uses_native_aggregate_abi(*target) && classified->register_passed()) {
+                                    std::uint32_t piece_offset = 0;
                                     for (std::size_t piece = 0; piece < classified->register_count; ++piece) {
                                         const bool floating = classified->classes[piece] == target::AbiValueClass::sse;
-                                        const auto value = allocate_register(floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64));
-                                        machine_block.instructions.push_back({floating ? Opcode::load_ptr_f64 : Opcode::load_ptr_i64,
-                                            value, {source_register}, static_cast<std::int64_t>(piece * 8U), 0, {}, {}});
+                                        const auto width = classified->piece_widths[piece] == 0U
+                                            ? std::uint8_t{8} : classified->piece_widths[piece];
+                                        const auto value_type = floating && width == 4U ? ir::Type(ir::TypeKind::f32)
+                                            : floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64);
+                                        const auto value = allocate_register(value_type);
+                                        machine_block.instructions.push_back({floating ? (width == 4U ? Opcode::load_ptr_f32 : Opcode::load_ptr_f64)
+                                                                                  : Opcode::load_ptr_i64,
+                                            value, {source_register}, static_cast<std::int64_t>(piece_offset), 0, {}, {}});
                                         call_instruction.inputs.push_back(value);
+                                        piece_offset += width;
                                     }
                                     continue;
                                 }
@@ -912,7 +955,7 @@ LowerResult lower_module(const ir::Module& source) {
                             const auto destination = allocate_register(ir::Type(ir::TypeKind::ptr));
                             machine_block.instructions.push_back({Opcode::load_stack_address, destination, {}, -static_cast<std::int64_t>(base + allocated), 0, {}, {}});
                             const auto return_classification = target::classify_aggregate(source, target.return_aggregate_kind,
-                                target.return_aggregate_name, function_native_abi(target), host_layout);
+                                target.return_aggregate_name, function_native_abi(target, target_architecture), host_layout);
                             const bool direct_return = return_classification && uses_native_aggregate_abi(target) &&
                                 return_classification->register_passed() && !return_classification->returned_indirectly;
                             instruction.opcode = direct_return ? Opcode::call_aggregate : Opcode::call_void;
@@ -921,6 +964,8 @@ LowerResult lower_module(const ir::Module& source) {
                             if (direct_return) {
                                 instruction.immediate = static_cast<std::int64_t>(return_classification->size);
                                 instruction.argument_index = encode_aggregate_return(*return_classification);
+                            } else if (function_native_abi(target, target_architecture) == target::NativeAbi::aapcs64) {
+                                instruction.indirect_result = true;
                             }
                             failed = !append_call_arguments(instruction, &target);
                         }
@@ -1437,7 +1482,15 @@ LowerResult lower_module(const ir::Module& source) {
     }
 
     if (result.diagnostics.empty()) {
-        (void)optimize_module(output);
+        // AArch64 runs architecture-neutral canonical combines only. x86-64
+        // keeps its richer immediate/memory/flags/SLP selection pipeline until
+        // equivalent AArch64 legality and cost hooks exist. This preserves a
+        // clean target boundary while still eliminating target-independent IR
+        // noise before AArch64 allocation and encoding.
+        if (target_architecture == TargetArchitecture::aarch64)
+            (void)optimize_aarch64_canonical_module(output);
+        else
+            (void)optimize_module(output);
         auto machine_diagnostics = verify_module(output);
         if (machine_diagnostics.empty()) result.module = std::move(output);
         else result.diagnostics = std::move(machine_diagnostics);

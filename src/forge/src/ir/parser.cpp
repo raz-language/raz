@@ -28,6 +28,43 @@ public:
                 else module.functions().push_back(parse_function());
             }
             expect("}");
+
+            // Compatibility Raz FIR may carry a quoted literal as a
+            // pointer-sized scalar const. Canonical Forge IR stores literals as
+            // private NUL-terminated globals, so intern and rewrite them here.
+            std::uint64_t string_index = 0;
+            for (auto& function : module.functions()) {
+                for (auto& block : function.blocks) {
+                    for (auto& operation : block.operations) {
+                        if (operation.opcode != "const" || operation.operands.size() != 1U ||
+                            operation.operands[0].size() < 2U || operation.operands[0].front() != '"' ||
+                            operation.operands[0].back() != '"')
+                            continue;
+                        if (operation.type != Type(TypeKind::i64) && operation.type != Type(TypeKind::ptr))
+                            fail("string constant requires pointer-sized i64 or ptr result");
+
+                        Token literal{TokenKind::string, operation.operands[0], {}};
+                        auto bytes = decode_string(literal);
+                        bytes.push_back(0);
+                        Global global;
+                        std::string module_tag = module.name();
+                        for (char& ch : module_tag) {
+                            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                                  (ch >= '0' && ch <= '9') || ch == '_')) ch = '_';
+                        }
+                        global.name = "__forge_string_literal_" + module_tag + "_" + std::to_string(string_index++);
+                        global.type = Type(TypeKind::i8);
+                        global.is_constant = true;
+                        global.linkage = SymbolLinkage::internal;
+                        global.alignment = 1;
+                        global.element_count = static_cast<std::uint32_t>(bytes.size());
+                        global.bytes = std::move(bytes);
+                        module.globals().push_back(std::move(global));
+                        operation.opcode = "global.address";
+                        operation.operands = {"@" + module.globals().back().name};
+                    }
+                }
+            }
         } catch (const std::runtime_error&) {}
         ParseResult result; result.diagnostics=std::move(diagnostics_);
         if (result.diagnostics.empty()) result.module=std::move(module);
@@ -461,7 +498,9 @@ private:
         else if (op.opcode == "aggregate.copy.struct" || op.opcode == "aggregate.copy.array") arity = 3;
         else fail("unknown opcode '" + op.opcode + "'");
         for (std::size_t i = 0; i < arity; ++i) {
-            if (peek().kind != TokenKind::value && peek().kind != TokenKind::integer && peek().kind != TokenKind::symbol && peek().kind != TokenKind::identifier)
+            const bool string_constant = op.opcode == "const" && peek().kind == TokenKind::string;
+            if (peek().kind != TokenKind::value && peek().kind != TokenKind::integer && peek().kind != TokenKind::symbol &&
+                peek().kind != TokenKind::identifier && !string_constant)
                 fail("expected operand for '" + op.opcode + "'");
             op.operands.push_back(tokens_[pos_++].text);
             if (i + 1 < arity) take(",");

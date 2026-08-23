@@ -10,7 +10,7 @@ From a Developer PowerShell or a normal PowerShell with Visual Studio Build Tool
 ./bootstrap.bat
 ```
 
-The bootstrap driver configures the native host components, constructs the production Raz compiler, and performs reproducibility qualification required for a release toolchain.
+The bootstrap driver configures/reuses the native Stage-0 components, constructs the production Raz compiler, and performs one Raz-owned self-host build. Deterministic release verification is optional via `--verify-reproducibility`.
 
 Useful options include:
 
@@ -20,6 +20,7 @@ Useful options include:
 -Jobs <n>
 -HostPreset release
 -BootstrapProfile release
+--verify-reproducibility   # optional release/CI fixed-point check
 ```
 
 ## Native components only
@@ -52,9 +53,8 @@ build/
 
 target/bootstrap/
 ├─ candidate/
-├─ repro-1/
-├─ repro-2/
-└─ repro-3/
+├─ repro-1/        # normal final self-hosted compiler
+└─ repro-2/        # only with --verify-reproducibility
 ```
 
-On Windows the final qualified compiler is `target/bootstrap/repro-3/raz-compiler.exe`. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.
+On Windows the normal final compiler is `target/bootstrap/repro-1/target/<profile>/raz-compiler.exe`. When `--verify-reproducibility` is requested, `repro-2` is the independent comparison generation rather than the everyday bootstrap artifact. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.

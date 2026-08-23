@@ -5,6 +5,20 @@ namespace std::fmt;
 
 import alloc::string;
 
+extern fn raz_rt_f64_format(f64 value, usize output, i64 capacity) -> i64;
+
+public trait Display {
+    fn fmt(Self& self, String&mut output) -> bool;
+}
+
+public trait Debug {
+    fn fmt_debug(Self& self, String&mut output) -> bool;
+}
+
+public trait ToString {
+    fn to_string(Self& self) -> String;
+}
+
 // Allocation-conscious formatting primitives. The append_* family writes into
 // caller-owned String storage and performs no temporary heap allocation. The
 // format_* helpers reserve the exact worst-case capacity once for convenience.
@@ -32,6 +46,36 @@ public fn append_bool(String&mut output, bool value) -> bool {
         index += 1;
     }
     return true;
+}
+
+public fn append_literal(String&mut output, string value) -> bool {
+    return alloc::string::append_literal(output, value);
+}
+
+public fn append_str(String&mut output, Str& value) -> bool {
+    return alloc::string::append_bytes(output, value.data, value.length);
+}
+
+public fn append_string(String&mut output, String& value) -> bool {
+    return alloc::string::append_string(output, value);
+}
+
+/// Shortest locale-independent round-trippable f64 representation.
+public fn append_f64(String&mut output, f64 value) -> bool {
+    i64 start = output.length;
+    i64 spare = 64;
+
+    if (start > 9223372036854775807 - spare || !alloc::string::reserve(output, start + spare)) {
+        return false;
+    }
+
+    i64 written = raz_rt_f64_format(value, output.data + start, output.capacity - start);
+
+    if (written < 0 || written > output.capacity - start) {
+        return false;
+    }
+    output.length = start + written;
+    return alloc::string::truncate(output, output.length);
 }
 
 public fn append_i64(String&mut output, i64 value) -> bool {
@@ -164,4 +208,223 @@ public fn format_hex_u64(u64 value, bool upper) -> String {
 
     append_hex_u64(&mut output, value, upper);
     return output;
+}
+
+public fn append_binary_u64(String&mut output, u64 value) -> bool {
+    if (value == 0) {
+        return alloc::string::push_byte(output, 48);
+    }
+
+    i64 digits[64];
+    i64 count = 0;
+    u64 current = value;
+
+    while (current != 0) {
+        digits[count] = 48 + (current & 1)as i64;
+        count += 1;
+        current >>= 1;
+    }
+    while (count > 0) {
+        count -= 1;
+        if (!alloc::string::push_byte(output, digits[count])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+public fn append_octal_u64(String&mut output, u64 value) -> bool {
+    if (value == 0) {
+        return alloc::string::push_byte(output, 48);
+    }
+
+    i64 digits[22];
+    i64 count = 0;
+    u64 current = value;
+
+    while (current != 0) {
+        digits[count] = 48 + (current & 7)as i64;
+        count += 1;
+        current >>= 3;
+    }
+    while (count > 0) {
+        count -= 1;
+        if (!alloc::string::push_byte(output, digits[count])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+public fn append_padded_u64(String&mut output, u64 value, i64 width, i64 fill) -> bool {
+    if (width < 0) {
+        return false;
+    }
+
+    String temporary = alloc::string::with_capacity(20);
+
+    if (!append_u64(&mut temporary, value)) {
+        return false;
+    }
+
+    i64 padding = width - alloc::string::len(&temporary);
+
+    while (padding > 0) {
+        if (!alloc::string::push_byte(output, fill)) {
+            return false;
+        }
+        padding -= 1;
+    }
+    return alloc::string::append_string(output, &temporary);
+}
+
+public fn format_f64(f64 value) -> String {
+    String output = alloc::string::with_capacity(32);
+
+    append_f64(&mut output, value);
+    return output;
+}
+
+fn debug_hex_digit(i64 value) -> i64 {
+    if (value < 10) {
+        return 48 + value;
+    }
+    return 97 + value - 10;
+}
+
+public fn append_debug_str(String&mut output, Str& value) -> bool {
+    if (!alloc::string::push_byte(output, 34)) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < value.length) {
+        i64 byte = alloc::string::str_byte_at(value, index);
+
+        if (byte == 34) {
+            if (!alloc::string::append_literal(output, "\\\"")) {
+                return false;
+            }
+        } else if (byte == 92) {
+            if (!alloc::string::append_literal(output, "\\\\")) {
+                return false;
+            }
+        } else if (byte == 10) {
+            if (!alloc::string::append_literal(output, "\\n")) {
+                return false;
+            }
+        } else if (byte == 13) {
+            if (!alloc::string::append_literal(output, "\\r")) {
+                return false;
+            }
+        } else if (byte == 9) {
+            if (!alloc::string::append_literal(output, "\\t")) {
+                return false;
+            }
+        } else if (byte < 32 || byte == 127) {
+            if (
+                !alloc::string::append_literal(output, "\\x") ||
+                !alloc::string::push_byte(output, debug_hex_digit((byte >> 4) & 15)) ||
+                !alloc::string::push_byte(output, debug_hex_digit(byte & 15))
+            ) {
+                return false;
+            }
+        } else if (!alloc::string::push_byte(output, byte)) {
+            return false;
+        }
+        index += 1;
+    }
+    return alloc::string::push_byte(output, 34);
+}
+
+public fn debug_literal(string value) -> String {
+    Str view = alloc::string::str_from_literal(value);
+    String output = alloc::string::with_capacity(view.length + 2);
+
+    append_debug_str(&mut output, &view);
+    return output;
+}
+
+public fn format_bool(bool value) -> String {
+    String output = alloc::string::with_capacity(5);
+
+    append_bool(&mut output, value);
+    return output;
+}
+
+public fn format_binary_u64(u64 value) -> String {
+    String output = alloc::string::with_capacity(64);
+
+    append_binary_u64(&mut output, value);
+    return output;
+}
+
+public fn format_octal_u64(u64 value) -> String {
+    String output = alloc::string::with_capacity(22);
+
+    append_octal_u64(&mut output, value);
+    return output;
+}
+
+impl Display for i64 {
+    fn fmt(i64& self, String&mut output) -> bool {
+        return append_i64(output, *self);
+    }
+}
+
+impl Display for u64 {
+    fn fmt(u64& self, String&mut output) -> bool {
+        return append_u64(output, *self);
+    }
+}
+
+impl Display for f64 {
+    fn fmt(f64& self, String&mut output) -> bool {
+        return append_f64(output, *self);
+    }
+}
+
+impl Display for Str {
+    fn fmt(Str& self, String&mut output) -> bool {
+        return append_str(output, self);
+    }
+}
+
+impl Display for String {
+    fn fmt(String& self, String&mut output) -> bool {
+        return append_string(output, self);
+    }
+}
+
+impl Debug for Str {
+    fn fmt_debug(Str& self, String&mut output) -> bool {
+        return append_debug_str(output, self);
+    }
+}
+
+impl Debug for String {
+    fn fmt_debug(String& self, String&mut output) -> bool {
+        Str view = alloc::string::as_str(self);
+
+        return append_debug_str(output, &view);
+    }
+}
+
+impl ToString for i64 {
+    fn to_string(i64& self) -> String {
+        return format_i64(*self);
+    }
+}
+
+impl ToString for u64 {
+    fn to_string(u64& self) -> String {
+        return format_u64(*self);
+    }
+}
+
+impl ToString for f64 {
+    fn to_string(f64& self) -> String {
+        return format_f64(*self);
+    }
 }

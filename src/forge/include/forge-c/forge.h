@@ -4,7 +4,7 @@
 #ifndef FORGE_C_FORGE_H
 #define FORGE_C_FORGE_H
 
-#define FORGE_C_API_VERSION 14
+#define FORGE_C_API_VERSION 16
 
 #include <stddef.h>
 #include <stdint.h>
@@ -59,7 +59,9 @@ typedef enum forge_symbol_visibility {
 
 typedef enum forge_native_abi {
     FORGE_ABI_SYSTEM_V_X86_64,
-    FORGE_ABI_WINDOWS_X64
+    FORGE_ABI_WINDOWS_X64,
+    FORGE_ABI_AAPCS64,
+    FORGE_ABI_DARWIN_ARM64
 } forge_native_abi_t;
 
 typedef enum forge_optimization_level {
@@ -144,6 +146,8 @@ int forge_function_add_parameter(forge_function_t* function, const char* name,
                                  forge_borrow_mode_t borrow_mode,
                                  const char* function_signature_name);
 int forge_function_set_target_feature(forge_function_t* function, const char* target_feature);
+int forge_function_copy_body_from(forge_function_t* function, const forge_module_t* source_module,
+                                  const char* source_function_name);
 
 forge_function_t* forge_function_create(forge_module_t* module, const char* name,
                                         forge_type_kind_t return_type,
@@ -222,6 +226,18 @@ size_t forge_module_emit_object(forge_module_t* module, forge_native_abi_t abi,
                                 uint8_t* output, size_t output_capacity);
 size_t forge_module_write_object_file(forge_module_t* module, forge_native_abi_t abi,
                                      const char* output_path);
+// Cache-aware x86-64 object emission. `previous_module_path` stores the last
+// canonical Forge module while `cache_root` stores content-addressed native
+// function artifacts. Unchanged functions reuse their encoded machine image.
+// The current module is always verified before any cache entry is trusted.
+size_t forge_module_write_object_file_incremental(forge_module_t* module, forge_native_abi_t abi,
+                                                  const char* output_path,
+                                                  const char* cache_root,
+                                                  const char* previous_module_path,
+                                                  const char* frontend_id,
+                                                  const char* configuration,
+                                                  size_t* rebuilt_functions,
+                                                  size_t* reused_functions);
 size_t forge_module_diagnostic_count(const forge_module_t* module);
 forge_diagnostic_severity_t forge_module_diagnostic_severity(const forge_module_t* module, size_t index);
 const char* forge_module_diagnostic_message(const forge_module_t* module, size_t index);

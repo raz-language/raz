@@ -36,9 +36,9 @@ async_markers = [
     "fn llvm_async_emit_state_store",
     "fn llvm_async_emit_slot_load",
     "fn llvm_async_emit_slot_store",
-    "async_decl_0",
-    "async_decl_10",
-    "async_decl_11",
+    "declare ptr @raz_rt_async_frame_create(i64)",
+    "declare i32 @raz_rt_async_await_poll(ptr, ptr, i32)",
+    "declare i64 @raz_rt_async_await_result(ptr)",
     "writer_async_function_name",
     "return llvm_emit_async_function",
 ]
@@ -50,8 +50,8 @@ ownership_markers = [
     "fn llvm_async_emit_slot_store_owned",
     "fn llvm_async_emit_slot_disarm",
     "fn llvm_emit_async_structure_cleanup_function",
-    "async_decl_13",
-    "async_decl_14",
+    "declare void @raz_rt_async_slot_store_owned(ptr, i64, i64, i64)",
+    "declare void @raz_rt_async_slot_disarm(ptr, i64)",
     "hir_structure_needs_drop",
 ]
 for marker in ownership_markers:

@@ -175,7 +175,7 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
             error(diagnostics, "packed integer DAG postfix stack must end at depth one in @" + name);
         // Every live intermediate needs its own vector register.
         if (max_stack_depth > 8U)
-            error(diagnostics, "packed integer DAG exceeds x86 vector evaluation depth in @" + name);
+            error(diagnostics, "packed integer DAG exceeds supported vector evaluation depth in @" + name);
         const auto source_count = saw_source ? max_source + 1U : 0U;
         if (source_count == 0U || ins.inputs.size() != source_count + 1U)
             error(diagnostics, "packed integer DAG source/program mismatch in @" + name);
@@ -245,7 +245,10 @@ std::size_t expected_inputs(Opcode opcode) {
     case Opcode::load_stack_i32:
     case Opcode::load_stack_i64:
     case Opcode::load_stack_f32:
-    case Opcode::load_stack_f64: return 0;
+    case Opcode::load_stack_f64:
+    case Opcode::load_stack_v128:
+    case Opcode::load_stack_v256:
+    case Opcode::load_stack_v512: return 0;
     case Opcode::copy:
     case Opcode::copy_f32:
     case Opcode::copy_f64:
@@ -275,6 +278,11 @@ std::size_t expected_inputs(Opcode opcode) {
     case Opcode::store_stack_i64:
     case Opcode::store_stack_f32:
     case Opcode::store_stack_f64:
+    case Opcode::store_stack_v128:
+    case Opcode::store_stack_v256:
+    case Opcode::store_stack_v512:
+    case Opcode::reduce_add_i32_contiguous:
+    case Opcode::reduce_add_i64_contiguous:
     case Opcode::load_ptr_i8:
     case Opcode::load_ptr_i16:
     case Opcode::load_ptr_i32:
@@ -383,6 +391,13 @@ Diagnostics verify_module(const Module& module) {
                     error(diagnostics, "immediate store on unsupported opcode in @" + function.name);
                 if (expected != static_cast<std::size_t>(-1) && ins.inputs.size() != expected) error(diagnostics, "wrong operand count for " + std::string(opcode_name(ins.opcode)) + " in @" + function.name);
                 if (is_packed_binary(ins.opcode)) verify_packed_binary(ins, function.name, diagnostics);
+                if (ins.opcode == Opcode::reduce_add_i32_contiguous || ins.opcode == Opcode::reduce_add_i64_contiguous) {
+                    const auto minimum = ins.opcode == Opcode::reduce_add_i64_contiguous ? 2 : 4;
+                    const auto maximum = ins.opcode == Opcode::reduce_add_i64_contiguous ? 16 : 32;
+                    if (ins.immediate < minimum || ins.immediate > maximum ||
+                        (ins.immediate & (ins.immediate - 1)) != 0)
+                        error(diagnostics, "invalid packed reduction lane count in @" + function.name);
+                }
                 for (auto reg : ins.inputs) if (reg >= function.register_count) error(diagnostics, "input virtual register out of range in @" + function.name);
                 if ((ins.opcode == Opcode::call_i32 || ins.opcode == Opcode::call_i64 || ins.opcode == Opcode::call_f32 || ins.opcode == Opcode::call_f64 || ins.opcode == Opcode::call_void || ins.opcode == Opcode::call_aggregate || ins.opcode == Opcode::load_function_address || (ins.opcode == Opcode::load_global_address || ins.opcode == Opcode::load_tls_address)) && ins.symbol.empty()) error(diagnostics, "call has empty target in @" + function.name);
                 if ((ins.opcode == Opcode::call_indirect_i32 || ins.opcode == Opcode::call_indirect_i64 || ins.opcode == Opcode::call_indirect_f32 || ins.opcode == Opcode::call_indirect_f64 || ins.opcode == Opcode::call_indirect_void) && ins.inputs.empty()) error(diagnostics, "indirect call has no target in @" + function.name);
@@ -393,6 +408,9 @@ Diagnostics verify_module(const Module& module) {
                     case Opcode::load_stack_i32: case Opcode::store_stack_i32: return 4;
                     case Opcode::load_stack_i64: case Opcode::store_stack_i64: case Opcode::load_stack_f64: case Opcode::store_stack_f64: return 8;
                     case Opcode::load_stack_f32: case Opcode::store_stack_f32: return 4;
+                    case Opcode::load_stack_v128: case Opcode::store_stack_v128: return 16;
+                    case Opcode::load_stack_v256: case Opcode::store_stack_v256: return 32;
+                    case Opcode::load_stack_v512: case Opcode::store_stack_v512: return 64;
                     default: return 0;
                     }
                 }();
@@ -402,6 +420,12 @@ Diagnostics verify_module(const Module& module) {
                 if (ins.opcode == Opcode::load_stack_address &&
                     (ins.immediate >= 0 || -ins.immediate > static_cast<std::int64_t>(function.local_stack_size)))
                     error(diagnostics, "stack address offset out of range in @" + function.name);
+                if (ins.opcode == Opcode::store_stack_v128 || ins.opcode == Opcode::store_stack_v256 ||
+                    ins.opcode == Opcode::store_stack_v512) {
+                    for (const auto reg : ins.inputs)
+                        if (reg < function.register_classes.size() && function.register_classes[reg] != RegisterClass::vector)
+                            error(diagnostics, "packed stack store has non-vector input register in @" + function.name);
+                }
                 if (has_result(ins.opcode)) {
                     if (ins.result >= function.register_count) error(diagnostics, "result virtual register out of range in @" + function.name);
                     else {
@@ -411,6 +435,9 @@ Diagnostics verify_module(const Module& module) {
                                 error(diagnostics, "floating opcode has non-floating result register in @" + function.name);
                             if (is_float_comparison(ins.opcode) && result_class != RegisterClass::integer)
                                 error(diagnostics, "floating comparison has non-integer result register in @" + function.name);
+                            if ((ins.opcode == Opcode::load_stack_v128 || ins.opcode == Opcode::load_stack_v256 ||
+                                 ins.opcode == Opcode::load_stack_v512) && result_class != RegisterClass::vector)
+                                error(diagnostics, "packed stack load has non-vector result register in @" + function.name);
                         }
                         if (defined[ins.result]) error(diagnostics, "virtual register v" + std::to_string(ins.result) + " defined more than once in @" + function.name);
                         else defined[ins.result] = true;

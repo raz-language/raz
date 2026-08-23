@@ -53,6 +53,30 @@ fn bindgen_append_range(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 e
     return cursor;
 }
 
+fn bindgen_append_string_literal(i64 out, i64 cap, i64 cursor, string text) -> i64 {
+    i64 length = compiler_literal_length(text);
+    i64 i = 0;
+    while (i < length) {
+        cursor = bindgen_append_byte(out, cap, cursor, compiler_literal_byte(text, i));
+        if (cursor < 0) { return -1; }
+        i += 1;
+    }
+    return cursor;
+}
+
+fn bindgen_equal_string(i64 data, i64 start, i64 end, string text) -> bool {
+    i64 length = compiler_literal_length(text);
+    start = bindgen_skip_space(data, start, end);
+    end = bindgen_trim_end(data, start, end);
+    if (end - start != length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(text, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
 fn bindgen_append_literal(i64 out, i64 cap, i64 cursor, i64[] text, i64 length) -> i64 {
     i64 i = 0;
     while (i < length) {
@@ -101,6 +125,10 @@ fn bindgen_find_last_byte(i64 data, i64 start, i64 end, i64 ch) -> i64 {
         }
     }
     return -1;
+}
+
+fn bindgen_type_word_string(i64 data, i64 start, i64 end, string word) -> bool {
+    return bindgen_equal_string(data, start, end, word);
 }
 
 fn bindgen_type_word(i64 data, i64 start, i64 end, i64[] word, i64 length) -> bool {
@@ -224,8 +252,7 @@ fn bindgen_pp_eval(i64 data, i64 start, i64 end, BindgenMacroTable& macros) -> i
     if (end - start == 1 && raz_compiler_rt_arena_get(data, start) == 49) { return 1; }
     bool negate = false;
     if (raz_compiler_rt_arena_get(data, start) == 33) { negate = true; start = bindgen_skip_space(data, start + 1, end); }
-    i64 defined_word[7] = [100,101,102,105,110,101,100];
-    if (end - start >= 7 && bindgen_equal_ascii(data, start, start + 7, &defined_word, 7)) {
+        if (end - start >= 7 && bindgen_equal_string(data, start, start + 7, "defined")) {
         i64 n = bindgen_skip_space(data, start + 7, end);
         if (n < end && raz_compiler_rt_arena_get(data, n) == 40) {
             n = bindgen_skip_space(data, n + 1, end);
@@ -256,8 +283,7 @@ fn bindgen_emit_function_pointer_type(i64 out, i64 cap, i64 cursor, i64 data, i6
     i64 params_close = bindgen_find_last_byte(data, params_open + 1, end, 41);
     if (params_open < 0 || params_close < params_open) { return -1; }
 
-    i64 fn_text[3] = [102,110,40];
-    cursor = bindgen_append_literal(out, cap, cursor, &fn_text, 3);
+        cursor = bindgen_append_string_literal(out, cap, cursor, "fn(");
     i64 item_start = params_open + 1;
     i64 p = item_start;
     i64 index = 0;
@@ -271,11 +297,9 @@ fn bindgen_emit_function_pointer_type(i64 out, i64 cap, i64 cursor, i64 data, i6
         if (boundary) {
             i64 a = bindgen_skip_space(data, item_start, p);
             i64 b = bindgen_trim_end(data, a, p);
-            i64 void_word[4] = [118,111,105,100];
-            if (b > a && !bindgen_equal_ascii(data, a, b, &void_word, 4)) {
+                        if (b > a && !bindgen_equal_string(data, a, b, "void")) {
                 if (index > 0) {
-                    i64 comma[2] = [44,32];
-                    cursor = bindgen_append_literal(out, cap, cursor, &comma, 2);
+                                        cursor = bindgen_append_string_literal(out, cap, cursor, ", ");
                 }
                 i64 name_end = b;
                 i64 name_start = name_end;
@@ -298,10 +322,8 @@ fn bindgen_emit_function_pointer_type(i64 out, i64 cap, i64 cursor, i64 data, i6
         p += 1;
     }
     cursor = bindgen_append_byte(out, cap, cursor, 41);
-    i64 void_word[4] = [118,111,105,100];
-    if (!bindgen_equal_ascii(data, start, first_open, &void_word, 4)) {
-        i64 arrow[4] = [32,45,62,32];
-        cursor = bindgen_append_literal(out, cap, cursor, &arrow, 4);
+        if (!bindgen_equal_string(data, start, first_open, "void")) {
+                cursor = bindgen_append_string_literal(out, cap, cursor, " -> ");
         cursor = bindgen_emit_base_type(out, cap, cursor, data, start, first_open, windows_abi, aliases);
     }
     return cursor;
@@ -315,12 +337,12 @@ fn bindgen_emit_base_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64
     end = bindgen_trim_end(data, start, end);
 
     // Strip common declaration qualifiers from the base spelling.
-    i64 const_word[6] = [99, 111, 110, 115, 116, 32];
+    string const_word = "const ";
     if (end - start >= 6) {
         bool pref = true;
         i64 q = 0;
         while (q < 6) {
-            if (raz_compiler_rt_arena_get(data, start + q) != const_word[q]) { pref = false; }
+            if (raz_compiler_rt_arena_get(data, start + q) != compiler_literal_byte(const_word, q)) { pref = false; }
             q += 1;
         }
         if (pref) { start = bindgen_skip_space(data, start + 6, end); }
@@ -346,21 +368,18 @@ fn bindgen_emit_base_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64
             i64 alias_base_start = bindgen_skip_space(data, alias_type_start, alias_star);
             i64 alias_base_end = bindgen_trim_end(data, alias_base_start, alias_star);
             bool alias_pointee_const = false;
-            i64 const_prefix[5] = [99,111,110,115,116];
-            i64 alias_space = bindgen_find_byte(data, alias_base_start, alias_base_end, 32);
-            if (alias_space >= 0 && bindgen_equal_ascii(data, alias_base_start, alias_space, &const_prefix, 5)) {
+                        i64 alias_space = bindgen_find_byte(data, alias_base_start, alias_base_end, 32);
+            if (alias_space >= 0 && bindgen_equal_string(data, alias_base_start, alias_space, "const")) {
                 alias_pointee_const = true;
             }
             cursor = bindgen_emit_base_type(out, cap, cursor, data, alias_base_start, alias_base_end, windows_abi, aliases);
             i64 pointer = alias_star;
             while (cursor >= 0 && pointer >= 0 && pointer < alias_type_end) {
                 if (alias_pointee_const) {
-                    i64 const_pointer[6] = [42,99,111,110,115,116];
-                    cursor = bindgen_append_literal(out, cap, cursor, &const_pointer, 6);
+                                        cursor = bindgen_append_string_literal(out, cap, cursor, "*const");
                     alias_pointee_const = false;
                 } else {
-                    i64 mut_pointer[4] = [42,109,117,116];
-                    cursor = bindgen_append_literal(out, cap, cursor, &mut_pointer, 4);
+                                        cursor = bindgen_append_string_literal(out, cap, cursor, "*mut");
                 }
                 pointer = bindgen_find_byte(data, pointer + 1, alias_type_end, 42);
             }
@@ -369,78 +388,74 @@ fn bindgen_emit_base_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64
         return bindgen_emit_base_type(out, cap, cursor, data, alias_type_start, alias_type_end, windows_abi, aliases);
     }
 
-    i64 w_void[4] = [118,111,105,100];
-    i64 w_char[4] = [99,104,97,114];
-    i64 w_schar[11] = [115,105,103,110,101,100,32,99,104,97,114];
-    i64 w_uchar[13] = [117,110,115,105,103,110,101,100,32,99,104,97,114];
-    i64 w_short[5] = [115,104,111,114,116];
-    i64 w_ushort[14] = [117,110,115,105,103,110,101,100,32,115,104,111,114,116];
-    i64 w_int[3] = [105,110,116];
-    i64 w_uint[12] = [117,110,115,105,103,110,101,100,32,105,110,116];
-    i64 w_long[4] = [108,111,110,103];
-    i64 w_ulong[13] = [117,110,115,105,103,110,101,100,32,108,111,110,103];
-    i64 w_ll[9] = [108,111,110,103,32,108,111,110,103];
-    i64 w_ull[18] = [117,110,115,105,103,110,101,100,32,108,111,110,103,32,108,111,110,103];
-    i64 w_float[5] = [102,108,111,97,116];
-    i64 w_double[6] = [100,111,117,98,108,101];
-    i64 w_bool[5] = [95,66,111,111,108];
-    i64 w_size[6] = [115,105,122,101,95,116];
-    i64 w_ssize[7] = [115,115,105,122,101,95,116];
-    i64 w_ptrdiff[9] = [112,116,114,100,105,102,102,95,116];
-    i64 w_int8[6] = [105,110,116,56,95,116]; i64 w_uint8[7] = [117,105,110,116,56,95,116];
-    i64 w_int16[7] = [105,110,116,49,54,95,116]; i64 w_uint16[8] = [117,105,110,116,49,54,95,116];
-    i64 w_int32[7] = [105,110,116,51,50,95,116]; i64 w_uint32[8] = [117,105,110,116,51,50,95,116];
-    i64 w_int64[7] = [105,110,116,54,52,95,116]; i64 w_uint64[8] = [117,105,110,116,54,52,95,116];
-    i64 w_intptr[8] = [105,110,116,112,116,114,95,116]; i64 w_uintptr[9] = [117,105,110,116,112,116,114,95,116];
-    i64 t_void[4] = [118,111,105,100];
-    i64 t_i8[2] = [105,56]; i64 t_u8[2] = [117,56];
-    i64 t_i16[3] = [105,49,54]; i64 t_u16[3] = [117,49,54];
-    i64 t_i32[3] = [105,51,50]; i64 t_u32[3] = [117,51,50];
-    i64 t_i64[3] = [105,54,52]; i64 t_u64[3] = [117,54,52];
-    i64 t_f32[3] = [102,51,50]; i64 t_f64[3] = [102,54,52];
-    i64 t_bool[4] = [98,111,111,108]; i64 t_usize[5] = [117,115,105,122,101]; i64 t_isize[5] = [105,115,105,122,101];
+    string w_void = "void";
+    string w_char = "char";
+    string w_schar = "signed char";
+    string w_uchar = "unsigned char";
+    string w_short = "short";
+    string w_ushort = "unsigned short";
+    string w_int = "int";
+    string w_uint = "unsigned int";
+    string w_long = "long";
+    string w_ulong = "unsigned long";
+    string w_ll = "long long";
+    string w_ull = "unsigned long long";
+    string w_float = "float";
+    string w_double = "double";
+    string w_bool = "_Bool";
+    string w_size = "size_t";
+    string w_ssize = "ssize_t";
+    string w_ptrdiff = "ptrdiff_t";
+    string w_int8 = "int8_t"; string w_uint8 = "uint8_t";
+    string w_int16 = "int16_t"; string w_uint16 = "uint16_t";
+    string w_int32 = "int32_t"; string w_uint32 = "uint32_t";
+    string w_int64 = "int64_t"; string w_uint64 = "uint64_t";
+    string w_intptr = "intptr_t"; string w_uintptr = "uintptr_t";
+        string t_i8 = "i8"; string t_u8 = "u8";
+    string t_i16 = "i16"; string t_u16 = "u16";
+    string t_i32 = "i32"; string t_u32 = "u32";
+    string t_i64 = "i64"; string t_u64 = "u64";
+    string t_f32 = "f32"; string t_f64 = "f64";
+    string t_bool = "bool"; string t_usize = "usize"; string t_isize = "isize";
 
-    if (bindgen_type_word(data, start, end, &w_void, 4)) { return bindgen_append_literal(out, cap, cursor, &t_void, 4); }
-    if (bindgen_type_word(data, start, end, &w_int8, 6)) { return bindgen_append_literal(out, cap, cursor, &t_i8, 2); }
-    if (bindgen_type_word(data, start, end, &w_uint8, 7)) { return bindgen_append_literal(out, cap, cursor, &t_u8, 2); }
-    if (bindgen_type_word(data, start, end, &w_int16, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i16, 3); }
-    if (bindgen_type_word(data, start, end, &w_uint16, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u16, 3); }
-    if (bindgen_type_word(data, start, end, &w_int32, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
-    if (bindgen_type_word(data, start, end, &w_uint32, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
-    if (bindgen_type_word(data, start, end, &w_int64, 7)) { return bindgen_append_literal(out, cap, cursor, &t_i64, 3); }
-    if (bindgen_type_word(data, start, end, &w_uint64, 8)) { return bindgen_append_literal(out, cap, cursor, &t_u64, 3); }
-    if (bindgen_type_word(data, start, end, &w_intptr, 8)) { return bindgen_append_literal(out, cap, cursor, &t_isize, 5); }
-    if (bindgen_type_word(data, start, end, &w_uintptr, 9)) { return bindgen_append_literal(out, cap, cursor, &t_usize, 5); }
-    if (bindgen_type_word(data, start, end, &w_char, 4) || bindgen_type_word(data, start, end, &w_schar, 11)) { return bindgen_append_literal(out, cap, cursor, &t_i8, 2); }
-    if (bindgen_type_word(data, start, end, &w_uchar, 13)) { return bindgen_append_literal(out, cap, cursor, &t_u8, 2); }
-    if (bindgen_type_word(data, start, end, &w_short, 5)) { return bindgen_append_literal(out, cap, cursor, &t_i16, 3); }
-    if (bindgen_type_word(data, start, end, &w_ushort, 14)) { return bindgen_append_literal(out, cap, cursor, &t_u16, 3); }
-    if (bindgen_type_word(data, start, end, &w_int, 3)) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
-    if (bindgen_type_word(data, start, end, &w_uint, 12)) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
-    if (bindgen_type_word(data, start, end, &w_long, 4)) {
-        if (windows_abi) { return bindgen_append_literal(out, cap, cursor, &t_i32, 3); }
-        return bindgen_append_literal(out, cap, cursor, &t_i64, 3);
+    if (bindgen_type_word_string(data, start, end, w_void)) { return bindgen_append_string_literal(out, cap, cursor, "void"); }
+    if (bindgen_type_word_string(data, start, end, w_int8)) { return bindgen_append_string_literal(out, cap, cursor, t_i8); }
+    if (bindgen_type_word_string(data, start, end, w_uint8)) { return bindgen_append_string_literal(out, cap, cursor, t_u8); }
+    if (bindgen_type_word_string(data, start, end, w_int16)) { return bindgen_append_string_literal(out, cap, cursor, t_i16); }
+    if (bindgen_type_word_string(data, start, end, w_uint16)) { return bindgen_append_string_literal(out, cap, cursor, t_u16); }
+    if (bindgen_type_word_string(data, start, end, w_int32)) { return bindgen_append_string_literal(out, cap, cursor, t_i32); }
+    if (bindgen_type_word_string(data, start, end, w_uint32)) { return bindgen_append_string_literal(out, cap, cursor, t_u32); }
+    if (bindgen_type_word_string(data, start, end, w_int64)) { return bindgen_append_string_literal(out, cap, cursor, t_i64); }
+    if (bindgen_type_word_string(data, start, end, w_uint64)) { return bindgen_append_string_literal(out, cap, cursor, t_u64); }
+    if (bindgen_type_word_string(data, start, end, w_intptr)) { return bindgen_append_string_literal(out, cap, cursor, t_isize); }
+    if (bindgen_type_word_string(data, start, end, w_uintptr)) { return bindgen_append_string_literal(out, cap, cursor, t_usize); }
+    if (bindgen_type_word_string(data, start, end, w_char) || bindgen_type_word_string(data, start, end, w_schar)) { return bindgen_append_string_literal(out, cap, cursor, t_i8); }
+    if (bindgen_type_word_string(data, start, end, w_uchar)) { return bindgen_append_string_literal(out, cap, cursor, t_u8); }
+    if (bindgen_type_word_string(data, start, end, w_short)) { return bindgen_append_string_literal(out, cap, cursor, t_i16); }
+    if (bindgen_type_word_string(data, start, end, w_ushort)) { return bindgen_append_string_literal(out, cap, cursor, t_u16); }
+    if (bindgen_type_word_string(data, start, end, w_int)) { return bindgen_append_string_literal(out, cap, cursor, t_i32); }
+    if (bindgen_type_word_string(data, start, end, w_uint)) { return bindgen_append_string_literal(out, cap, cursor, t_u32); }
+    if (bindgen_type_word_string(data, start, end, w_long)) {
+        if (windows_abi) { return bindgen_append_string_literal(out, cap, cursor, t_i32); }
+        return bindgen_append_string_literal(out, cap, cursor, t_i64);
     }
-    if (bindgen_type_word(data, start, end, &w_ulong, 13)) {
-        if (windows_abi) { return bindgen_append_literal(out, cap, cursor, &t_u32, 3); }
-        return bindgen_append_literal(out, cap, cursor, &t_u64, 3);
+    if (bindgen_type_word_string(data, start, end, w_ulong)) {
+        if (windows_abi) { return bindgen_append_string_literal(out, cap, cursor, t_u32); }
+        return bindgen_append_string_literal(out, cap, cursor, t_u64);
     }
-    if (bindgen_type_word(data, start, end, &w_ll, 9)) { return bindgen_append_literal(out, cap, cursor, &t_i64, 3); }
-    if (bindgen_type_word(data, start, end, &w_ull, 18)) { return bindgen_append_literal(out, cap, cursor, &t_u64, 3); }
-    if (bindgen_type_word(data, start, end, &w_float, 5)) { return bindgen_append_literal(out, cap, cursor, &t_f32, 3); }
-    if (bindgen_type_word(data, start, end, &w_double, 6)) { return bindgen_append_literal(out, cap, cursor, &t_f64, 3); }
-    if (bindgen_type_word(data, start, end, &w_bool, 5)) { return bindgen_append_literal(out, cap, cursor, &t_bool, 4); }
-    if (bindgen_type_word(data, start, end, &w_size, 6)) { return bindgen_append_literal(out, cap, cursor, &t_usize, 5); }
-    if (bindgen_type_word(data, start, end, &w_ssize, 7) || bindgen_type_word(data, start, end, &w_ptrdiff, 9)) { return bindgen_append_literal(out, cap, cursor, &t_isize, 5); }
+    if (bindgen_type_word_string(data, start, end, w_ll)) { return bindgen_append_string_literal(out, cap, cursor, t_i64); }
+    if (bindgen_type_word_string(data, start, end, w_ull)) { return bindgen_append_string_literal(out, cap, cursor, t_u64); }
+    if (bindgen_type_word_string(data, start, end, w_float)) { return bindgen_append_string_literal(out, cap, cursor, t_f32); }
+    if (bindgen_type_word_string(data, start, end, w_double)) { return bindgen_append_string_literal(out, cap, cursor, t_f64); }
+    if (bindgen_type_word_string(data, start, end, w_bool)) { return bindgen_append_string_literal(out, cap, cursor, t_bool); }
+    if (bindgen_type_word_string(data, start, end, w_size)) { return bindgen_append_string_literal(out, cap, cursor, t_usize); }
+    if (bindgen_type_word_string(data, start, end, w_ssize) || bindgen_type_word_string(data, start, end, w_ptrdiff)) { return bindgen_append_string_literal(out, cap, cursor, t_isize); }
 
     // Preserve a named type, but remove leading struct/union/enum keywords.
     i64 k = start;
     i64 kw_end = bindgen_find_byte(data,k,end,32);
     if (kw_end > k) {
-        i64 ws[6] = [115,116,114,117,99,116];
-        i64 wu[5] = [117,110,105,111,110];
-        i64 we[4] = [101,110,117,109];
-        if (bindgen_equal_ascii(data,k,kw_end,&ws,6) || bindgen_equal_ascii(data,k,kw_end,&wu,5) || bindgen_equal_ascii(data,k,kw_end,&we,4)) {
+                                if (bindgen_equal_string(data,k,kw_end, "struct") || bindgen_equal_string(data,k,kw_end, "union") || bindgen_equal_string(data,k,kw_end, "enum")) {
             k = bindgen_skip_space(data,kw_end,end);
         }
     }
@@ -473,40 +488,23 @@ fn bindgen_parse_positive_integer(i64 data, i64 start, i64 end) -> i64 {
 fn bindgen_base_size_align(i64 data, i64 start, i64 end, bool windows_abi, i64&mut size, i64&mut alignment) -> bool {
     start = bindgen_skip_space(data, start, end);
     end = bindgen_trim_end(data, start, end);
-    i64 const_prefix[5] = [99,111,110,115,116];
-    if (end - start >= 5 && bindgen_equal_ascii(data, start, start + 5, &const_prefix, 5)) {
+        if (end - start >= 5 && bindgen_equal_string(data, start, start + 5, "const")) {
         start = bindgen_skip_space(data, start + 5, end);
     }
-    i64 w_char[4] = [99,104,97,114];
-    i64 w_schar[11] = [115,105,103,110,101,100,32,99,104,97,114];
-    i64 w_uchar[13] = [117,110,115,105,103,110,101,100,32,99,104,97,114];
-    i64 w_short[5] = [115,104,111,114,116];
-    i64 w_ushort[14] = [117,110,115,105,103,110,101,100,32,115,104,111,114,116];
-    i64 w_int[3] = [105,110,116];
-    i64 w_uint[12] = [117,110,115,105,103,110,101,100,32,105,110,116];
-    i64 w_long[4] = [108,111,110,103];
-    i64 w_ulong[13] = [117,110,115,105,103,110,101,100,32,108,111,110,103];
-    i64 w_ll[9] = [108,111,110,103,32,108,111,110,103];
-    i64 w_ull[18] = [117,110,115,105,103,110,101,100,32,108,111,110,103,32,108,111,110,103];
-    i64 w_float[5] = [102,108,111,97,116];
-    i64 w_double[6] = [100,111,117,98,108,101];
-    i64 w_bool[5] = [95,66,111,111,108];
-    i64 w_size[6] = [115,105,122,101,95,116];
-    i64 w_ptrdiff[9] = [112,116,114,100,105,102,102,95,116];
-    if (bindgen_equal_ascii(data,start,end,&w_char,4) || bindgen_equal_ascii(data,start,end,&w_schar,11) || bindgen_equal_ascii(data,start,end,&w_uchar,13) || bindgen_equal_ascii(data,start,end,&w_bool,5)) {
+                                                                    if (bindgen_equal_string(data,start,end, "char") || bindgen_equal_string(data,start,end, "signed char") || bindgen_equal_string(data,start,end, "unsigned char") || bindgen_equal_string(data,start,end, "_Bool")) {
         *size = 1; *alignment = 1; return true;
     }
-    if (bindgen_equal_ascii(data,start,end,&w_short,5) || bindgen_equal_ascii(data,start,end,&w_ushort,14)) {
+    if (bindgen_equal_string(data,start,end, "short") || bindgen_equal_string(data,start,end, "unsigned short")) {
         *size = 2; *alignment = 2; return true;
     }
-    if (bindgen_equal_ascii(data,start,end,&w_int,3) || bindgen_equal_ascii(data,start,end,&w_uint,12) || bindgen_equal_ascii(data,start,end,&w_float,5)) {
+    if (bindgen_equal_string(data,start,end, "int") || bindgen_equal_string(data,start,end, "unsigned int") || bindgen_equal_string(data,start,end, "float")) {
         *size = 4; *alignment = 4; return true;
     }
-    if (bindgen_equal_ascii(data,start,end,&w_long,4) || bindgen_equal_ascii(data,start,end,&w_ulong,13)) {
+    if (bindgen_equal_string(data,start,end, "long") || bindgen_equal_string(data,start,end, "unsigned long")) {
         if (windows_abi) { *size = 4; *alignment = 4; } else { *size = 8; *alignment = 8; }
         return true;
     }
-    if (bindgen_equal_ascii(data,start,end,&w_ll,9) || bindgen_equal_ascii(data,start,end,&w_ull,18) || bindgen_equal_ascii(data,start,end,&w_double,6) || bindgen_equal_ascii(data,start,end,&w_size,6) || bindgen_equal_ascii(data,start,end,&w_ptrdiff,9)) {
+    if (bindgen_equal_string(data,start,end, "long long") || bindgen_equal_string(data,start,end, "unsigned long long") || bindgen_equal_string(data,start,end, "double") || bindgen_equal_string(data,start,end, "size_t") || bindgen_equal_string(data,start,end, "ptrdiff_t")) {
         *size = 8; *alignment = 8; return true;
     }
     return false;
@@ -573,23 +571,21 @@ fn bindgen_parse_decimal(i64 data,i64 start,i64 end)->i64{
 
 fn bindgen_bitfield_capacity(i64 data,i64 start,i64 end,bool windows_abi)->i64{
     start=bindgen_skip_space(data,start,end);end=bindgen_trim_end(data,start,end);
-    i64 uc[13]=[117,110,115,105,103,110,101,100,32,99,104,97,114];i64 us[14]=[117,110,115,105,103,110,101,100,32,115,104,111,114,116];i64 ui[12]=[117,110,115,105,103,110,101,100,32,105,110,116];i64 ul[13]=[117,110,115,105,103,110,101,100,32,108,111,110,103];i64 u8t[7]=[117,105,110,116,56,95,116];i64 u16t[8]=[117,105,110,116,49,54,95,116];i64 u32t[8]=[117,105,110,116,51,50,95,116];i64 u64t[8]=[117,105,110,116,54,52,95,116];
-    if(bindgen_equal_ascii(data,start,end,&uc,13)||bindgen_equal_ascii(data,start,end,&u8t,7)){return 8;}if(bindgen_equal_ascii(data,start,end,&us,14)||bindgen_equal_ascii(data,start,end,&u16t,8)){return 16;}if(bindgen_equal_ascii(data,start,end,&ui,12)||bindgen_equal_ascii(data,start,end,&u32t,8)){return 32;}if(bindgen_equal_ascii(data,start,end,&ul,13)){if(windows_abi){return 32;}return 64;}if(bindgen_equal_ascii(data,start,end,&u64t,8)){return 64;}return 0;
+    string uc = "unsigned char";string us = "unsigned short";string ui = "unsigned int";string ul = "unsigned long";string u8t = "uint8_t";string u16t = "uint16_t";string u32t = "uint32_t";string u64t = "uint64_t";
+    if(bindgen_equal_string(data,start,end, uc)||bindgen_equal_string(data,start,end, u8t)){return 8;}if(bindgen_equal_string(data,start,end, us)||bindgen_equal_string(data,start,end, u16t)){return 16;}if(bindgen_equal_string(data,start,end, ui)||bindgen_equal_string(data,start,end, u32t)){return 32;}if(bindgen_equal_string(data,start,end, ul)){if(windows_abi){return 32;}return 64;}if(bindgen_equal_string(data,start,end, u64t)){return 64;}return 0;
 }
 
 fn bindgen_emit_bitfield_storage(i64 out,i64 cap,i64 cursor,i64 data,i64 type_start,i64 type_end,bool windows_abi,BindgenAliasTable& aliases,i64 index)->i64{
-    cursor=bindgen_emit_base_type(out,cap,cursor,data,type_start,type_end,windows_abi,aliases);if(cursor<0){return -1;}i64 name[24]=[32,95,95,114,97,122,95,98,105,116,102,105,101,108,100,95,115,116,111,114,97,103,101,95];cursor=bindgen_append_literal(out,cap,cursor,&name,24);cursor=bindgen_append_decimal(out,cap,cursor,index);cursor=bindgen_append_byte(out,cap,cursor,59);cursor=bindgen_append_byte(out,cap,cursor,10);return cursor;
+    cursor=bindgen_emit_base_type(out,cap,cursor,data,type_start,type_end,windows_abi,aliases);if(cursor<0){return -1;}string name = " __raz_bitfield_storage_";cursor=bindgen_append_string_literal(out,cap,cursor, name);cursor=bindgen_append_decimal(out,cap,cursor,index);cursor=bindgen_append_byte(out,cap,cursor,59);cursor=bindgen_append_byte(out,cap,cursor,10);return cursor;
 }
 
 fn bindgen_emit_union_storage(i64 out, i64 cap, i64 cursor, i64 input, i64 name_start, i64 name_end, i64 size, i64 alignment) -> i64 {
     if (size <= 0) { size = 1; }
     if (alignment <= 0) { alignment = 1; }
     // @repr(C)@align(N)public struct Name { u8[N] storage; }
-    i64 repr[15] = [64,114,101,112,114,40,67,41,64,97,108,105,103,110,40];
-    cursor = bindgen_append_literal(out, cap, cursor, &repr, 15);
+        cursor = bindgen_append_string_literal(out, cap, cursor, "@repr(C)@align(");
     cursor = bindgen_append_decimal(out, cap, cursor, alignment);
-    i64 middle[15] = [41,112,117,98,108,105,99,32,115,116,114,117,99,116,32];
-    cursor = bindgen_append_literal(out, cap, cursor, &middle, 15);
+        cursor = bindgen_append_string_literal(out, cap, cursor, ")public struct ");
     cursor = bindgen_append_range(out, cap, cursor, input, name_start, name_end);
     cursor = bindgen_append_byte(out, cap, cursor, 32);
     cursor = bindgen_append_byte(out, cap, cursor, 123);
@@ -598,8 +594,7 @@ fn bindgen_emit_union_storage(i64 out, i64 cap, i64 cursor, i64 input, i64 name_
     cursor = bindgen_append_byte(out, cap, cursor, 56);
     cursor = bindgen_append_byte(out, cap, cursor, 91);
     cursor = bindgen_append_decimal(out, cap, cursor, size);
-    i64 tail[15] = [93,32,115,116,111,114,97,103,101,59,10,125,10,10,10];
-    cursor = bindgen_append_literal(out, cap, cursor, &tail, 15);
+        cursor = bindgen_append_string_literal(out, cap, cursor, "] storage;\n}\n\n\n");
     return cursor;
 }
 
@@ -610,18 +605,15 @@ fn bindgen_emit_decl_type(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64
     cursor = bindgen_emit_base_type(out, cap, cursor, data, start, base_end, windows_abi, aliases);
     if (cursor < 0) { return -1; }
     bool pointee_const = false;
-    i64 const_word[5] = [99,111,110,115,116];
-    i64 first_space = bindgen_find_byte(data, start, base_end, 32);
-    if (first_space >= 0 && bindgen_equal_ascii(data, start, first_space, &const_word, 5)) { pointee_const = true; }
+        i64 first_space = bindgen_find_byte(data, start, base_end, 32);
+    if (first_space >= 0 && bindgen_equal_string(data, start, first_space, "const")) { pointee_const = true; }
     i64 scan = star;
     while (scan >= 0 && scan < name_start) {
         if (raz_compiler_rt_arena_get(data, scan) == 42) {
             if (pointee_const) {
-                i64 ptr[6] = [42,99,111,110,115,116];
-                cursor = bindgen_append_literal(out, cap, cursor, &ptr, 6);
+                                cursor = bindgen_append_string_literal(out, cap, cursor, "*const");
             } else {
-                i64 ptr[4] = [42,109,117,116];
-                cursor = bindgen_append_literal(out, cap, cursor, &ptr, 4);
+                                cursor = bindgen_append_string_literal(out, cap, cursor, "*mut");
             }
             if (cursor < 0) { return -1; }
             pointee_const = false;
@@ -676,12 +668,25 @@ fn bindgen_inline_aggregate_size_align(i64 data, i64 start, i64 end, bool is_uni
 }
 
 fn bindgen_emit_opaque_field(i64 out, i64 cap, i64 cursor, i64 data, i64 name_start, i64 name_end, i64 size, i64 alignment, i64 synthetic_index) -> i64 {
+    // The carrier has to be as wide as the aggregate's alignment, so the element
+    // count below is the aggregate's size divided by that width.
     i64 unit_size = 1;
-    if (alignment == 8) { i64 t[3] = [117,54,52]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 8; }
-    else if (alignment == 4) { i64 t[3] = [117,51,50]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 4; }
-    else if (alignment == 2) { i64 t[3] = [117,49,54]; cursor = bindgen_append_literal(out, cap, cursor, &t, 3); unit_size = 2; }
-    else if (alignment == 1) { i64 t[2] = [117,56]; cursor = bindgen_append_literal(out, cap, cursor, &t, 2); unit_size = 1; }
-    else { return -1; }
+
+    if (alignment == 8) {
+        cursor = bindgen_append_string_literal(out, cap, cursor, "u64");
+        unit_size = 8;
+    } else if (alignment == 4) {
+        cursor = bindgen_append_string_literal(out, cap, cursor, "u32");
+        unit_size = 4;
+    } else if (alignment == 2) {
+        cursor = bindgen_append_string_literal(out, cap, cursor, "u16");
+        unit_size = 2;
+    } else if (alignment == 1) {
+        cursor = bindgen_append_string_literal(out, cap, cursor, "u8");
+        unit_size = 1;
+    } else {
+        return -1;
+    }
     cursor = bindgen_append_byte(out, cap, cursor, 91);
     cursor = bindgen_append_decimal(out, cap, cursor, size / unit_size);
     cursor = bindgen_append_byte(out, cap, cursor, 93);
@@ -689,8 +694,7 @@ fn bindgen_emit_opaque_field(i64 out, i64 cap, i64 cursor, i64 data, i64 name_st
     if (name_end > name_start) {
         cursor = bindgen_append_range(out, cap, cursor, data, name_start, name_end);
     } else {
-        i64 prefix[18] = [95,95,114,97,122,95,97,110,111,110,95,115,116,111,114,97,103,101];
-        cursor = bindgen_append_literal(out, cap, cursor, &prefix, 18);
+                cursor = bindgen_append_string_literal(out, cap, cursor, "__raz_anon_storage");
         cursor = bindgen_append_decimal(out, cap, cursor, synthetic_index);
     }
     cursor = bindgen_append_byte(out, cap, cursor, 59);
@@ -702,10 +706,9 @@ fn bindgen_emit_inline_anonymous_aggregate(i64 out, i64 cap, i64 cursor, i64 dat
     i64 open = bindgen_find_byte(data, start, end, 123);
     i64 close = bindgen_find_last_byte(data, start, end, 125);
     if (open < 0 || close <= open) { return -1; }
-    i64 union_word[5] = [117,110,105,111,110];
-    i64 kind_end = bindgen_find_byte(data, start, open, 32);
+        i64 kind_end = bindgen_find_byte(data, start, open, 32);
     if (kind_end < 0) { kind_end = open; }
-    bool is_union = bindgen_equal_ascii(data, start, kind_end, &union_word, 5);
+    bool is_union = bindgen_equal_string(data, start, kind_end, "union");
     i64 size = 0;
     i64 alignment = 0;
     if (!bindgen_inline_aggregate_size_align(data, start, end, is_union, windows_abi, &mut size, &mut alignment)) { return -1; }
@@ -750,8 +753,7 @@ fn bindgen_emit_field(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end
 fn bindgen_emit_params(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 end, bool windows_abi, BindgenAliasTable& aliases) -> i64 {
     start = bindgen_skip_space(data,start,end);
     end = bindgen_trim_end(data,start,end);
-    i64 w_void[4]=[118,111,105,100];
-    if (start >= end || bindgen_equal_ascii(data, start, end, &w_void, 4)) { return cursor; }
+        if (start >= end || bindgen_equal_string(data, start, end, "void")) { return cursor; }
     i64 item_start=start; i64 depth=0; i64 index=0; i64 p=start;
     while (p<=end) {
         i64 ch = 0;
@@ -761,19 +763,19 @@ fn bindgen_emit_params(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 en
         if (boundary) {
             i64 a=bindgen_skip_space(data,item_start,p); i64 b=bindgen_trim_end(data,a,p);
             if (b>a) {
-                if (index>0) { i64 comma[2]=[44,32]; cursor=bindgen_append_literal(out,cap,cursor,&comma,2); }
+                if (index>0) { string comma = ", "; cursor=bindgen_append_string_literal(out,cap,cursor, comma); }
                 i64 callback_open=bindgen_find_byte(data,a,b,40); i64 callback_star=-1; i64 callback_close=-1;
                 if(callback_open>=0){callback_star=bindgen_find_byte(data,callback_open+1,b,42);} if(callback_star>=0){callback_close=bindgen_find_byte(data,callback_star+1,b,41);}
                 if(callback_open>=0&&callback_star>callback_open&&callback_close>callback_star){
                     i64 callback_name_start=bindgen_skip_space(data,callback_star+1,callback_close);i64 callback_name_end=callback_name_start;while(callback_name_end<callback_close&&bindgen_is_ident(raz_compiler_rt_arena_get(data,callback_name_end))){callback_name_end+=1;}
-                    cursor=bindgen_emit_function_pointer_type(out,cap,cursor,data,a,b,windows_abi,aliases);cursor=bindgen_append_byte(out,cap,cursor,32);if(callback_name_end>callback_name_start){cursor=bindgen_append_range(out,cap,cursor,data,callback_name_start,callback_name_end);}else{i64 sep[3]=[97,114,103];cursor=bindgen_append_literal(out,cap,cursor,&sep,3);cursor=bindgen_append_byte(out,cap,cursor,48+(index%10));}
+                    cursor=bindgen_emit_function_pointer_type(out,cap,cursor,data,a,b,windows_abi,aliases);cursor=bindgen_append_byte(out,cap,cursor,32);if(callback_name_end>callback_name_start){cursor=bindgen_append_range(out,cap,cursor,data,callback_name_start,callback_name_end);}else{string sep = "arg";cursor=bindgen_append_string_literal(out,cap,cursor, sep);cursor=bindgen_append_byte(out,cap,cursor,48+(index%10));}
                 } else {
                     i64 name_end=b; i64 name_start=name_end;
                     while (name_start>a && bindgen_is_ident(raz_compiler_rt_arena_get(data,name_start-1))) { name_start-=1; }
                     if(name_start==name_end || bindgen_find_byte(data,a,b,42)==name_start-1) {
                         // unnamed parameter: synthesize argN
                         cursor = bindgen_emit_base_type(out, cap, cursor, data, a, b, windows_abi, aliases);
-                        i64 sep[4]=[32,97,114,103]; cursor=bindgen_append_literal(out,cap,cursor,&sep,4);
+                        string sep = " arg"; cursor=bindgen_append_string_literal(out,cap,cursor, sep);
                         cursor=bindgen_append_byte(out,cap,cursor,48+(index%10));
                     } else {
                         cursor = bindgen_emit_decl_type(out, cap, cursor, data, a, b, name_start, windows_abi, aliases);
@@ -796,13 +798,12 @@ fn bindgen_emit_function(i64 out, i64 cap, i64 cursor, i64 data, i64 start, i64 
     i64 name_end=bindgen_trim_end(data,start,open); i64 name_start=name_end;
     while (name_start>start && bindgen_is_ident(raz_compiler_rt_arena_get(data,name_start-1))) { name_start-=1; }
     if (name_start == name_end) { return cursor; }
-    i64 extern_fn[17] = [64,97,98,105,40,67,41,101,120,116,101,114,110,32,102,110,32];
-    cursor = bindgen_append_literal(out, cap, cursor, &extern_fn, 17);
+        cursor = bindgen_append_string_literal(out, cap, cursor, "@abi(C)extern fn ");
     cursor=bindgen_append_range(out,cap,cursor,data,name_start,name_end);
     cursor=bindgen_append_byte(out,cap,cursor,40);
     cursor = bindgen_emit_params(out, cap, cursor, data, open + 1, close, windows_abi, aliases);
     cursor=bindgen_append_byte(out,cap,cursor,41);
-    i64 arrow[4]=[32,45,62,32]; cursor=bindgen_append_literal(out,cap,cursor,&arrow,4);
+    string arrow = " -> "; cursor=bindgen_append_string_literal(out,cap,cursor, arrow);
     cursor = bindgen_emit_decl_type(out, cap, cursor, data, start, name_start, name_start, windows_abi, aliases);
     cursor=bindgen_append_byte(out,cap,cursor,59); cursor=bindgen_append_byte(out,cap,cursor,10); cursor=bindgen_append_byte(out,cap,cursor,10);
     return cursor;
@@ -818,8 +819,7 @@ fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -
     BindgenMacroTable macros;
     if (!bindgen_alias_table_init(&mut aliases)) { return -1; }
     if (!bindgen_macro_table_init(&mut macros)) { bindgen_alias_table_destroy(&mut aliases); return -1; }
-    i64 header[138]=[47,47,32,71,101,110,101,114,97,116,101,100,32,98,121,32,96,114,97,122,32,98,105,110,100,103,101,110,96,46,32,68,111,32,110,111,116,32,101,100,105,116,32,98,121,32,104,97,110,100,46,10,47,47,32,67,32,65,66,73,32,100,101,99,108,97,114,97,116,105,111,110,115,32,97,114,101,32,112,114,101,115,101,114,118,101,100,32,119,105,116,104,111,117,116,32,114,117,110,116,105,109,101,32,119,114,97,112,112,101,114,115,46,10,10,110,97,109,101,115,112,97,99,101,32,99,95,98,105,110,100,105,110,103,115,59,10,10];
-    cursor=bindgen_append_literal(out,cap,cursor,&header,138);
+        cursor=bindgen_append_string_literal(out,cap,cursor, "// Generated by `raz bindgen`. Do not edit by hand.\n// C ABI declarations are preserved without runtime wrappers.\n\nnamespace c_bindings;\n\n");
     i64 line = 0;
     i64 block_kind = 0;
     i64 block_name_start = 0;
@@ -843,20 +843,20 @@ fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -
         if (a < b && raz_compiler_rt_arena_get(input, a) == 35) {
             i64 hash_body = bindgen_skip_space(input, a + 1, b);
             i64 word_end = hash_body; while (word_end < b && bindgen_is_ident(raz_compiler_rt_arena_get(input, word_end))) { word_end += 1; }
-            i64 if_word[2] = [105,102]; i64 ifdef_word[5] = [105,102,100,101,102]; i64 ifndef_word[6] = [105,102,110,100,101,102]; i64 else_word[4] = [101,108,115,101]; i64 endif_word[5] = [101,110,100,105,102];
-            if (bindgen_equal_ascii(input, hash_body, word_end, &if_word, 2) || bindgen_equal_ascii(input, hash_body, word_end, &ifdef_word, 5) || bindgen_equal_ascii(input, hash_body, word_end, &ifndef_word, 6)) {
+            string if_word = "if"; string ifdef_word = "ifdef"; string ifndef_word = "ifndef"; string else_word = "else"; string endif_word = "endif";
+            if (bindgen_equal_string(input, hash_body, word_end, if_word) || bindgen_equal_string(input, hash_body, word_end, ifdef_word) || bindgen_equal_string(input, hash_body, word_end, ifndef_word)) {
                 if (pp_depth >= 32) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
                 bool parent = pp_active;
                 i64 cond = -1;
-                if (bindgen_equal_ascii(input, hash_body, word_end, &ifdef_word, 5)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 1; } else { cond = 0; } }
-                else if (bindgen_equal_ascii(input, hash_body, word_end, &ifndef_word, 6)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 0; } else { cond = 1; } }
+                if (bindgen_equal_string(input, hash_body, word_end, ifdef_word)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 1; } else { cond = 0; } }
+                else if (bindgen_equal_string(input, hash_body, word_end, ifndef_word)) { if (bindgen_macro_defined(&macros, input, word_end, b)) { cond = 0; } else { cond = 1; } }
                 else { cond = bindgen_pp_eval(input, word_end, b, &macros); }
                 if (cond < 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
                 pp_parent[pp_depth] = parent; pp_taken[pp_depth] = cond != 0; pp_depth += 1; pp_active = parent && cond != 0; handled_pp = true;
-            } else if (bindgen_equal_ascii(input, hash_body, word_end, &else_word, 4)) {
+            } else if (bindgen_equal_string(input, hash_body, word_end, else_word)) {
                 if (pp_depth <= 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
                 i64 level = pp_depth - 1; pp_active = pp_parent[level] && !pp_taken[level]; pp_taken[level] = true; handled_pp = true;
-            } else if (bindgen_equal_ascii(input, hash_body, word_end, &endif_word, 5)) {
+            } else if (bindgen_equal_string(input, hash_body, word_end, endif_word)) {
                 if (pp_depth <= 0) { bindgen_macro_table_destroy(&mut macros); bindgen_alias_table_destroy(&mut aliases); return -1; }
                 pp_depth -= 1; pp_active = pp_parent[pp_depth]; handled_pp = true;
             }
@@ -913,42 +913,37 @@ fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -
                 }
             } else if(raz_compiler_rt_arena_get(input,a)==35) {
                 // #define NAME integer-expression: preserve the expression verbatim.
-                i64 def[7]=[35,100,101,102,105,110,101];
-                if(b-a>7 && bindgen_equal_ascii(input,a,a+7,&def,7)) {
+                                if(b-a>7 && bindgen_equal_string(input,a,a+7, "#define")) {
                     i64 n=bindgen_skip_space(input,a+7,b); i64 ne=n; while (ne<b && bindgen_is_ident(raz_compiler_rt_arena_get(input,ne))) { ne+=1; }
                     i64 v = bindgen_skip_space(input, ne, b);
                     bool function_macro = ne < b && raz_compiler_rt_arena_get(input, ne) == 40;
                     bool string_macro = v < b && (raz_compiler_rt_arena_get(input, v) == 34 || raz_compiler_rt_arena_get(input, v) == 39);
                     if (ne > n && !function_macro) { bindgen_macro_add(&mut macros, input, n, ne); }
                     if (ne > n && v < b && raz_compiler_rt_arena_get(input, n) != 95 && !function_macro && !string_macro) {
-                        i64 pc[17]=[112,117,98,108,105,99,32,99,111,110,115,116,32,105,54,52,32];
-                        cursor=bindgen_append_literal(out,cap,cursor,&pc,17); cursor=bindgen_append_range(out,cap,cursor,input,n,ne); i64 eq[3]=[32,61,32]; cursor=bindgen_append_literal(out,cap,cursor,&eq,3); cursor=bindgen_emit_macro_expr(out,cap,cursor,input,v,b); cursor=bindgen_append_byte(out,cap,cursor,59); cursor=bindgen_append_byte(out,cap,cursor,10); cursor=bindgen_append_byte(out,cap,cursor,10);
+                                                cursor=bindgen_append_string_literal(out,cap,cursor, "public const i64 "); cursor=bindgen_append_range(out,cap,cursor,input,n,ne); string eq = " = "; cursor=bindgen_append_string_literal(out,cap,cursor, eq); cursor=bindgen_emit_macro_expr(out,cap,cursor,input,v,b); cursor=bindgen_append_byte(out,cap,cursor,59); cursor=bindgen_append_byte(out,cap,cursor,10); cursor=bindgen_append_byte(out,cap,cursor,10);
                     }
                 }
             } else {
                 i64 brace=bindgen_find_byte(input,a,b,123);
                 if(brace>=0) {
-                    i64 struct_word[6]=[115,116,114,117,99,116]; i64 union_word[5]=[117,110,105,111,110]; i64 enum_word[4]=[101,110,117,109];
-                    i64 k=a; i64 typedef_word[7]=[116,121,112,101,100,101,102];
-                    if (b - a >= 7 && bindgen_equal_ascii(input, a, a + 7, &typedef_word, 7)) { k = bindgen_skip_space(input, a + 7, b); }
+                    string struct_word = "struct"; string union_word = "union"; string enum_word = "enum";
+                    i64 k=a; string typedef_word = "typedef";
+                    if (b - a >= 7 && bindgen_equal_string(input, a, a + 7, typedef_word)) { k = bindgen_skip_space(input, a + 7, b); }
                     i64 kw_end = bindgen_find_byte(input, k, brace, 32);
                     if (kw_end < 0) { kw_end = brace; }
                     i64 kind = 0;
-                    if (bindgen_equal_ascii(input, k, kw_end, &struct_word, 6)) { kind = 1; } else if (bindgen_equal_ascii(input, k, kw_end, &union_word, 5)) { kind = 2; } else if (bindgen_equal_ascii(input, k, kw_end, &enum_word, 4)) { kind = 3; }
+                    if (bindgen_equal_string(input, k, kw_end, struct_word)) { kind = 1; } else if (bindgen_equal_string(input, k, kw_end, union_word)) { kind = 2; } else if (bindgen_equal_string(input, k, kw_end, enum_word)) { kind = 3; }
                     if(kind>0) {
                         i64 ns=bindgen_skip_space(input,kw_end,brace); i64 ne=ns; while (ne<brace && bindgen_is_ident(raz_compiler_rt_arena_get(input,ne))) { ne+=1; }
                         if (ne > ns) {
                             if (kind != 2) {
                                 if (kind == 1) {
-                                    i64 prefix[22] = [64,114,101,112,114,40,67,41,112,117,98,108,105,99,32,115,116,114,117,99,116,32];
-                                    cursor = bindgen_append_literal(out, cap, cursor, &prefix, 22);
+                                                                        cursor = bindgen_append_string_literal(out, cap, cursor, "@repr(C)public struct ");
                                 } else {
-                                    i64 prefix[12] = [112,117,98,108,105,99,32,101,110,117,109,32];
-                                    cursor = bindgen_append_literal(out, cap, cursor, &prefix, 12);
+                                                                        cursor = bindgen_append_string_literal(out, cap, cursor, "public enum ");
                                 }
                                 cursor = bindgen_append_range(out, cap, cursor, input, ns, ne);
-                                i64 op[3] = [32,123,10];
-                                cursor = bindgen_append_literal(out, cap, cursor, &op, 3);
+                                                                cursor = bindgen_append_string_literal(out, cap, cursor, " {\n");
                             }
                             block_kind = kind;
                             block_name_start = ns;
@@ -962,8 +957,7 @@ fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -
                         }
                     }
                 } else if (bindgen_find_byte(input, a, b, 40) >= 0 && raz_compiler_rt_arena_get(input, b - 1) == 59) {
-                    i64 td[7] = [116,121,112,101,100,101,102];
-                    if (b - a >= 7 && bindgen_equal_ascii(input, a, a + 7, &td, 7)) {
+                                        if (b - a >= 7 && bindgen_equal_string(input, a, a + 7, "typedef")) {
                         i64 body = bindgen_skip_space(input, a + 7, b - 1);
                         i64 open = bindgen_find_byte(input, body, b - 1, 40);
                         i64 star = -1;
@@ -981,8 +975,7 @@ fn bindgen_generate(i64 input, i64 length, i64 out, i64 cap, bool windows_abi) -
                     }
                 } else {
                     // Simple typedef: typedef <type> Name;
-                    i64 td[7]=[116,121,112,101,100,101,102];
-                    if(b-a>=7 && bindgen_equal_ascii(input,a,a+7,&td,7) && raz_compiler_rt_arena_get(input,b-1)==59) {
+                                        if(b-a>=7 && bindgen_equal_string(input,a,a+7, "typedef") && raz_compiler_rt_arena_get(input,b-1)==59) {
                         i64 body=bindgen_skip_space(input,a+7,b-1); i64 ne=bindgen_trim_end(input,body,b-1); i64 ns=ne; while (ns>body && bindgen_is_ident(raz_compiler_rt_arena_get(input,ns-1))) { ns-=1; }
                         if (ns < ne) {
                             bindgen_alias_add(&mut aliases, ns, ne, body, ns);
@@ -1006,7 +999,7 @@ fn bindgen_command(i64 argc) -> i64 {
     i64 pl = cli_load_arg(2, path, 4096);
     if (pl <= 0) { return 2; }
     bool windows_abi=raz_compiler_rt_host_platform()==1; i64 output_index=3;
-    if(argc>3){ i64 option=raz_compiler_rt_arena_create(128); i64 ol=cli_load_arg(3,option,128); i64 win[20]=[45,45,116,97,114,103,101,116,45,97,98,105,61,119,105,110,100,111,119,115]; i64 unix[17]=[45,45,116,97,114,103,101,116,45,97,98,105,61,117,110,105,120]; if(cli_arg_equals(option,ol,&win,20)){windows_abi=true;output_index=4;} else if(cli_arg_equals(option,ol,&unix,17)){windows_abi=false;output_index=4;} raz_compiler_rt_arena_destroy(option); }
+    if(argc>3){ i64 option=raz_compiler_rt_arena_create(128); i64 ol=cli_load_arg(3,option,128); string win = "--target-abi=windows"; string unix = "--target-abi=unix"; if(cli_arg_equals_literal(option, ol, win)){windows_abi=true;output_index=4;} else if(cli_arg_equals_literal(option, ol, unix)){windows_abi=false;output_index=4;} raz_compiler_rt_arena_destroy(option); }
     i64 il = raz_compiler_rt_read_ascii(path, pl, input, 8388608);
     if (il < 0) { cli_print_invalid_arguments(); return 2; }
     i64 generated = bindgen_generate(input, il, output, 16777216, windows_abi);

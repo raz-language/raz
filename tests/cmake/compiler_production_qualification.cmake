@@ -61,7 +61,7 @@ if(NOT candidate_build_result EQUAL 0)
 endif()
 
 if(WIN32)
-  set(candidate_executable "${project}/target/debug/raz-compiler.exe")
+  set(candidate_executable "${project}/target/debug/bin/raz-compiler.exe")
   set(production_object "${project}/compiler-output.obj")
   set(production_executable "${project}/production.exe")
   set(smoke_object "${WORK_ROOT}/smoke/smoke.obj")
@@ -74,6 +74,8 @@ if(WIN32)
   set(structured_scalar_executable "${WORK_ROOT}/structured-scalar/structured-scalar.exe")
   set(structured_float_object "${WORK_ROOT}/structured-float/structured-float.obj")
   set(structured_float_executable "${WORK_ROOT}/structured-float/structured-float.exe")
+  set(structured_literal_receiver_object "${WORK_ROOT}/structured-literal-receiver/structured-literal-receiver.obj")
+  set(structured_literal_receiver_executable "${WORK_ROOT}/structured-literal-receiver/structured-literal-receiver.exe")
   set(structured_aggregate_object "${WORK_ROOT}/structured-aggregate/structured-aggregate.obj")
   set(structured_aggregate_executable "${WORK_ROOT}/structured-aggregate/structured-aggregate.exe")
   set(structured_array_object "${WORK_ROOT}/structured-array/structured-array.obj")
@@ -83,7 +85,7 @@ if(WIN32)
   set(structured_nested_object "${WORK_ROOT}/structured-nested/structured-nested.obj")
   set(structured_nested_executable "${WORK_ROOT}/structured-nested/structured-nested.exe")
 else()
-  set(candidate_executable "${project}/target/debug/raz-compiler")
+  set(candidate_executable "${project}/target/debug/bin/raz-compiler")
   set(production_object "${project}/compiler-output.o")
   set(production_executable "${project}/production")
   set(smoke_object "${WORK_ROOT}/smoke/smoke.o")
@@ -96,6 +98,8 @@ else()
   set(structured_scalar_executable "${WORK_ROOT}/structured-scalar/structured-scalar")
   set(structured_float_object "${WORK_ROOT}/structured-float/structured-float.o")
   set(structured_float_executable "${WORK_ROOT}/structured-float/structured-float")
+  set(structured_literal_receiver_object "${WORK_ROOT}/structured-literal-receiver/structured-literal-receiver.o")
+  set(structured_literal_receiver_executable "${WORK_ROOT}/structured-literal-receiver/structured-literal-receiver")
   set(structured_aggregate_object "${WORK_ROOT}/structured-aggregate/structured-aggregate.o")
   set(structured_aggregate_executable "${WORK_ROOT}/structured-aggregate/structured-aggregate")
   set(structured_array_object "${WORK_ROOT}/structured-array/structured-array.o")
@@ -269,6 +273,46 @@ execute_process(
   RESULT_VARIABLE structured_float_run_result)
 if(NOT structured_float_run_result EQUAL 42)
   message(FATAL_ERROR "Structured Forge float/C-ABI smoke returned ${structured_float_run_result}, expected 42")
+endif()
+
+# Direct literal method receivers require a MIR-only temporary local so `&self`
+# has stable storage. Structured Forge must infer the synthetic slot type and
+# lower it to native stack storage rather than falling back to compiler-private
+# arena/reference helpers.
+set(structured_literal_receiver "${WORK_ROOT}/structured-literal-receiver")
+file(MAKE_DIRECTORY "${structured_literal_receiver}")
+file(WRITE "${structured_literal_receiver}/main.rz" [=[impl string {
+    fn marker(string& self) -> i64 {
+        return 42;
+    }
+}
+
+public fn main() -> i64 {
+    return "literal".marker();
+}
+]=])
+execute_process(
+  COMMAND "${production_executable}" --forge-native --forge-structured-only --opt=3 "main.rz" "structured-literal-receiver.fir"
+  WORKING_DIRECTORY "${structured_literal_receiver}"
+  RESULT_VARIABLE structured_literal_receiver_compile_result
+  OUTPUT_VARIABLE structured_literal_receiver_compile_output
+  ERROR_VARIABLE structured_literal_receiver_compile_error)
+if(NOT structured_literal_receiver_compile_result EQUAL 0 OR NOT EXISTS "${structured_literal_receiver_object}")
+  message(FATAL_ERROR "Structured Forge literal receiver compilation failed:\n${structured_literal_receiver_compile_output}\n${structured_literal_receiver_compile_error}")
+endif()
+execute_process(
+  COMMAND "${CXX_COMPILER}" "${structured_literal_receiver_object}" -o "${structured_literal_receiver_executable}"
+  RESULT_VARIABLE structured_literal_receiver_link_result
+  OUTPUT_VARIABLE structured_literal_receiver_link_output
+  ERROR_VARIABLE structured_literal_receiver_link_error)
+if(NOT structured_literal_receiver_link_result EQUAL 0 OR NOT EXISTS "${structured_literal_receiver_executable}")
+  message(FATAL_ERROR "Structured Forge literal receiver leaked a compiler/runtime helper dependency:\n${structured_literal_receiver_link_output}\n${structured_literal_receiver_link_error}")
+endif()
+execute_process(
+  COMMAND "${structured_literal_receiver_executable}"
+  RESULT_VARIABLE structured_literal_receiver_run_result)
+if(NOT structured_literal_receiver_run_result EQUAL 42)
+  message(FATAL_ERROR "Structured Forge literal receiver smoke returned ${structured_literal_receiver_run_result}, expected 42")
 endif()
 
 # Exercise true Forge aggregate ABI metadata rather than the legacy pointer-only
@@ -1091,6 +1135,254 @@ endif()
 execute_process(COMMAND "${payload_enum_executable}" RESULT_VARIABLE payload_enum_result)
 if(NOT payload_enum_result EQUAL 42)
   message(FATAL_ERROR "Payload-enum native executable returned ${payload_enum_result}, expected 42")
+endif()
+
+# Nested payload-pattern parity: repeated outer variants are legal when their
+# nested discriminants differ, bindings come from the selected nested payload,
+# complete nested variant coverage is exhaustive without a wildcard, and
+# duplicate/subsumed patterns remain rejected.
+set(nested_payload_match_smoke "${WORK_ROOT}/nested-payload-match-smoke")
+file(MAKE_DIRECTORY "${nested_payload_match_smoke}")
+file(WRITE "${nested_payload_match_smoke}/main.rz" [=[enum Inner {
+    Empty,
+    Number(i64, i64, i64),
+    Flag(bool),
+}
+
+enum Outer {
+    None,
+    Some(Inner),
+}
+
+fn read(Outer value) -> i64 {
+    match value {
+        Outer::Some(Inner::Number(number, ..)) => { return number; }
+        Outer::Some(Inner::Flag(enabled)) => {
+            if (enabled) { return 7; }
+            return 3;
+        }
+        Outer::Some(Inner::Empty) => { return 1; }
+        Outer::None => { return 0; }
+    }
+}
+
+public fn main() -> i64 {
+    Outer number = Outer::Some(Inner::Number(35, 11, 13));
+    Outer flag = Outer::Some(Inner::Flag(true));
+    return read(number) + read(flag);
+}
+]=])
+set(nested_payload_match_ir "${nested_payload_match_smoke}/nested-payload-match-output.fir")
+execute_process(COMMAND "${production_executable}" "main.rz" "nested-payload-match-output.fir" WORKING_DIRECTORY "${nested_payload_match_smoke}" RESULT_VARIABLE nested_payload_match_compile_result)
+if(NOT nested_payload_match_compile_result EQUAL 0 OR NOT EXISTS "${nested_payload_match_ir}")
+  message(FATAL_ERROR "Native production compiler nested payload-match compilation failed with ${nested_payload_match_compile_result}")
+endif()
+if(WIN32)
+  set(nested_payload_match_object "${nested_payload_match_smoke}/nested-payload-match-smoke.obj")
+  set(nested_payload_match_executable "${nested_payload_match_smoke}/nested-payload-match-smoke.exe")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${nested_payload_match_ir}" "--emit-coff=${nested_payload_match_object}" --abi=windows RESULT_VARIABLE nested_payload_match_codegen_result OUTPUT_VARIABLE nested_payload_match_codegen_output ERROR_VARIABLE nested_payload_match_codegen_error)
+else()
+  set(nested_payload_match_object "${nested_payload_match_smoke}/nested-payload-match-smoke.o")
+  set(nested_payload_match_executable "${nested_payload_match_smoke}/nested-payload-match-smoke")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${nested_payload_match_ir}" "--emit-elf=${nested_payload_match_object}" --abi=sysv RESULT_VARIABLE nested_payload_match_codegen_result OUTPUT_VARIABLE nested_payload_match_codegen_output ERROR_VARIABLE nested_payload_match_codegen_error)
+endif()
+if(NOT nested_payload_match_codegen_result EQUAL 0 OR NOT EXISTS "${nested_payload_match_object}")
+  message(FATAL_ERROR "Nested payload-match native object emission failed:\n${nested_payload_match_codegen_output}\n${nested_payload_match_codegen_error}")
+endif()
+if(WIN32)
+  execute_process(COMMAND "${CXX_COMPILER}" "${nested_payload_match_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -o "${nested_payload_match_executable}" RESULT_VARIABLE nested_payload_match_link_result OUTPUT_VARIABLE nested_payload_match_link_output ERROR_VARIABLE nested_payload_match_link_error)
+else()
+  execute_process(COMMAND "${CXX_COMPILER}" "${nested_payload_match_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -pthread -o "${nested_payload_match_executable}" RESULT_VARIABLE nested_payload_match_link_result OUTPUT_VARIABLE nested_payload_match_link_output ERROR_VARIABLE nested_payload_match_link_error)
+endif()
+if(NOT nested_payload_match_link_result EQUAL 0 OR NOT EXISTS "${nested_payload_match_executable}")
+  message(FATAL_ERROR "Nested payload-match native link failed:\n${nested_payload_match_link_output}\n${nested_payload_match_link_error}")
+endif()
+execute_process(COMMAND "${nested_payload_match_executable}" RESULT_VARIABLE nested_payload_match_result)
+if(NOT nested_payload_match_result EQUAL 42)
+  message(FATAL_ERROR "Nested payload-match native executable returned ${nested_payload_match_result}, expected 42")
+endif()
+
+file(WRITE "${nested_payload_match_smoke}/duplicate.rz" [=[enum Inner { Number(i64) }
+enum Outer { Some(Inner) }
+public fn main() -> i64 {
+    Outer value = Outer::Some(Inner::Number(42));
+    match value {
+        Outer::Some(Inner::Number(first)) => { return first; }
+        Outer::Some(Inner::Number(second)) => { return second; }
+        _ => { return 0; }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "duplicate.rz" "duplicate.fir" WORKING_DIRECTORY "${nested_payload_match_smoke}" RESULT_VARIABLE nested_payload_match_duplicate_result)
+if(nested_payload_match_duplicate_result EQUAL 0 OR EXISTS "${nested_payload_match_smoke}/duplicate.fir")
+  message(FATAL_ERROR "Native production compiler accepted a duplicate nested payload pattern")
+endif()
+
+file(WRITE "${nested_payload_match_smoke}/non-exhaustive.rz" [=[enum Inner { Empty, Number(i64) }
+enum Outer { None, Some(Inner) }
+public fn main() -> i64 {
+    Outer value = Outer::Some(Inner::Number(42));
+    match value {
+        Outer::Some(Inner::Number(number)) => { return number; }
+        Outer::None => { return 0; }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "non-exhaustive.rz" "non-exhaustive.fir" WORKING_DIRECTORY "${nested_payload_match_smoke}" RESULT_VARIABLE nested_payload_match_non_exhaustive_result)
+if(nested_payload_match_non_exhaustive_result EQUAL 0 OR EXISTS "${nested_payload_match_smoke}/non-exhaustive.fir")
+  message(FATAL_ERROR "Native production compiler accepted a non-exhaustive nested payload match")
+endif()
+
+
+file(WRITE "${nested_payload_match_smoke}/subsumed.rz" [=[enum Inner { Empty, Number(i64) }
+enum Outer { Some(Inner) }
+public fn main() -> i64 {
+    Outer value = Outer::Some(Inner::Number(42));
+    match value {
+        Outer::Some(inner) => { return 1; }
+        Outer::Some(Inner::Number(number)) => { return number; }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "subsumed.rz" "subsumed.fir" WORKING_DIRECTORY "${nested_payload_match_smoke}" RESULT_VARIABLE nested_payload_match_subsumed_result)
+if(nested_payload_match_subsumed_result EQUAL 0 OR EXISTS "${nested_payload_match_smoke}/subsumed.fir")
+  message(FATAL_ERROR "Native production compiler accepted an unreachable/subsumed nested payload pattern")
+endif()
+
+# Aggregate-pattern parity: enum payloads may destructure named struct fields,
+# including nested enum constraints reached through aggregate-field path steps.
+set(struct_payload_match_smoke "${WORK_ROOT}/struct-payload-match-smoke")
+file(MAKE_DIRECTORY "${struct_payload_match_smoke}")
+file(WRITE "${struct_payload_match_smoke}/main.rz" [=[enum Mode {
+    A(i64),
+    B(i64),
+}
+
+struct Header {
+    Mode mode;
+    i64 length;
+    i64 flags;
+}
+
+enum Packet {
+    Message(Header, i64),
+}
+
+fn read(Packet packet) -> i64 {
+    match packet {
+        Packet::Message(Header { mode: Mode::A(value), .. }, body) => { return value + body; }
+        Packet::Message(Header { mode: Mode::B(value), .. }, body) => { return value + body + 1; }
+    }
+}
+
+public fn main() -> i64 {
+    Header header = Header { mode: Mode::B(35), length: 9, flags: 3 };
+    return read(Packet::Message(header, 6));
+}
+]=])
+set(struct_payload_match_ir "${struct_payload_match_smoke}/struct-payload-match-output.fir")
+execute_process(COMMAND "${production_executable}" "main.rz" "struct-payload-match-output.fir" WORKING_DIRECTORY "${struct_payload_match_smoke}" RESULT_VARIABLE struct_payload_match_compile_result)
+if(NOT struct_payload_match_compile_result EQUAL 0 OR NOT EXISTS "${struct_payload_match_ir}")
+  message(FATAL_ERROR "Native production compiler struct payload-match compilation failed with ${struct_payload_match_compile_result}")
+endif()
+if(WIN32)
+  set(struct_payload_match_object "${struct_payload_match_smoke}/struct-payload-match-smoke.obj")
+  set(struct_payload_match_executable "${struct_payload_match_smoke}/struct-payload-match-smoke.exe")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${struct_payload_match_ir}" "--emit-coff=${struct_payload_match_object}" --abi=windows RESULT_VARIABLE struct_payload_match_codegen_result OUTPUT_VARIABLE struct_payload_match_codegen_output ERROR_VARIABLE struct_payload_match_codegen_error)
+else()
+  set(struct_payload_match_object "${struct_payload_match_smoke}/struct-payload-match-smoke.o")
+  set(struct_payload_match_executable "${struct_payload_match_smoke}/struct-payload-match-smoke")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${struct_payload_match_ir}" "--emit-elf=${struct_payload_match_object}" --abi=sysv RESULT_VARIABLE struct_payload_match_codegen_result OUTPUT_VARIABLE struct_payload_match_codegen_output ERROR_VARIABLE struct_payload_match_codegen_error)
+endif()
+if(NOT struct_payload_match_codegen_result EQUAL 0 OR NOT EXISTS "${struct_payload_match_object}")
+  message(FATAL_ERROR "Struct payload-match native object emission failed:\n${struct_payload_match_codegen_output}\n${struct_payload_match_codegen_error}")
+endif()
+if(WIN32)
+  execute_process(COMMAND "${CXX_COMPILER}" "${struct_payload_match_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -o "${struct_payload_match_executable}" RESULT_VARIABLE struct_payload_match_link_result OUTPUT_VARIABLE struct_payload_match_link_output ERROR_VARIABLE struct_payload_match_link_error)
+else()
+  execute_process(COMMAND "${CXX_COMPILER}" "${struct_payload_match_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -pthread -o "${struct_payload_match_executable}" RESULT_VARIABLE struct_payload_match_link_result OUTPUT_VARIABLE struct_payload_match_link_error)
+endif()
+if(NOT struct_payload_match_link_result EQUAL 0 OR NOT EXISTS "${struct_payload_match_executable}")
+  message(FATAL_ERROR "Struct payload-match native link failed:\n${struct_payload_match_link_output}\n${struct_payload_match_link_error}")
+endif()
+execute_process(COMMAND "${struct_payload_match_executable}" RESULT_VARIABLE struct_payload_match_result)
+if(NOT struct_payload_match_result EQUAL 42)
+  message(FATAL_ERROR "Struct payload-match native executable returned ${struct_payload_match_result}, expected 42")
+endif()
+
+file(WRITE "${struct_payload_match_smoke}/invalid-missing-fields.rz" [=[struct Header { i64 kind; i64 length; }
+enum Packet { Message(Header) }
+public fn main() -> i64 {
+    Packet packet = Packet::Message(Header { kind: 1, length: 2 });
+    match packet {
+        Packet::Message(Header { kind }) => { return kind; }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "invalid-missing-fields.rz" "invalid-missing-fields.fir" WORKING_DIRECTORY "${struct_payload_match_smoke}" RESULT_VARIABLE struct_payload_match_missing_result)
+if(struct_payload_match_missing_result EQUAL 0 OR EXISTS "${struct_payload_match_smoke}/invalid-missing-fields.fir")
+  message(FATAL_ERROR "Native production compiler accepted a struct pattern with omitted fields and no rest pattern")
+endif()
+
+# Guarded-pattern parity: guards execute after bindings are established, false
+# guards fall through to later structural arms, and guarded arms never satisfy
+# compile-time exhaustiveness by themselves.
+set(match_guard_smoke "${WORK_ROOT}/match-guard-smoke")
+file(MAKE_DIRECTORY "${match_guard_smoke}")
+file(WRITE "${match_guard_smoke}/main.rz" [=[enum Inner { Empty, Number(i64) }
+enum Outer { None, Some(Inner) }
+fn read(Outer value) -> i64 {
+    match value {
+        Outer::Some(Inner::Number(number)) if number < 10 => { return 1; }
+        Outer::Some(Inner::Number(number)) if number == 42 => { return number; }
+        Outer::Some(Inner::Number(move number)) => { return number + 1; }
+        Outer::Some(Inner::Empty) => { return 2; }
+        Outer::None => { return 0; }
+    }
+}
+public fn main() -> i64 { return read(Outer::Some(Inner::Number(42))); }
+]=])
+set(match_guard_ir "${match_guard_smoke}/match-guard-output.fir")
+execute_process(COMMAND "${production_executable}" "main.rz" "match-guard-output.fir" WORKING_DIRECTORY "${match_guard_smoke}" RESULT_VARIABLE match_guard_compile_result)
+if(NOT match_guard_compile_result EQUAL 0 OR NOT EXISTS "${match_guard_ir}")
+  message(FATAL_ERROR "Native production compiler guarded-pattern compilation failed with ${match_guard_compile_result}")
+endif()
+if(WIN32)
+  set(match_guard_object "${match_guard_smoke}/match-guard-smoke.obj")
+  set(match_guard_executable "${match_guard_smoke}/match-guard-smoke.exe")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${match_guard_ir}" "--emit-coff=${match_guard_object}" --abi=windows RESULT_VARIABLE match_guard_codegen_result OUTPUT_VARIABLE match_guard_codegen_output ERROR_VARIABLE match_guard_codegen_error)
+else()
+  set(match_guard_object "${match_guard_smoke}/match-guard-smoke.o")
+  set(match_guard_executable "${match_guard_smoke}/match-guard-smoke")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${match_guard_ir}" "--emit-elf=${match_guard_object}" --abi=sysv RESULT_VARIABLE match_guard_codegen_result OUTPUT_VARIABLE match_guard_codegen_output ERROR_VARIABLE match_guard_codegen_error)
+endif()
+if(NOT match_guard_codegen_result EQUAL 0 OR NOT EXISTS "${match_guard_object}")
+  message(FATAL_ERROR "Guarded-pattern native object emission failed:\n${match_guard_codegen_output}\n${match_guard_codegen_error}")
+endif()
+if(WIN32)
+  execute_process(COMMAND "${CXX_COMPILER}" "${match_guard_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -o "${match_guard_executable}" RESULT_VARIABLE match_guard_link_result OUTPUT_VARIABLE match_guard_link_output ERROR_VARIABLE match_guard_link_error)
+else()
+  execute_process(COMMAND "${CXX_COMPILER}" "${match_guard_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -pthread -o "${match_guard_executable}" RESULT_VARIABLE match_guard_link_result OUTPUT_VARIABLE match_guard_link_output ERROR_VARIABLE match_guard_link_error)
+endif()
+if(NOT match_guard_link_result EQUAL 0 OR NOT EXISTS "${match_guard_executable}")
+  message(FATAL_ERROR "Guarded-pattern native link failed:\n${match_guard_link_output}\n${match_guard_link_error}")
+endif()
+execute_process(COMMAND "${match_guard_executable}" RESULT_VARIABLE match_guard_result)
+if(NOT match_guard_result EQUAL 42)
+  message(FATAL_ERROR "Guarded-pattern native executable returned ${match_guard_result}, expected 42")
+endif()
+file(WRITE "${match_guard_smoke}/invalid-non-exhaustive.rz" [=[enum Value { A(i64), B(i64) }
+public fn main() -> i64 {
+    Value value = Value::A(42);
+    match value {
+        Value::A(number) if number > 0 => { return number; }
+        Value::B(number) if number > 0 => { return number; }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "invalid-non-exhaustive.rz" "invalid-non-exhaustive.fir" WORKING_DIRECTORY "${match_guard_smoke}" RESULT_VARIABLE match_guard_non_exhaustive_result)
+if(match_guard_non_exhaustive_result EQUAL 0 OR EXISTS "${match_guard_smoke}/invalid-non-exhaustive.fir")
+  message(FATAL_ERROR "Native production compiler incorrectly treated guarded arms as exhaustive")
 endif()
 
 # Defer parity: lexical LIFO cleanup on normal scope exit, return, and loop exit.
@@ -2011,4 +2303,74 @@ foreach(c1_invalid IN ITEMS invalid-bound invalid-associated invalid-generic-ass
     message(FATAL_ERROR "C1 native production compiler accepted invalid trait case ${c1_invalid}")
   endif()
 endforeach()
+
+
+# Pattern-borrow qualification: projected references must alias the original
+# aggregate storage, remain path-sensitive, and reject parent mutation while a
+# child loan is live.
+set(pattern_ref_smoke "${WORK_ROOT}/pattern-ref-smoke")
+file(MAKE_DIRECTORY "${pattern_ref_smoke}")
+file(WRITE "${pattern_ref_smoke}/main.rz" [=[struct Header { i64 left; i64 right; }
+enum Packet { Message(Header) }
+fn main() -> i64 {
+    Packet packet = Packet::Message(Header { left: 1, right: 2 });
+    match packet {
+        Packet::Message(Header { ref mut left, ref mut right }) => {
+            *left = 20;
+            *right = 22;
+        }
+    }
+    match packet {
+        Packet::Message(Header { ref left, ref right }) => { return *left + *right; }
+    }
+}
+]=])
+set(pattern_ref_ir "${pattern_ref_smoke}/main.fir")
+execute_process(COMMAND "${production_executable}" "main.rz" "main.fir" WORKING_DIRECTORY "${pattern_ref_smoke}" RESULT_VARIABLE pattern_ref_compile_result)
+if(NOT pattern_ref_compile_result EQUAL 0 OR NOT EXISTS "${pattern_ref_ir}")
+  message(FATAL_ERROR "Native production compiler pattern-reference smoke failed to compile: ${pattern_ref_compile_result}")
+endif()
+if(WIN32)
+  set(pattern_ref_object "${pattern_ref_smoke}/main.obj")
+  set(pattern_ref_executable "${pattern_ref_smoke}/main.exe")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${pattern_ref_ir}" "--emit-coff=${pattern_ref_object}" --abi=windows RESULT_VARIABLE pattern_ref_codegen_result)
+  if(pattern_ref_codegen_result EQUAL 0)
+    execute_process(COMMAND "${CXX_COMPILER}" "${pattern_ref_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} ws2_32.lib bcrypt.lib -o "${pattern_ref_executable}" RESULT_VARIABLE pattern_ref_link_result)
+  endif()
+else()
+  set(pattern_ref_object "${pattern_ref_smoke}/main.o")
+  set(pattern_ref_executable "${pattern_ref_smoke}/main")
+  execute_process(COMMAND "${optimized_forge_codegen}" "${pattern_ref_ir}" "--emit-elf=${pattern_ref_object}" --abi=sysv RESULT_VARIABLE pattern_ref_codegen_result)
+  if(pattern_ref_codegen_result EQUAL 0)
+    execute_process(COMMAND "${CXX_COMPILER}" "${pattern_ref_object}" "${RAZ_RUNTIME_LIB}" ${raz_runtime_link_deps} -pthread -o "${pattern_ref_executable}" RESULT_VARIABLE pattern_ref_link_result)
+  endif()
+endif()
+if(NOT pattern_ref_codegen_result EQUAL 0 OR NOT pattern_ref_link_result EQUAL 0 OR NOT EXISTS "${pattern_ref_executable}")
+  message(FATAL_ERROR "Pattern-reference smoke failed to emit/link")
+endif()
+execute_process(COMMAND "${pattern_ref_executable}" RESULT_VARIABLE pattern_ref_run_result)
+if(NOT pattern_ref_run_result EQUAL 42)
+  message(FATAL_ERROR "Pattern-reference executable returned ${pattern_ref_run_result}, expected 42")
+endif()
+file(WRITE "${pattern_ref_smoke}/invalid-parent-conflict.rz" [=[enum Pair { Both(i64, i64) }
+fn main() -> i64 {
+    Pair pair = Pair::Both(1, 2);
+    match pair {
+        Pair::Both(ref mut left, _) => {
+            pair = Pair::Both(20, 22);
+            return *left;
+        }
+    }
+}
+]=])
+execute_process(COMMAND "${production_executable}" "invalid-parent-conflict.rz" "invalid-parent-conflict.fir" WORKING_DIRECTORY "${pattern_ref_smoke}" RESULT_VARIABLE pattern_ref_conflict_result OUTPUT_VARIABLE pattern_ref_conflict_output ERROR_VARIABLE pattern_ref_conflict_error)
+if(pattern_ref_conflict_result EQUAL 0 OR EXISTS "${pattern_ref_smoke}/invalid-parent-conflict.fir")
+  message(FATAL_ERROR "Native production compiler accepted parent mutation while a pattern child loan was live")
+endif()
+string(CONCAT pattern_ref_conflict_text "${pattern_ref_conflict_output}" "${pattern_ref_conflict_error}")
+if(NOT pattern_ref_conflict_text MATCHES "borrow conflict")
+  message(FATAL_ERROR "Pattern-reference conflict did not report borrow conflict")
+endif()
+message(STATUS "Pattern borrow bindings: shared/exclusive projected references, disjoint mutation, write-through, and parent-conflict rejection passed")
+
 message(STATUS "C1 compiler trait parity: generic bounds, bound method lookup, associated requirements, generic trait applicability, and overlap rejection passed")

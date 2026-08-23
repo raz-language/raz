@@ -639,9 +639,9 @@ Diagnostics verify_module(const Module& module) {
                         diagnostics.push_back({DiagnosticSeverity::error, "callback store signature mismatch for " + operation.operands[1], {}});
                 }
                 if (operation.opcode == "global.address") {
-                    if (operation.type != Type(TypeKind::ptr) || operation.result.empty() ||
+                    if ((operation.type != Type(TypeKind::ptr) && operation.type != Type(TypeKind::i64)) || operation.result.empty() ||
                         operation.operands.size() != 1 || !operation.operands[0].starts_with("@")) {
-                        diagnostics.push_back({DiagnosticSeverity::error, "global.address requires ptr result and global symbol", {}});
+                        diagnostics.push_back({DiagnosticSeverity::error, "global.address requires pointer-sized ptr/i64 result and global symbol", {}});
                     } else if (!global_names.contains(operation.operands[0].substr(1))) {
                         diagnostics.push_back({DiagnosticSeverity::error, "unknown global address " + operation.operands[0], {}});
                     }

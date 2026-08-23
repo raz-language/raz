@@ -8,6 +8,17 @@ public import raz_compiler_driver_signing;
 // Registry transport and deterministic package-archive handling. Network policy,
 // HTTP framing, TLS pumping, mirror fallback, and archive extraction live in Raz;
 // the runtime exports only socket/TLS/filesystem ABI primitives.
+fn registry_env_ascii_literal(string key, i64 output, i64 capacity) -> i64 {
+    i64 key_length = compiler_literal_length(key);
+    i64 name = raz_compiler_rt_arena_create(key_length);
+    if (name == 0) { return -1; }
+    i64 i = 0;
+    while (i < key_length) { raz_compiler_rt_arena_set(name, i, compiler_literal_byte(key, i)); i += 1; }
+    i64 n = raz_compiler_rt_env_get_ascii(name, key_length, output, capacity);
+    raz_compiler_rt_arena_destroy(name);
+    return n;
+}
+
 fn registry_env_ascii(i64[]key, i64 key_length, i64 output, i64 capacity) -> i64 {
     i64 name = raz_compiler_rt_arena_create(key_length);
 
@@ -26,6 +37,17 @@ fn registry_env_ascii(i64[]key, i64 key_length, i64 output, i64 capacity) -> i64
 
     raz_compiler_rt_arena_destroy(name);
     return n;
+}
+
+fn registry_starts_literal(i64 data, i64 length, string prefix) -> bool {
+    i64 prefix_length = compiler_literal_length(prefix);
+    if (length < prefix_length) { return false; }
+    i64 i = 0;
+    while (i < prefix_length) {
+        if (raz_compiler_rt_arena_get(data, i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
 }
 
 fn registry_starts(i64 data, i64 length, i64[]prefix, i64 prefix_length) -> bool {
@@ -56,15 +78,15 @@ fn registry_url_parse(
     i64&mut port,
     bool&mut secure,
 ) -> bool {
-    i64 http[7] = [104, 116, 116, 112, 58, 47, 47];
-    i64 https[8] = [104, 116, 116, 112, 115, 58, 47, 47];
+    string http = "http://";
+    string https = "https://";
     i64 cursor = 0;
 
-    if (registry_starts(url, length, &https, 8)) {
+    if (registry_starts_literal(url, length, https)) {
         *secure = true;
         *port = 443;
         cursor = 8;
-    } else if (registry_starts(url, length, &http, 7)) {
+    } else if (registry_starts_literal(url, length, http)) {
         *secure = false;
         *port = 80;
         cursor = 7;
@@ -209,26 +231,26 @@ fn registry_transport_request(
     i64 capacity,
 ) -> i64 {
     i64 cursor = 0;
-    i64 a[4] = [71, 69, 84, 32];
+    
 
-    package_append_literal(request, capacity, &mut cursor, &a, 4);
+    package_append_string_literal(request, capacity, &mut cursor, "GET ");
     package_append(request, capacity, &mut cursor, path, 0, path_length);
 
-    i64 b[17] = [32, 72, 84, 84, 80, 47, 49, 46, 48, 13, 10, 72, 111, 115, 116, 58, 32];
+    
 
-    package_append_literal(request, capacity, &mut cursor, &b, 17);
+    package_append_string_literal(request, capacity, &mut cursor, " HTTP/1.0\r\nHost: ");
     package_append(request, capacity, &mut cursor, host, 0, host_length);
 
-    i64 c[34] = [13, 10, 85, 115, 101, 114, 45, 65, 103, 101, 110, 116, 58, 32, 82, 97, 122, 47, 49, 46, 48, 13, 10, 65, 99, 99, 101, 112, 116, 58, 32, 42, 47, 42];
+    
 
-    package_append_literal(request, capacity, &mut cursor, &c, 34);
+    package_append_string_literal(request, capacity, &mut cursor, "\r\nUser-Agent: Raz/1.0\r\nAccept: */*");
 
     bool github_api = host_length == 14;
-    i64 gh_host[14] = [97, 112, 105, 46, 103, 105, 116, 104, 117, 98, 46, 99, 111, 109];
+    string gh_host = "api.github.com";
     i64 gh_i = 0;
 
     while (github_api && gh_i < 14) {
-        if (raz_compiler_rt_arena_get(host, gh_i) != gh_host[gh_i]) {
+        if (raz_compiler_rt_arena_get(host, gh_i) != compiler_literal_byte(gh_host, gh_i)) {
             github_api = false;
         }
         gh_i += 1;
@@ -240,26 +262,26 @@ fn registry_transport_request(
             i64 tl = registry_publish_token(token, 8192, true);
 
             if (tl> 0) {
-                i64 ah[24] = [13, 10, 65, 117, 116, 104, 111, 114, 105, 122, 97, 116, 105, 111, 110, 58, 32, 66, 101, 97, 114, 101, 114, 32];
+                
 
-                package_append_literal(request, capacity, &mut cursor, &ah, 24);
+                package_append_string_literal(request, capacity, &mut cursor, "\r\nAuthorization: Bearer ");
                 package_append(request, capacity, &mut cursor, token, 0, tl);
             }
             raz_compiler_rt_arena_destroy(token);
         }
 
-        i64 api[61] = [13, 10, 65, 99, 99, 101, 112, 116, 58, 32, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 118, 110, 100, 46, 103, 105, 116, 104, 117, 98, 43, 106, 115, 111, 110, 13, 10, 88, 45, 71, 105, 116, 72, 117, 98, 45, 65, 112, 105, 45, 86, 101, 114, 115, 105, 111, 110, 58, 32];
+        
 
-        package_append_literal(request, capacity, &mut cursor, &api, 61);
+        package_append_string_literal(request, capacity, &mut cursor, "\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: ");
 
-        i64 ver[10] = [50, 48, 50, 54, 45, 48, 51, 45, 49, 48];
+        
 
-        package_append_literal(request, capacity, &mut cursor, &ver, 10);
+        package_append_string_literal(request, capacity, &mut cursor, "2026-03-10");
     }
 
-    i64 tail[23] = [13, 10, 67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 58, 32, 99, 108, 111, 115, 101, 13, 10, 13, 10];
+    
 
-    package_append_literal(request, capacity, &mut cursor, &tail, 23);
+    package_append_string_literal(request, capacity, &mut cursor, "\r\nConnection: close\r\n\r\n");
     return cursor;
 }
 
@@ -325,7 +347,7 @@ fn registry_http_location(i64 response, i64 length, i64 output, i64 capacity) ->
         i += 1;
     }
 
-    i64 key[8] = [108, 111, 99, 97, 116, 105, 111, 110];
+    string key = "location";
 
     while (i < length) {
         i64 start = i;
@@ -361,7 +383,7 @@ fn registry_http_location(i64 response, i64 length, i64 output, i64 capacity) ->
                 if (ch >= 65 && ch <= 90) {
                     ch += 32;
                 }
-                if (ch != key[k]) {
+                if (ch != compiler_literal_byte(key, k)) {
                     same = false;
                 }
                 k += 1;
@@ -600,16 +622,16 @@ fn registry_join_url(
             suffix_length -= 1;
         }
     } else if (suffix_length == 0 || raz_compiler_rt_arena_get(suffix, suffix_start) != 47) {
-        i64 slash[1] = [47];
+        
 
-        package_append_literal(output, capacity, &mut cursor, &slash, 1);
+        package_append_string_literal(output, capacity, &mut cursor, "/");
     }
     package_append(output, capacity, &mut cursor, suffix, suffix_start, suffix_length);
     return cursor;
 }
 
 fn registry_default_base(i64 output, i64 capacity) -> i64 {
-    i64 value[60] = [104, 116, 116, 112, 115, 58, 47, 47, 114, 97, 119, 46, 103, 105, 116, 104, 117, 98, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116, 46, 99, 111, 109, 47, 114, 97, 122, 45, 108, 97, 110, 103, 117, 97, 103, 101, 47, 112, 97, 99, 107, 97, 103, 101, 115, 47, 109, 97, 105, 110];
+    string value = "https://raw.githubusercontent.com/raz-language/packages/main";
 
     if (capacity < 60) {
         return -1;
@@ -618,7 +640,7 @@ fn registry_default_base(i64 output, i64 capacity) -> i64 {
     i64 i = 0;
 
     while (i < 60) {
-        raz_compiler_rt_arena_set(output, i, value[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(value, i));
         i += 1;
     }
     return 60;
@@ -631,13 +653,13 @@ fn registry_fetch_base_index(i64 base, i64 base_length, i64 output, i64 capacity
         return -70;
     }
 
-    i64 suffix[9] = [105, 110, 100, 101, 120, 46, 116, 120, 116];
+    string suffix = "index.txt";
     i64 sl = 9;
     i64 tmp = raz_compiler_rt_arena_create(9);
     i64 i = 0;
 
     while (i<9) {
-        raz_compiler_rt_arena_set(tmp, i, suffix[i]);
+        raz_compiler_rt_arena_set(tmp, i, compiler_literal_byte(suffix, i));
         i += 1;
     }
 
@@ -675,18 +697,18 @@ fn registry_index_cache_path(i64 output, i64 capacity) -> i64 {
 
     package_append(output, capacity, &mut cursor, parent, 0, parent_length);
 
-    i64 registry_dir[9] = [47, 114, 101, 103, 105, 115, 116, 114, 121];
+    
 
-    package_append_literal(output, capacity, &mut cursor, &registry_dir, 9);
+    package_append_string_literal(output, capacity, &mut cursor, "/registry");
     if (raz_compiler_rt_create_dir_ascii(output, cursor) != 0) {
         raz_compiler_rt_arena_destroy(credentials);
         raz_compiler_rt_arena_destroy(parent);
         return -1;
     }
 
-    i64 tail[10] = [47, 105, 110, 100, 101, 120, 46, 116, 120, 116];
+    
 
-    package_append_literal(output, capacity, &mut cursor, &tail, 10);
+    package_append_string_literal(output, capacity, &mut cursor, "/index.txt");
     raz_compiler_rt_arena_destroy(credentials);
     raz_compiler_rt_arena_destroy(parent);
     return cursor;
@@ -745,8 +767,8 @@ fn registry_load_index(i64 output, i64 capacity, i64 base, i64 base_capacity, i6
         // offline resolver snapshots from accidentally treating package paths as
         // process-working-directory paths.
 
-        i64 pkey[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
-        i64 configured = registry_env_ascii(&pkey, 16, base, base_capacity);
+        string pkey = "RAZ_REGISTRY_URL";
+        i64 configured = registry_env_ascii_literal(pkey, base, base_capacity);
 
         if (configured> 0) {
             *base_length = configured;
@@ -779,8 +801,8 @@ fn registry_load_index(i64 output, i64 capacity, i64 base, i64 base_capacity, i6
         return -70;
     }
 
-    i64 pkey[16] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 85, 82, 76];
-    i64 plen = registry_env_ascii(&pkey, 16, primary, 8192);
+    string pkey = "RAZ_REGISTRY_URL";
+    i64 plen = registry_env_ascii_literal(pkey, primary, 8192);
 
     // The official registry is GitHub-backed. RAZ_REGISTRY_URL still overrides
     // this for private registries, mirrors, and deterministic test fixtures.
@@ -807,8 +829,8 @@ fn registry_load_index(i64 output, i64 capacity, i64 base, i64 base_capacity, i6
         }
     }
 
-    i64 mkey[20] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 77, 73, 82, 82, 79, 82, 83];
-    i64 ml = registry_env_ascii(&mkey, 20, mirrors, 32768);
+    string mkey = "RAZ_REGISTRY_MIRRORS";
+    i64 ml = registry_env_ascii_literal(mkey, mirrors, 32768);
     i64 pos = 0;
 
     while (ml> 0 && pos<ml) {
@@ -945,7 +967,7 @@ fn registry_decode_hex(i64 source, i64 start, i64 length, i64 output, i64 capaci
 }
 
 fn registry_extract_archive(i64 archive, i64 length, i64 destination, i64 destination_length) -> i64 {
-    i64 header[8] = [82, 65, 90, 80, 75, 71, 49, 10];
+    string header = "RAZPKG1\n";
 
     if (length<8) {
         return 66;
@@ -954,7 +976,7 @@ fn registry_extract_archive(i64 archive, i64 length, i64 destination, i64 destin
     i64 i = 0;
 
     while (i<8) {
-        if (raz_compiler_rt_arena_get(archive, i) != header[i]) {
+        if (raz_compiler_rt_arena_get(archive, i) != compiler_literal_byte(header, i)) {
             return 66;
         }
         i += 1;
@@ -1017,9 +1039,9 @@ fn registry_extract_archive(i64 archive, i64 length, i64 destination, i64 destin
 
         package_append(full, 8192, &mut cursor, destination, 0, destination_length);
 
-        i64 slash[1] = [47];
+        
 
-        package_append_literal(full, 8192, &mut cursor, &slash, 1);
+        package_append_string_literal(full, 8192, &mut cursor, "/");
         package_append(full, 8192, &mut cursor, path, 0, pl);
 
         i64 parent = cursor - 1;
@@ -1173,9 +1195,9 @@ fn registry_pack_tree(i64 root, i64 root_length, i64 archive, i64 archive_capaci
     }
 
     i64 cursor = 0;
-    i64 header[8] = [82, 65, 90, 80, 75, 71, 49, 10];
+    
 
-    if (!package_append_literal(archive, archive_capacity, &mut cursor, &header, 8)) {
+    if (!package_append_string_literal(archive, archive_capacity, &mut cursor, "RAZPKG1\n")) {
         return -40;
     }
 
@@ -1232,9 +1254,9 @@ fn registry_pack_tree(i64 root, i64 root_length, i64 archive, i64 archive_capaci
             raz_compiler_rt_arena_get(full, fc - 1) != 47 &&
             raz_compiler_rt_arena_get(full, fc - 1) != 92
         ) {
-            i64 slash[1] = [47];
+            
 
-            package_append_literal(full, 8192, &mut fc, &slash, 1);
+            package_append_string_literal(full, 8192, &mut fc, "/");
         }
         package_append(full, 8192, &mut fc, listing, start, pl);
 
@@ -1244,25 +1266,25 @@ fn registry_pack_tree(i64 root, i64 root_length, i64 archive, i64 archive_capaci
             return -65;
         }
 
-        i64 f[2] = [70, 32];
+        
 
         if (
-            !package_append_literal(archive, archive_capacity, &mut cursor, &f, 2) ||
+            !package_append_string_literal(archive, archive_capacity, &mut cursor, "F ") ||
             !registry_append_hex_bytes(archive, archive_capacity, &mut cursor, listing, start, pl)
         ) {
             return -40;
         }
 
-        i64 sp[1] = [32];
+        
 
-        package_append_literal(archive, archive_capacity, &mut cursor, &sp, 1);
+        package_append_string_literal(archive, archive_capacity, &mut cursor, " ");
         if (!registry_append_hex_bytes(archive, archive_capacity, &mut cursor, data, 0, dl)) {
             return -40;
         }
 
-        i64 nl[1] = [10];
+        
 
-        package_append_literal(archive, archive_capacity, &mut cursor, &nl, 1);
+        package_append_string_literal(archive, archive_capacity, &mut cursor, "\n");
         raz_compiler_rt_arena_destroy(full);
         raz_compiler_rt_arena_destroy(data);
     }
@@ -1283,19 +1305,19 @@ fn registry_credentials_path(
         return -1;
     }
 
-    i64 raz_home_key[8] = [82, 65, 90, 95, 72, 79, 77, 69];
-    i64 hl = registry_env_ascii(&raz_home_key, 8, home, 8192);
+    string raz_home_key = "RAZ_HOME";
+    i64 hl = registry_env_ascii_literal(raz_home_key, home, 8192);
     bool explicit_raz_home = hl> 0;
 
     if (hl <= 0) {
-        i64 home_key[4] = [72, 79, 77, 69];
+        string home_key = "HOME";
 
-        hl = registry_env_ascii(&home_key, 4, home, 8192);
+        hl = registry_env_ascii_literal(home_key, home, 8192);
     }
     if (hl <= 0) {
-        i64 profile_key[11] = [85, 83, 69, 82, 80, 82, 79, 70, 73, 76, 69];
+        string profile_key = "USERPROFILE";
 
-        hl = registry_env_ascii(&profile_key, 11, home, 8192);
+        hl = registry_env_ascii_literal(profile_key, home, 8192);
     }
 
     i64 cursor = 0;
@@ -1313,7 +1335,7 @@ fn registry_credentials_path(
             i += 1;
         }
         if (!explicit_raz_home) {
-            i64 suffix[5] = [47, 46, 114, 97, 122];
+            string suffix = "/.raz";
 
             i = 0;
             while (i < 5) {
@@ -1321,13 +1343,13 @@ fn registry_credentials_path(
                     raz_compiler_rt_arena_destroy(home);
                     return -1;
                 }
-                raz_compiler_rt_arena_set(parent, cursor, suffix[i]);
+                raz_compiler_rt_arena_set(parent, cursor, compiler_literal_byte(suffix, i));
                 cursor += 1;
                 i += 1;
             }
         }
     } else {
-        i64 fallback[6] = [46, 47, 46, 114, 97, 122];
+        string fallback = "./.raz";
         i64 i = 0;
 
         while (i < 6) {
@@ -1335,7 +1357,7 @@ fn registry_credentials_path(
                 raz_compiler_rt_arena_destroy(home);
                 return -1;
             }
-            raz_compiler_rt_arena_set(parent, cursor, fallback[i]);
+            raz_compiler_rt_arena_set(parent, cursor, compiler_literal_byte(fallback, i));
             cursor += 1;
             i += 1;
         }
@@ -1353,11 +1375,11 @@ fn registry_credentials_path(
         i += 1;
     }
 
-    i64 tail[12] = [47, 99, 114, 101, 100, 101, 110, 116, 105, 97, 108, 115];
+    string tail = "/credentials";
 
     i = 0;
     while (i < 12) {
-        raz_compiler_rt_arena_set(output, cursor + i, tail[i]);
+        raz_compiler_rt_arena_set(output, cursor + i, compiler_literal_byte(tail, i));
         i += 1;
     }
     raz_compiler_rt_arena_destroy(home);
@@ -1439,9 +1461,9 @@ fn registry_login_command(i64 argc) -> i64 {
         return 56;
     }
 
-    i64 message[37] = [83, 97, 118, 101, 100, 32, 82, 97, 122, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 99, 114, 101, 100, 101, 110, 116, 105, 97, 108, 115, 46, 10, 0, 0, 0, 0, 0];
+    string message = "Saved Raz registry credentials.\n";
 
-    cli_write(&message, 32);
+    cli_write_literal(message);
     raz_compiler_rt_arena_destroy(token);
     raz_compiler_rt_arena_destroy(path);
     raz_compiler_rt_arena_destroy(parent);
@@ -1470,21 +1492,21 @@ fn registry_logout_command(i64 argc) -> i64 {
         }
     }
 
-    i64 message[33] = [82, 101, 109, 111, 118, 101, 100, 32, 82, 97, 122, 32, 114, 101, 103, 105, 115, 116, 114, 121, 32, 99, 114, 101, 100, 101, 110, 116, 105, 97, 108, 115, 46];
+    
 
-    cli_write(&message, 33);
+    cli_write_literal("Removed Raz registry credentials.");
 
-    i64 newline[1] = [10];
+    
 
-    cli_write(&newline, 1);
+    cli_write_literal("\n");
     raz_compiler_rt_arena_destroy(path);
     raz_compiler_rt_arena_destroy(parent);
     return 0;
 }
 
 fn registry_publish_token(i64 output, i64 capacity, bool allow_github) -> i64 {
-    i64 registry_key[18] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 84, 79, 75, 69, 78];
-    i64 length = registry_env_ascii(&registry_key, 18, output, capacity);
+    string registry_key = "RAZ_REGISTRY_TOKEN";
+    i64 length = registry_env_ascii_literal(registry_key, output, capacity);
 
     if (length> 0 || !allow_github) {
         return length;
@@ -1494,9 +1516,9 @@ fn registry_publish_token(i64 output, i64 capacity, bool allow_github) -> i64 {
     // GitHub-backed without making users duplicate the same token into a Raz-
     // specific environment variable.
 
-    i64 github_key[12] = [71, 73, 84, 72, 85, 66, 95, 84, 79, 75, 69, 78];
+    string github_key = "GITHUB_TOKEN";
 
-    length = registry_env_ascii(&github_key, 12, output, capacity);
+    length = registry_env_ascii_literal(github_key, output, capacity);
     if (length> 0) {
         return length;
     }
@@ -1613,45 +1635,45 @@ fn registry_github_publish_archive(
     }
 
     i64 uc = 0;
-    i64 prefix[69] = [104, 116, 116, 112, 115, 58, 47, 47, 97, 112, 105, 46, 103, 105, 116, 104, 117, 98, 46, 99, 111, 109, 47, 114, 101, 112, 111, 115, 47, 114, 97, 122, 45, 108, 97, 110, 103, 117, 97, 103, 101, 47, 112, 97, 99, 107, 97, 103, 101, 115, 47, 99, 111, 110, 116, 101, 110, 116, 115, 47, 112, 97, 99, 107, 97, 103, 101, 115, 47];
+    
 
-    package_append_literal(url, 16384, &mut uc, &prefix, 69);
+    package_append_string_literal(url, 16384, &mut uc, "https://api.github.com/repos/raz-language/packages/contents/packages/");
     package_append(url, 16384, &mut uc, name, 0, name_length);
 
-    i64 slash[1] = [47];
+    
 
-    package_append_literal(url, 16384, &mut uc, &slash, 1);
+    package_append_string_literal(url, 16384, &mut uc, "/");
     package_append(url, 16384, &mut uc, version, 0, version_length);
 
-    i64 extension[4] = [46, 100, 112, 107];
+    
 
-    package_append_literal(url, 16384, &mut uc, &extension, 4);
+    package_append_string_literal(url, 16384, &mut uc, ".dpk");
 
     i64 bc = 0;
-    i64 open[20] = [123, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 80, 117, 98, 108, 105, 115, 104, 32];
+    
 
-    package_append_literal(body, body_capacity, &mut bc, &open, 20);
+    package_append_string_literal(body, body_capacity, &mut bc, "{\"message\":\"Publish ");
     package_append(body, body_capacity, &mut bc, name, 0, name_length);
 
-    i64 at[1] = [64];
+    
 
-    package_append_literal(body, body_capacity, &mut bc, &at, 1);
+    package_append_string_literal(body, body_capacity, &mut bc, "@");
     package_append(body, body_capacity, &mut bc, version, 0, version_length);
 
-    i64 middle[13] = [34, 44, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34];
+    
 
-    package_append_literal(body, body_capacity, &mut bc, &middle, 13);
+    package_append_string_literal(body, body_capacity, &mut bc, "\",\"content\":\"");
     package_append(body, body_capacity, &mut bc, encoded, 0, encoded_length);
 
-    i64 close[18] = [34, 44, 34, 98, 114, 97, 110, 99, 104, 34, 58, 34, 109, 97, 105, 110, 34, 125];
+    
 
-    package_append_literal(body, body_capacity, &mut bc, &close, 18);
+    package_append_string_literal(body, body_capacity, &mut bc, "\",\"branch\":\"main\"}");
 
-    i64 ct[16] = [97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110];
+    string ct = "application/json";
     i64 i = 0;
 
     while (i<16) {
-        raz_compiler_rt_arena_set(content_type, i, ct[i]);
+        raz_compiler_rt_arena_set(content_type, i, compiler_literal_byte(ct, i));
         i += 1;
     }
 
@@ -1697,35 +1719,35 @@ fn registry_github_admin_dispatch(
     }
 
     i64 uc = 0;
-    i64 endpoint[98] = [104, 116, 116, 112, 115, 58, 47, 47, 97, 112, 105, 46, 103, 105, 116, 104, 117, 98, 46, 99, 111, 109, 47, 114, 101, 112, 111, 115, 47, 114, 97, 122, 45, 108, 97, 110, 103, 117, 97, 103, 101, 47, 112, 97, 99, 107, 97, 103, 101, 115, 47, 97, 99, 116, 105, 111, 110, 115, 47, 119, 111, 114, 107, 102, 108, 111, 119, 115, 47, 114, 101, 103, 105, 115, 116, 114, 121, 45, 97, 100, 109, 105, 110, 46, 121, 109, 108, 47, 100, 105, 115, 112, 97, 116, 99, 104, 101, 115];
+    
 
-    package_append_literal(url, 16384, &mut uc, &endpoint, 98);
+    package_append_string_literal(url, 16384, &mut uc, "https://api.github.com/repos/raz-language/packages/actions/workflows/registry-admin.yml/dispatches");
 
     i64 bc = 0;
-    i64 open[34] = [123, 34, 114, 101, 102, 34, 58, 34, 109, 97, 105, 110, 34, 44, 34, 105, 110, 112, 117, 116, 115, 34, 58, 123, 34, 97, 99, 116, 105, 111, 110, 34, 58, 34];
+    
 
-    package_append_literal(body, 32768, &mut bc, &open, 34);
+    package_append_string_literal(body, 32768, &mut bc, "{\"ref\":\"main\",\"inputs\":{\"action\":\"");
     package_append(body, 32768, &mut bc, action, 0, action_length);
 
-    i64 mid1[13] = [34, 44, 34, 112, 97, 99, 107, 97, 103, 101, 34, 58, 34];
+    
 
-    package_append_literal(body, 32768, &mut bc, &mid1, 13);
+    package_append_string_literal(body, 32768, &mut bc, "\",\"package\":\"");
     package_append(body, 32768, &mut bc, package_name, 0, package_length);
 
-    i64 mid2[11] = [34, 44, 34, 118, 97, 108, 117, 101, 34, 58, 34];
+    
 
-    package_append_literal(body, 32768, &mut bc, &mid2, 11);
+    package_append_string_literal(body, 32768, &mut bc, "\",\"value\":\"");
     package_append(body, 32768, &mut bc, value, 0, value_length);
 
-    i64 close[3] = [34, 125, 125];
+    
 
-    package_append_literal(body, 32768, &mut bc, &close, 3);
+    package_append_string_literal(body, 32768, &mut bc, "\"}}");
 
-    i64 ct[16] = [97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110];
+    string ct = "application/json";
     i64 i = 0;
 
     while (i < 16) {
-        raz_compiler_rt_arena_set(content_type, i, ct[i]);
+        raz_compiler_rt_arena_set(content_type, i, compiler_literal_byte(ct, i));
         i += 1;
     }
 
@@ -1790,38 +1812,38 @@ fn registry_http_write(
     i64 cursor = 0;
 
     if (method == 1) {
-        i64 post[5] = [80, 79, 83, 84, 32];
+        
 
-        package_append_literal(request, body_length + 32768, &mut cursor, &post, 5);
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "POST ");
     } else {
-        i64 put[4] = [80, 85, 84, 32];
+        
 
-        package_append_literal(request, body_length + 32768, &mut cursor, &put, 4);
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "PUT ");
     }
     package_append(request, body_length + 32768, &mut cursor, path, 0, pl);
 
-    i64 b[17] = [32, 72, 84, 84, 80, 47, 49, 46, 48, 13, 10, 72, 111, 115, 116, 58, 32];
+    
 
-    package_append_literal(request, body_length + 32768, &mut cursor, &b, 17);
+    package_append_string_literal(request, body_length + 32768, &mut cursor, " HTTP/1.0\r\nHost: ");
     package_append(request, body_length + 32768, &mut cursor, host, 0, hl);
 
-    i64 ct[16] = [13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 84, 121, 112, 101, 58, 32];
+    
 
-    package_append_literal(request, body_length + 32768, &mut cursor, &ct, 16);
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nContent-Type: ");
     package_append(request, body_length + 32768, &mut cursor, content_type, 0, content_type_length);
 
-    i64 clh[18] = [13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32];
+    
 
-    package_append_literal(request, body_length + 32768, &mut cursor, &clh, 18);
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nContent-Length: ");
     registry_append_decimal(request, body_length + 32768, &mut cursor, body_length);
 
     i64 token = raz_compiler_rt_arena_create(8192);
     bool github_api = hl == 14;
-    i64 gh_host[14] = [97, 112, 105, 46, 103, 105, 116, 104, 117, 98, 46, 99, 111, 109];
+    string gh_host = "api.github.com";
     i64 gh_i = 0;
 
     while (github_api && gh_i<14) {
-        if (raz_compiler_rt_arena_get(host, gh_i) != gh_host[gh_i]) {
+        if (raz_compiler_rt_arena_get(host, gh_i) != compiler_literal_byte(gh_host, gh_i)) {
             github_api = false;
         }
         gh_i += 1;
@@ -1830,9 +1852,9 @@ fn registry_http_write(
     i64 tl = registry_publish_token(token, 8192, github_api);
 
     if (tl> 0) {
-        i64 ah[24] = [13, 10, 65, 117, 116, 104, 111, 114, 105, 122, 97, 116, 105, 111, 110, 58, 32, 66, 101, 97, 114, 101, 114, 32];
+        
 
-        package_append_literal(request, body_length + 32768, &mut cursor, &ah, 24);
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nAuthorization: Bearer ");
         package_append(request, body_length + 32768, &mut cursor, token, 0, tl);
     }
     raz_compiler_rt_arena_destroy(token);
@@ -1841,13 +1863,13 @@ fn registry_http_write(
     // precomputed signature and the registry decides how to verify it.
 
     i64 signature = raz_compiler_rt_arena_create(8192);
-    i64 skey[22] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 83, 73, 71, 78, 65, 84, 85, 82, 69];
-    i64 sl = registry_env_ascii(&skey, 22, signature, 8192);
+    string skey = "RAZ_REGISTRY_SIGNATURE";
+    i64 sl = registry_env_ascii_literal(skey, signature, 8192);
 
     if (sl> 0) {
-        i64 sh[19] = [13, 10, 88, 45, 82, 97, 122, 45, 83, 105, 103, 110, 97, 116, 117, 114, 101, 58, 32];
+        
 
-        package_append_literal(request, body_length + 32768, &mut cursor, &sh, 19);
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nX-Raz-Signature: ");
         package_append(request, body_length + 32768, &mut cursor, signature, 0, sl);
     }
     raz_compiler_rt_arena_destroy(signature);
@@ -1855,13 +1877,13 @@ fn registry_http_write(
     // harmless for generic/private registries and let the same transport serve
     // both the static official registry and GitHub Contents publishing.
 
-    i64 api_headers[92] = [13, 10, 85, 115, 101, 114, 45, 65, 103, 101, 110, 116, 58, 32, 82, 97, 122, 47, 49, 46, 48, 13, 10, 65, 99, 99, 101, 112, 116, 58, 32, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 118, 110, 100, 46, 103, 105, 116, 104, 117, 98, 43, 106, 115, 111, 110, 13, 10, 88, 45, 71, 105, 116, 72, 117, 98, 45, 65, 112, 105, 45, 86, 101, 114, 115, 105, 111, 110, 58, 32, 50, 48, 50, 54, 45, 48, 51, 45, 49, 48];
+    
 
-    package_append_literal(request, body_length + 32768, &mut cursor, &api_headers, 92);
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nUser-Agent: Raz/1.0\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2026-03-10");
 
-    i64 tail[23] = [13, 10, 67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 58, 32, 99, 108, 111, 115, 101, 13, 10, 13, 10];
+    
 
-    package_append_literal(request, body_length + 32768, &mut cursor, &tail, 23);
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nConnection: close\r\n\r\n");
     package_append(request, body_length + 32768, &mut cursor, body, 0, body_length);
 
     i64 sent = 0;
@@ -1970,11 +1992,11 @@ fn registry_ends_dpk(i64 path, i64 length) -> bool {
         return false;
     }
 
-    i64 ext[4] = [46, 100, 112, 107];
+    string ext = ".dpk";
     i64 i = 0;
 
     while (i<4) {
-        if (raz_compiler_rt_arena_get(path, length - 4 + i) != ext[i]) {
+        if (raz_compiler_rt_arena_get(path, length - 4 + i) != compiler_literal_byte(ext, i)) {
             return false;
         }
         i += 1;
@@ -2033,6 +2055,17 @@ fn registry_store_materialize_local_archive(
     return store_length;
 }
 
+fn registry_path_prefix_literal(i64 path, i64 length, string prefix) -> bool {
+    i64 pl = compiler_literal_length(prefix);
+    if (length < pl) { return false; }
+    i64 i = 0;
+    while (i < pl) {
+        if (raz_compiler_rt_arena_get(path, i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
 fn registry_path_prefix(i64 path, i64 length, i64[]prefix, i64 pl) -> bool {
     if (length<pl) {
         return false;
@@ -2050,44 +2083,44 @@ fn registry_path_prefix(i64 path, i64 length, i64[]prefix, i64 pl) -> bool {
 }
 
 fn registry_package_path_ignored(i64 path, i64 length) -> bool {
-    i64 git[5] = [46, 103, 105, 116, 47];
+    string git = ".git/";
 
-    if (registry_path_prefix(path, length, &git, 5)) {
+    if (registry_path_prefix_literal(path, length, git)) {
         return true;
     }
 
-    i64 razd[5] = [46, 114, 97, 122, 47];
+    string razd = ".raz/";
 
-    if (registry_path_prefix(path, length, &razd, 5)) {
+    if (registry_path_prefix_literal(path, length, razd)) {
         return true;
     }
 
-    i64 publish[13] = [46, 114, 97, 122, 45, 112, 117, 98, 108, 105, 115, 104, 47];
+    string publish = ".raz-publish/";
 
-    if (registry_path_prefix(path, length, &publish, 13)) {
+    if (registry_path_prefix_literal(path, length, publish)) {
         return true;
     }
 
-    i64 build[6] = [98, 117, 105, 108, 100, 47];
+    string build = "build/";
 
-    if (registry_path_prefix(path, length, &build, 6)) {
+    if (registry_path_prefix_literal(path, length, build)) {
         return true;
     }
 
-    i64 target[7] = [116, 97, 114, 103, 101, 116, 47];
+    string target = "target/";
 
-    if (registry_path_prefix(path, length, &target, 7)) {
+    if (registry_path_prefix_literal(path, length, target)) {
         return true;
     }
 
-    i64 diag[21] = [115, 116, 97, 103, 101, 49, 45, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 46, 116, 120, 116];
+    string diag = "stage1-diagnostic.txt";
 
     if (length == 21) {
         i64 i = 0;
         bool same = true;
 
         while (i<21) {
-            if (raz_compiler_rt_arena_get(path, i) != diag[i]) {
+            if (raz_compiler_rt_arena_get(path, i) != compiler_literal_byte(diag, i)) {
                 same = false;
             }
             i += 1;
@@ -2097,16 +2130,16 @@ fn registry_package_path_ignored(i64 path, i64 length) -> bool {
         }
     }
 
-    i64 metadata_cache[10] = [46, 114, 97, 122, 46, 99, 97, 99, 104, 101];
-    i64 metadata_registry[13] = [46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 metadata_index[19] = [46, 114, 97, 122, 46, 114, 101, 103, 105, 115, 116, 114, 121, 45, 105, 110, 100, 101, 120];
-    i64 metadata_git[8] = [46, 114, 97, 122, 46, 103, 105, 116];
+    string metadata_cache = ".raz.cache";
+    string metadata_registry = ".raz.registry";
+    string metadata_index = ".raz.registry-index";
+    string metadata_git = ".raz.git";
 
     if (
-        (length == 10 && registry_path_prefix(path, length, &metadata_cache, 10)) ||
-        (length == 13 && registry_path_prefix(path, length, &metadata_registry, 13)) ||
-        (length == 19 && registry_path_prefix(path, length, &metadata_index, 19)) ||
-        (length == 8 && registry_path_prefix(path, length, &metadata_git, 8))
+        (length == 10 && registry_path_prefix_literal(path, length, metadata_cache)) ||
+        (length == 13 && registry_path_prefix_literal(path, length, metadata_registry)) ||
+        (length == 19 && registry_path_prefix_literal(path, length, metadata_index)) ||
+        (length == 8 && registry_path_prefix_literal(path, length, metadata_git))
     ) {
         return true;
     }
@@ -2192,9 +2225,9 @@ fn registry_tree_hash(i64 root, i64 root_length) -> i64 {
             raz_compiler_rt_arena_get(full, c - 1) != 47 &&
             raz_compiler_rt_arena_get(full, c - 1) != 92
         ) {
-            i64 slash[1] = [47];
+            
 
-            package_append_literal(full, 8192, &mut c, &slash, 1);
+            package_append_string_literal(full, 8192, &mut c, "/");
         }
         package_append(full, 8192, &mut c, listing, st, pl);
 
@@ -2238,11 +2271,11 @@ fn registry_index_path(i64 output, i64 capacity) -> i64 {
         return -1;
     }
 
-    i64 n[18] = [82, 65, 90, 95, 82, 69, 71, 73, 83, 84, 82, 89, 95, 73, 78, 68, 69, 88];
+    string n = "RAZ_REGISTRY_INDEX";
     i64 i = 0;
 
     while (i<18) {
-        raz_compiler_rt_arena_set(name, i, n[i]);
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(n, i));
         i += 1;
     }
 
@@ -2250,6 +2283,21 @@ fn registry_index_path(i64 output, i64 capacity) -> i64 {
 
     raz_compiler_rt_arena_destroy(name);
     return length;
+}
+
+fn registry_env_flag_literal(string key) -> bool {
+    i64 key_length = compiler_literal_length(key);
+    i64 name = raz_compiler_rt_arena_create(key_length);
+    i64 value = raz_compiler_rt_arena_create(16);
+    if (name == 0 || value == 0) { return false; }
+    i64 i = 0;
+    while (i < key_length) { raz_compiler_rt_arena_set(name, i, compiler_literal_byte(key, i)); i += 1; }
+    i64 length = raz_compiler_rt_env_get_ascii(name, key_length, value, 16);
+    raz_compiler_rt_arena_destroy(name);
+    if (length <= 0) { raz_compiler_rt_arena_destroy(value); return false; }
+    bool enabled = !(length == 1 && raz_compiler_rt_arena_get(value, 0) == 48);
+    raz_compiler_rt_arena_destroy(value);
+    return enabled;
 }
 
 fn registry_env_flag(i64[]key, i64 key_length) -> bool {
@@ -2281,14 +2329,14 @@ fn registry_env_flag(i64[]key, i64 key_length) -> bool {
 }
 
 fn registry_offline() -> bool {
-    i64 key[11] = [82, 65, 90, 95, 79, 70, 70, 76, 73, 78, 69];
+    string key = "RAZ_OFFLINE";
 
-    return registry_env_flag(&key, 11);
+    return registry_env_flag_literal(key);
 }
 
 fn registry_store_root(i64 output, i64 capacity) -> i64 {
-    i64 store_key[17] = [82, 65, 90, 95, 80, 65, 67, 75, 65, 71, 69, 95, 83, 84, 79, 82, 69];
-    i64 length = registry_env_ascii(&store_key, 17, output, capacity);
+    string store_key = "RAZ_PACKAGE_STORE";
+    i64 length = registry_env_ascii_literal(store_key, output, capacity);
 
     if (length> 0) {
         return length;
@@ -2300,8 +2348,8 @@ fn registry_store_root(i64 output, i64 capacity) -> i64 {
         return -1;
     }
 
-    i64 raz_home_key[8] = [82, 65, 90, 95, 72, 79, 77, 69];
-    i64 hl = registry_env_ascii(&raz_home_key, 8, home, 8192);
+    string raz_home_key = "RAZ_HOME";
+    i64 hl = registry_env_ascii_literal(raz_home_key, home, 8192);
 
     if (hl> 0) {
         if (hl + 6> capacity) {
@@ -2316,24 +2364,24 @@ fn registry_store_root(i64 output, i64 capacity) -> i64 {
             i += 1;
         }
 
-        i64 tail[6] = [47, 115, 116, 111, 114, 101];
+        string tail = "/store";
 
         i = 0;
         while (i<6) {
-            raz_compiler_rt_arena_set(output, hl + i, tail[i]);
+            raz_compiler_rt_arena_set(output, hl + i, compiler_literal_byte(tail, i));
             i += 1;
         }
         raz_compiler_rt_arena_destroy(home);
         return hl + 6;
     }
 
-    i64 home_key[4] = [72, 79, 77, 69];
+    string home_key = "HOME";
 
-    hl = registry_env_ascii(&home_key, 4, home, 8192);
+    hl = registry_env_ascii_literal(home_key, home, 8192);
     if (hl <= 0) {
-        i64 profile_key[11] = [85, 83, 69, 82, 80, 82, 79, 70, 73, 76, 69];
+        string profile_key = "USERPROFILE";
 
-        hl = registry_env_ascii(&profile_key, 11, home, 8192);
+        hl = registry_env_ascii_literal(profile_key, home, 8192);
     }
     if (hl> 0) {
         if (hl + 12> capacity) {
@@ -2348,11 +2396,11 @@ fn registry_store_root(i64 output, i64 capacity) -> i64 {
             i += 1;
         }
 
-        i64 tail[11] = [47, 46, 114, 97, 122, 47, 115, 116, 111, 114, 101];
+        string tail = "/.raz/store";
 
         i = 0;
         while (i<11) {
-            raz_compiler_rt_arena_set(output, hl + i, tail[i]);
+            raz_compiler_rt_arena_set(output, hl + i, compiler_literal_byte(tail, i));
             i += 1;
         }
         raz_compiler_rt_arena_destroy(home);
@@ -2360,7 +2408,7 @@ fn registry_store_root(i64 output, i64 capacity) -> i64 {
     }
     raz_compiler_rt_arena_destroy(home);
 
-    i64 fallback[14] = [46, 47, 116, 97, 114, 103, 101, 116, 47, 115, 116, 111, 114, 101];
+    string fallback = "./target/store";
 
     if (capacity<14) {
         return -1;
@@ -2369,7 +2417,7 @@ fn registry_store_root(i64 output, i64 capacity) -> i64 {
     i64 i = 0;
 
     while (i<14) {
-        raz_compiler_rt_arena_set(output, i, fallback[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(fallback, i));
         i += 1;
     }
     return 14;

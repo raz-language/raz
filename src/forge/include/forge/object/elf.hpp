@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "forge/codegen/x86_64/encoder.hpp"
+#include "forge/codegen/aarch64/encoder.hpp"
 #include "forge/diagnostics/diagnostic.hpp"
 #include "forge/machine/module.hpp"
 
@@ -34,5 +35,12 @@ struct ElfObjectResult {
     codegen::x86_64::Abi abi = codegen::x86_64::Abi::system_v);
 [[nodiscard]] ElfObjectResult emit_elf64_x86_64(
     codegen::x86_64::EncodedModuleImage image);
+
+// Emits an ELF64 little-endian AArch64 relocatable object using AAPCS64.
+[[nodiscard]] ElfObjectResult emit_elf64_aarch64(
+    const machine::Module& module,
+    codegen::aarch64::Abi abi = codegen::aarch64::Abi::aapcs64);
+[[nodiscard]] ElfObjectResult emit_elf64_aarch64(
+    codegen::aarch64::EncodedModuleImage image);
 
 } // namespace forge::object

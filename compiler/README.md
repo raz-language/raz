@@ -2,7 +2,7 @@
 
 This directory contains the production Raz compiler, written in Raz.
 
-The compiler source is organized by responsibility under `compiler/src/` and is compiled as ordinary semantic Raz modules. Each compiler module owns an explicit `raz_compiler_*` namespace and an import edge; production builds do not use physical source concatenation. `host-source-order.txt` is retained only as deterministic host-compiler ordering metadata. `src/main.rz` remains the small final entrypoint.
+The compiler source is organized by responsibility under `compiler/src/` and is compiled as ordinary semantic Raz modules. Each compiler module owns an explicit `raz_compiler_*` namespace and an import edge; production builds do not use physical source concatenation. No compiler source-order file is retained; deterministic qualification materialization is derived from discovered modules, while `src/main.rz` remains the small semantic entrypoint.
 
 ## Source layout
 
@@ -105,4 +105,4 @@ The compiler is split at stable responsibility boundaries so semantic analysis, 
 
 ## Source ordering
 
-Raz packages use deterministic semantic module discovery and explicit imports. The generic project loader still recognizes `source-order.txt` for legacy packages, but the canonical compiler intentionally does not provide one. `compiler/host-source-order.txt` lists every compiler source exactly once with `src/main.rz` last solely for host-compiler construction and reproducibility qualification. Repository checks ensure that file cannot accidentally become the production compilation policy again.
+Raz packages use deterministic semantic module discovery and explicit imports. The generic project loader still recognizes `source-order.txt` for legacy packages, but the canonical compiler intentionally does not provide one. The compiler keeps no ordering metadata at all. Host-side qualification discovers `compiler/src/**/*.rz` directly and treats `src/main.rz` as the entrypoint; repository checks prevent compiler source-order files from returning.

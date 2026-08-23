@@ -677,7 +677,7 @@ bool segments_overlap(const LiveInterval& left, const LiveInterval& right) {
 
 RegisterAllocation allocate_linear_scan(const Function& function) {
     RegisterAllocation allocation;
-    if (function.register_count > 16384U) {
+    if (function.register_count > 65536U) {
         allocation.diagnostics.push_back({DiagnosticSeverity::error,
             "linear-scan virtual-register limit exceeded in @" + function.name, {}});
         return allocation;
@@ -1485,7 +1485,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
 
 StackAllocation allocate_stack_slots(const Function& function) {
     StackAllocation allocation;
-    if (function.register_count > 16384U) {
+    if (function.register_count > 65536U) {
         allocation.diagnostics.push_back({DiagnosticSeverity::error,
             "baseline stack allocator virtual-register limit exceeded in @" + function.name, {}});
         return allocation;

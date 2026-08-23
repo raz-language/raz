@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(Forge
  VERSION 2.0.0
- DESCRIPTION "Verified deterministic compiler core and x86-64 backend"
+ DESCRIPTION "Verified deterministic compiler core with x86-64 and AArch64 backends"
  LANGUAGES CXX)
 option(FORGE_BUILD_TESTS "Build Forge tests" ON)
 option(FORGE_BUILD_TOOLS "Build Forge command-line tools" ON)
@@ -48,8 +48,8 @@ add_library(forge
  src/ir/context.cpp src/ir/module.cpp src/ir/builder.cpp src/ir/source_map.cpp src/ir/incremental.cpp src/ir/artifact_cache.cpp src/ir/build_driver.cpp
   src/ir/dependency_build.cpp src/capi/forge.cpp src/ir/lexer.cpp src/ir/parser.cpp src/ir/printer.cpp src/ir/verifier.cpp src/ir/binary.cpp
  src/analysis/function_analysis.cpp src/pass/pass.cpp src/pass/pipeline.cpp src/transforms/scalar.cpp
- src/machine/module.cpp src/machine/lower.cpp src/machine/liveness.cpp src/machine/optimize.cpp src/machine/register_allocation.cpp src/machine/verifier.cpp src/codegen/x86_64/encoder.cpp
- src/jit/engine.cpp src/jit/invoke.cpp src/object/elf.cpp src/object/coff.cpp src/object/archive.cpp src/object/incremental.cpp src/object/native_link.cpp src/interpreter/interpreter.cpp src/runtime/bindings.cpp src/target/data_layout.cpp src/target/abi.cpp)
+ src/machine/module.cpp src/machine/lower.cpp src/machine/liveness.cpp src/machine/optimize.cpp src/machine/register_allocation.cpp src/machine/verifier.cpp src/codegen/x86_64/encoder.cpp src/codegen/aarch64/register_allocation.cpp src/codegen/aarch64/encoder.cpp
+ src/jit/engine.cpp src/jit/invoke.cpp src/object/elf.cpp src/object/elf_aarch64.cpp src/object/macho_aarch64.cpp src/object/coff.cpp src/object/archive.cpp src/object/incremental.cpp src/object/native_link.cpp src/interpreter/interpreter.cpp src/runtime/bindings.cpp src/target/data_layout.cpp src/target/abi.cpp)
 add_library(Forge::forge ALIAS forge)
 set_target_properties(forge PROPERTIES
  VERSION ${PROJECT_VERSION}
@@ -126,6 +126,7 @@ forge_add_test(forge-dependency-build-tests tests/frontend/dependency_build_test
  forge_add_test(forge-analysis-tests tests/analysis/analysis_tests.cpp)
  forge_add_test(forge-binary-tests tests/serialization/binary_tests.cpp)
  forge_add_test(forge-codegen-tests tests/codegen/codegen_tests.cpp)
+ forge_add_test(forge-aarch64-codegen-tests tests/codegen/aarch64_codegen_tests.cpp)
  forge_add_test(forge-abi-hardening-tests tests/codegen/abi_hardening_tests.cpp)
  forge_add_test(forge-vector-register-class-tests tests/codegen/vector_register_class_tests.cpp)
  forge_add_test(forge-interpreter-tests tests/interpreter/interpreter_tests.cpp)
@@ -137,26 +138,12 @@ forge_add_test(forge-dependency-build-tests tests/frontend/dependency_build_test
  forge_add_test(forge-data-layout-tests tests/target/data_layout_tests.cpp)
  forge_add_test(forge-abi-classification-tests tests/target/abi_classification_tests.cpp)
  forge_add_test(forge-object-tests tests/object/elf_tests.cpp)
+ forge_add_test(forge-aarch64-object-tests tests/object/aarch64_elf_tests.cpp)
+ forge_add_test(forge-aarch64-macho-object-tests tests/object/aarch64_macho_tests.cpp)
  forge_add_test(forge-coff-object-tests tests/object/coff_tests.cpp)
  forge_add_test(forge-archive-tests tests/object/archive_tests.cpp)
 forge_add_test(forge-incremental-object-tests tests/object/incremental_object_tests.cpp)
  forge_add_test(forge-native-incremental-link-tests tests/object/native_incremental_link_tests.cpp)
- add_test(NAME forge-elf-deterministic-output COMMAND ${CMAKE_COMMAND}
-  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DFORMAT=elf
-  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a.o -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-b.o
-  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
- add_test(NAME forge-coff-deterministic-output COMMAND ${CMAKE_COMMAND}
-  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DFORMAT=coff
-  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a.obj -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-b.obj
-  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
- add_test(NAME forge-optimization-levels-release-gate COMMAND ${CMAKE_COMMAND}
-  -DFORGE_OPT=$<TARGET_FILE:forge-opt> -DFORGE=$<TARGET_FILE:forge-cli>
-  -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/optimization.fir
-  -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/optimization-levels
-  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/check_optimization_levels.cmake)
- add_test(NAME forge-example-corpus-release-gate COMMAND ${CMAKE_COMMAND}
-  -DFORGE=$<TARGET_FILE:forge-cli> -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/check_example_corpus.cmake)
  add_test(NAME forge-repository-hygiene-release-gate COMMAND ${CMAKE_COMMAND}
   -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
   -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/check_repository_hygiene.cmake)
@@ -172,6 +159,31 @@ forge_add_test(forge-incremental-object-tests tests/object/incremental_object_te
   -DPARENT_BUILD_TYPE=${CMAKE_BUILD_TYPE}
   -DPARENT_CONFIG=$<CONFIG>
   -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/package/check_install_consumer.cmake)
+ if(FORGE_BUILD_TOOLS)
+  add_test(NAME forge-elf-deterministic-output COMMAND ${CMAKE_COMMAND}
+  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DFORMAT=elf
+  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a.o -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-b.o
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
+ add_test(NAME forge-coff-deterministic-output COMMAND ${CMAKE_COMMAND}
+  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DFORMAT=coff
+  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a.obj -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-b.obj
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
+ add_test(NAME forge-aarch64-elf-deterministic-output COMMAND ${CMAKE_COMMAND}
+  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DARCH=aarch64 -DFORMAT=elf
+  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-aarch64-a.o -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-aarch64-b.o
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
+ add_test(NAME forge-aarch64-macho-deterministic-output COMMAND ${CMAKE_COMMAND}
+  -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/native-i64.fir -DARCH=aarch64 -DFORMAT=macho
+  -DOUTPUT1=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a64-a.o -DOUTPUT2=${CMAKE_CURRENT_BINARY_DIR}/deterministic-a64-b.o
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/object/check_deterministic.cmake)
+ add_test(NAME forge-optimization-levels-release-gate COMMAND ${CMAKE_COMMAND}
+  -DFORGE_OPT=$<TARGET_FILE:forge-opt> -DFORGE=$<TARGET_FILE:forge-cli>
+  -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/optimization.fir
+  -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/optimization-levels
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/check_optimization_levels.cmake)
+ add_test(NAME forge-example-corpus-release-gate COMMAND ${CMAKE_COMMAND}
+  -DFORGE=$<TARGET_FILE:forge-cli> -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/check_example_corpus.cmake)
  if(UNIX AND NOT APPLE)
   add_test(NAME forge-static-library-workflow COMMAND ${CMAKE_COMMAND}
    -DFORGE=$<TARGET_FILE:forge-cli> -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/examples/library-answer.fir
@@ -340,6 +352,7 @@ forge_add_test(forge-incremental-object-tests tests/object/incremental_object_te
    COMMAND forge-run --engine=compare ${CMAKE_CURRENT_SOURCE_DIR}/examples/abi.fir sum_eight 1 2 3 4 5 6 7 8)
   set_tests_properties(forge-run-eight-argument-cli PROPERTIES PASS_REGULAR_EXPRESSION "36")
   set_tests_properties(forge-run-jit-cli forge-run-compare-cli forge-run-constant-store forge-run-immediate-control-low forge-run-immediate-control-high forge-run-eight-argument-cli PROPERTIES LABELS "jit-runtime")
+  endif()
  endif()
  set_tests_properties(forge-jit-invoke-tests forge-runtime-binding-tests forge-differential-tests PROPERTIES LABELS "jit-runtime")
  set_tests_properties(forge-install-consumer-release-gate PROPERTIES LABELS "installed-consumer")

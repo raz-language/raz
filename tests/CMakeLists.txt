@@ -95,6 +95,8 @@ set_tests_properties(razc-reject-unknown-payload-type PROPERTIES WILL_FAIL TRUE)
 add_test(NAME razc-hir-concrete-generic-layouts COMMAND razc_host --hir ${PROJECT_SOURCE_DIR}/tests/examples/generics/concrete_layouts.rz)
 set_tests_properties(razc-hir-concrete-generic-layouts PROPERTIES PASS_REGULAR_EXPRESSION "type @Pair<i64,bool> \\[instantiated\\] size 16 align 8;enum @Option<i64> \\[instantiated\\] repr tagged size 16 align 8")
 add_test(NAME razc-check-payload-constructors COMMAND razc_host --check ${PROJECT_SOURCE_DIR}/tests/examples/enums/payload_constructors.rz)
+add_test(NAME razc-check-nested-payload-constructor COMMAND razc_host --check ${PROJECT_SOURCE_DIR}/tests/examples/enums/nested_payload_constructor.rz)
+add_test(NAME razc-mir-nested-payload-constructor COMMAND razc_host --mir ${PROJECT_SOURCE_DIR}/tests/examples/enums/nested_payload_constructor.rz)
 add_test(NAME razc-reject-invalid-payload-constructor COMMAND razc_host --check ${PROJECT_SOURCE_DIR}/tests/examples/enums/invalid_payload_constructor.rz)
 set_tests_properties(razc-reject-invalid-payload-constructor PROPERTIES WILL_FAIL TRUE)
 
@@ -1108,9 +1110,8 @@ add_test(NAME raz-cpp-spacing-format
     ${PROJECT_SOURCE_DIR}/tests)
 set_tests_properties(raz-cpp-spacing-format PROPERTIES TIMEOUT 60)
 
-# The production compiler has one committed canonical ordered source set.
-# Host construction may generate temporary copies in build directories, never
-# alternate committed mirrors.
+# The production compiler is a canonical semantic module set. Bootstrap must
+# discover it without imposing a physical source order or committing mirrors.
 add_test(NAME raz-host-source-layout
   COMMAND ${CMAKE_COMMAND}
     -DPROJECT_ROOT=${PROJECT_SOURCE_DIR}
@@ -1549,6 +1550,22 @@ add_test(NAME raz-layout-query-profile
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/query_profile.cmake)
 set_tests_properties(raz-layout-query-profile PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
 
+# Native platform policy: LLVM AArch64 targets, host-aware backend default,
+# cross-target runtime safety, and AArch64 stage-0 bootstrap contract.
+add_test(NAME raz-platform-expansion-source
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-platform-expansion.py)
+set_tests_properties(raz-platform-expansion-source PROPERTIES TIMEOUT 30)
+
+# Cross-stage AArch64 object qualification: Raz frontend -> canonical Forge IR ->
+# embedded Forge AArch64 ELF/Mach-O writers. This is executable on x86-64 CI and
+# verifies architecture/object-format identity without pretending to execute ARM code.
+add_test(NAME raz-forge-aarch64-cross-object
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/test-forge-aarch64-cross-object.py
+    --razc $<TARGET_FILE:razc_host>
+    --forge-codegen $<TARGET_FILE:raz-compiler-forge-codegen>
+    --work ${CMAKE_CURRENT_BINARY_DIR}/forge-aarch64-cross-object-work)
+set_tests_properties(raz-forge-aarch64-cross-object PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
 # Production compiler CLI, discoverable Forge/LLVM backend selection,
 # command help, target/backend discovery, and toolchain diagnostics.
 add_test(NAME raz-cli-capabilities
@@ -1654,6 +1671,10 @@ add_test(NAME raz-project-native-output
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-project-native-output.py)
 set_tests_properties(raz-project-native-output PROPERTIES TIMEOUT 30)
 
+add_test(NAME raz-bootstrap-runtime-deps
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-bootstrap-runtime-deps.py)
+set_tests_properties(raz-bootstrap-runtime-deps PROPERTIES TIMEOUT 30)
+
 add_test(NAME raz-sync-policy-runtime
   COMMAND ${CMAKE_COMMAND}
     -DRAZ_EXE=$<TARGET_FILE:raz_host>
@@ -1715,6 +1736,18 @@ add_test(NAME raz-host-compiler-contract
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-host-compiler-contract.py)
 set_tests_properties(raz-host-compiler-contract PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
 
+add_test(NAME raz-stage0-boundary
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-stage0-boundary.py)
+set_tests_properties(raz-stage0-boundary PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
+add_test(NAME raz-stage0-cache
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-stage0-cache.py)
+set_tests_properties(raz-stage0-cache PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
+add_test(NAME raz-bootstrap-fixed-point
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-bootstrap-fixed-point.py)
+set_tests_properties(raz-bootstrap-fixed-point PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
 add_test(NAME raz-compiler-trait-solver
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-compiler-trait-solver.py
     --raz $<TARGET_FILE:raz_host>
@@ -1734,3 +1767,6 @@ add_test(NAME raz-toolchain-manager-runtime
     --work ${CMAKE_CURRENT_BINARY_DIR}/razup-runtime-work
     --linker ${CMAKE_CXX_COMPILER})
 set_tests_properties(raz-toolchain-manager-runtime PROPERTIES RUN_SERIAL TRUE TIMEOUT 240)
+
+add_test(NAME compiler-text-literals
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-compiler-text-literals.py)

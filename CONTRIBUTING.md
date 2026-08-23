@@ -8,7 +8,7 @@ Thank you for helping improve Raz. The production compiler is implemented in Raz
 2. **Language behavior belongs in Raz.** Do not move compiler semantics or standard-library functionality into native shims simply because the Raz implementation is harder.
 3. **Keep the host compiler compatibility-stable and native boundaries narrow.** C++ is appropriate for the host compiler and permanent runtime/OS/ABI boundaries that cannot reasonably live in Raz. New language semantics belong under `compiler/src/`.
 4. **Preserve determinism.** Source discovery, dependency ordering, generated identifiers, and compiler output must remain reproducible.
-5. **Keep one canonical compiler source set.** The production compiler lives under `compiler/src/` as semantic modules with explicit imports; `src/main.rz` is the entry module. `compiler/host-source-order.txt` is host-compiler ordering metadata only. Do not reintroduce `compiler/source-order.txt` or commit generated compiler mirrors.
+5. **Keep one canonical compiler source set.** The production compiler lives under `compiler/src/` as semantic modules with explicit imports; `src/main.rz` is the entry module. Do not add compiler source-order metadata (`source-order.txt` or host variants) or commit generated compiler mirrors.
 
 ## Before opening a change
 

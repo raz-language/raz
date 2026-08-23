@@ -37,9 +37,16 @@ require("compiler/src/driver/project.rz", "raz_compiler_forge_link_executable_i6
 require("compiler/src/backend/forge/writer.rz", "extern fn raz_compiler_project_native_path_i64(", "platform artifact bridge declaration")
 require("compiler/src/backend/forge/writer.rz", "extern fn raz_compiler_forge_link_executable_i64(", "Raz link bridge declaration")
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", "raz_compiler_project_native_path_i64(", "native artifact platform bridge")
-require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'profile_root / "native"', "native object subdirectory")
+require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'profile_root / "obj"', "native object subdirectory")
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'package_name + ".exe"', "Windows executable suffix")
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'package_name + ".obj"', "Windows object suffix")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_bin_root(graph, options)', "executable artifact category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_library_root(graph, options)', "library artifact category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_object_root(graph, options)', "object artifact category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_ir_root(graph, options)', "IR artifact category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_module_root(graph, options)', "module metadata category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'project_package_root(graph, options)', "package artifact category")
+require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'ensure_project_output_layout(graph, options)', "profile category layout creation")
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'environment_value("RAZ_LINKER")', "configurable native linker")
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", "RAZ_OBLINK_PATH", "bundled ObLink bridge default")
 require("src/bootstrap/tools/raz/detail/build_driver.hpp", "oblink_driver", "ObLink project-driver detection")
@@ -49,8 +56,8 @@ require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", 'environment_va
 require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", "std::filesystem::is_regular_file(output) ? 1 : 0", "linked artifact validation")
 require("src/bootstrap/CMakeLists.txt", 'RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>"', "bridge runtime path")
 require("compiler/src/driver/cli.rz", "fn cli_release_option(", "release option")
-require("docs/CLI.md", "target/debug/<package>", "CLI native artifact docs")
-require("docs/GETTING-STARTED.md", "target/debug/hello.exe", "getting-started Windows artifact docs")
+require("docs/CLI.md", "target/debug/bin/<package>", "CLI native artifact docs")
+require("docs/GETTING-STARTED.md", "target/debug/bin/hello.exe", "getting-started Windows artifact docs")
 
 require("src/bootstrap/tools/raz/detail/cli_options.hpp", 'std::string target = "host";', "implicit host target default")
 require("src/bootstrap/tools/raz/detail/build_driver.hpp", 'if (options.target == "host") return target_root / options.profile;', "host profile output flattening")
@@ -81,8 +88,13 @@ checks += 1
 # GNU -lws2_32/-lbcrypt/-lcrypt32 options to clang-cl and unconditionally add
 # Strawberry OpenSSL archives, which could pull an incompatible MinGW CRT.
 bridge = (ROOT / "src/bootstrap/compiler/backend/forge/forge_bridge.cpp").read_text(encoding="utf-8")
-if 'retry << shell_quote(std::filesystem::path(fallback)) << " /nologo /MD "' not in bridge:
+if 'retry << shell_quote(fallback_path) << " /nologo /MD "' not in bridge:
     raise SystemExit("missing MSVC-style clang-cl fallback command")
 if '<< " ws2_32.lib bcrypt.lib crypt32.lib /Fe:"' not in bridge:
     raise SystemExit("missing MSVC Windows system libraries in bridge fallback")
+
+if 'append_runtime_link_dependencies(retry);' not in bridge:
+    raise SystemExit("Windows fallback must preserve raz_runtime transitive dependencies")
+if 'external_linker_path()' not in bridge:
+    raise SystemExit("Windows fallback linker must use automatic tool discovery")
 print(f"project native output contracts: {checks}/{checks} passed")

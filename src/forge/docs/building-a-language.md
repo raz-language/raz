@@ -47,14 +47,14 @@ The builder manages insertion points, unique SSA names, source spans, duplicate 
 Include `<forge-c/forge.h>`. The API uses opaque, stable handles and explicit destroy functions.
 
 ```c
-#if FORGE_C_API_VERSION != 14
+#if FORGE_C_API_VERSION != 16
 #error "Unsupported Forge C API"
 #endif
 ```
 
 Use the two-call buffer pattern for canonical IR, source maps, fingerprints, manifests, build-plan JSON, and native object emission: call with a null output buffer to obtain the required size, allocate, then call again.
 
-C API v14 supports embedding the complete native backend behind an FFI boundary, including native TLS globals and addresses. A frontend that already has textual Forge IR can keep the entire backend in-process:
+C API v16 supports embedding the complete native backend behind an FFI boundary, including native TLS globals/addresses and ELF AArch64 or Mach-O arm64 object selection. A frontend that already has textual Forge IR can keep the entire backend in-process:
 
 ```c
 forge_context_t* context = forge_context_create();
@@ -70,7 +70,7 @@ forge_module_emit_object(
     module, FORGE_ABI_SYSTEM_V_X86_64, object, object_size);
 ```
 
-This parse/optimize/emit path remains useful as a migration boundary. C API v14 also exposes direct structured module construction for named aggregates and globals, rich function/block parameters, target features, and generic operations with exact result names, operands, successors, alignment, source ranges, and attributes. Frontends that need zero serialization can build the same Forge IR model directly and use parsing only as a compatibility fallback.
+This parse/optimize/emit path remains useful as a migration boundary. C API v16 also exposes direct structured module construction for named aggregates and globals, rich function/block parameters, target features, and generic operations with exact result names, operands, successors, alignment, source ranges, and attributes. Frontends that need zero serialization can build the same Forge IR model directly and use parsing only as a compatibility fallback.
 
 ## Diagnostics and source maps
 

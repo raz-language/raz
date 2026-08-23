@@ -18,7 +18,7 @@ scalar = (root / required[0]).read_text(encoding="utf-8")
 cfg = (root / required[1]).read_text(encoding="utf-8")
 const = (root / "compiler/src/mir/transform/const_prop.rz").read_text(encoding="utf-8")
 pipeline = (root / "compiler/src/mir/transform/pipeline.rz").read_text(encoding="utf-8")
-order = (root / "compiler/host-source-order.txt").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 for needle in [
     "simplify_mir_scalars",
@@ -44,7 +44,7 @@ for call in ("simplify_mir_scalars(mir)", "cleanup_mir_cfg(mir)"):
         problems.append(f"pipeline missing {call}")
 for module in ("src/mir/transform/scalar.rz", "src/mir/transform/cfg_cleanup.rz"):
     if module not in order:
-        problems.append(f"bootstrap order missing {module}")
+        problems.append(f"semantic compiler source graph missing {module}")
 
 if problems:
     print("mir-scalar-optimization: FAIL")

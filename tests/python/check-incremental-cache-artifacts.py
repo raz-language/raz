@@ -23,7 +23,7 @@ checks = {
         'incremental_module_interface_fingerprints' in inc and
         'incremental_module_hir_fingerprints' in inc,
     'persistent MIR state schema includes HIR and optimized MIR identity':
-        '[82, 65, 90, 77, 73, 82, 32, 50, 10]' in inc and
+        'writer_literal(&mut writer, "RAZMIR 2\\n");' in inc and
         'incremental_hir_module_fingerprint' in inc and
         'incremental_mir_module_fingerprint' in inc,
     # Ordering matters: classification marks modules dirty and the cache load

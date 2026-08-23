@@ -15,7 +15,7 @@ int fail(const char* message) {
 }
 
 int main() {
-    if (FORGE_C_API_VERSION != 14) return fail("unexpected C API version");
+    if (FORGE_C_API_VERSION != 16) return fail("unexpected C API version");
     auto* context = forge_context_create();
     auto* module = forge_module_create(context, "c_api_test");
     const forge_type_kind_t parameters[] = {FORGE_TYPE_I64, FORGE_TYPE_I64};
@@ -159,7 +159,7 @@ int main() {
     forge_function_destroy(add);
     forge_module_destroy(module);
 
-    // C API v14: construct the complete IR model directly without parsing FIR text.
+    // C API v16: construct the complete IR model directly without parsing FIR text.
     auto* structured = forge_module_create(context, "structured");
     if (structured == nullptr) return fail("failed to create structured module");
     const size_t pair_index = forge_module_add_struct(structured, "Pair", 0);
@@ -420,9 +420,25 @@ int main() {
     if (forge_module_emit_object(parsed_module, host_abi, object.data(), object.size()) != object_required)
         return fail("failed to emit native object");
     if (object.size() < 32) return fail("native object unexpectedly small");
+    const size_t aarch64_required = forge_module_emit_object(parsed_module, FORGE_ABI_AAPCS64, nullptr, 0);
+    if (aarch64_required < 64U) return fail("failed to size AArch64 object through C API");
+    std::vector<uint8_t> aarch64_object(aarch64_required);
+    if (forge_module_emit_object(parsed_module, FORGE_ABI_AAPCS64, aarch64_object.data(), aarch64_object.size()) != aarch64_required)
+        return fail("failed to emit AArch64 object through C API");
+    if (aarch64_object[0] != 0x7f || aarch64_object[1] != 'E' || aarch64_object[2] != 'L' ||
+        aarch64_object[3] != 'F' || aarch64_object[18] != 183U || aarch64_object[19] != 0U)
+        return fail("C API AArch64 object has wrong ELF machine");
+    const size_t darwin_required = forge_module_emit_object(parsed_module, FORGE_ABI_DARWIN_ARM64, nullptr, 0);
+    if (darwin_required < 128U) return fail("failed to size Darwin arm64 object through C API");
+    std::vector<uint8_t> darwin_object(darwin_required);
+    if (forge_module_emit_object(parsed_module, FORGE_ABI_DARWIN_ARM64, darwin_object.data(), darwin_object.size()) != darwin_required)
+        return fail("failed to emit Darwin arm64 object through C API");
+    if (darwin_object[0] != 0xcf || darwin_object[1] != 0xfa || darwin_object[2] != 0xed ||
+        darwin_object[3] != 0xfe || darwin_object[4] != 0x0c || darwin_object[7] != 0x01)
+        return fail("C API Darwin arm64 object has wrong Mach-O header");
     forge_module_destroy(parsed_module);
 
     forge_context_destroy(context);
-    std::cout << "C frontend API v14 ABI test passed\n";
+    std::cout << "C frontend API v16 ABI test passed\n";
     return 0;
 }

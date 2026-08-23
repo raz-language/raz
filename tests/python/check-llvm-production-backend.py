@@ -14,7 +14,7 @@ main = (root / 'compiler/src/main.rz').read_text(encoding='utf-8')
 backend = (root / 'compiler/src/driver/backend.rz').read_text(encoding='utf-8')
 runtime_root = root / 'src/runtime'
 runtime = '\n'.join(p.read_text(encoding='utf-8') for p in sorted(runtime_root.glob('*.cpp')))
-order = (root / 'compiler/host-source-order.txt').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
 
 required_target = [
     'public struct LlvmTargetOptions',
@@ -54,12 +54,10 @@ for marker in ['--backend=llvm', '--target=', '--data-layout=', '--cpu=', '--fea
     pass
 
 if 'src/backend/llvm/target.rz' not in order:
-    raise SystemExit('llvm-production-backend: FAIL llvm_target.rz missing from canonical production compiler source order')
+    raise SystemExit('llvm-production-backend: FAIL llvm_target.rz missing from canonical production compiler source graph')
 if 'llvm_emit_target_metadata(&mut writer, options)' not in llvm:
     raise SystemExit('llvm-production-backend: FAIL LLVM module does not emit target metadata')
-if 'define 32 @main' in llvm:
-    raise SystemExit('llvm-production-backend: FAIL malformed main wrapper marker')
-if 'i64 wrapper[20]' not in llvm or '64, 109, 97, 105, 110' not in llvm:
+if 'llvm_literal(&mut writer, "define i32 @main() {");' not in llvm:
     raise SystemExit('llvm-production-backend: FAIL native LLVM main wrapper missing')
 if 'llvm_parse_target_option(&mut llvm_options' not in main:
     raise SystemExit('llvm-production-backend: FAIL compiler CLI does not parse LLVM production options')
@@ -77,10 +75,10 @@ for marker in [
     'fn llvm_symbol_list_contains',
     'fn llvm_validate_symbol_options',
     'fn llvm_emit_symbol_prefix',
-    '100, 108, 108, 101, 120, 112, 111, 114, 116',  # dllexport
-    '100, 108, 108, 105, 109, 112, 111, 114, 116',  # dllimport
-    '108, 105, 110, 107, 111, 110, 99, 101, 95, 111, 100, 114', # linkonce_odr
-    '105, 110, 116, 101, 114, 110, 97, 108', # internal
+    'llvm_literal(out, "dllexport ");',
+    'llvm_literal(out, "dllimport ");',
+    'llvm_literal(out, "linkonce_odr ");',
+    'llvm_literal(out, "internal ");',
 ]:
     if marker not in llvm:
         raise SystemExit(f'llvm-production-backend: FAIL missing symbol/linkage marker: {marker}')

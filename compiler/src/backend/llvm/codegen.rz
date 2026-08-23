@@ -6,10 +6,71 @@ namespace raz_compiler_backend_llvm_codegen;
 public import raz_compiler_backend_llvm_globals_codegen;
 
 // LLVM MIR function/module emission. Frontend and MIR semantics remain backend-neutral.
-fn llvm_string_global_name(ForgeWriter&mut out, i64 instruction) {
-    i64 prefix[9] = [64, 46, 114, 97, 122, 46, 115, 116, 114];
 
-    llvm_chars(out, &prefix, 9);
+fn llvm_build_function_reachability(HirModule& hir, MirModule& mir, i64 main_index) -> i64 {
+    i64 reachable = raz_compiler_rt_arena_create(hir.function_count);
+    if (reachable == 0) { return 0; }
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        raz_compiler_rt_arena_set(reachable, function_index, 0);
+        if (
+            function_index == main_index ||
+            raz_compiler_rt_arena_get(hir.function_drop_structs, function_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.function_clone_structs, function_index) >= 0
+        ) {
+            raz_compiler_rt_arena_set(reachable, function_index, 1);
+        }
+        function_index += 1;
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        function_index = 0;
+        while (function_index < hir.function_count) {
+            if (raz_compiler_rt_arena_get(reachable, function_index) != 0) {
+                i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+                i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+                while (ip < end) {
+                    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+                    i64 target = -1;
+                    if (opcode == 8 || opcode == 43 || opcode == 50) {
+                        target = raz_compiler_rt_arena_get(mir.op_a, ip);
+                    }
+                    if (
+                        target >= 0 && target < hir.function_count &&
+                        raz_compiler_rt_arena_get(reachable, target) == 0
+                    ) {
+                        raz_compiler_rt_arena_set(reachable, target, 1);
+                        changed = true;
+                    }
+                    ip += 1;
+                }
+            }
+            function_index += 1;
+        }
+    }
+    return reachable;
+}
+
+fn llvm_write_emit_failure(Source& source, HirModule& hir, i64 function_index) {
+    ForgeWriter diagnostic;
+
+    writer_init(&mut diagnostic);
+    writer_literal(&mut diagnostic, "error: LLVM backend could not emit function ");
+    if (function_index >= 0 && function_index < hir.function_count) {
+        llvm_function_name(&mut diagnostic, source, hir, function_index);
+    } else {
+        writer_decimal(&mut diagnostic, function_index);
+    }
+    writer_newline(&mut diagnostic);
+    raz_compiler_rt_stdio_write_ascii(2, diagnostic.data, diagnostic.length);
+    writer_destroy(&mut diagnostic);
+}
+
+fn llvm_string_global_name(ForgeWriter&mut out, i64 instruction) {
+    
+
+    llvm_literal(out, "@.raz.str");
     writer_decimal(out, instruction);
 }
 
@@ -24,16 +85,16 @@ fn llvm_emit_string_globals(ForgeWriter&mut out, Source& source, MirModule& mir)
 
             llvm_string_global_name(out, ip);
 
-            i64 head[29] = [32, 61, 32, 112, 114, 105, 118, 97, 116, 101, 32, 117, 110, 110, 97, 109, 101, 100, 95, 97, 100, 100, 114, 32, 99, 111, 110, 115, 116];
+            
 
-            llvm_chars(out, &head, 29);
+            llvm_literal(out, " = private unnamed_addr constant");
             writer_space(out);
             writer_put(out, 91);
             writer_decimal(out, length + 1);
 
-            i64 xtype[6] = [32, 120, 32, 105, 56, 93];
+            
 
-            llvm_chars(out, &xtype, 6);
+            llvm_literal(out, " x i8]");
             writer_space(out);
             writer_put(out, 91);
 
@@ -185,9 +246,9 @@ fn llvm_emit_symbol_prefix(
     bool generated_helper,
 ) {
     if (generated_helper) {
-        i64 internal_word[9] = [105, 110, 116, 101, 114, 110, 97, 108, 32];
+        
 
-        llvm_chars(out, &internal_word, 9);
+        llvm_literal(out, "internal ");
         return;
     }
     bool is_import = llvm_symbol_list_contains(
@@ -223,26 +284,26 @@ fn llvm_emit_symbol_prefix(
         options.linkonce_length,
     );
     if (is_linkonce && !declaration) {
-        i64 word[13] = [108, 105, 110, 107, 111, 110, 99, 101, 95, 111, 100, 114, 32];
+        
 
-        llvm_chars(out, &word, 13);
+        llvm_literal(out, "linkonce_odr ");
     } else if (is_weak && !declaration) {
-        i64 word[5] = [119, 101, 97, 107, 32];
+        
 
-        llvm_chars(out, &word, 5);
+        llvm_literal(out, "weak ");
     }
     if (is_import && declaration) {
-        i64 word[10] = [100, 108, 108, 105, 109, 112, 111, 114, 116, 32];
+        
 
-        llvm_chars(out, &word, 10);
+        llvm_literal(out, "dllimport ");
     } else if (is_export && !declaration) {
-        i64 word[10] = [100, 108, 108, 101, 120, 112, 111, 114, 116, 32];
+        
 
-        llvm_chars(out, &word, 10);
+        llvm_literal(out, "dllexport ");
     } else if (options.visibility_kind == 1) {
-        i64 word[7] = [104, 105, 100, 100, 101, 110, 32];
+        
 
-        llvm_chars(out, &word, 7);
+        llvm_literal(out, "hidden ");
     }
 }
 
@@ -256,13 +317,13 @@ fn llvm_emit_function_header(
     bool declaration,
 ) {
     if (declaration) {
-        i64 word[7] = [100, 101, 99, 108, 97, 114, 101];
+        
 
-        llvm_chars(out, &word, 7);
+        llvm_literal(out, "declare");
     } else {
-        i64 word[6] = [100, 101, 102, 105, 110, 101];
+        
 
-        llvm_chars(out, &word, 6);
+        llvm_literal(out, "define");
     }
     writer_space(out);
     llvm_emit_symbol_prefix(out, source, hir, options, function_index, declaration, false);
@@ -270,9 +331,9 @@ fn llvm_emit_function_header(
     i64 abi_kind = raz_compiler_rt_arena_get(hir.function_abi_kinds, function_index);
 
     if (abi_kind == 1) {
-        i64 ccc[3] = [99, 99, 99];
+        
 
-        llvm_chars(out, &ccc, 3);
+        llvm_literal(out, "ccc");
         writer_space(out);
     }
     llvm_function_return_type(out, hir, function_index);
@@ -300,13 +361,32 @@ fn llvm_emit_function_header(
     i64 feature_length = raz_compiler_rt_arena_get(hir.function_target_feature_lengths, function_index);
 
     if (feature_length > 0) {
-        i64 prefix[20] = [32, 34, 116, 97, 114, 103, 101, 116, 45, 102, 101, 97, 116, 117, 114, 101, 115, 34, 61, 34];
+        
 
-        llvm_chars(out, &prefix, 20);
+        llvm_literal(out, " \"target-features\"=\"");
 
         i64 feature_offset = raz_compiler_rt_arena_get(hir.function_target_feature_offsets, function_index);
 
-        writer_text(out, source, feature_offset, feature_length);
+        // LLVM requires every entry of "target-features" to carry an explicit
+        // '+' or '-'. Raz spells the attribute as `@target_feature(avx2)`, so
+        // add the enabling sign to each comma-separated feature that lacks one.
+        i64 feature_index = 0;
+        bool at_feature_start = true;
+
+        while (feature_index < feature_length) {
+            i64 feature_byte = source_byte(source, feature_offset + feature_index);
+
+            if (feature_byte == 44) {
+                at_feature_start = true;
+            } else if (feature_byte != 32) {
+                if (at_feature_start && feature_byte != 43 && feature_byte != 45) {
+                    writer_put(out, 43);
+                }
+                at_feature_start = false;
+            }
+            writer_put(out, feature_byte);
+            feature_index += 1;
+        }
         writer_put(out, 34);
     }
 }
@@ -355,9 +435,9 @@ fn llvm_block_argument_type(MirModule& mir, i64 function_start, i64 function_end
 fn llvm_emit_predecessor(ForgeWriter&mut out, i64 block) {
     writer_put(out, 37);
     if (block < 0) {
-        i64 entry[5] = [101, 110, 116, 114, 121];
+        
 
-        llvm_chars(out, &entry, 5);
+        llvm_literal(out, "entry");
     } else {
         llvm_block(out, block);
     }
@@ -379,9 +459,9 @@ fn llvm_emit_block_phi(
     writer_put(out, 61);
     writer_space(out);
 
-    i64 phi[3] = [112, 104, 105];
+    
 
-    llvm_chars(out, &phi, 3);
+    llvm_literal(out, "phi");
     writer_space(out);
     llvm_type(out, type_kind);
     writer_space(out);
@@ -439,16 +519,15 @@ fn llvm_hir_local_index(HirModule& hir, i64 function_index, i64 local_slot) -> i
         return -1;
     }
 
-    i64 cursor = raz_compiler_rt_arena_get(hir.function_local_starts, function_index);
+    i64 link = raz_compiler_rt_arena_get(hir.function_last_locals, function_index);
 
-    while (cursor < hir.local_count) {
-        if (
-            raz_compiler_rt_arena_get(hir.local_function_indices, cursor) == function_index &&
-            raz_compiler_rt_arena_get(hir.local_slots, cursor) == local_slot
-        ) {
-            return cursor;
+    while (link > 0) {
+        i64 index = link - 1;
+
+        if (raz_compiler_rt_arena_get(hir.local_slots, index) == local_slot) {
+            return index;
         }
-        cursor += 1;
+        link = raz_compiler_rt_arena_get(hir.local_previous_function_locals, index);
     }
     return -1;
 }
@@ -459,7 +538,14 @@ fn llvm_local_is_reference(HirModule& hir, i64 function_index, i64 local_slot) -
     if (local_slot >= 0 && local_slot < declared_count) {
         i64 local_index = llvm_hir_local_index(hir, function_index, local_slot);
 
-        return local_index >= 0 && raz_compiler_rt_arena_get(hir.local_references, local_index) != 0;
+        if (local_index < 0) { return false; }
+        i64 local_type = raz_compiler_rt_arena_get(hir.local_types, local_index);
+        return
+            raz_compiler_rt_arena_get(hir.local_references, local_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_slices, local_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_array_extents, local_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.local_type_structs, local_index) >= 0 ||
+            local_type == 12 || local_type == 13 || local_type == 14;
     }
 
     i64 parameter = local_slot - declared_count;
@@ -468,7 +554,14 @@ fn llvm_local_is_reference(HirModule& hir, i64 function_index, i64 local_slot) -
     if (parameter >= 0 && parameter < parameter_count) {
         i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
 
-        return raz_compiler_rt_arena_get(hir.parameter_references, parameter_start + parameter) != 0;
+        i64 parameter_index = parameter_start + parameter;
+        i64 parameter_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_index);
+        return
+            raz_compiler_rt_arena_get(hir.parameter_references, parameter_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_slices, parameter_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_array_extents, parameter_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter_index) >= 0 ||
+            parameter_type == 12 || parameter_type == 13 || parameter_type == 14;
     }
     return false;
 }
@@ -477,16 +570,16 @@ fn llvm_emit_local_store_word(ForgeWriter&mut out, i64 slot, i64 value) {
     writer_space(out);
     writer_space(out);
 
-    i64 storeword[10] = [115, 116, 111, 114, 101, 32, 105, 54, 52, 32];
+    
 
-    llvm_chars(out, &storeword, 10);
+    llvm_literal(out, "store i64 ");
     llvm_value(out, value);
     writer_put(out, 44);
     writer_space(out);
 
-    i64 ptrword[4] = [112, 116, 114, 32];
+    
 
-    llvm_chars(out, &ptrword, 4);
+    llvm_literal(out, "ptr ");
     llvm_local(out, slot);
     writer_newline(out);
 }
@@ -497,9 +590,9 @@ fn llvm_emit_local_store(ForgeWriter&mut out, i64 instruction, i64 slot, i64 val
     writer_space(out);
     writer_space(out);
 
-    i64 storeword[5] = [115, 116, 111, 114, 101];
+    
 
-    llvm_chars(out, &storeword, 5);
+    llvm_literal(out, "store");
     writer_space(out);
     writer_i64(out);
     writer_space(out);
@@ -513,9 +606,9 @@ fn llvm_emit_local_store(ForgeWriter&mut out, i64 instruction, i64 slot, i64 val
     writer_put(out, 44);
     writer_space(out);
 
-    i64 ptrword[3] = [112, 116, 114];
+    
 
-    llvm_chars(out, &ptrword, 3);
+    llvm_literal(out, "ptr");
     writer_space(out);
     llvm_local(out, slot);
     writer_newline(out);
@@ -525,33 +618,27 @@ fn llvm_emit_local_store(ForgeWriter&mut out, i64 instruction, i64 slot, i64 val
 // async function is a launcher returning an i64 future handle; execution lives
 // in a generated poll function that resumes from explicit frame states.
 fn llvm_async_label(ForgeWriter&mut out, i64 state, i64 kind) {
-    i64 prefix[6] = [97, 115, 121, 110, 99, 46];
+    
 
-    llvm_chars(out, &prefix, 6);
+    llvm_literal(out, "async.");
     if (kind == 0) {
-        i64 word[4] = [114, 117, 110, 46];
+        string word = "run.";
 
-        llvm_chars(out, &word, 4);
+        llvm_literal(out, word);
     } else if (kind == 1) {
-        i64 word[7] = [114, 101, 115, 117, 109, 101, 46];
+        string word = "resume.";
 
-        llvm_chars(out, &word, 7);
+        llvm_literal(out, word);
     } else if (kind == 2) {
-        i64 word[5] = [99, 111, 110, 116, 46];
+        string word = "cont.";
 
-        llvm_chars(out, &word, 5);
+        llvm_literal(out, word);
     } else if (kind == 3) {
-        i64 word[8] = [112, 101, 110, 100, 105, 110, 103, 46];
+        string word = "pending.";
 
-        llvm_chars(out, &word, 8);
+        llvm_literal(out, word);
     } else if (kind == 4) {
-        i64 word[7] = [99, 104, 101, 99, 107, 46, 0];
-        i64 i = 0;
-
-        while (i < 6) {
-            writer_put(out, word[i]);
-            i += 1;
-        }
+        llvm_literal(out, "resume.");
     }
     writer_decimal(out, state);
 }
@@ -578,36 +665,36 @@ fn llvm_async_mir_supported(HirModule& hir, MirModule& mir, i64 function_index) 
 fn llvm_async_emit_slot_load(ForgeWriter&mut out, i64 result, i64 slot) {
     llvm_emit_assignment(out, result);
 
-    i64 prefix[37] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 108, 111, 97, 100, 40, 112, 116, 114, 32];
+    
 
-    llvm_chars(out, &prefix, 37);
+    llvm_literal(out, "call i64 @raz_rt_async_slot_load(ptr ");
 
-    i64 frame[6] = [37, 102, 114, 97, 109, 101];
+    
 
-    llvm_chars(out, &frame, 6);
+    llvm_literal(out, "%frame");
 
-    i64 middle[6] = [44, 32, 105, 54, 52, 32];
+    
 
-    llvm_chars(out, &middle, 6);
+    llvm_literal(out, ", i64 ");
     writer_decimal(out, slot);
     writer_put(out, 41);
     writer_newline(out);
 }
 
 fn llvm_async_emit_slot_store(ForgeWriter&mut out, i64 slot, i64 value) {
-    i64 prefix[43] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 32, 37, 102];
+    
 
-    llvm_chars(out, &prefix, 43);
+    llvm_literal(out, "  call void @raz_rt_async_slot_store(ptr %f");
 
-    i64 rest[4] = [114, 97, 109, 101];
+    
 
-    llvm_chars(out, &rest, 4);
+    llvm_literal(out, "rame");
 
-    i64 middle[6] = [44, 32, 105, 54, 52, 32];
+    string middle = ", i64 ";
 
-    llvm_chars(out, &middle, 6);
+    llvm_literal(out, middle);
     writer_decimal(out, slot);
-    llvm_chars(out, &middle, 6);
+    llvm_literal(out, middle);
     llvm_value(out, value);
     writer_put(out, 41);
     writer_newline(out);
@@ -651,21 +738,21 @@ fn llvm_async_block_argument_ordinal(MirModule& mir, i64 function_index, i64 blo
 }
 
 fn llvm_async_cleanup_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 structure) {
-    i64 prefix[20] = [64, 95, 95, 114, 97, 122, 95, 97, 115, 121, 110, 99, 95, 99, 108, 101, 97, 110, 117, 112];
+    
 
-    llvm_chars(out, &prefix, 20);
+    llvm_literal(out, "@__raz_async_cleanup");
     writer_put(out, 95);
     writer_structure_name(out, source, hir, structure);
 }
 
 fn llvm_async_emit_slot_disarm(ForgeWriter&mut out, i64 slot) {
-    i64 pre[46] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 100, 105, 115, 97, 114, 109, 40, 112, 116, 114, 32, 37, 102, 114, 97];
+    
 
-    llvm_chars(out, &pre, 46);
+    llvm_literal(out, "  call void @raz_rt_async_slot_disarm(ptr %fra");
 
-    i64 tail[12] = [109, 101, 44, 32, 105, 54, 52, 32, 0, 0, 0, 0];
+    string tail = "me, i64 ";
 
-    llvm_chars(out, &tail, 8);
+    llvm_literal(out, tail);
     writer_decimal(out, slot);
     writer_put(out, 41);
     writer_newline(out);
@@ -688,31 +775,31 @@ fn llvm_async_emit_slot_store_owned(
     writer_put(out, 61);
     writer_space(out);
 
-    i64 ptoi[13] = [112, 116, 114, 116, 111, 105, 110, 116, 32, 112, 116, 114, 32];
+    
 
-    llvm_chars(out, &ptoi, 13);
+    llvm_literal(out, "ptrtoint ptr ");
     llvm_async_cleanup_name(out, source, hir, structure);
 
-    i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+    
 
-    llvm_chars(out, &toi64, 7);
+    llvm_literal(out, " to i64");
     writer_newline(out);
 
-    i64 pre[52] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 95, 111, 119, 110, 101, 100, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109];
+    
 
-    llvm_chars(out, &pre, 52);
+    llvm_literal(out, "  call void @raz_rt_async_slot_store_owned(ptr %fram");
 
-    i64 mid[6] = [101, 44, 32, 105, 54, 52];
+    
 
-    llvm_chars(out, &mid, 6);
+    llvm_literal(out, "e, i64");
     writer_space(out);
     writer_decimal(out, slot);
 
-    i64 mid2[6] = [44, 32, 105, 54, 52, 32];
+    string mid2 = ", i64 ";
 
-    llvm_chars(out, &mid2, 6);
+    llvm_literal(out, mid2);
     llvm_value(out, value);
-    llvm_chars(out, &mid2, 6);
+    llvm_literal(out, mid2);
     llvm_async_temp(out, 90, instruction);
     writer_put(out, 41);
     writer_newline(out);
@@ -746,20 +833,20 @@ fn llvm_emit_async_structure_cleanup_function(
         return true;
     }
 
-    i64 def[12] = [100, 101, 102, 105, 110, 101, 32, 118, 111, 105, 100, 32];
+    
 
-    llvm_chars(out, &def, 12);
+    llvm_literal(out, "define void ");
     llvm_async_cleanup_name(out, source, hir, structure);
 
-    i64 arg[13] = [40, 105, 54, 52, 32, 37, 118, 97, 108, 117, 101, 41, 32];
+    
 
-    llvm_chars(out, &arg, 13);
+    llvm_literal(out, "(i64 %value) ");
     writer_put(out, 123);
     writer_newline(out);
 
-    i64 entry[7] = [101, 110, 116, 114, 121, 58, 10];
+    
 
-    llvm_chars(out, &entry, 7);
+    llvm_literal(out, "entry:\n");
 
     i64 drop_function = raz_compiler_rt_arena_get(hir.struct_drop_functions, structure);
 
@@ -771,19 +858,19 @@ fn llvm_emit_async_structure_cleanup_function(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 call[9] = [99, 97, 108, 108, 32, 105, 54, 52, 32];
+        string call = "call i64 ";
 
-        llvm_chars(out, &call, 9);
+        llvm_literal(out, call);
         llvm_function_name(out, source, hir, drop_function);
 
-        i64 open[5] = [40, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &open, 5);
+        llvm_literal(out, "(i64 ");
         writer_put(out, 37);
 
-        i64 value[5] = [118, 97, 108, 117, 101];
+        string value = "value";
 
-        llvm_chars(out, &value, 5);
+        llvm_literal(out, value);
         writer_put(out, 41);
         writer_newline(out);
     }
@@ -810,52 +897,52 @@ fn llvm_emit_async_structure_cleanup_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 get[38] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &get, 38);
+            llvm_literal(out, "call i64 @raz_rt_stage1_arena_get(i64 ");
             writer_put(out, 37);
 
-            i64 value[5] = [118, 97, 108, 117, 101];
+            string value = "value";
 
-            llvm_chars(out, &value, 5);
+            llvm_literal(out, value);
 
-            i64 comma[6] = [44, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &comma, 6);
+            llvm_literal(out, ", i64 ");
             writer_decimal(out, field);
             writer_put(out, 41);
             writer_newline(out);
             writer_space(out);
             writer_space(out);
 
-            i64 callv[10] = [99, 97, 108, 108, 32, 118, 111, 105, 100, 32];
+            
 
-            llvm_chars(out, &callv, 10);
+            llvm_literal(out, "call void ");
             llvm_async_cleanup_name(out, source, hir, child);
 
-            i64 open2[5] = [40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &open2, 5);
+            llvm_literal(out, "(i64 ");
             llvm_async_temp(out, 92, structure * 256 + field);
             writer_put(out, 41);
             writer_newline(out);
         }
     }
 
-    i64 destroy[45] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54, 52, 32];
+    
 
-    llvm_chars(out, &destroy, 45);
+    llvm_literal(out, "  call void @raz_rt_stage1_arena_destroy(i64 ");
     writer_put(out, 37);
 
-    i64 value2[5] = [118, 97, 108, 117, 101];
+    
 
-    llvm_chars(out, &value2, 5);
+    llvm_literal(out, "value");
     writer_put(out, 41);
     writer_newline(out);
 
-    i64 ret[10] = [32, 32, 114, 101, 116, 32, 118, 111, 105, 100];
+    
 
-    llvm_chars(out, &ret, 10);
+    llvm_literal(out, "  ret void");
     writer_newline(out);
     writer_put(out, 125);
     writer_newline(out);
@@ -864,19 +951,11 @@ fn llvm_emit_async_structure_cleanup_function(
 }
 
 fn llvm_async_emit_state_store(ForgeWriter&mut out, i64 state) {
-    i64 prefix[47] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109];
+    
 
-    llvm_chars(out, &prefix, 47);
+    llvm_literal(out, "  call void @raz_rt_async_state_store(ptr %fram");
 
-    i64 tail[10] = [101, 44, 32, 105, 51, 50, 32, 0, 0, 0];
-
-    writer_put(out, tail[0]);
-    writer_put(out, tail[1]);
-    writer_put(out, tail[2]);
-    writer_put(out, tail[3]);
-    writer_put(out, tail[4]);
-    writer_put(out, tail[5]);
-    writer_put(out, tail[6]);
+    llvm_literal(out, "e, i32 ");
     writer_decimal(out, state);
     writer_put(out, 41);
     writer_newline(out);
@@ -897,9 +976,9 @@ fn llvm_emit_async_scalar_instruction(
     if (opcode == 1) {
         llvm_emit_assignment(out, ip);
         if (primitive_type_is_float(type_kind)) {
-            i64 fadd[5] = [102, 97, 100, 100, 32];
+            
 
-            llvm_chars(out, &fadd, 5);
+            llvm_literal(out, "fadd ");
             llvm_type(out, type_kind);
             writer_space(out);
             if (raz_compiler_rt_arena_get(mir.op_b, ip) > 0) {
@@ -920,9 +999,9 @@ fn llvm_emit_async_scalar_instruction(
             writer_put(out, 46);
             writer_put(out, 48);
         } else {
-            i64 add[4] = [97, 100, 100, 32];
+            string add = "add ";
 
-            llvm_chars(out, &add, 4);
+            llvm_literal(out, add);
             llvm_type(out, type_kind);
             writer_space(out);
             writer_decimal(out, 0);
@@ -964,13 +1043,13 @@ fn llvm_emit_async_scalar_instruction(
         writer_put(out, 61);
         writer_space(out);
         if (primitive_type_is_float(type_kind)) {
-            i64 cmp[5] = [102, 99, 109, 112, 32];
+            
 
-            llvm_chars(out, &cmp, 5);
+            llvm_literal(out, "fcmp ");
         } else {
-            i64 cmp[5] = [105, 99, 109, 112, 32];
+            
 
-            llvm_chars(out, &cmp, 5);
+            llvm_literal(out, "icmp ");
         }
         if (!llvm_emit_compare_predicate(out, opcode, type_kind)) {
             return false;
@@ -985,14 +1064,14 @@ fn llvm_emit_async_scalar_instruction(
         writer_newline(out);
         llvm_emit_assignment(out, ip);
 
-        i64 zext[8] = [122, 101, 120, 116, 32, 105, 49, 32];
+        string zext = "zext i1 ";
 
-        llvm_chars(out, &zext, 8);
+        llvm_literal(out, zext);
         llvm_async_temp(out, 30, ip);
 
-        i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+        
 
-        llvm_chars(out, &toi64, 7);
+        llvm_literal(out, " to i64");
         writer_newline(out);
         return true;
     }
@@ -1004,9 +1083,9 @@ fn llvm_emit_async_scalar_instruction(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 cmp[8] = [105, 99, 109, 112, 32, 110, 101, 32];
+        
 
-        llvm_chars(out, &cmp, 8);
+        llvm_literal(out, "icmp ne ");
         writer_i64(out);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -1016,9 +1095,9 @@ fn llvm_emit_async_scalar_instruction(
         writer_newline(out);
         llvm_emit_assignment(out, ip);
 
-        i64 sel[7] = [115, 101, 108, 101, 99, 116, 32];
+        
 
-        llvm_chars(out, &sel, 7);
+        llvm_literal(out, "select ");
         writer_put(out, 105);
         writer_put(out, 49);
         writer_space(out);
@@ -1044,9 +1123,9 @@ fn llvm_emit_async_scalar_instruction(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 cmp[8] = [105, 99, 109, 112, 32, 101, 113, 32];
+        
 
-        llvm_chars(out, &cmp, 8);
+        llvm_literal(out, "icmp eq ");
         writer_i64(out);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -1056,27 +1135,27 @@ fn llvm_emit_async_scalar_instruction(
         writer_newline(out);
         llvm_emit_assignment(out, ip);
 
-        i64 zext[8] = [122, 101, 120, 116, 32, 105, 49, 32];
+        
 
-        llvm_chars(out, &zext, 8);
+        llvm_literal(out, "zext i1 ");
         llvm_async_temp(out, 32, ip);
 
-        i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+        
 
-        llvm_chars(out, &toi64, 7);
+        llvm_literal(out, " to i64");
         writer_newline(out);
         return true;
     }
     if (opcode == 19 || opcode == 20) {
         llvm_emit_assignment(out, ip);
         if (opcode == 19) {
-            i64 w[3] = [97, 110, 100];
+            
 
-            llvm_chars(out, &w, 3);
+            llvm_literal(out, "and");
         } else {
-            i64 w[2] = [111, 114];
+            
 
-            llvm_chars(out, &w, 2);
+            llvm_literal(out, "or");
         }
         writer_space(out);
         writer_i64(out);
@@ -1098,9 +1177,9 @@ fn llvm_emit_async_scalar_instruction(
             writer_space(out);
         }
 
-        i64 call[5] = [99, 97, 108, 108, 32];
+        string call = "call ";
 
-        llvm_chars(out, &call, 5);
+        llvm_literal(out, call);
         llvm_function_return_type(out, hir, target);
         writer_space(out);
         llvm_function_name(out, source, hir, target);
@@ -1129,9 +1208,9 @@ fn llvm_emit_async_scalar_instruction(
 
         llvm_emit_assignment(out, ip);
 
-        i64 call[5] = [99, 97, 108, 108, 32];
+        string call = "call ";
 
-        llvm_chars(out, &call, 5);
+        llvm_literal(out, call);
         llvm_function_type_return_type(out, hir, signature);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -1158,16 +1237,16 @@ fn llvm_emit_async_scalar_instruction(
     if (opcode == 47) {
         llvm_emit_assignment(out, ip);
 
-        i64 loadword[5] = [108, 111, 97, 100, 32];
+        
 
-        llvm_chars(out, &loadword, 5);
+        llvm_literal(out, "load ");
         llvm_type(out, type_kind);
         writer_put(out, 44);
         writer_space(out);
 
-        i64 ptrword[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrword, 4);
+        llvm_literal(out, "ptr ");
         llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
         writer_newline(out);
         return true;
@@ -1176,18 +1255,18 @@ fn llvm_emit_async_scalar_instruction(
         writer_space(out);
         writer_space(out);
 
-        i64 storeword[6] = [115, 116, 111, 114, 101, 32];
+        
 
-        llvm_chars(out, &storeword, 6);
+        llvm_literal(out, "store ");
         llvm_type(out, type_kind);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
         writer_put(out, 44);
         writer_space(out);
 
-        i64 ptrword[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrword, 4);
+        llvm_literal(out, "ptr ");
         llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
         writer_newline(out);
         return true;
@@ -1197,28 +1276,28 @@ fn llvm_emit_async_scalar_instruction(
         // module object itself rather than loading its current scalar value.
         llvm_emit_assignment(out, ip);
 
-        i64 ptrtoint[8] = [112, 116, 114, 116, 111, 105, 110, 116];
+        string ptrtoint = "ptrtoint";
 
-        llvm_chars(out, &ptrtoint, 8);
+        llvm_literal(out, ptrtoint);
         writer_space(out);
 
-        i64 ptrword[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrword, 4);
+        llvm_literal(out, "ptr ");
         llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-        i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+        
 
-        llvm_chars(out, &toi64, 7);
+        llvm_literal(out, " to i64");
         writer_newline(out);
         return true;
     }
     if (opcode == 46) {
         llvm_emit_assignment(out, ip);
 
-        i64 add[8] = [97, 100, 100, 32, 105, 54, 52, 32];
+        string add = "add i64 ";
 
-        llvm_chars(out, &add, 8);
+        llvm_literal(out, add);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
         writer_put(out, 44);
         writer_space(out);
@@ -1255,9 +1334,9 @@ fn llvm_emit_async_scalar_instruction(
         }
         llvm_emit_assignment(out, ip);
 
-        i64 add[8] = [97, 100, 100, 32, 105, 54, 52, 32];
+        string add = "add i64 ";
 
-        llvm_chars(out, &add, 8);
+        llvm_literal(out, add);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
         writer_put(out, 44);
         writer_space(out);
@@ -1268,40 +1347,40 @@ fn llvm_emit_async_scalar_instruction(
     if (opcode == 28) {
         llvm_emit_assignment(out, ip);
 
-        i64 pre[38] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &pre, 38);
+        llvm_literal(out, "call i64 @raz_rt_stage1_arena_get(i64 ");
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-        i64 mid[6] = [44, 32, 105, 54, 52, 32];
+        string mid = ", i64 ";
 
-        llvm_chars(out, &mid, 6);
+        llvm_literal(out, mid);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
         writer_put(out, 41);
         writer_newline(out);
         return true;
     }
     if (opcode == 29) {
-        i64 pre[39] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 115, 101, 116, 40, 105, 54];
+        
 
-        llvm_chars(out, &pre, 39);
+        llvm_literal(out, "  call void @raz_rt_stage1_arena_set(i6");
         writer_put(out, 52);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-        i64 mid[6] = [44, 32, 105, 54, 52, 32];
+        string mid = ", i64 ";
 
-        llvm_chars(out, &mid, 6);
+        llvm_literal(out, mid);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
-        llvm_chars(out, &mid, 6);
+        llvm_literal(out, mid);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_c, ip));
         writer_put(out, 41);
         writer_newline(out);
         llvm_emit_assignment(out, ip);
 
-        i64 add[8] = [97, 100, 100, 32, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &add, 8);
+        llvm_literal(out, "add i64 ");
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_c, ip));
         writer_put(out, 44);
         writer_space(out);
@@ -1312,9 +1391,9 @@ fn llvm_emit_async_scalar_instruction(
     if (opcode == 30) {
         llvm_emit_assignment(out, ip);
 
-        i64 pre[41] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &pre, 41);
+        llvm_literal(out, "call i64 @raz_rt_stage1_arena_create(i64 ");
         writer_decimal(out, raz_compiler_rt_arena_get(mir.op_a, ip));
         writer_put(out, 41);
         writer_newline(out);
@@ -1343,9 +1422,9 @@ fn llvm_emit_async_scalar_instruction(
             }
         }
 
-        i64 pre[43] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54];
+        
 
-        llvm_chars(out, &pre, 43);
+        llvm_literal(out, "  call void @raz_rt_stage1_arena_destroy(i6");
         writer_put(out, 52);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -1375,16 +1454,16 @@ fn llvm_emit_async_scalar_instruction(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 inttoptr[9] = [105, 110, 116, 116, 111, 112, 116, 114, 32];
+        
 
-        llvm_chars(out, &inttoptr, 9);
+        llvm_literal(out, "inttoptr ");
         writer_i64(out);
         writer_space(out);
         llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-        i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
+        
 
-        llvm_chars(out, &toptr, 7);
+        llvm_literal(out, " to ptr");
         writer_newline(out);
         writer_space(out);
         writer_space(out);
@@ -1393,16 +1472,16 @@ fn llvm_emit_async_scalar_instruction(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 gep[14] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114, 32];
+        
 
-        llvm_chars(out, &gep, 14);
+        llvm_literal(out, "getelementptr ");
         writer_i64(out);
         writer_put(out, 44);
         writer_space(out);
 
-        i64 ptrsp[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrsp, 4);
+        llvm_literal(out, "ptr ");
         llvm_async_temp(out, 53, ip);
         writer_put(out, 44);
         writer_space(out);
@@ -1412,18 +1491,18 @@ fn llvm_emit_async_scalar_instruction(
         writer_newline(out);
         llvm_emit_assignment(out, ip);
 
-        i64 ptoi[9] = [112, 116, 114, 116, 111, 105, 110, 116, 32];
+        
 
-        llvm_chars(out, &ptoi, 9);
+        llvm_literal(out, "ptrtoint ");
 
-        i64 ptrsp2[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrsp2, 4);
+        llvm_literal(out, "ptr ");
         llvm_async_temp(out, 54, ip);
 
-        i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+        
 
-        llvm_chars(out, &toi64, 7);
+        llvm_literal(out, " to i64");
         writer_newline(out);
         return true;
     }
@@ -1451,9 +1530,9 @@ fn llvm_emit_async_function(
 
     // Public launcher: create frame, expose its completion future, run initial poll.
 
-    i64 define_word[7] = [100, 101, 102, 105, 110, 101, 32];
+    string define_word = "define ";
 
-    llvm_chars(out, &define_word, 7);
+    llvm_literal(out, define_word);
     llvm_emit_symbol_prefix(out, source, hir, options, function_index, false, false);
     writer_i64(out);
     writer_space(out);
@@ -1477,13 +1556,13 @@ fn llvm_emit_async_function(
     writer_put(out, 123);
     writer_newline(out);
 
-    i64 entry[7] = [101, 110, 116, 114, 121, 58, 10];
+    string entry = "entry:\n";
 
-    llvm_chars(out, &entry, 7);
+    llvm_literal(out, entry);
 
-    i64 fpre[16] = [32, 32, 37, 102, 114, 97, 109, 101, 32, 61, 32, 99, 97, 108, 108, 32];
+    
 
-    llvm_chars(out, &fpre, 16);
+    llvm_literal(out, "  %frame = call ");
     writer_put(out, 112);
     writer_put(out, 116);
     writer_put(out, 114);
@@ -1504,49 +1583,49 @@ fn llvm_emit_async_function(
     writer_put(out, 41);
     writer_newline(out);
 
-    i64 futurepre[34] = [32, 32, 37, 102, 117, 116, 117, 114, 101, 32, 61, 32, 99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99];
+    
 
-    llvm_chars(out, &futurepre, 34);
+    llvm_literal(out, "  %future = call i64 @raz_rt_async");
 
-    i64 futtail[24] = [95, 102, 114, 97, 109, 101, 95, 102, 117, 116, 117, 114, 101, 95, 105, 54, 52, 40, 112, 116, 114, 32, 37, 102];
+    
 
-    llvm_chars(out, &futtail, 24);
+    llvm_literal(out, "_frame_future_i64(ptr %f");
 
-    i64 frametail[5] = [114, 97, 109, 101, 41];
+    
 
-    llvm_chars(out, &frametail, 5);
+    llvm_literal(out, "rame)");
     writer_newline(out);
 
-    i64 pollpre[17] = [32, 32, 37, 105, 110, 105, 116, 32, 61, 32, 99, 97, 108, 108, 32, 105, 51];
+    
 
-    llvm_chars(out, &pollpre, 17);
+    llvm_literal(out, "  %init = call i3");
     writer_put(out, 50);
     writer_space(out);
     writer_async_function_name(out, source, hir, function_index, 2);
 
-    i64 framearg[11] = [40, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101];
+    
 
-    llvm_chars(out, &framearg, 11);
+    llvm_literal(out, "(ptr %frame");
     writer_put(out, 41);
     writer_newline(out);
 
-    i64 destroy[52] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 100, 101, 115, 116, 114, 111, 121, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101, 41, 10];
+    
 
-    llvm_chars(out, &destroy, 52);
+    llvm_literal(out, "  call void @raz_rt_async_frame_destroy(ptr %frame)\n");
 
-    i64 retfuture[18] = [32, 32, 114, 101, 116, 32, 105, 54, 52, 32, 37, 102, 117, 116, 117, 114, 101, 10];
+    
 
-    llvm_chars(out, &retfuture, 18);
+    llvm_literal(out, "  ret i64 %future\n");
     writer_put(out, 125);
     writer_newline(out);
     writer_newline(out);
     // Constructor.
-    llvm_chars(out, &define_word, 7);
+    llvm_literal(out, define_word);
     llvm_emit_symbol_prefix(out, source, hir, options, function_index, false, true);
 
-    i64 ptr_word[4] = [112, 116, 114, 32];
+    
 
-    llvm_chars(out, &ptr_word, 4);
+    llvm_literal(out, "ptr ");
     writer_async_function_name(out, source, hir, function_index, 1);
     writer_put(out, 40);
     p = 0;
@@ -1564,117 +1643,117 @@ fn llvm_emit_async_function(
     writer_space(out);
     writer_put(out, 123);
     writer_newline(out);
-    llvm_chars(out, &entry, 7);
+    llvm_literal(out, entry);
 
-    i64 newpre[56] = [32, 32, 37, 102, 114, 97, 109, 101, 32, 61, 32, 99, 97, 108, 108, 32, 112, 116, 114, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 32, 0, 0, 0, 0, 0];
+    string newpre = "  %frame = call ptr @raz_rt_async_frame_create(i64 ";
 
-    llvm_chars(out, &newpre, 52);
+    llvm_literal(out, newpre);
     writer_decimal(out, local_count + parameter_count + await_count + block_argument_count);
     writer_put(out, 41);
     writer_newline(out);
     llvm_async_emit_state_store(out, 0);
 
-    i64 setpoll[47] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 115, 101, 116, 95, 112, 111, 108, 108, 101, 114, 40, 112, 116, 114, 32];
+    
 
-    llvm_chars(out, &setpoll, 47);
+    llvm_literal(out, "  call void @raz_rt_async_frame_set_poller(ptr ");
 
-    i64 fr[6] = [37, 102, 114, 97, 109, 101];
+    string fr = "%frame";
 
-    llvm_chars(out, &fr, 6);
+    llvm_literal(out, fr);
 
-    i64 comma_ptr[6] = [44, 32, 112, 116, 114, 32];
+    
 
-    llvm_chars(out, &comma_ptr, 6);
+    llvm_literal(out, ", ptr ");
     writer_async_function_name(out, source, hir, function_index, 2);
     writer_put(out, 41);
     writer_newline(out);
     // Constructor parameters are spilled directly into frame slots.
     p = 0;
     while (p < parameter_count) {
-        i64 sp[43] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 32, 37, 102];
+        
 
-        llvm_chars(out, &sp, 43);
+        llvm_literal(out, "  call void @raz_rt_async_slot_store(ptr %f");
 
-        i64 frest[4] = [114, 97, 109, 101];
+        
 
-        llvm_chars(out, &frest, 4);
+        llvm_literal(out, "rame");
 
-        i64 mid[6] = [44, 32, 105, 54, 52, 32];
+        string mid = ", i64 ";
 
-        llvm_chars(out, &mid, 6);
+        llvm_literal(out, mid);
         writer_decimal(out, local_count + p);
-        llvm_chars(out, &mid, 6);
+        llvm_literal(out, mid);
         llvm_parameter(out, p);
         writer_put(out, 41);
         writer_newline(out);
         p += 1;
     }
 
-    i64 retframe[18] = [32, 32, 114, 101, 116, 32, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101, 10, 125];
+    
 
-    llvm_chars(out, &retframe, 18);
+    llvm_literal(out, "  ret ptr %frame\n}");
     writer_newline(out);
     writer_newline(out);
     // Poll/resume state machine.
-    llvm_chars(out, &define_word, 7);
+    llvm_literal(out, define_word);
     llvm_emit_symbol_prefix(out, source, hir, options, function_index, false, true);
 
-    i64 i32_word[4] = [105, 51, 50, 32];
+    
 
-    llvm_chars(out, &i32_word, 4);
+    llvm_literal(out, "i32 ");
     writer_async_function_name(out, source, hir, function_index, 2);
 
-    i64 pollargs[13] = [40, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101, 41, 32];
+    
 
-    llvm_chars(out, &pollargs, 13);
+    llvm_literal(out, "(ptr %frame) ");
     writer_put(out, 123);
     writer_newline(out);
-    llvm_chars(out, &entry, 7);
+    llvm_literal(out, entry);
 
-    i64 statecall[49] = [32, 32, 37, 115, 116, 97, 116, 101, 32, 61, 32, 99, 97, 108, 108, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 116, 97, 116, 101, 95, 108, 111, 97, 100, 40, 112, 116, 114, 32];
+    
 
-    llvm_chars(out, &statecall, 49);
-    llvm_chars(out, &fr, 6);
+    llvm_literal(out, "  %state = call i32 @raz_rt_async_state_load(ptr ");
+    llvm_literal(out, fr);
     writer_put(out, 41);
     writer_newline(out);
 
-    i64 sw[35] = [32, 32, 115, 119, 105, 116, 99, 104, 32, 105, 51, 50, 32, 37, 115, 116, 97, 116, 101, 44, 32, 108, 97, 98, 101, 108, 32, 37, 97, 115, 121, 110, 99, 46, 105];
+    
 
-    llvm_chars(out, &sw, 35);
+    llvm_literal(out, "  switch i32 %state, label %async.i");
 
-    i64 invalid[12] = [110, 118, 97, 108, 105, 100, 32, 91, 10, 32, 32, 32];
+    string invalid = "nvalid [\n   ";
 
-    llvm_chars(out, &invalid, 12);
+    llvm_literal(out, invalid);
 
     i64 state = 0;
 
     while (state <= cancelled_state) {
-        i64 item[8] = [105, 51, 50, 32, 0, 0, 0, 0];
+        string item = "i32 ";
 
-        llvm_chars(out, &item, 4);
+        llvm_literal(out, item);
         writer_decimal(out, state);
 
-        i64 lab[9] = [44, 32, 108, 97, 98, 101, 108, 32, 37];
+        string lab = ", label %";
 
-        llvm_chars(out, &lab, 9);
+        llvm_literal(out, lab);
         if (state <= await_count) {
             llvm_async_label(out, state, 4);
         } else if (state == completed_state) {
-            i64 c[15] = [97, 115, 121, 110, 99, 46, 99, 111, 109, 112, 108, 101, 116, 101, 100];
+            
 
-            llvm_chars(out, &c, 15);
+            llvm_literal(out, "async.completed");
         } else {
-            i64 c[15] = [97, 115, 121, 110, 99, 46, 99, 97, 110, 99, 101, 108, 108, 101, 100];
+            
 
-            llvm_chars(out, &c, 15);
+            llvm_literal(out, "async.cancelled");
         }
         writer_newline(out);
         state += 1;
     }
 
-    i64 close[4] = [32, 32, 93, 10];
+    
 
-    llvm_chars(out, &close, 4);
+    llvm_literal(out, "  ]\n");
     // State entry checks and resume re-polls.
     state = 0;
     while (state <= await_count) {
@@ -1688,13 +1767,13 @@ fn llvm_emit_async_function(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 cancelcall[42] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 99, 97, 110, 99, 101, 108, 95, 114, 101, 113, 117, 101, 115, 116, 101, 100, 40, 112, 116];
+        
 
-        llvm_chars(out, &cancelcall, 42);
+        llvm_literal(out, "call i64 @raz_rt_async_cancel_requested(pt");
 
-        i64 cr[8] = [114, 32, 37, 102, 114, 97, 109, 101];
+        
 
-        llvm_chars(out, &cr, 8);
+        llvm_literal(out, "r %frame");
         writer_put(out, 41);
         writer_newline(out);
         writer_space(out);
@@ -1704,9 +1783,9 @@ fn llvm_emit_async_function(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 cmpne[12] = [105, 99, 109, 112, 32, 110, 101, 32, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &cmpne, 12);
+        llvm_literal(out, "icmp ne i64 ");
         llvm_async_temp(out, 60, state);
         writer_put(out, 44);
         writer_space(out);
@@ -1715,19 +1794,19 @@ fn llvm_emit_async_function(
         writer_space(out);
         writer_space(out);
 
-        i64 br[6] = [98, 114, 32, 105, 49, 32];
+        string br = "br i1 ";
 
-        llvm_chars(out, &br, 6);
+        llvm_literal(out, br);
         llvm_async_temp(out, 61, state);
 
-        i64 lab[9] = [44, 32, 108, 97, 98, 101, 108, 32, 37];
+        string lab = ", label %";
 
-        llvm_chars(out, &lab, 9);
+        llvm_literal(out, lab);
 
-        i64 cancelled[15] = [97, 115, 121, 110, 99, 46, 99, 97, 110, 99, 101, 108, 108, 101, 100];
+        string cancelled = "async.cancelled";
 
-        llvm_chars(out, &cancelled, 15);
-        llvm_chars(out, &lab, 9);
+        llvm_literal(out, cancelled);
+        llvm_literal(out, lab);
         if (state == 0) {
             llvm_async_label(out, 0, 0);
         } else {
@@ -1749,14 +1828,14 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 slotpre[37] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 115, 108, 111, 116, 95, 108, 111, 97, 100, 40, 112, 116, 114, 32];
+            
 
-            llvm_chars(out, &slotpre, 37);
-            llvm_chars(out, &fr, 6);
+            llvm_literal(out, "call i64 @raz_rt_async_slot_load(ptr ");
+            llvm_literal(out, fr);
 
-            i64 mid[6] = [44, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &mid, 6);
+            llvm_literal(out, ", i64 ");
             writer_decimal(out, local_count + parameter_count + state - 1);
             writer_put(out, 41);
             writer_newline(out);
@@ -1767,14 +1846,14 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 itp[16] = [105, 110, 116, 116, 111, 112, 116, 114, 32, 105, 54, 52, 32, 0, 0, 0];
+            string itp = "inttoptr i64 ";
 
-            llvm_chars(out, &itp, 13);
+            llvm_literal(out, itp);
             llvm_async_temp(out, 62, state);
 
-            i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
+            
 
-            llvm_chars(out, &toptr, 7);
+            llvm_literal(out, " to ptr");
             writer_newline(out);
             writer_space(out);
             writer_space(out);
@@ -1783,18 +1862,18 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 ap[44] = [99, 97, 108, 108, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 112, 111, 108, 108, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101];
+            
 
-            llvm_chars(out, &ap, 44);
+            llvm_literal(out, "call i32 @raz_rt_async_await_poll(ptr %frame");
 
-            i64 mptr[6] = [44, 32, 112, 116, 114, 32];
+            
 
-            llvm_chars(out, &mptr, 6);
+            llvm_literal(out, ", ptr ");
             llvm_async_temp(out, 63, state);
 
-            i64 mi32[6] = [44, 32, 105, 51, 50, 32];
+            
 
-            llvm_chars(out, &mi32, 6);
+            llvm_literal(out, ", i32 ");
             writer_decimal(out, state);
             writer_put(out, 41);
             writer_newline(out);
@@ -1805,9 +1884,9 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 eq[12] = [105, 99, 109, 112, 32, 101, 113, 32, 105, 51, 50, 32];
+            string eq = "icmp eq i32 ";
 
-            llvm_chars(out, &eq, 12);
+            llvm_literal(out, eq);
             llvm_async_temp(out, 64, state);
             writer_put(out, 44);
             writer_space(out);
@@ -1815,48 +1894,48 @@ fn llvm_emit_async_function(
             writer_newline(out);
             writer_space(out);
             writer_space(out);
-            llvm_chars(out, &br, 6);
+            llvm_literal(out, br);
             llvm_async_temp(out, 65, state);
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_async_label(out, state, 2);
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_async_label(out, state, 3);
             writer_newline(out);
         }
         state += 1;
     }
 
-    i64 comp[16] = [97, 115, 121, 110, 99, 46, 99, 111, 109, 112, 108, 101, 116, 101, 100, 58];
+    
 
-    llvm_chars(out, &comp, 16);
+    llvm_literal(out, "async.completed:");
     writer_newline(out);
 
-    i64 ret1[12] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 49, 10];
+    
 
-    llvm_chars(out, &ret1, 12);
+    llvm_literal(out, "  ret i32 1\n");
 
-    i64 canc[16] = [97, 115, 121, 110, 99, 46, 99, 97, 110, 99, 101, 108, 108, 101, 100, 58];
+    
 
-    llvm_chars(out, &canc, 16);
+    llvm_literal(out, "async.cancelled:");
     writer_newline(out);
 
-    i64 canccall[48] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 102, 114, 97, 109, 101, 95, 99, 97, 110, 99, 101, 108, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109];
+    
 
-    llvm_chars(out, &canccall, 48);
+    llvm_literal(out, "  call void @raz_rt_async_frame_cancel(ptr %fram");
 
-    i64 ect[3] = [101, 41, 10];
+    
 
-    llvm_chars(out, &ect, 3);
+    llvm_literal(out, "e)\n");
 
-    i64 retm1[13] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 45, 49, 10];
+    string retm1 = "  ret i32 -1\n";
 
-    llvm_chars(out, &retm1, 13);
+    llvm_literal(out, retm1);
 
-    i64 invlab[14] = [97, 115, 121, 110, 99, 46, 105, 110, 118, 97, 108, 105, 100, 58];
+    
 
-    llvm_chars(out, &invlab, 14);
+    llvm_literal(out, "async.invalid:");
     writer_newline(out);
-    llvm_chars(out, &retm1, 13);
+    llvm_literal(out, retm1);
     // Emit MIR segments. Each await terminates the current segment and creates
     // its ready continuation; state dispatch above re-polls before entering it.
 
@@ -1883,9 +1962,9 @@ fn llvm_emit_async_function(
                 writer_space(out);
                 writer_space(out);
 
-                i64 b[9] = [98, 114, 32, 108, 97, 98, 101, 108, 32];
+                
 
-                llvm_chars(out, &b, 9);
+                llvm_literal(out, "br label ");
                 writer_put(out, 37);
                 llvm_block(out, ip);
                 writer_newline(out);
@@ -1911,9 +1990,9 @@ fn llvm_emit_async_function(
             writer_space(out);
             writer_space(out);
 
-            i64 b[9] = [98, 114, 32, 108, 97, 98, 101, 108, 32];
+            
 
-            llvm_chars(out, &b, 9);
+            llvm_literal(out, "br label ");
             writer_put(out, 37);
             llvm_block(out, target);
             writer_newline(out);
@@ -1954,9 +2033,9 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 cmp[12] = [105, 99, 109, 112, 32, 110, 101, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &cmp, 12);
+            llvm_literal(out, "icmp ne i64 ");
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_put(out, 44);
             writer_space(out);
@@ -1965,16 +2044,16 @@ fn llvm_emit_async_function(
             writer_space(out);
             writer_space(out);
 
-            i64 br[6] = [98, 114, 32, 105, 49, 32];
+            string br = "br i1 ";
 
-            llvm_chars(out, &br, 6);
+            llvm_literal(out, br);
             llvm_async_temp(out, 70, ip);
 
-            i64 lab[9] = [44, 32, 108, 97, 98, 101, 108, 32, 37];
+            string lab = ", label %";
 
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_block(out, tt);
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_block(out, ft);
             writer_newline(out);
             terminated = true;
@@ -1990,14 +2069,14 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 itp[13] = [105, 110, 116, 116, 111, 112, 116, 114, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &itp, 13);
+            llvm_literal(out, "inttoptr i64 ");
             llvm_value(out, future);
 
-            i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
+            
 
-            llvm_chars(out, &toptr, 7);
+            llvm_literal(out, " to ptr");
             writer_newline(out);
             writer_space(out);
             writer_space(out);
@@ -2006,18 +2085,18 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 ap[44] = [99, 97, 108, 108, 32, 105, 51, 50, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 112, 111, 108, 108, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109, 101];
+            
 
-            llvm_chars(out, &ap, 44);
+            llvm_literal(out, "call i32 @raz_rt_async_await_poll(ptr %frame");
 
-            i64 mptr[6] = [44, 32, 112, 116, 114, 32];
+            
 
-            llvm_chars(out, &mptr, 6);
+            llvm_literal(out, ", ptr ");
             llvm_async_temp(out, 71, ip);
 
-            i64 mi32[6] = [44, 32, 105, 51, 50, 32];
+            
 
-            llvm_chars(out, &mi32, 6);
+            llvm_literal(out, ", i32 ");
             writer_decimal(out, segment + 1);
             writer_put(out, 41);
             writer_newline(out);
@@ -2028,9 +2107,9 @@ fn llvm_emit_async_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 eq[12] = [105, 99, 109, 112, 32, 101, 113, 32, 105, 51, 50, 32];
+            
 
-            llvm_chars(out, &eq, 12);
+            llvm_literal(out, "icmp eq i32 ");
             llvm_async_temp(out, 72, ip);
             writer_put(out, 44);
             writer_space(out);
@@ -2039,37 +2118,37 @@ fn llvm_emit_async_function(
             writer_space(out);
             writer_space(out);
 
-            i64 br[6] = [98, 114, 32, 105, 49, 32];
+            
 
-            llvm_chars(out, &br, 6);
+            llvm_literal(out, "br i1 ");
             llvm_async_temp(out, 73, ip);
 
-            i64 lab[9] = [44, 32, 108, 97, 98, 101, 108, 32, 37];
+            string lab = ", label %";
 
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_async_label(out, segment + 1, 2);
-            llvm_chars(out, &lab, 9);
+            llvm_literal(out, lab);
             llvm_async_label(out, segment + 1, 3);
             writer_newline(out);
             llvm_async_label(out, segment + 1, 3);
             writer_put(out, 58);
             writer_newline(out);
 
-            i64 ret0[12] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 48, 10];
+            
 
-            llvm_chars(out, &ret0, 12);
+            llvm_literal(out, "  ret i32 0\n");
             llvm_async_label(out, segment + 1, 2);
             writer_put(out, 58);
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 ar[44] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 97, 119, 97, 105, 116, 95, 114, 101, 115, 117, 108, 116, 40, 112, 116, 114, 32, 37, 102, 114, 97];
+            
 
-            llvm_chars(out, &ar, 44);
+            llvm_literal(out, "call i64 @raz_rt_async_await_result(ptr %fra");
 
-            i64 met[4] = [109, 101, 41, 0];
+            string met = "me)";
 
-            llvm_chars(out, &met, 3);
+            llvm_literal(out, met);
             writer_newline(out);
             segment += 1;
             open = true;
@@ -2077,18 +2156,18 @@ fn llvm_emit_async_function(
         } else if (opcode == 21) {
             llvm_async_disarm_owned_locals(out, hir, function_index);
 
-            i64 zero_result[48] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116, 114, 32, 37, 102, 114, 97, 109];
+            
 
-            llvm_chars(out, &zero_result, 48);
+            llvm_literal(out, "  call void @raz_rt_async_result_store(ptr %fram");
 
-            i64 zero_tail[13] = [101, 44, 32, 105, 54, 52, 32, 48, 41, 10, 0, 0, 0];
+            string zero_tail = "e, i64 0)\n";
 
-            llvm_chars(out, &zero_tail, 10);
+            llvm_literal(out, zero_tail);
             llvm_async_emit_state_store(out, completed_state);
 
-            i64 ret1[12] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 49, 10];
+            
 
-            llvm_chars(out, &ret1, 12);
+            llvm_literal(out, "  ret i32 1\n");
             terminated = true;
             open = false;
         } else if (opcode == 10) {
@@ -2096,25 +2175,25 @@ fn llvm_emit_async_function(
 
             llvm_async_disarm_owned_locals(out, hir, function_index);
 
-            i64 rs[41] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 97, 115, 121, 110, 99, 95, 114, 101, 115, 117, 108, 116, 95, 115, 116, 111, 114, 101, 40, 112, 116];
+            
 
-            llvm_chars(out, &rs, 41);
+            llvm_literal(out, "  call void @raz_rt_async_result_store(pt");
 
-            i64 rr[8] = [114, 32, 37, 102, 114, 97, 109, 101];
+            
 
-            llvm_chars(out, &rr, 8);
+            llvm_literal(out, "r %frame");
 
-            i64 mid[6] = [44, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &mid, 6);
+            llvm_literal(out, ", i64 ");
             llvm_value(out, result);
             writer_put(out, 41);
             writer_newline(out);
             llvm_async_emit_state_store(out, completed_state);
 
-            i64 ret1[12] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 49, 10];
+            
 
-            llvm_chars(out, &ret1, 12);
+            llvm_literal(out, "  ret i32 1\n");
             terminated = true;
             open = false;
         } else {
@@ -2128,9 +2207,9 @@ fn llvm_emit_async_function(
         llvm_async_disarm_owned_locals(out, hir, function_index);
         llvm_async_emit_state_store(out, completed_state);
 
-        i64 ret1[12] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 49, 10];
+        
 
-        llvm_chars(out, &ret1, 12);
+        llvm_literal(out, "  ret i32 1\n");
     }
     writer_put(out, 125);
     writer_newline(out);
@@ -2154,9 +2233,9 @@ fn llvm_emit_function(
     writer_put(out, 123);
     writer_newline(out);
 
-    i64 entryword[6] = [101, 110, 116, 114, 121, 58];
+    
 
-    llvm_chars(out, &entryword, 6);
+    llvm_literal(out, "entry:");
     writer_newline(out);
     // MIR locals are raw machine-sized slots. Keeping that representation in
     // LLVM preserves Raz's backend-neutral local/reference semantics.
@@ -2172,25 +2251,25 @@ fn llvm_emit_function(
         writer_put(out, 61);
         writer_space(out);
 
-        i64 alloca_word[6] = [97, 108, 108, 111, 99, 97];
+        
 
-        llvm_chars(out, &alloca_word, 6);
+        llvm_literal(out, "alloca");
         writer_space(out);
         writer_i64(out);
         writer_newline(out);
         writer_space(out);
         writer_space(out);
 
-        i64 store_zero[10] = [115, 116, 111, 114, 101, 32, 105, 54, 52, 32];
+        
 
-        llvm_chars(out, &store_zero, 10);
+        llvm_literal(out, "store i64 ");
         writer_decimal(out, 0);
         writer_put(out, 44);
         writer_space(out);
 
-        i64 ptrword[4] = [112, 116, 114, 32];
+        
 
-        llvm_chars(out, &ptrword, 4);
+        llvm_literal(out, "ptr ");
         llvm_local(out, local);
         writer_newline(out);
         local += 1;
@@ -2210,9 +2289,9 @@ fn llvm_emit_function(
                 writer_space(out);
                 writer_space(out);
 
-                i64 brword[9] = [98, 114, 32, 108, 97, 98, 101, 108, 32];
+                
 
-                llvm_chars(out, &brword, 9);
+                llvm_literal(out, "br label ");
                 writer_put(out, 37);
                 llvm_block(out, ip);
                 writer_newline(out);
@@ -2229,9 +2308,9 @@ fn llvm_emit_function(
         } else if (terminated) {} else if (opcode == 1) {
             llvm_emit_assignment(out, ip);
             if (primitive_type_is_float(type_kind)) {
-                i64 word[4] = [102, 97, 100, 100];
+                string word = "run.";
 
-                llvm_chars(out, &word, 4);
+                llvm_literal(out, word);
                 writer_space(out);
                 llvm_type(out, type_kind);
                 writer_space(out);
@@ -2253,9 +2332,9 @@ fn llvm_emit_function(
                 writer_put(out, 46);
                 writer_put(out, 48);
             } else {
-                i64 word[3] = [97, 100, 100];
+                string word = "add";
 
-                llvm_chars(out, &word, 3);
+                llvm_literal(out, word);
                 writer_space(out);
                 llvm_type(out, type_kind);
                 writer_space(out);
@@ -2270,9 +2349,9 @@ fn llvm_emit_function(
 
             llvm_emit_assignment(out, ip);
             if (primitive_type_is_float(type_kind)) {
-                i64 word[4] = [102, 97, 100, 100];
+                string word = "run.";
 
-                llvm_chars(out, &word, 4);
+                llvm_literal(out, word);
                 writer_space(out);
                 llvm_parameter_type(out, hir, function_index, parameter);
                 writer_space(out);
@@ -2289,22 +2368,22 @@ fn llvm_emit_function(
                     raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index) + parameter,
                 ) == 0
             ) {
-                i64 gep[13] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114];
+                
 
-                llvm_chars(out, &gep, 13);
+                llvm_literal(out, "getelementptr");
 
-                i64 tail[9] = [32, 105, 56, 44, 32, 112, 116, 114, 32];
+                
 
-                llvm_chars(out, &tail, 9);
+                llvm_literal(out, " i8, ptr ");
                 llvm_parameter(out, parameter);
 
-                i64 zero[7] = [44, 32, 105, 54, 52, 32, 48];
+                string zero = ", i64 0";
 
-                llvm_chars(out, &zero, 7);
+                llvm_literal(out, zero);
             } else {
-                i64 word[3] = [97, 100, 100];
+                string word = "add";
 
-                llvm_chars(out, &word, 3);
+                llvm_literal(out, word);
                 writer_space(out);
                 llvm_parameter_type(out, hir, function_index, parameter);
                 writer_space(out);
@@ -2322,17 +2401,17 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 loadword[4] = [108, 111, 97, 100];
+            
 
-            llvm_chars(out, &loadword, 4);
+            llvm_literal(out, "load");
             writer_space(out);
             writer_i64(out);
             writer_put(out, 44);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_local(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_newline(out);
             if (llvm_local_is_reference(hir, function_index, raz_compiler_rt_arena_get(mir.op_a, ip))) {
@@ -2341,9 +2420,9 @@ fn llvm_emit_function(
                 // explicit inttoptr conversion at the actual memory access.
                 llvm_emit_assignment(out, ip);
 
-                i64 addword[8] = [97, 100, 100, 32, 105, 54, 52, 32];
+                
 
-                llvm_chars(out, &addword, 8);
+                llvm_literal(out, "add i64 ");
                 llvm_temp(out, 10, ip);
                 writer_put(out, 44);
                 writer_space(out);
@@ -2373,13 +2452,9 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
             if (primitive_type_is_float(type_kind)) {
-                i64 word[5] = [102, 99, 109, 112, 32];
-
-                llvm_chars(out, &word, 5);
+                llvm_literal(out, "fcmp ");
             } else {
-                i64 word[5] = [105, 99, 109, 112, 32];
-
-                llvm_chars(out, &word, 5);
+                llvm_literal(out, "icmp ");
             }
             if (!llvm_emit_compare_predicate(out, opcode, type_kind)) {
                 return false;
@@ -2394,18 +2469,18 @@ fn llvm_emit_function(
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 zext[4] = [122, 101, 120, 116];
+            string zext = "zext";
 
-            llvm_chars(out, &zext, 4);
+            llvm_literal(out, zext);
 
-            i64 i1word[4] = [32, 105, 49, 32];
+            
 
-            llvm_chars(out, &i1word, 4);
+            llvm_literal(out, " i1 ");
             llvm_temp(out, 30, ip);
 
-            i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+            
 
-            llvm_chars(out, &toi64, 7);
+            llvm_literal(out, " to i64");
             writer_newline(out);
         } else if (opcode == 17) {
             // MIR select uses Raz's integer boolean convention. Convert the
@@ -2418,9 +2493,9 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 cmpword[8] = [105, 99, 109, 112, 32, 110, 101, 32];
+            
 
-            llvm_chars(out, &cmpword, 8);
+            llvm_literal(out, "icmp ne ");
             writer_i64(out);
             writer_space(out);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -2430,9 +2505,9 @@ fn llvm_emit_function(
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 selectword[7] = [115, 101, 108, 101, 99, 116, 32];
+            
 
-            llvm_chars(out, &selectword, 7);
+            llvm_literal(out, "select ");
             writer_put(out, 105);
             writer_put(out, 49);
             writer_space(out);
@@ -2458,9 +2533,9 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 cmpword[8] = [105, 99, 109, 112, 32, 101, 113, 32];
+            
 
-            llvm_chars(out, &cmpword, 8);
+            llvm_literal(out, "icmp eq ");
             writer_i64(out);
             writer_space(out);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -2470,27 +2545,27 @@ fn llvm_emit_function(
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 zextword[8] = [122, 101, 120, 116, 32, 105, 49, 32];
+            
 
-            llvm_chars(out, &zextword, 8);
+            llvm_literal(out, "zext i1 ");
             llvm_temp(out, 32, ip);
 
-            i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+            
 
-            llvm_chars(out, &toi64, 7);
+            llvm_literal(out, " to i64");
             writer_newline(out);
         } else if (opcode == 19 || opcode == 20) {
             // HIR short-circuit expressions normally lower through CFG. These
             // MIR opcodes also exist for already-materialized boolean values.
             llvm_emit_assignment(out, ip);
             if (opcode == 19) {
-                i64 andword[3] = [97, 110, 100];
+                
 
-                llvm_chars(out, &andword, 3);
+                llvm_literal(out, "and");
             } else {
-                i64 orword[2] = [111, 114];
+                
 
-                llvm_chars(out, &orword, 2);
+                llvm_literal(out, "or");
             }
             writer_space(out);
             writer_i64(out);
@@ -2501,15 +2576,36 @@ fn llvm_emit_function(
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
             writer_newline(out);
         } else if (opcode == 40) {
-            if (
-                !llvm_emit_numeric_cast(
-                    out,
-                    ip,
-                    raz_compiler_rt_arena_get(mir.op_a, ip),
-                    raz_compiler_rt_arena_get(mir.op_b, ip),
-                    type_kind,
-                )
-            ) {
+            i64 cast_source = raz_compiler_rt_arena_get(mir.op_a, ip);
+            i64 source_type = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 source_opcode = -1;
+            i64 source_source_type = -1;
+            if (cast_source >= 0 && cast_source < mir.instruction_count) {
+                source_opcode = raz_compiler_rt_arena_get(mir.opcodes, cast_source);
+                if (source_opcode == 40) {
+                    source_source_type = raz_compiler_rt_arena_get(mir.op_b, cast_source);
+                }
+            }
+            bool source_pointer_type = source_type == 12 || source_type == 13 || source_type == 14;
+            bool target_pointer_type = type_kind == 12 || type_kind == 13 || type_kind == 14;
+            bool source_is_native_pointer =
+                source_opcode == 40 &&
+                source_pointer_type &&
+                !(source_source_type == 12 || source_source_type == 13 || source_source_type == 14);
+            if (source_pointer_type && !target_pointer_type && !source_is_native_pointer) {
+                llvm_emit_assignment(out, ip);
+                if (primitive_type_width(type_kind) > 0 && primitive_type_width(type_kind) < 64) {
+                    llvm_literal(out, "trunc i64 ");
+                    llvm_value(out, cast_source);
+                    llvm_literal(out, " to ");
+                    llvm_type(out, type_kind);
+                } else {
+                    llvm_literal(out, "add i64 ");
+                    llvm_value(out, cast_source);
+                    llvm_literal(out, ", 0");
+                }
+                writer_newline(out);
+            } else if (!llvm_emit_numeric_cast(out, ip, cast_source, source_type, type_kind)) {
                 return false;
             }
         } else if (opcode == 8) {
@@ -2523,9 +2619,9 @@ fn llvm_emit_function(
                 writer_space(out);
             }
 
-            i64 callword[4] = [99, 97, 108, 108];
+            
 
-            llvm_chars(out, &callword, 4);
+            llvm_literal(out, "call");
             writer_space(out);
             llvm_function_return_type(out, hir, target);
             writer_space(out);
@@ -2561,9 +2657,9 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 ret[3] = [114, 101, 116];
+            string ret = "ret";
 
-            llvm_chars(out, &ret, 3);
+            llvm_literal(out, ret);
             writer_space(out);
             llvm_function_return_type(out, hir, function_index);
             writer_space(out);
@@ -2574,9 +2670,9 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 ret[8] = [114, 101, 116, 32, 118, 111, 105, 100];
+            string ret = "ret void";
 
-            llvm_chars(out, &ret, 8);
+            llvm_literal(out, ret);
             writer_newline(out);
             terminated = true;
         } else if (opcode == 22) {
@@ -2588,9 +2684,9 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 brword[9] = [98, 114, 32, 108, 97, 98, 101, 108, 32];
+            
 
-            llvm_chars(out, &brword, 9);
+            llvm_literal(out, "br label ");
             writer_put(out, 37);
             llvm_block(out, target);
             writer_newline(out);
@@ -2609,9 +2705,9 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 cmpword[8] = [105, 99, 109, 112, 32, 110, 101, 32];
+            
 
-            llvm_chars(out, &cmpword, 8);
+            llvm_literal(out, "icmp ne ");
             writer_i64(out);
             writer_space(out);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -2622,17 +2718,17 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 brprefix[6] = [98, 114, 32, 105, 49, 32];
+            
 
-            llvm_chars(out, &brprefix, 6);
+            llvm_literal(out, "br i1 ");
             llvm_temp(out, 31, ip);
 
-            i64 labelword[8] = [44, 32, 108, 97, 98, 101, 108, 32];
+            string labelword = ", label ";
 
-            llvm_chars(out, &labelword, 8);
+            llvm_literal(out, labelword);
             writer_put(out, 37);
             llvm_block(out, true_target);
-            llvm_chars(out, &labelword, 8);
+            llvm_literal(out, labelword);
             writer_put(out, 37);
             llvm_block(out, false_target);
             writer_newline(out);
@@ -2643,119 +2739,128 @@ fn llvm_emit_function(
             // element borrows share the same dereference/store operations.
             llvm_emit_assignment(out, ip);
 
-            i64 ptrtoint[8] = [112, 116, 114, 116, 111, 105, 110, 116];
+            string ptrtoint = "ptrtoint";
 
-            llvm_chars(out, &ptrtoint, 8);
+            llvm_literal(out, ptrtoint);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_local(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+            
 
-            llvm_chars(out, &toi64, 7);
+            llvm_literal(out, " to i64");
             writer_newline(out);
         } else if (opcode == 26) {
             i64 reference = raz_compiler_rt_arena_get(mir.op_a, ip);
+            i64 reference_opcode = -1;
+            i64 reference_type = 0;
 
-            writer_space(out);
-            writer_space(out);
-            llvm_temp(out, 51, ip);
-            writer_space(out);
-            writer_put(out, 61);
-            writer_space(out);
+            if (reference >= 0 && reference < mir.instruction_count) {
+                reference_opcode = raz_compiler_rt_arena_get(mir.opcodes, reference);
+                reference_type = raz_compiler_rt_arena_get(mir.op_types, reference);
+            }
+            // A semantic pointer/reference is not necessarily represented as an
+            // LLVM ptr: borrowed parameters and aggregate references deliberately
+            // use Raz's machine-word address ABI. Numeric casts *to* a raw pointer
+            // are already native LLVM ptr values and must not be inttoptr'd again.
+            bool reference_is_pointer =
+                reference_opcode == 40 &&
+                (reference_type == 12 || reference_type == 13 || reference_type == 14);
 
-            i64 inttoptr[8] = [105, 110, 116, 116, 111, 112, 116, 114];
-
-            llvm_chars(out, &inttoptr, 8);
-            writer_space(out);
-            writer_i64(out);
-            writer_space(out);
-            llvm_value(out, reference);
-
-            i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
-
-            llvm_chars(out, &toptr, 7);
-            writer_newline(out);
-            writer_space(out);
-            writer_space(out);
-            llvm_temp(out, 10, ip);
-            writer_space(out);
-            writer_put(out, 61);
-            writer_space(out);
-
-            i64 loadword[9] = [108, 111, 97, 100, 32, 105, 54, 52, 44];
-
-            llvm_chars(out, &loadword, 9);
-            writer_space(out);
-
-            i64 ptrword[4] = [112, 116, 114, 32];
-
-            llvm_chars(out, &ptrword, 4);
-            llvm_temp(out, 51, ip);
-            writer_newline(out);
-            llvm_emit_raw_to_value(out, ip, 10, ip, type_kind);
+            if (reference_is_pointer) {
+                llvm_emit_assignment(out, ip);
+                llvm_literal(out, "load ");
+                llvm_type(out, type_kind);
+                llvm_literal(out, ", ptr ");
+                llvm_value(out, reference);
+                writer_newline(out);
+            } else {
+                writer_space(out);
+                writer_space(out);
+                llvm_temp(out, 51, ip);
+                writer_space(out);
+                writer_put(out, 61);
+                writer_space(out);
+                llvm_literal(out, "inttoptr i64 ");
+                llvm_value(out, reference);
+                llvm_literal(out, " to ptr");
+                writer_newline(out);
+                writer_space(out);
+                writer_space(out);
+                llvm_temp(out, 10, ip);
+                writer_space(out);
+                writer_put(out, 61);
+                writer_space(out);
+                llvm_literal(out, "load i64, ptr ");
+                llvm_temp(out, 51, ip);
+                writer_newline(out);
+                llvm_emit_raw_to_value(out, ip, 10, ip, type_kind);
+            }
         } else if (opcode == 27) {
+            i64 reference = raz_compiler_rt_arena_get(mir.op_a, ip);
+            i64 reference_opcode = -1;
+            i64 reference_type = 0;
+
+            if (reference >= 0 && reference < mir.instruction_count) {
+                reference_opcode = raz_compiler_rt_arena_get(mir.opcodes, reference);
+                reference_type = raz_compiler_rt_arena_get(mir.op_types, reference);
+            }
+            // A semantic pointer/reference is not necessarily represented as an
+            // LLVM ptr: borrowed parameters and aggregate references deliberately
+            // use Raz's machine-word address ABI. Numeric casts *to* a raw pointer
+            // are already native LLVM ptr values and must not be inttoptr'd again.
+            bool reference_is_pointer =
+                reference_opcode == 40 &&
+                (reference_type == 12 || reference_type == 13 || reference_type == 14);
             i64 value = raz_compiler_rt_arena_get(mir.op_b, ip);
-            i64 raw = llvm_emit_value_to_raw(out, ip, value, type_kind);
 
-            writer_space(out);
-            writer_space(out);
-            llvm_temp(out, 52, ip);
-            writer_space(out);
-            writer_put(out, 61);
-            writer_space(out);
+            if (reference_is_pointer) {
+                i64 value_type = llvm_value_result_type(mir, value);
 
-            i64 inttoptr[8] = [105, 110, 116, 116, 111, 112, 116, 114];
-
-            llvm_chars(out, &inttoptr, 8);
-            writer_space(out);
-            writer_i64(out);
-            writer_space(out);
-            llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
-
-            i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
-
-            llvm_chars(out, &toptr, 7);
-            writer_newline(out);
-            writer_space(out);
-            writer_space(out);
-
-            i64 storeword[10] = [115, 116, 111, 114, 101, 32, 105, 54, 52, 32];
-
-            llvm_chars(out, &storeword, 10);
-            if (raw >= 0) {
-                llvm_value(out, raw);
-            } else if (raw == -21) {
-                llvm_temp(out, 21, ip);
+                writer_space(out);
+                writer_space(out);
+                llvm_literal(out, "store ");
+                llvm_type(out, value_type);
+                writer_space(out);
+                llvm_value(out, value);
+                writer_put(out, 44);
+                writer_space(out);
+                llvm_literal(out, "ptr ");
+                llvm_value(out, reference);
+                writer_newline(out);
             } else {
-                llvm_temp(out, 20, ip);
+                i64 raw = llvm_emit_value_to_raw(out, ip, value, type_kind);
+                writer_space(out);
+                writer_space(out);
+                llvm_temp(out, 52, ip);
+                writer_space(out);
+                writer_put(out, 61);
+                writer_space(out);
+                llvm_literal(out, "inttoptr i64 ");
+                llvm_value(out, reference);
+                llvm_literal(out, " to ptr");
+                writer_newline(out);
+                writer_space(out);
+                writer_space(out);
+                llvm_literal(out, "store i64 ");
+                if (raw >= 0) {
+                    llvm_value(out, raw);
+                } else if (raw == -21) {
+                    llvm_temp(out, 21, ip);
+                } else {
+                    llvm_temp(out, 20, ip);
+                }
+                writer_put(out, 44);
+                writer_space(out);
+                llvm_literal(out, "ptr ");
+                llvm_temp(out, 52, ip);
+                writer_newline(out);
             }
-            writer_put(out, 44);
-            writer_space(out);
-
-            i64 ptrword[4] = [112, 116, 114, 32];
-
-            llvm_chars(out, &ptrword, 4);
-            llvm_temp(out, 52, ip);
-            writer_newline(out);
             llvm_emit_assignment(out, ip);
-
-            i64 addword[8] = [97, 100, 100, 32, 105, 54, 52, 32];
-
-            llvm_chars(out, &addword, 8);
-            if (raw >= 0) {
-                llvm_value(out, raw);
-            } else if (raw == -21) {
-                llvm_temp(out, 21, ip);
-            } else {
-                llvm_temp(out, 20, ip);
-            }
-            writer_put(out, 44);
-            writer_space(out);
-            writer_decimal(out, 0);
+            llvm_literal(out, "add i64 0, 0");
             writer_newline(out);
         } else if (opcode == 28) {
             writer_space(out);
@@ -2765,18 +2870,29 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 callprefix[38] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 103, 101, 116, 40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &callprefix, 38);
+            llvm_literal(out, "call i64 @raz_rt_stage1_arena_get(i64 ");
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 middle[6] = [44, 32, 105, 54, 52, 32];
+            string middle = ", i64 ";
 
-            llvm_chars(out, &middle, 6);
+            llvm_literal(out, middle);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
             writer_put(out, 41);
             writer_newline(out);
-            llvm_emit_raw_to_value(out, ip, 41, ip, type_kind);
+            if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+                // Aggregate storage carries pointer-like values as Raz machine-word
+                // addresses. Keep the loaded word as i64 until an operation needs
+                // to materialize a native LLVM ptr.
+                llvm_emit_assignment(out, ip);
+                llvm_literal(out, "add i64 ");
+                llvm_temp(out, 41, ip);
+                llvm_literal(out, ", 0");
+                writer_newline(out);
+            } else {
+                llvm_emit_raw_to_value(out, ip, 41, ip, type_kind);
+            }
         } else if (opcode == 29) {
             i64 value = raz_compiler_rt_arena_get(mir.op_c, ip);
             i64 raw = llvm_emit_value_to_raw(out, ip, value, llvm_value_result_type(mir, value));
@@ -2784,16 +2900,16 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 callprefix[39] = [99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 115, 101, 116, 40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &callprefix, 39);
+            llvm_literal(out, "call void @raz_rt_stage1_arena_set(i64 ");
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 middle[6] = [44, 32, 105, 54, 52, 32];
+            string middle = ", i64 ";
 
-            llvm_chars(out, &middle, 6);
+            llvm_literal(out, middle);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
-            llvm_chars(out, &middle, 6);
+            llvm_literal(out, middle);
             if (raw >= 0) {
                 llvm_value(out, raw);
             } else if (raw == -21) {
@@ -2805,9 +2921,9 @@ fn llvm_emit_function(
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 addword[8] = [97, 100, 100, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &addword, 8);
+            llvm_literal(out, "add i64 ");
             if (raw >= 0) {
                 llvm_value(out, raw);
             } else if (raw == -21) {
@@ -2822,9 +2938,9 @@ fn llvm_emit_function(
         } else if (opcode == 30) {
             llvm_emit_assignment(out, ip);
 
-            i64 callprefix[41] = [99, 97, 108, 108, 32, 105, 54, 52, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 99, 114, 101, 97, 116, 101, 40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &callprefix, 41);
+            llvm_literal(out, "call i64 @raz_rt_stage1_arena_create(i64 ");
             writer_decimal(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_put(out, 41);
             writer_newline(out);
@@ -2832,9 +2948,9 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 callprefix[43] = [99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 114, 97, 122, 95, 114, 116, 95, 115, 116, 97, 103, 101, 49, 95, 97, 114, 101, 110, 97, 95, 100, 101, 115, 116, 114, 111, 121, 40, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &callprefix, 43);
+            llvm_literal(out, "call void @raz_rt_stage1_arena_destroy(i64 ");
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_put(out, 41);
             writer_newline(out);
@@ -2843,9 +2959,9 @@ fn llvm_emit_function(
 
             llvm_emit_assignment(out, ip);
 
-            i64 callword[4] = [99, 97, 108, 108];
+            
 
-            llvm_chars(out, &callword, 4);
+            llvm_literal(out, "call");
             writer_space(out);
             llvm_function_type_return_type(out, hir, signature);
             writer_space(out);
@@ -2871,52 +2987,52 @@ fn llvm_emit_function(
         } else if (opcode == 47) {
             llvm_emit_assignment(out, ip);
 
-            i64 loadword[5] = [108, 111, 97, 100, 32];
+            
 
-            llvm_chars(out, &loadword, 5);
+            llvm_literal(out, "load ");
             llvm_type(out, type_kind);
             writer_put(out, 44);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_newline(out);
         } else if (opcode == 48) {
             writer_space(out);
             writer_space(out);
 
-            i64 storeword[6] = [115, 116, 111, 114, 101, 32];
+            
 
-            llvm_chars(out, &storeword, 6);
+            llvm_literal(out, "store ");
             llvm_type(out, type_kind);
             writer_space(out);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
             writer_put(out, 44);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_newline(out);
         } else if (opcode == 49) {
             llvm_emit_assignment(out, ip);
 
-            i64 ptrtoint[8] = [112, 116, 114, 116, 111, 105, 110, 116];
+            string ptrtoint = "ptrtoint";
 
-            llvm_chars(out, &ptrtoint, 8);
+            llvm_literal(out, ptrtoint);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_module_global_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+            
 
-            llvm_chars(out, &toi64, 7);
+            llvm_literal(out, " to i64");
             writer_newline(out);
         } else if (opcode == 46) {
             // Spawn remains visible as a distinct MIR effect. The source async
@@ -2924,9 +3040,9 @@ fn llvm_emit_function(
             // lowering preserves that handle exactly like Forge does.
             llvm_emit_assignment(out, ip);
             if (primitive_type_is_float(type_kind)) {
-                i64 copyword[5] = [102, 97, 100, 100, 32];
+                
 
-                llvm_chars(out, &copyword, 5);
+                llvm_literal(out, "fadd ");
                 llvm_type(out, type_kind);
                 writer_space(out);
                 llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -2936,9 +3052,9 @@ fn llvm_emit_function(
                 writer_put(out, 46);
                 writer_put(out, 48);
             } else {
-                i64 copyword[4] = [97, 100, 100, 32];
+                
 
-                llvm_chars(out, &copyword, 4);
+                llvm_literal(out, "add ");
                 llvm_type(out, type_kind);
                 writer_space(out);
                 llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
@@ -2958,17 +3074,17 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 inttoptr[8] = [105, 110, 116, 116, 111, 112, 116, 114];
+            
 
-            llvm_chars(out, &inttoptr, 8);
+            llvm_literal(out, "inttoptr");
             writer_space(out);
             writer_i64(out);
             writer_space(out);
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 toptr[7] = [32, 116, 111, 32, 112, 116, 114];
+            
 
-            llvm_chars(out, &toptr, 7);
+            llvm_literal(out, " to ptr");
             writer_newline(out);
             writer_space(out);
             writer_space(out);
@@ -2977,83 +3093,93 @@ fn llvm_emit_function(
             writer_put(out, 61);
             writer_space(out);
 
-            i64 gep[13] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114];
+            
 
-            llvm_chars(out, &gep, 13);
+            llvm_literal(out, "getelementptr");
             writer_space(out);
             writer_i64(out);
             writer_put(out, 44);
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_temp(out, 53, ip);
 
-            i64 idxprefix[6] = [44, 32, 105, 54, 52, 32];
+            
 
-            llvm_chars(out, &idxprefix, 6);
+            llvm_literal(out, ", i64 ");
             llvm_value(out, raz_compiler_rt_arena_get(mir.op_b, ip));
             writer_newline(out);
             llvm_emit_assignment(out, ip);
 
-            i64 ptrtoint[8] = [112, 116, 114, 116, 111, 105, 110, 116];
+            
 
-            llvm_chars(out, &ptrtoint, 8);
+            llvm_literal(out, "ptrtoint");
             writer_space(out);
 
-            i64 ptrword2[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword2, 4);
+            llvm_literal(out, "ptr ");
             llvm_temp(out, 54, ip);
 
-            i64 toi64[7] = [32, 116, 111, 32, 105, 54, 52];
+            
 
-            llvm_chars(out, &toi64, 7);
+            llvm_literal(out, " to i64");
             writer_newline(out);
         } else if (opcode == 42) {
             llvm_emit_assignment(out, ip);
 
-            i64 gep[14] = [103, 101, 116, 101, 108, 101, 109, 101, 110, 116, 112, 116, 114, 32];
+            
 
-            llvm_chars(out, &gep, 14);
+            llvm_literal(out, "getelementptr ");
             writer_put(out, 91);
             writer_decimal(out, raz_compiler_rt_arena_get(mir.op_b, ip) + 1);
 
-            i64 arraytype[7] = [32, 120, 32, 105, 56, 93, 44];
+            
 
-            llvm_chars(out, &arraytype, 7);
+            llvm_literal(out, " x i8],");
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_string_global_name(out, ip);
 
-            i64 zeros[14] = [44, 32, 105, 54, 52, 32, 48, 44, 32, 105, 54, 52, 32, 48];
+            
 
-            llvm_chars(out, &zeros, 14);
+            llvm_literal(out, ", i64 0, i64 0");
             writer_newline(out);
         } else if (opcode == 43) {
             llvm_emit_assignment(out, ip);
 
-            i64 selectword[15] = [115, 101, 108, 101, 99, 116, 32, 105, 49, 32, 116, 114, 117, 101, 44];
+            
 
-            llvm_chars(out, &selectword, 15);
+            llvm_literal(out, "select i1 true,");
             writer_space(out);
 
-            i64 ptrword[4] = [112, 116, 114, 32];
+            
 
-            llvm_chars(out, &ptrword, 4);
+            llvm_literal(out, "ptr ");
             llvm_function_name(out, source, hir, raz_compiler_rt_arena_get(mir.op_a, ip));
 
-            i64 tail[10] = [44, 32, 112, 116, 114, 32, 110, 117, 108, 108];
+            
 
-            llvm_chars(out, &tail, 10);
+            llvm_literal(out, ", ptr null");
             writer_newline(out);
         } else if (opcode == 32 || opcode == 33) {
             // Ownership markers are compile-time MIR effects; LLVM needs no code.
         } else {
+            ForgeWriter diagnostic;
+
+            writer_init(&mut diagnostic);
+            writer_literal(&mut diagnostic, "error: LLVM backend unsupported MIR opcode ");
+            writer_decimal(&mut diagnostic, opcode);
+            writer_literal(&mut diagnostic, " at instruction ");
+            writer_decimal(&mut diagnostic, ip);
+            writer_newline(&mut diagnostic);
+            raz_compiler_rt_stdio_write_ascii(2, diagnostic.data, diagnostic.length);
+            writer_destroy(&mut diagnostic);
             return false;
         }
         ip += 1;
@@ -3063,17 +3189,17 @@ fn llvm_emit_function(
             writer_space(out);
             writer_space(out);
 
-            i64 ret[8] = [114, 101, 116, 32, 118, 111, 105, 100];
+            
 
-            llvm_chars(out, &ret, 8);
+            llvm_literal(out, "ret void");
             writer_newline(out);
         } else {
             writer_space(out);
             writer_space(out);
 
-            i64 unreachable[11] = [117, 110, 114, 101, 97, 99, 104, 97, 98, 108, 101];
+            
 
-            llvm_chars(out, &unreachable, 11);
+            llvm_literal(out, "unreachable");
             writer_newline(out);
         }
     }
@@ -3089,6 +3215,7 @@ fn write_llvm_output(ForgeWriter&mut writer, i64 output_path, i64 output_path_le
     if (output_path != 0 && output_path_length > 0) {
         written = raz_compiler_rt_write_ascii(output_path, output_path_length, writer.data, writer.length);
     } else {
+        // intentional-byte-array: raw fallback output path for raz_rt_write_ascii_i64.
         i64 path[16] = [115, 116, 97, 103, 101, 49, 45, 111, 117, 116, 112, 117, 116, 46, 108, 108];
 
         written = raz_rt_write_ascii_i64(&mut path[0], 16, writer.data, writer.length);
@@ -3127,9 +3254,9 @@ fn emit_llvm_module(
 
     writer_init(&mut writer);
 
-    i64 header[36] = [59, 32, 82, 97, 122, 32, 76, 76, 86, 77, 32, 98, 97, 99, 107, 101, 110, 100, 32, 45, 32, 103, 101, 110, 101, 114, 97, 116, 101, 100, 32, 73, 82, 10, 10, 10];
+    
 
-    llvm_chars(&mut writer, &header, 36);
+    llvm_literal(&mut writer, "; Raz LLVM backend - generated IR\n\n\n");
     llvm_emit_target_metadata(&mut writer, options);
     llvm_emit_runtime_declarations(&mut writer);
     llvm_emit_module_globals(&mut writer, source, hir);
@@ -3159,18 +3286,27 @@ fn emit_llvm_module(
         }
         structure += 1;
     }
+    i64 main_index = find_main_function(hir, source);
+    i64 reachable_functions = llvm_build_function_reachability(hir, mir, main_index);
+    if (reachable_functions == 0) { writer_destroy(&mut writer); return false; }
     function_index = 0;
     while (function_index < hir.function_count) {
-        if (raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0) {
+        bool explicitly_retained =
+            llvm_symbol_list_contains(source, hir, function_index, options.export_arg, options.export_offset, options.export_length) ||
+            llvm_symbol_list_contains(source, hir, function_index, options.weak_arg, options.weak_offset, options.weak_length) ||
+            llvm_symbol_list_contains(source, hir, function_index, options.linkonce_arg, options.linkonce_offset, options.linkonce_length);
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0 &&
+            (raz_compiler_rt_arena_get(reachable_functions, function_index) != 0 || explicitly_retained)
+        ) {
             if (!llvm_emit_function(&mut writer, source, hir, mir, options, function_index)) {
+                llvm_write_emit_failure(source, hir, function_index);
                 writer_destroy(&mut writer);
                 return false;
             }
         }
         function_index += 1;
     }
-
-    i64 main_index = find_main_function(hir, source);
 
     if (
         main_index < 0 ||
@@ -3181,23 +3317,23 @@ fn emit_llvm_module(
         return false;
     }
 
-    i64 wrapper[20] = [100, 101, 102, 105, 110, 101, 32, 105, 51, 50, 32, 64, 109, 97, 105, 110, 40, 41, 32, 123];
+    
 
-    llvm_chars(&mut writer, &wrapper, 20);
+    llvm_literal(&mut writer, "define i32 @main() {");
     writer_newline(&mut writer);
     if (llvm_has_aggregate_globals(hir)) {
-        i64 init_call[34] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 105, 110, 105, 116, 40, 41, 10];
+        
 
-        llvm_chars(&mut writer, &init_call, 34);
+        llvm_literal(&mut writer, "  call void @__raz_globals_init()\n");
     }
 
-    i64 callprefix[11] = [37, 114, 97, 122, 109, 97, 105, 110, 32, 61, 32];
+    
 
-    llvm_chars(&mut writer, &callprefix, 11);
+    llvm_literal(&mut writer, "%razmain = ");
 
-    i64 callword[5] = [99, 97, 108, 108, 32];
+    
 
-    llvm_chars(&mut writer, &callword, 5);
+    llvm_literal(&mut writer, "call ");
     llvm_function_return_type(&mut writer, hir, main_index);
     writer_space(&mut writer);
     llvm_function_name(&mut writer, source, hir, main_index);
@@ -3205,9 +3341,9 @@ fn emit_llvm_module(
     writer_put(&mut writer, 41);
     writer_newline(&mut writer);
     if (llvm_has_aggregate_globals(hir)) {
-        i64 fini_call[34] = [32, 32, 99, 97, 108, 108, 32, 118, 111, 105, 100, 32, 64, 95, 95, 114, 97, 122, 95, 103, 108, 111, 98, 97, 108, 115, 95, 102, 105, 110, 105, 40, 41, 10];
+        
 
-        llvm_chars(&mut writer, &fini_call, 34);
+        llvm_literal(&mut writer, "  call void @__raz_globals_fini()\n");
     }
 
     i64 main_return_type = raz_compiler_rt_arena_get(hir.function_return_types, main_index);
@@ -3225,57 +3361,57 @@ fn emit_llvm_module(
     writer_space(&mut writer);
     writer_space(&mut writer);
 
-    i64 exitname[8] = [37, 101, 120, 105, 116, 32, 61, 32];
+    
 
-    llvm_chars(&mut writer, &exitname, 8);
+    llvm_literal(&mut writer, "%exit = ");
 
     i64 main_width = primitive_type_width(main_return_type);
 
     if (main_width > 32) {
-        i64 truncword[6] = [116, 114, 117, 110, 99, 32];
+        
 
-        llvm_chars(&mut writer, &truncword, 6);
+        llvm_literal(&mut writer, "trunc ");
         llvm_type(&mut writer, main_return_type);
         writer_space(&mut writer);
 
-        i64 razmain[8] = [37, 114, 97, 122, 109, 97, 105, 110];
+        string razmain = "%razmain";
 
-        llvm_chars(&mut writer, &razmain, 8);
+        llvm_literal(&mut writer, razmain);
 
-        i64 toword[7] = [32, 116, 111, 32, 105, 51, 50];
+        
 
-        llvm_chars(&mut writer, &toword, 7);
+        llvm_literal(&mut writer, " to i32");
     } else if (main_width < 32) {
-        i64 zextword[5] = [122, 101, 120, 116, 32];
+        
 
-        llvm_chars(&mut writer, &zextword, 5);
+        llvm_literal(&mut writer, "zext ");
         llvm_type(&mut writer, main_return_type);
         writer_space(&mut writer);
 
-        i64 razmain[8] = [37, 114, 97, 122, 109, 97, 105, 110];
+        string razmain = "%razmain";
 
-        llvm_chars(&mut writer, &razmain, 8);
+        llvm_literal(&mut writer, razmain);
 
-        i64 toword[7] = [32, 116, 111, 32, 105, 51, 50];
+        
 
-        llvm_chars(&mut writer, &toword, 7);
+        llvm_literal(&mut writer, " to i32");
     } else {
-        i64 addword[8] = [97, 100, 100, 32, 105, 51, 50, 32];
+        
 
-        llvm_chars(&mut writer, &addword, 8);
+        llvm_literal(&mut writer, "add i32 ");
 
-        i64 razmain[8] = [37, 114, 97, 122, 109, 97, 105, 110];
+        
 
-        llvm_chars(&mut writer, &razmain, 8);
+        llvm_literal(&mut writer, "%razmain");
         writer_put(&mut writer, 44);
         writer_space(&mut writer);
         writer_decimal(&mut writer, 0);
     }
     writer_newline(&mut writer);
 
-    i64 retline[15] = [32, 32, 114, 101, 116, 32, 105, 51, 50, 32, 37, 101, 120, 105, 116];
+    
 
-    llvm_chars(&mut writer, &retline, 15);
+    llvm_literal(&mut writer, "  ret i32 %exit");
     writer_newline(&mut writer);
     writer_put(&mut writer, 125);
     writer_newline(&mut writer);

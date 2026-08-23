@@ -79,6 +79,9 @@ public enum DiagnosticCode {
     UseAfterMove,
     BorrowConflict,
     AmbiguousName,
+    UnreachablePattern,
+    NonExhaustivePattern,
+    DynTraitMethodUnavailable,
 }
 
 public struct Token {
@@ -144,6 +147,9 @@ extern fn raz_rt_process_arg(i64 index, usize output, i64 capacity) -> i64;
 extern fn raz_rt_stdio_write(i64 stream, usize data, i64 size) -> i64;
 extern fn raz_rt_env_get(usize name, i64 name_length, usize output, i64 capacity) -> i64;
 extern fn raz_rt_path_exists(usize path, i64 length) -> i64;
+extern fn raz_rt_host_platform() -> i64;
+extern fn raz_rt_host_arch() -> i64;
+extern fn raz_rt_tool_resolve(usize data, i64 length, usize output, i64 capacity) -> i64;
 extern fn raz_rt_process_run(usize command, i64 length) -> i64;
 extern fn raz_rt_process_run_argv(
     usize program,
@@ -183,17 +189,69 @@ extern fn raz_rt_file_read(usize handle, usize output, i64 capacity) -> i64;
 extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
 extern fn raz_rt_file_close(usize handle);
 extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+
+fn compiler_literal_length(string value) -> i64 {
+    return raz_rt_cstr_len(value);
+}
+
+fn compiler_literal_byte(string value, i64 index) -> i64 {
+    i64 length = raz_rt_cstr_len(value);
+
+    if (index < 0 || index >= length) {
+        return -1;
+    }
+    return raz_rt_load_u8(raz_rt_cstr_ptr(value) + index);
+}
+
 extern fn raz_rt_time_monotonic_nanos() -> i64;
 extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
+extern fn raz_rt_load_scalar(usize address, i64 bytes, i64 signed_value) -> i64;
+extern fn raz_rt_store_scalar(usize address, i64 bytes, i64 value) -> i64;
+
+extern fn raz_rt_ed25519_keygen(
+    usize private_key,
+    i64 private_capacity,
+    usize public_key,
+    i64 public_capacity,
+) -> i64;
+extern fn raz_rt_ed25519_public(
+    usize private_key,
+    i64 private_length,
+    usize public_key,
+    i64 public_capacity,
+) -> i64;
+extern fn raz_rt_ed25519_sign(
+    usize private_key,
+    i64 private_length,
+    usize message,
+    i64 message_length,
+    usize signature,
+    i64 signature_capacity,
+) -> i64;
+extern fn raz_rt_ed25519_verify(
+    usize public_key,
+    i64 public_length,
+    usize message,
+    i64 message_length,
+    usize signature,
+    i64 signature_length,
+) -> i64;
+
 // Production compiler arena. The first 24 bytes intentionally preserve the
 // bootstrap arena ABI header so the few remaining Stage-1 OS/string adapters
 // can consume arena-backed buffers while arena ownership itself lives in Raz.
-fn raz_compiler_rt_arena_create(i64 count) -> i64 {
-    if (count <= 0 || count > 1152921504606846972) {
+fn raz_compiler_rt_arena_create_width(i64 count, i64 element_bytes) -> i64 {
+    if (
+        count <= 0 ||
+        (element_bytes != 1 && element_bytes != 2 && element_bytes != 4 && element_bytes != 8) ||
+        count > (9223372036854775807 - 24) / element_bytes
+    ) {
         return 0;
     }
 
-    i64 bytes = 24 + count * 8;
+    i64 bytes = 24 + count * element_bytes;
     usize allocation = raz_rt_alloc_aligned(bytes, 8);
 
     if (allocation == 0) {
@@ -203,8 +261,13 @@ fn raz_compiler_rt_arena_create(i64 count) -> i64 {
     unsafe {
         *((allocation + 0)as i64*mut) = 4923358263036431937;
         *((allocation + 8)as i64*mut) = count;
+        *((allocation + 16)as i64*mut) = element_bytes;
     }
     return (allocation + 24)as i64;
+}
+
+fn raz_compiler_rt_arena_create(i64 count) -> i64 {
+    return raz_compiler_rt_arena_create_width(count, 8);
 }
 
 fn raz_compiler_rt_arena_destroy(i64 handle) {
@@ -217,6 +280,7 @@ fn raz_compiler_rt_arena_destroy(i64 handle) {
     unsafe {
         *((allocation + 0)as i64*mut) = 0;
         *((allocation + 8)as i64*mut) = 0;
+        *((allocation + 16)as i64*mut) = 0;
     }
     raz_rt_dealloc_aligned(allocation, 8);
 }
@@ -236,6 +300,36 @@ fn raz_compiler_rt_arena_count(i64 handle) -> i64 {
     }
 }
 
+fn raz_compiler_rt_arena_element_bytes(i64 handle) -> i64 {
+    if (handle == 0) {
+        return 0;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        if (*((allocation + 0)as i64*const) != 4923358263036431937) {
+            return 0;
+        }
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width == 1 || width == 2 || width == 4 || width == 8) {
+            return width;
+        }
+    }
+    return 8;
+}
+
+fn raz_compiler_rt_arena_address(i64 handle, i64 index) -> i64 {
+    i64 count = raz_compiler_rt_arena_count(handle);
+
+    if (index < 0 || index >= count) {
+        return 0;
+    }
+    return ((handle as usize) + index * raz_compiler_rt_arena_element_bytes(handle))as i64;
+}
+
 fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64 {
     if (handle == 0 || index < 0) {
         return 0;
@@ -253,7 +347,13 @@ fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64 {
         if (index >= count) {
             return 0;
         }
-        return *(((handle as usize) + index * 8)as i64*const);
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width != 1 && width != 2 && width != 4 && width != 8) {
+            width = 8;
+        }
+        return raz_rt_load_scalar((handle as usize) + index * width, width, 0);
     }
 }
 
@@ -274,14 +374,19 @@ fn raz_compiler_rt_arena_set(i64 handle, i64 index, i64 value) {
         if (index >= count) {
             return;
         }
-        *(((handle as usize) + index * 8)as i64*mut) = value;
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width != 1 && width != 2 && width != 4 && width != 8) {
+            width = 8;
+        }
+        raz_rt_store_scalar((handle as usize) + index * width, width, value);
     }
 }
 
-// Fixed-size compiler-internal tables may use these accessors only after their
-// owner has established handle validity and index bounds. Keeping this narrow
-// avoids repeated arena header/magic/count checks on hot query and MIR lanes
-// while preserving the checked arena API everywhere else.
+// Fixed-size compiler-internal tables use 8-byte cells by construction. These
+// accessors deliberately remain width-specialized so hot compiler metadata
+// lanes do not pay repeated header checks.
 fn raz_compiler_rt_arena_get_unchecked(i64 handle, i64 index) -> i64 {
     unsafe {
         return *(((handle as usize) + index * 8)as i64*const);
@@ -308,7 +413,14 @@ fn raz_compiler_rt_arena_range_equal(i64 handle, i64 left, i64 right, i64 count)
     ) {
         return 0;
     }
-    return raz_rt_bytes_equal((handle as usize) + left * 8, (handle as usize) + right * 8, count * 8);
+
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+
+    return raz_rt_bytes_equal(
+        (handle as usize) + left * width,
+        (handle as usize) + right * width,
+        count * width,
+    );
 }
 
 fn raz_compiler_rt_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed) -> i64 {
@@ -325,10 +437,12 @@ fn raz_compiler_rt_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed)
         hash += modulus;
     }
 
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+    usize address = (handle as usize) + offset * width;
     i64 index = 0;
 
     while (index < count) {
-        hash = (hash * 131 + raz_compiler_rt_arena_get(handle, offset + index) + 1) % modulus;
+        hash = (hash * 131 + raz_rt_load_scalar(address + index * width, width, 0) + 1) % modulus;
         index += 1;
     }
     return hash;
@@ -355,12 +469,27 @@ fn raz_compiler_rt_arena_copy(
     ) {
         return -1;
     }
-    if (count > 0) {
+
+    i64 destination_width = raz_compiler_rt_arena_element_bytes(destination);
+    i64 source_width = raz_compiler_rt_arena_element_bytes(source);
+
+    if (count > 0 && destination_width == source_width) {
         raz_rt_move(
-            (destination as usize) + destination_offset * 8,
-            (source as usize) + source_offset * 8,
-            count * 8,
+            (destination as usize) + destination_offset * destination_width,
+            (source as usize) + source_offset * source_width,
+            count * source_width,
         );
+    } else if (count > 0) {
+        i64 copied = 0;
+
+        while (copied < count) {
+            raz_compiler_rt_arena_set(
+                destination,
+                destination_offset + copied,
+                raz_compiler_rt_arena_get(source, source_offset + copied),
+            );
+            copied += 1;
+        }
     }
     return count;
 }
@@ -378,13 +507,19 @@ fn compiler_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
         return 0;
     }
 
-    i64 index = 0;
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
 
-    while (index < length) {
-        unsafe {
-            *((bytes + index)as u8*mut) = (raz_compiler_rt_arena_get(handle, offset + index) & 255)as u8;
+    if (length > 0 && width == 1) {
+        raz_rt_move(bytes, (handle as usize) + offset, length);
+    } else {
+        i64 index = 0;
+
+        while (index < length) {
+            unsafe {
+                *((bytes + index)as u8*mut) = (raz_compiler_rt_arena_get(handle, offset + index) & 255)as u8;
+            }
+            index += 1;
         }
-        index += 1;
     }
     unsafe {
         *((bytes + length)as u8*mut) = 0;
@@ -405,13 +540,19 @@ fn compiler_ascii_unpack(i64 handle, i64 offset, usize bytes, i64 length) -> boo
         return false;
     }
 
-    i64 index = 0;
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
 
-    while (index < length) {
-        unsafe {
-            raz_compiler_rt_arena_set(handle, offset + index, (*((bytes + index)as u8*const))as i64);
+    if (length > 0 && width == 1) {
+        raz_rt_move((handle as usize) + offset, bytes, length);
+    } else {
+        i64 index = 0;
+
+        while (index < length) {
+            unsafe {
+                raz_compiler_rt_arena_set(handle, offset + index, (*((bytes + index)as u8*const))as i64);
+            }
+            index += 1;
         }
-        index += 1;
     }
     return true;
 }
@@ -647,6 +788,40 @@ fn raz_compiler_rt_path_exists_ascii(i64 path, i64 path_length) -> i64 {
 
 fn raz_compiler_rt_monotonic_nanos() -> i64 {
     return raz_rt_time_monotonic_nanos();
+}
+
+// Host platform code (1 = Windows). Lives here rather than in the driver so
+// backend link drivers can select platform system libraries.
+fn raz_compiler_rt_host_platform() -> i64 {
+    return raz_rt_host_platform();
+}
+
+fn raz_compiler_rt_tool_resolve_ascii(i64 name, i64 name_length, i64 output, i64 capacity) -> i64 {
+    if (name == 0 || name_length <= 0 || output == 0 || capacity <= 0) {
+        return -1;
+    }
+
+    usize name_bytes = compiler_ascii_pack(name, 0, name_length);
+    usize output_bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (name_bytes == 0 || output_bytes == 0) {
+        if (name_bytes != 0) {
+            raz_rt_dealloc_aligned(name_bytes, 8);
+        }
+        if (output_bytes != 0) {
+            raz_rt_dealloc_aligned(output_bytes, 8);
+        }
+        return -1;
+    }
+
+    i64 result = raz_rt_tool_resolve(name_bytes, name_length, output_bytes, capacity + 1);
+
+    if (result > 0 && result <= capacity) {
+        compiler_ascii_unpack(output, 0, output_bytes, result);
+    }
+    raz_rt_dealloc_aligned(output_bytes, 8);
+    raz_rt_dealloc_aligned(name_bytes, 8);
+    return result;
 }
 
 fn raz_compiler_rt_process_run_ascii(i64 command, i64 length) -> i64 {
@@ -897,11 +1072,20 @@ fn diagnostic_code_value(DiagnosticCode code) -> i64 {
     if (code == DiagnosticCode::AmbiguousName) {
         return 13;
     }
+    if (code == DiagnosticCode::UnreachablePattern) {
+        return 14;
+    }
+    if (code == DiagnosticCode::NonExhaustivePattern) {
+        return 15;
+    }
     return 0;
 }
 
 fn source_byte(Source& value, i64 index) -> i64 {
-    return raz_compiler_rt_arena_get(value.bytes, index);
+    if (index < 0 || index >= value.length) {
+        return 0;
+    }
+    return raz_rt_load_u8((value.bytes as usize) + index);
 }
 
 fn is_space(i64 value) -> bool {
@@ -1440,11 +1624,11 @@ fn qualify_extended_lexer() -> bool {
         return false;
     }
 
-    i64 seed[27] = [91, 32, 93, 32, 46, 32, 58, 32, 38, 32, 124, 32, 33, 32, 38, 38, 32, 124, 124, 32, 43, 61, 32, 45, 61, 32, 10];
+    string seed = "[ ] . : & | ! && || += -= \n";
     i64 index = 0;
 
     while (index < 27) {
-        raz_compiler_rt_arena_set(data, index, seed[index]);
+        raz_compiler_rt_arena_set(data, index, compiler_literal_byte(seed, index));
         index += 1;
     }
 
@@ -1615,7 +1799,7 @@ fn token_is_namespace(Source& source, Token& token) -> bool {
 }
 
 fn token_is_raz_package(Source& source, Token& token) -> bool {
-    i64 expected[13] = [95, 95, 114, 97, 122, 95, 112, 97, 99, 107, 97, 103, 101];
+    string expected = "__raz_package";
 
     if (token.length != 13) {
         return false;
@@ -1624,7 +1808,7 @@ fn token_is_raz_package(Source& source, Token& token) -> bool {
     i64 index = 0;
 
     while (index < 13) {
-        if (source_byte(source, token.offset + index) != expected[index]) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
             return false;
         }
         index += 1;
@@ -1633,7 +1817,7 @@ fn token_is_raz_package(Source& source, Token& token) -> bool {
 }
 
 fn token_is_raz_module(Source& source, Token& token) -> bool {
-    i64 expected[12] = [95, 95, 114, 97, 122, 95, 109, 111, 100, 117, 108, 101];
+    string expected = "__raz_module";
 
     if (token.length != 12) {
         return false;
@@ -1642,7 +1826,7 @@ fn token_is_raz_module(Source& source, Token& token) -> bool {
     i64 index = 0;
 
     while (index < 12) {
-        if (source_byte(source, token.offset + index) != expected[index]) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
             return false;
         }
         index += 1;
@@ -1651,7 +1835,7 @@ fn token_is_raz_module(Source& source, Token& token) -> bool {
 }
 
 fn token_is_raz_dependency(Source& source, Token& token) -> bool {
-    i64 expected[16] = [95, 95, 114, 97, 122, 95, 100, 101, 112, 101, 110, 100, 101, 110, 99, 121];
+    string expected = "__raz_dependency";
 
     if (token.length != 16) {
         return false;
@@ -1660,7 +1844,7 @@ fn token_is_raz_dependency(Source& source, Token& token) -> bool {
     i64 index = 0;
 
     while (index < 16) {
-        if (source_byte(source, token.offset + index) != expected[index]) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
             return false;
         }
         index += 1;
@@ -2370,6 +2554,23 @@ fn token_is_clone_function(Source& source, i64 offset, i64 length) -> bool {
     );
 }
 
+fn token_matches_literal(Source& source, Token& token, string expected, i64 length) -> bool {
+    if (token.length != length) {
+        return false;
+    }
+
+    usize expected_bytes = raz_rt_cstr_ptr(expected);
+    i64 index = 0;
+
+    while (index < length) {
+        if (source_byte(source, token.offset + index) != raz_rt_load_u8(expected_bytes + index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
 fn token_extern_kind(Source& source, Token& token) -> i64 {
     if (token.length == 27 && source_byte(source, token.offset + 21) == 99) {
         return 1;
@@ -2395,12 +2596,46 @@ fn token_extern_kind(Source& source, Token& token) -> i64 {
     if (token.length == 22 && source_byte(source, token.offset + 8) == 114) {
         return 6;
     }
+    if (token_matches_literal(source, token, "raz_rt_random_fill", 18)) {
+        return 7;
+    }
+    if (token_matches_literal(source, token, "raz_rt_random_seed", 18)) {
+        return 8;
+    }
+    if (token_matches_literal(source, token, "raz_rt_secure_zero", 18)) {
+        return 9;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_keygen", 21)) {
+        return 10;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_public", 21)) {
+        return 11;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_sign", 19)) {
+        return 12;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_verify", 21)) {
+        return 13;
+    }
     return 0;
 }
 
 fn token_same(Source& source, i64 left_offset, i64 left_length, i64 right_offset, i64 right_length) -> bool {
-    if (left_length != right_length) {
+    if (
+        left_length != right_length ||
+        left_offset < 0 ||
+        right_offset < 0 ||
+        left_length < 0 ||
+        left_offset > source.length ||
+        right_offset > source.length ||
+        left_length > source.length - left_offset ||
+        right_length > source.length - right_offset
+    ) {
         return false;
     }
-    return raz_compiler_rt_arena_range_equal(source.bytes, left_offset, right_offset, left_length) != 0;
+    return raz_rt_bytes_equal(
+        (source.bytes as usize) + left_offset,
+        (source.bytes as usize) + right_offset,
+        left_length,
+    ) != 0;
 }

@@ -393,3 +393,5 @@ Native requirements are **transitive**. If an application depends on a Raz packa
 Raz deliberately does not accept arbitrary shell commands or raw linker command strings from package manifests. The first native dependency contract is limited to library identities and search paths so registry packages cannot turn normal dependency resolution into arbitrary command execution.
 
 The native library itself remains an external platform/package-manager responsibility. For example, the `sqlite` package requires SQLite 3 to be installed or otherwise available in a declared `library-paths` directory.
+
+By default, `raz pack` writes distributable archives under `target/release/packages/`. An explicit output path overrides this location.

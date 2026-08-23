@@ -169,12 +169,12 @@ fn forge_is_builtin_runtime_extern(Source& source, HirModule& hir, i64 function_
         return true;
     }
     if (length == 22) {
-        i64 expected[22] = [114, 97, 122, 95, 114, 116, 95, 119, 114, 105, 116, 101, 95, 97, 115, 99, 105, 105, 95, 105, 54, 52];
+        string expected = "raz_rt_write_ascii_i64";
         i64 index = 0;
         bool same = true;
 
         while (index < 22 && same) {
-            if (source_byte(source, offset + index) != expected[index]) {
+            if (source_byte(source, offset + index) != compiler_literal_byte(expected, index)) {
                 same = false;
             }
             index += 1;
@@ -184,12 +184,12 @@ fn forge_is_builtin_runtime_extern(Source& source, HirModule& hir, i64 function_
         }
     }
     if (length == 21) {
-        i64 expected[21] = [114, 97, 122, 95, 114, 116, 95, 114, 101, 97, 100, 95, 97, 115, 99, 105, 105, 95, 105, 54, 52];
+        string expected = "raz_rt_read_ascii_i64";
         i64 index = 0;
         bool same = true;
 
         while (index < 21 && same) {
-            if (source_byte(source, offset + index) != expected[index]) {
+            if (source_byte(source, offset + index) != compiler_literal_byte(expected, index)) {
                 same = false;
             }
             index += 1;
@@ -502,12 +502,12 @@ fn emit_forge_function(
 
             i64 global_index = raz_compiler_rt_arena_get(mir.op_a, ip);
 
-            writer_global_address_opcode(
-                out,
-                raz_compiler_rt_arena_get(hir.global_tls_flags, global_index) != 0,
-            );
+            // String globals are addresses, but the Raz value ABI transports
+            // those address bits as i64. global.address explicitly permits an
+            // i64 result, avoiding ptr/i64 mismatches in scalar locals/calls.
+            writer_global_address_opcode(out, false);
             writer_space(out);
-            writer_ptr(out);
+            writer_i64(out);
             writer_space(out);
             writer_string_global_name(out, ip);
             writer_newline(out);
@@ -610,8 +610,28 @@ fn emit_forge_function(
                 writer_newline(out);
 
                 i64 load_type = raz_compiler_rt_arena_get(mir.op_types, ip);
+                i64 loaded_local_index = forge_native_hir_local_index(hir, function_index, loaded_local_slot);
+                bool word_backed_local = false;
 
-                if (primitive_type_is_float(load_type)) {
+                if (loaded_local_index >= 0) {
+                    word_backed_local =
+                        raz_compiler_rt_arena_get(hir.local_references, loaded_local_index) != 0 ||
+                        raz_compiler_rt_arena_get(hir.local_slices, loaded_local_index) != 0 ||
+                        raz_compiler_rt_arena_get(hir.local_array_extents, loaded_local_index) >= 0 ||
+                        raz_compiler_rt_arena_get(hir.local_type_structs, loaded_local_index) >= 0;
+                }
+                if (word_backed_local) {
+                    writer_instruction_prefix(out, ip);
+                    writer_literal(out, "call i64 ");
+                    writer_runtime_name(out, 3);
+                    writer_put(out, 40);
+                    writer_register(out, frame_register);
+                    writer_put(out, 44);
+                    writer_space(out);
+                    writer_register(out, slot_register);
+                    writer_put(out, 41);
+                    writer_newline(out);
+                } else if (primitive_type_is_float(load_type)) {
                     i64 loaded_register = ip;
 
                     if (load_type == 11) {
@@ -702,14 +722,39 @@ fn emit_forge_function(
         } else if (opcode == 40) {
             writer_instruction_prefix(out, ip);
 
+            i64 cast_source = raz_compiler_rt_arena_get(mir.op_a, ip);
             i64 source_type = raz_compiler_rt_arena_get(mir.op_b, ip);
             i64 target_type = raz_compiler_rt_arena_get(mir.op_types, ip);
+            i64 source_opcode = -1;
+            i64 source_source_type = -1;
 
-            writer_numeric_cast_opcode(out, source_type, target_type);
+            if (cast_source >= 0 && cast_source < mir.instruction_count) {
+                source_opcode = raz_compiler_rt_arena_get(mir.opcodes, cast_source);
+                if (source_opcode == 40) {
+                    source_source_type = raz_compiler_rt_arena_get(mir.op_b, cast_source);
+                }
+            }
+
+            bool source_pointer_type = source_type == 12 || source_type == 13 || source_type == 14;
+            bool target_pointer_type = target_type == 12 || target_type == 13 || target_type == 14;
+
+            bool source_is_native_pointer =
+                source_opcode == 40 &&
+                source_pointer_type &&
+                !(source_source_type == 12 || source_source_type == 13 || source_source_type == 14);
+            if (source_pointer_type && !target_pointer_type && !source_is_native_pointer) {
+                if (primitive_type_width(target_type) > 0 && primitive_type_width(target_type) < 64) {
+                    writer_literal(out, "truncate ");
+                } else {
+                    writer_literal(out, "copy ");
+                }
+            } else {
+                writer_numeric_cast_opcode(out, source_type, target_type);
+            }
             writer_space(out);
             writer_scalar_type(out, target_type);
             writer_space(out);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
+            writer_register(out, cast_source);
             writer_newline(out);
         } else if (opcode == 8) {
             i64 target_function = raz_compiler_rt_arena_get(mir.op_a, ip);
@@ -967,9 +1012,9 @@ fn emit_forge_function(
             writer_put(out, 41);
             writer_newline(out);
         } else if (opcode == 45) {
-            // Borrowed-array iteration materializes an element reference by
-            // reusing the stage reference table with the aggregate handle as
-            // the owning arena and the loop index as its slot.
+            // Indexed borrows need the aggregate's physical element width.
+            // Scalar frame references stay on the legacy 8-byte ref ABI, while
+            // compact primitive arrays use the dedicated width-aware address.
             writer_instruction_prefix(out, ip);
             writer_put(out, 99);
             writer_put(out, 97);
@@ -978,7 +1023,7 @@ fn emit_forge_function(
             writer_space(out);
             writer_i64(out);
             writer_space(out);
-            writer_runtime_name(out, 5);
+            writer_runtime_name(out, 18);
             writer_put(out, 40);
             writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_put(out, 44);
@@ -1294,94 +1339,194 @@ fn emit_forge_function(
             writer_put(out, 41);
             writer_newline(out);
         } else if (opcode == 26) {
-            writer_instruction_prefix(out, ip);
-            writer_put(out, 99);
-            writer_put(out, 97);
-            writer_put(out, 108);
-            writer_put(out, 108);
-            writer_space(out);
-            writer_i64(out);
-            writer_space(out);
-            writer_runtime_name(out, 6);
-            writer_put(out, 40);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
-            writer_put(out, 41);
-            writer_newline(out);
+            i64 value_type = raz_compiler_rt_arena_get(mir.op_types, ip);
+            bool floating = value_type == 1;
+            i64 reference = raz_compiler_rt_arena_get(mir.op_a, ip);
+            i64 reference_opcode = -1;
+            i64 reference_type = 0;
+
+            if (reference >= 0 && reference < mir.instruction_count) {
+                reference_opcode = raz_compiler_rt_arena_get(mir.opcodes, reference);
+                reference_type = raz_compiler_rt_arena_get(mir.op_types, reference);
+            }
+            bool native_pointer =
+                reference_opcode == 40 &&
+                (reference_type == 12 || reference_type == 13 || reference_type == 14);
+            if (native_pointer) {
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "load ");
+                writer_scalar_type(out, value_type);
+                writer_space(out);
+                writer_register(out, reference);
+                writer_newline(out);
+            } else if (floating) {
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "call f64 ");
+                writer_runtime_name(out, 11);
+                writer_put(out, 40);
+                writer_register(out, reference);
+                writer_put(out, 41);
+                writer_newline(out);
+            } else if (primitive_type_width(value_type) > 0 && primitive_type_width(value_type) < 64) {
+                i64 raw_register = writer_synthetic_register(26, ip);
+
+                writer_instruction_prefix(out, raw_register);
+                writer_literal(out, "call i64 ");
+                writer_runtime_name(out, 6);
+                writer_put(out, 40);
+                writer_register(out, reference);
+                writer_put(out, 41);
+                writer_newline(out);
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "truncate ");
+                writer_scalar_type(out, value_type);
+                writer_space(out);
+                writer_register(out, raw_register);
+                writer_newline(out);
+            } else {
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "call i64 ");
+                writer_runtime_name(out, 6);
+                writer_put(out, 40);
+                writer_register(out, reference);
+                writer_put(out, 41);
+                writer_newline(out);
+            }
         } else if (opcode == 27) {
-            writer_space(out);
-            writer_space(out);
-            writer_put(out, 99);
-            writer_put(out, 97);
-            writer_put(out, 108);
-            writer_put(out, 108);
-            writer_space(out);
-            writer_put(out, 118);
-            writer_put(out, 111);
-            writer_put(out, 105);
-            writer_put(out, 100);
-            writer_space(out);
-            writer_runtime_name(out, 7);
-            writer_put(out, 40);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
-            writer_put(out, 44);
-            writer_space(out);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
-            writer_put(out, 41);
-            writer_newline(out);
+            i64 reference = raz_compiler_rt_arena_get(mir.op_a, ip);
+            i64 stored_register = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 stored_type = raz_compiler_rt_arena_get(mir.op_types, stored_register);
+            bool floating = stored_type == 1;
+            i64 reference_opcode = -1;
+            i64 reference_type = 0;
+
+            if (reference >= 0 && reference < mir.instruction_count) {
+                reference_opcode = raz_compiler_rt_arena_get(mir.opcodes, reference);
+                reference_type = raz_compiler_rt_arena_get(mir.op_types, reference);
+            }
+            bool native_pointer =
+                reference_opcode == 40 &&
+                (reference_type == 12 || reference_type == 13 || reference_type == 14);
+            if (native_pointer) {
+                writer_space(out);
+                writer_space(out);
+                writer_literal(out, "store ");
+                writer_scalar_type(out, stored_type);
+                writer_space(out);
+                writer_register(out, stored_register);
+                writer_space(out);
+                writer_register(out, reference);
+                writer_newline(out);
+            } else {
+                i64 runtime_value = stored_register;
+
+                if (
+                    !floating &&
+                    primitive_type_width(stored_type) > 0 &&
+                    primitive_type_width(stored_type) < 64
+                ) {
+                    runtime_value = writer_synthetic_register(27, ip);
+                    writer_instruction_prefix(out, runtime_value);
+                    if (primitive_type_is_unsigned(stored_type)) {
+                        writer_literal(out, "zero_extend i64 ");
+                    } else {
+                        writer_literal(out, "sign_extend i64 ");
+                    }
+                    writer_register(out, stored_register);
+                    writer_newline(out);
+                }
+                writer_space(out);
+                writer_space(out);
+                writer_literal(out, "call void ");
+                if (floating) {
+                    writer_runtime_name(out, 12);
+                } else {
+                    writer_runtime_name(out, 7);
+                }
+                writer_put(out, 40);
+                writer_register(out, reference);
+                writer_put(out, 44);
+                writer_space(out);
+                writer_register(out, runtime_value);
+                writer_put(out, 41);
+                writer_newline(out);
+            }
             writer_instruction_prefix(out, ip);
-            writer_put(out, 99);
-            writer_put(out, 111);
-            writer_put(out, 112);
-            writer_put(out, 121);
+            writer_literal(out, "copy ");
+            writer_scalar_type(out, stored_type);
             writer_space(out);
-            writer_i64(out);
-            writer_space(out);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
+            writer_register(out, stored_register);
             writer_newline(out);
         } else if (opcode == 28) {
             i64 value_type = raz_compiler_rt_arena_get(mir.op_types, ip);
             bool floating = value_type == 1;
 
-            writer_instruction_prefix(out, ip);
-            writer_put(out, 99);
-            writer_put(out, 97);
-            writer_put(out, 108);
-            writer_put(out, 108);
-            writer_space(out);
             if (floating) {
-                writer_f64(out);
-            } else {
-                writer_i64(out);
-            }
-            writer_space(out);
-            if (floating) {
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "call f64 ");
                 writer_runtime_name(out, 8);
-            } else {
+                writer_put(out, 40);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
+                writer_put(out, 44);
+                writer_space(out);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
+                writer_put(out, 41);
+                writer_newline(out);
+            } else if (primitive_type_width(value_type) > 0 && primitive_type_width(value_type) < 64) {
+                i64 raw_register = writer_synthetic_register(28, ip);
+
+                writer_instruction_prefix(out, raw_register);
+                writer_literal(out, "call i64 ");
                 writer_runtime_name(out, 3);
+                writer_put(out, 40);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
+                writer_put(out, 44);
+                writer_space(out);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
+                writer_put(out, 41);
+                writer_newline(out);
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "truncate ");
+                writer_scalar_type(out, value_type);
+                writer_space(out);
+                writer_register(out, raw_register);
+                writer_newline(out);
+            } else {
+                writer_instruction_prefix(out, ip);
+                writer_literal(out, "call i64 ");
+                writer_runtime_name(out, 3);
+                writer_put(out, 40);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
+                writer_put(out, 44);
+                writer_space(out);
+                writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
+                writer_put(out, 41);
+                writer_newline(out);
             }
-            writer_put(out, 40);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_a, ip));
-            writer_put(out, 44);
-            writer_space(out);
-            writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
-            writer_put(out, 41);
-            writer_newline(out);
         } else if (opcode == 29) {
             i64 stored_register = raz_compiler_rt_arena_get(mir.op_c, ip);
-            bool floating = raz_compiler_rt_arena_get(mir.op_types, stored_register) == 1;
+            i64 stored_type = raz_compiler_rt_arena_get(mir.op_types, stored_register);
+            bool floating = stored_type == 1;
+            i64 runtime_value = stored_register;
 
+            if (
+                !floating &&
+                primitive_type_width(stored_type) > 0 &&
+                primitive_type_width(stored_type) < 64
+            ) {
+                runtime_value = writer_synthetic_register(29, ip);
+                writer_instruction_prefix(out, runtime_value);
+                if (primitive_type_is_unsigned(stored_type)) {
+                    writer_literal(out, "zero_extend i64 ");
+                } else {
+                    writer_literal(out, "sign_extend i64 ");
+                }
+                writer_register(out, stored_register);
+                writer_newline(out);
+            }
             writer_space(out);
             writer_space(out);
-            writer_put(out, 99);
-            writer_put(out, 97);
-            writer_put(out, 108);
-            writer_put(out, 108);
-            writer_space(out);
-            writer_put(out, 118);
-            writer_put(out, 111);
-            writer_put(out, 105);
-            writer_put(out, 100);
-            writer_space(out);
+            writer_literal(out, "call void ");
             if (floating) {
                 writer_runtime_name(out, 9);
             } else {
@@ -1394,25 +1539,25 @@ fn emit_forge_function(
             writer_register(out, raz_compiler_rt_arena_get(mir.op_b, ip));
             writer_put(out, 44);
             writer_space(out);
-            writer_register(out, stored_register);
+            writer_register(out, runtime_value);
             writer_put(out, 41);
             writer_newline(out);
             writer_instruction_prefix(out, ip);
-            writer_put(out, 99);
-            writer_put(out, 111);
-            writer_put(out, 112);
-            writer_put(out, 121);
-            writer_space(out);
-            if (floating) {
-                writer_f64(out);
-            } else {
-                writer_i64(out);
-            }
+            writer_literal(out, "copy ");
+            writer_scalar_type(out, stored_type);
             writer_space(out);
             writer_register(out, stored_register);
             writer_newline(out);
         } else if (opcode == 30) {
             i64 allocation_count = writer_synthetic_register(12, ip);
+            i64 aggregate_marker = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 element_type = raz_compiler_rt_arena_get(mir.op_d, ip);
+
+            bool typed_array =
+                aggregate_marker == 2 &&
+                primitive_type_width(element_type) > 0 &&
+                primitive_type_width(element_type) <= 64;
+            i64 element_width = (primitive_type_width(element_type) + 7) / 8;
 
             writer_instruction_prefix(out, allocation_count);
             writer_put(out, 99);
@@ -1425,6 +1570,22 @@ fn emit_forge_function(
             writer_space(out);
             writer_decimal(out, raz_compiler_rt_arena_get(mir.op_a, ip));
             writer_newline(out);
+
+            i64 width_register = writer_synthetic_register(13, ip);
+
+            if (typed_array) {
+                writer_instruction_prefix(out, width_register);
+                writer_put(out, 99);
+                writer_put(out, 111);
+                writer_put(out, 110);
+                writer_put(out, 115);
+                writer_put(out, 116);
+                writer_space(out);
+                writer_i64(out);
+                writer_space(out);
+                writer_decimal(out, element_width);
+                writer_newline(out);
+            }
             writer_instruction_prefix(out, ip);
             writer_put(out, 99);
             writer_put(out, 97);
@@ -1433,9 +1594,18 @@ fn emit_forge_function(
             writer_space(out);
             writer_i64(out);
             writer_space(out);
-            writer_runtime_name(out, 1);
+            if (typed_array) {
+                writer_runtime_name(out, 17);
+            } else {
+                writer_runtime_name(out, 1);
+            }
             writer_put(out, 40);
             writer_register(out, allocation_count);
+            if (typed_array) {
+                writer_put(out, 44);
+                writer_space(out);
+                writer_register(out, width_register);
+            }
             writer_put(out, 41);
             writer_newline(out);
         } else if (opcode == 31) {
@@ -1457,7 +1627,16 @@ fn emit_forge_function(
             writer_put(out, 41);
             writer_newline(out);
         } else if (opcode == 32 || opcode == 33) {} else {
-            write_compiler_diagnostic(11, ip, opcode);
+            ForgeWriter diagnostic;
+
+            writer_init(&mut diagnostic);
+            writer_literal(&mut diagnostic, "error: Forge backend unsupported MIR opcode ");
+            writer_decimal(&mut diagnostic, opcode);
+            writer_literal(&mut diagnostic, " at instruction ");
+            writer_decimal(&mut diagnostic, ip);
+            writer_newline(&mut diagnostic);
+            raz_compiler_rt_stdio_write_ascii(2, diagnostic.data, diagnostic.length);
+            writer_destroy(&mut diagnostic);
             raz_compiler_rt_arena_destroy(local_registers);
             return false;
         }

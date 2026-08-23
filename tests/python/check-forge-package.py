@@ -21,6 +21,13 @@ required = [
     forge / "src/transforms/scalar.cpp",
     forge / "src/machine/register_allocation.cpp",
     forge / "src/codegen/x86_64/encoder.cpp",
+    forge / "include/forge/codegen/aarch64/encoder.hpp",
+    forge / "include/forge/codegen/aarch64/register_allocation.hpp",
+    forge / "src/codegen/aarch64/register_allocation.cpp",
+    forge / "src/codegen/aarch64/encoder.cpp",
+    forge / "src/object/elf_aarch64.cpp",
+    forge / "include/forge/object/macho.hpp",
+    forge / "src/object/macho_aarch64.cpp",
 ]
 missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
 if missing:

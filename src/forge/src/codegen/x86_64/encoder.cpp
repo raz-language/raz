@@ -5007,7 +5007,7 @@ ImageEncodeResult assemble_image(std::vector<EncodedFunction> functions,
         while ((bytes.size() & (alignment - 1U)) != 0) bytes.push_back(std::byte{0});
         const auto offset = bytes.size();
         global_offsets.emplace(global.name, GlobalLocation{section, offset});
-        result.image.globals.push_back({global.name, section, offset});
+        result.image.globals.push_back({global.name, section, offset, global.is_internal});
         for (const auto byte : global.initializer) bytes.push_back(static_cast<std::byte>(byte));
     }
 

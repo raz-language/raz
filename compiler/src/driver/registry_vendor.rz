@@ -4,13 +4,15 @@
 namespace raz_compiler_driver_registry_vendor;
 
 public import raz_compiler_driver_registry_install;
+import raz_compiler_driver_package;
 
 // Vendoring materializes the exact locked dependency graph into the project.
 // Registry packages retain their content-addressed directory names and pinned
 // Git checkouts are mirrored under vendor/git.  The .raz-vendor marker makes
 // normal builds prefer this tree and turns dependency hydration into a local
 // integrity check rather than a network/cache operation.
-fn registry_vendor_literal(i64[]bytes, i64 length) -> i64 {
+fn registry_vendor_literal(string bytes) -> i64 {
+    i64 length = compiler_literal_length(bytes);
     i64 output = raz_compiler_rt_arena_create(length);
 
     if (output == 0) {
@@ -20,17 +22,15 @@ fn registry_vendor_literal(i64[]bytes, i64 length) -> i64 {
     i64 i = 0;
 
     while (i < length) {
-        raz_compiler_rt_arena_set(output, i, bytes[i]);
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(bytes, i));
         i += 1;
     }
     return output;
 }
 
 fn registry_vendor_marker_write() -> i64 {
-    i64 path_bytes[13] = [46, 47, 46, 114, 97, 122, 45, 118, 101, 110, 100, 111, 114];
-    i64 body_bytes[11] = [82, 65, 90, 86, 69, 78, 68, 79, 82, 49, 10];
-    i64 path = registry_vendor_literal(&path_bytes, 13);
-    i64 body = registry_vendor_literal(&body_bytes, 11);
+    i64 path = registry_vendor_literal("./.raz-vendor");
+    i64 body = registry_vendor_literal("RAZVENDOR1\n");
 
     if (path == 0 || body == 0) {
         return 40;
@@ -47,8 +47,7 @@ fn registry_vendor_marker_write() -> i64 {
 }
 
 fn registry_vendor_marker_remove() {
-    i64 path_bytes[13] = [46, 47, 46, 114, 97, 122, 45, 118, 101, 110, 100, 111, 114];
-    i64 path = registry_vendor_literal(&path_bytes, 13);
+    i64 path = registry_vendor_literal("./.raz-vendor");
 
     if (path == 0) {
         return;
@@ -116,12 +115,12 @@ fn registry_vendor_copy_lock_data(i64 data, i64 length) -> i64 {
             pos += 1;
         }
 
-        i64 package_header[11] = [91, 91, 112, 97, 99, 107, 97, 103, 101, 93, 93];
+        string package_header = "[[package]]";
         bool header = end - start == 11;
         i64 i = 0;
 
         while (header && i < 11) {
-            if (raz_compiler_rt_arena_get(data, start + i) != package_header[i]) {
+            if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(package_header, i)) {
                 header = false;
             }
             i += 1;
@@ -148,19 +147,16 @@ fn registry_vendor_copy_lock_data(i64 data, i64 length) -> i64 {
             continue;
         }
 
-        i64 source_key[6] = [115, 111, 117, 114, 99, 101];
-        i64 checksum_key[8] = [99, 104, 101, 99, 107, 115, 117, 109];
-
-        if (registry_lock_key_equals(data, start, equal, &checksum_key, 8)) {
+        if (registry_lock_key_equals_literal(data, start, equal, "checksum")) {
             checksum_length = copy_quoted_value(data, equal + 1, end, checksum, 128);
-        } else if (registry_lock_key_equals(data, start, equal, &source_key, 6)) {
+        } else if (registry_lock_key_equals_literal(data, start, equal, "source")) {
             i64 sl = copy_quoted_value(data, equal + 1, end, source, 64);
-            i64 expected[8] = [114, 101, 103, 105, 115, 116, 114, 121];
+            string expected = "registry";
 
             registry_source = sl == 8;
             i = 0;
             while (registry_source && i < 8) {
-                if (raz_compiler_rt_arena_get(source, i) != expected[i]) {
+                if (raz_compiler_rt_arena_get(source, i) != compiler_literal_byte(expected, i)) {
                     registry_source = false;
                 }
                 i += 1;
@@ -180,10 +176,8 @@ fn registry_vendor_copy_lock_data(i64 data, i64 length) -> i64 {
 }
 
 fn registry_vendor_copy_git() -> i64 {
-    i64 source_bytes[12] = [46, 47, 116, 97, 114, 103, 101, 116, 47, 103, 105, 116];
-    i64 destination_bytes[12] = [46, 47, 118, 101, 110, 100, 111, 114, 47, 103, 105, 116];
-    i64 source = registry_vendor_literal(&source_bytes, 12);
-    i64 destination = registry_vendor_literal(&destination_bytes, 12);
+    i64 source = registry_vendor_literal("./target/git");
+    i64 destination = registry_vendor_literal("./vendor/git");
 
     if (source == 0 || destination == 0) {
         return 40;
@@ -208,9 +202,7 @@ fn package_vendor_check() -> i64 {
     if (!registry_vendor_active()) {
         return 78;
     }
-
-    i64 path_bytes[10] = [46, 47, 114, 97, 122, 46, 108, 111, 99, 107];
-    i64 path = registry_vendor_literal(&path_bytes, 10);
+    i64 path = registry_vendor_literal("./raz.lock");
     i64 data = raz_compiler_rt_arena_create(2097152);
 
     if (path == 0 || data == 0) {
@@ -244,14 +236,14 @@ fn package_vendor_command(i64 argc) -> i64 {
         }
 
         i64 al = raz_compiler_rt_process_arg(2, arg, 64);
-        i64 check[7] = [45, 45, 99, 104, 101, 99, 107];
+        string check = "--check";
 
         check_only = al == 7;
 
         i64 i = 0;
 
         while (check_only && i < 7) {
-            if (raz_compiler_rt_arena_get(arg, i) != check[i]) {
+            if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(check, i)) {
                 check_only = false;
             }
             i += 1;
@@ -267,9 +259,7 @@ fn package_vendor_command(i64 argc) -> i64 {
         return package_vendor_check();
     }
     registry_vendor_marker_remove();
-
-    i64 lock_bytes[10] = [46, 47, 114, 97, 122, 46, 108, 111, 99, 107];
-    i64 lock_path = registry_vendor_literal(&lock_bytes, 10);
+    i64 lock_path = registry_vendor_literal("./raz.lock");
     i64 probe = raz_compiler_rt_arena_create(1);
 
     if (lock_path == 0 || probe == 0) {
@@ -290,13 +280,9 @@ fn package_vendor_command(i64 argc) -> i64 {
     if (status != 0) {
         return status;
     }
-
-    i64 vendor_bytes[8] = [46, 47, 118, 101, 110, 100, 111, 114];
-    i64 registry_bytes[17] = [46, 47, 118, 101, 110, 100, 111, 114, 47, 114, 101, 103, 105, 115, 116, 114, 121];
-    i64 git_bytes[12] = [46, 47, 118, 101, 110, 100, 111, 114, 47, 103, 105, 116];
-    i64 vendor = registry_vendor_literal(&vendor_bytes, 8);
-    i64 registry_dir = registry_vendor_literal(&registry_bytes, 17);
-    i64 git_dir = registry_vendor_literal(&git_bytes, 12);
+    i64 vendor = registry_vendor_literal("./vendor");
+    i64 registry_dir = registry_vendor_literal("./vendor/registry");
+    i64 git_dir = registry_vendor_literal("./vendor/git");
 
     if (vendor == 0 || registry_dir == 0 || git_dir == 0) {
         return 40;
@@ -338,9 +324,8 @@ fn package_vendor_command(i64 argc) -> i64 {
     raz_compiler_rt_arena_destroy(git_dir);
     raz_compiler_rt_arena_destroy(data);
     if (status == 0) {
-        i64 message[43] = [86, 101, 110, 100, 111, 114, 101, 100, 32, 108, 111, 99, 107, 101, 100, 32, 100, 101, 112, 101, 110, 100, 101, 110, 99, 105, 101, 115, 32, 105, 110, 116, 111, 32, 46, 47, 118, 101, 110, 100, 111, 114, 10];
 
-        cli_write(&message, 43);
+        cli_write_literal("Vendored locked dependencies into ./vendor\n");
     }
     return status;
 }

@@ -64,6 +64,10 @@ Natural loops are identified from dominator-backed CFG backedges. Each loop reco
 
 `LoopInvariantCodeMotionPass` hoists non-trapping operations from canonical loop headers when every SSA operand is defined outside the loop or was already proven invariant. It does not hoist loads, calls, division, remainder, or operations with side effects.
 
+`LoopInvariantGuardHoistingPass` performs a non-duplicating form of loop unswitching for canonical natural loops whose header contains only a branch on a loop-invariant value. With a unique preheader and exactly one in-loop successor, the invariant decision moves to the preheader and the loop header becomes an unconditional jump along the selected loop arm. Exit payloads are remapped through the preheader's initial header arguments, so the transform is accepted only when every value needed by the bypassed exit already dominates the preheader. Loop-variant predicates, self-loop headers, ambiguous/multi-arm loop exits, and cases requiring cloned operations remain unchanged.
+
+This removes a repeated invariant branch from every loop iteration without duplicating the loop body. Interpreter regressions cover both outcomes of a runtime invariant flag and verify that a genuinely induction-dependent header predicate is not hoisted.
+
 ## Broad scalar cleanup
 
 Forge canonicalizes commutative integer expressions and inverse comparison predicates for common-subexpression elimination. For example, `a < b` and `b > a` share one dominating predicate. Scalar cleanup simplifies neutral or self-canceling operations, including `x - x`, `x ^ x`, `x & x`, `x | x`, integer division/remainder by one, multiplication by negative one, double `neg`/`not`, all-bits `and/or`, XOR with all-bits-one, and redundant integer selects. Integer self-comparisons are folded when their result is independent of runtime data.
