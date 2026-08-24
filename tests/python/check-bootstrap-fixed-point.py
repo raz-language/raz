@@ -8,7 +8,6 @@ import sys
 
 root = Path(__file__).resolve().parents[2]
 bootstrap = (root / "tools" / "bootstrap.py").read_text(encoding="utf-8")
-bench = (root / "tools" / "run-benchmarks-from-bootstrap.py").read_text(encoding="utf-8")
 release = (root / "tools" / "run-release-gate-from-bootstrap.py").read_text(encoding="utf-8")
 windows = (root / "docs" / "WINDOWS-BUILD.md").read_text(encoding="utf-8")
 qualification = (root / "docs" / "RELEASE-QUALIFICATION.md").read_text(encoding="utf-8")
@@ -28,7 +27,6 @@ checks = {
     "seed artifact follows bin layout": 'compiler_project / "target" / seed_profile / "bin" / f"raz-compiler{EXE}"' in bootstrap,
     "all bootstrap generations use canonical profile layout": 'PROFILE_OUTPUT_DIRECTORIES = ("bin", "lib", "obj", "ir", "modules", "packages")' in bootstrap and 'stage_layout["obj"] / f"raz-compiler{OBJ}"' in bootstrap and 'stage_layout["bin"] / f"raz-compiler{EXE}"' in bootstrap and 'verify_layout["obj"] / f"raz-compiler{OBJ}"' in bootstrap and 'verify_layout["bin"] / f"raz-compiler{EXE}"' in bootstrap,
     "legacy bootstrap scratch is migrated away": 'BOOTSTRAP_LEGACY_SCRATCH_NAMES = {"host-source-order.txt", "stage1-diagnostic.txt"}' in bootstrap and 'remove_legacy_bootstrap_scratch(build_dir)' in bootstrap,
-    "benchmark helper uses repro-1": "repro-1" in bench and "repro-2" not in bench,
     "release helper uses repro-1": "repro-1" in release and "repro-2" not in release,
     "Windows docs use repro-1 as normal final compiler": "repro-1" in windows,
     "release docs describe optional verification": "verify-reproducibility" in qualification,

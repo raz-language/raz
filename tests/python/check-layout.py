@@ -19,7 +19,6 @@ allowed_cpp_roots = (
     Path('src/oblink'),
     Path('src/runtime'),
     Path('tests/native'),
-    Path('benchmarks/reference/c'),
 )
 ignored_roots = {'build', 'out', 'target', '.git'}
 violations = []
@@ -35,7 +34,7 @@ for path in root.rglob('*'):
     violations.append(str(rel))
 
 if violations:
-    print('Native C/C++ files must remain inside src/bootstrap, src/forge, src/oblink, src/runtime, tests/native, or benchmarks/reference/c:')
+    print('Native C/C++ files must remain inside src/bootstrap, src/forge, src/oblink, src/runtime, tests/native:')
     print('\n'.join(f'  {item}' for item in violations))
     sys.exit(1)
 print('repository native-source layout: PASS')

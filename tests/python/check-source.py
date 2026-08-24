@@ -35,8 +35,6 @@ CHECKS = (
     "check-toolchain-completion.py",
     "check-release-gate.py",
     "check-phase2-ergonomics.py",
-    "check-phase3-performance.py",
-    "test-performance-regression.py",
     "check-phase4-ecosystem.py",
     "check-cli-package-status.py",
     "check-cli-run-arguments.py",

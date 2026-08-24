@@ -49,7 +49,7 @@ add_library(forge
   src/ir/dependency_build.cpp src/capi/forge.cpp src/ir/lexer.cpp src/ir/parser.cpp src/ir/printer.cpp src/ir/verifier.cpp src/ir/binary.cpp
  src/analysis/function_analysis.cpp src/pass/pass.cpp src/pass/pipeline.cpp src/transforms/scalar.cpp
  src/machine/module.cpp src/machine/lower.cpp src/machine/liveness.cpp src/machine/optimize.cpp src/machine/register_allocation.cpp src/machine/verifier.cpp src/codegen/x86_64/encoder.cpp src/codegen/aarch64/register_allocation.cpp src/codegen/aarch64/encoder.cpp
- src/jit/engine.cpp src/jit/invoke.cpp src/object/elf.cpp src/object/elf_aarch64.cpp src/object/macho_aarch64.cpp src/object/coff.cpp src/object/archive.cpp src/object/incremental.cpp src/object/native_link.cpp src/interpreter/interpreter.cpp src/runtime/bindings.cpp src/target/data_layout.cpp src/target/abi.cpp)
+ src/jit/engine.cpp src/jit/invoke.cpp src/object/elf.cpp src/object/elf_aarch64.cpp src/object/macho_aarch64.cpp src/object/coff.cpp src/object/archive.cpp src/object/incremental.cpp src/object/native_link.cpp src/interpreter/interpreter.cpp src/runtime/bindings.cpp src/platform/data_layout.cpp src/platform/abi.cpp)
 add_library(Forge::forge ALIAS forge)
 set_target_properties(forge PROPERTIES
  VERSION ${PROJECT_VERSION}

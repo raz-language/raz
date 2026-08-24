@@ -205,7 +205,6 @@ See [Compiler bootstrap](docs/COMPILER-BOOTSTRAP.md) and [Windows build](docs/WI
 compiler/    Raz compiler implementation
 library/     core, allocation, and standard libraries
 src/         native runtime boundaries, host compiler, and Forge
-benchmarks/  maintained performance reference workloads
 tests/       language, compiler, runtime, and integration coverage
 docs/        language and toolchain reference
 tools/       formatting, verification, and repository utilities
@@ -257,4 +256,3 @@ Please do not report security vulnerabilities through public issues. See [SECURI
 Raz is licensed under the [Apache License 2.0](LICENSE). Forge retains its nested Apache-2.0 license for independent redistribution. See [NOTICE](NOTICE) and [Licensing](docs/LICENSING.md) for attribution and redistribution details.
 
 
-Performance regression policy and benchmark tooling are documented in [`docs/PERFORMANCE-QUALIFICATION.md`](docs/PERFORMANCE-QUALIFICATION.md).
