@@ -125,8 +125,19 @@ void emit_vector_stack_move(Buffer& out, XmmRegister reg, std::int32_t displacem
 }
 
 void emit_ptr_modrm(Buffer& out, std::uint8_t reg, Register pointer, std::int32_t displacement) {
-    emit_modrm(out, displacement == 0 ? 0 : 2, reg, static_cast<std::uint8_t>(pointer));
-    if (displacement != 0) out.i32(displacement);
+    const auto base = static_cast<std::uint8_t>(pointer);
+    const auto low = static_cast<std::uint8_t>(base & 7U);
+    const bool needs_sib = low == 4U; // rsp/r12 cannot be encoded directly as r/m.
+
+    std::uint8_t mod = 0U;
+    if (displacement == 0 && low != 5U) mod = 0U;
+    else if (displacement >= -128 && displacement <= 127) mod = 1U;
+    else mod = 2U;
+
+    emit_modrm(out, mod, reg, needs_sib ? 4U : low);
+    if (needs_sib) out.byte(static_cast<std::uint8_t>((0U << 6U) | (4U << 3U) | low));
+    if (mod == 1U) out.byte(static_cast<std::uint8_t>(displacement));
+    else if (mod == 2U) out.i32(displacement);
 }
 
 void emit_xmm128_ptr_store(Buffer& out, Register pointer, XmmRegister source, std::int32_t displacement = 0) {
@@ -456,10 +467,15 @@ void emit_ucomi(Buffer& out, XmmRegister left, XmmRegister right, bool wide) {
 }
 
 void emit_mov_gpr_to_xmm(Buffer& out, XmmRegister destination, Register source, bool wide) {
+    const auto dst = static_cast<std::uint8_t>(destination);
+    const auto src = static_cast<std::uint8_t>(source);
     out.byte(0x66);
-    if (wide) out.byte(0x48);
+    const auto rex = static_cast<std::uint8_t>(0x40U | (wide ? 0x08U : 0U) |
+                                               (dst >= 8U ? 0x04U : 0U) |
+                                               (src >= 8U ? 0x01U : 0U));
+    if (rex != 0x40U) out.byte(rex);
     out.byte(0x0F); out.byte(0x6E);
-    emit_modrm(out, 3, static_cast<std::uint8_t>(destination), static_cast<std::uint8_t>(source));
+    emit_modrm(out, 3, dst, src);
 }
 
 void emit_int_to_float(Buffer& out, XmmRegister destination, Register source, bool source_wide, bool result_wide) {
@@ -3340,7 +3356,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
             case machine::Opcode::xor_i64: {
                 if (instruction.symbol == "$memstack") {
                     if (instruction.inputs.size() != 1) { add_error(diagnostics, "malformed i64 memory arithmetic instruction in @" + function.name); return encoded; }
-                    emit_read_location64(out, Register::eax, allocation.location(instruction.inputs[0]));
+                    read_integer_cached(Register::eax, allocation.location(instruction.inputs[0]), true);
                     emit_integer_stack_binary(out, instruction.opcode, Register::eax, static_cast<std::int32_t>(instruction.immediate), true);
                     write_integer_cached64(allocation.location(instruction.result), Register::eax);
                     break;
@@ -3403,7 +3419,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                                         static_cast<std::int32_t>(instruction.immediate), true);
                         break;
                     }
-                    emit_read_location64(out, Register::eax, source_location);
+                    read_integer_cached(Register::eax, source_location, true);
                     emit_integer_immediate_binary(out, instruction.opcode, Register::eax,
                                                   static_cast<std::int32_t>(instruction.immediate), true);
                     write_integer_cached64(result_location, Register::eax);
@@ -3491,8 +3507,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 const bool inplace = instruction.opcode == machine::Opcode::binary_i32_contiguous_inplace ||
                                      instruction.opcode == machine::Opcode::binary_i64_contiguous_inplace;
                 const auto lane_bytes = wide ? 8 : 4;
-                if (instruction.inputs.size() != (inplace ? 2U : 3U) || instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                if (instruction.inputs.size() != (inplace ? 2U : 3U) || instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed contiguous integer expression pack in @" + function.name);
                     return encoded;
                 }
@@ -3611,8 +3626,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
             case machine::Opcode::binary_i64_contiguous_map2: {
                 const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_map2;
                 const auto lane_bytes = wide ? 8 : 4;
-                if (instruction.inputs.size() != 3U || instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                if (instruction.inputs.size() != 3U || instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed vector-to-vector integer expression pack in @" + function.name);
                     return encoded;
                 }
@@ -3672,8 +3686,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_dag_reuse;
                 const auto lane_bytes = wide ? 8 : 4;
                 if (instruction.symbol.size() < 18U || (instruction.symbol.size() % 6U) != 0U ||
-                    instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed packed reusable integer DAG in @" + function.name);
                     return encoded;
                 }
@@ -3864,8 +3877,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_dag;
                 const auto lane_bytes = wide ? 8 : 4;
                 if (instruction.symbol.size() < 10U || (instruction.symbol.size() & 1U) != 0U ||
-                    instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed packed integer DAG in @" + function.name);
                     return encoded;
                 }
@@ -3953,8 +3965,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 const auto lane_bytes = wide ? 8 : 4;
                 if (instruction.symbol.size() < 6U || (instruction.symbol.size() & 1U) != 0U ||
                     instruction.inputs.size() != instruction.symbol.size() / 2U + 2U ||
-                    instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed arbitrary-depth integer expression pack in @" + function.name);
                     return encoded;
                 }
@@ -3976,9 +3987,9 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                 std::vector<machine::Opcode> chain_operations;
                 chain_operations.reserve(instruction.symbol.size() / 2U);
                 for (std::size_t metadata_offset = 0; metadata_offset + 1U < instruction.symbol.size(); metadata_offset += 2U) {
-                    const auto encoded = static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset])) |
-                                         (static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset + 1U])) << 8U);
-                    chain_operations.push_back(static_cast<machine::Opcode>(encoded));
+                    const auto encoded_opcode = static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset])) |
+                                                (static_cast<std::uint32_t>(static_cast<unsigned char>(instruction.symbol[metadata_offset + 1U])) << 8U);
+                    chain_operations.push_back(static_cast<machine::Opcode>(encoded_opcode));
                 }
                 const auto source_count = chain_operations.size() + 1U;
                 const auto total_bytes = static_cast<std::int32_t>(instruction.immediate * lane_bytes);
@@ -4016,8 +4027,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
             case machine::Opcode::binary_i64_contiguous_map3: {
                 const bool wide = instruction.opcode == machine::Opcode::binary_i64_contiguous_map3;
                 const auto lane_bytes = wide ? 8 : 4;
-                if (instruction.inputs.size() != 4U || instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                if (instruction.inputs.size() != 4U || instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed chained integer expression pack in @" + function.name);
                     return encoded;
                 }
@@ -4155,7 +4165,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
             case machine::Opcode::xor_i32: {
                 if (instruction.symbol == "$memstack") {
                     if (instruction.inputs.size() != 1) { add_error(diagnostics, "malformed memory arithmetic instruction in @" + function.name); return encoded; }
-                    emit_read_location(out, Register::eax, allocation.location(instruction.inputs[0]));
+                    read_integer_cached(Register::eax, allocation.location(instruction.inputs[0]), false);
                     emit_integer_stack_binary(out, instruction.opcode, Register::eax, static_cast<std::int32_t>(instruction.immediate), false);
                     write_integer_cached32(allocation.location(instruction.result), Register::eax);
                     break;
@@ -4218,7 +4228,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
                                         static_cast<std::int32_t>(instruction.immediate), false);
                         break;
                     }
-                    emit_read_location(out, Register::eax, source_location);
+                    read_integer_cached(Register::eax, source_location, false);
                     emit_integer_immediate_binary(out, instruction.opcode, Register::eax,
                                                   static_cast<std::int32_t>(instruction.immediate), false);
                     write_integer_cached32(result_location, Register::eax);

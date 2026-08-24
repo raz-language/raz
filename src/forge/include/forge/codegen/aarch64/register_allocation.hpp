@@ -41,6 +41,10 @@ struct RegisterAllocation {
     std::uint32_t spilled_value_count{};
     std::uint32_t vector_spilled_value_count{};
     std::uint32_t spill_slot_count{};
+    // Size of each colored spill home. Keeping this explicit makes wide-vector
+    // allocation observable to diagnostics/tests and avoids inferring a slot's
+    // width from whichever virtual value happens to own it first.
+    std::vector<std::uint16_t> spill_slot_sizes;
     std::uint32_t spill_bytes{};
     std::uint32_t reused_spill_slot_count{};
     std::uint32_t frame_bytes_saved{};

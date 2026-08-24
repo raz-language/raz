@@ -183,8 +183,7 @@ std::string compact_impl_interface(std::string_view declaration) {
   std::string result(declaration.substr(0, open + 1));
   result.push_back(' ');
   std::size_t cursor = open + 1;
-  int depth = 1;
-  while (cursor < declaration.size() && depth == 1) {
+  while (cursor < declaration.size()) {
     while (cursor < declaration.size() && std::isspace(static_cast<unsigned char>(declaration[cursor]))) ++cursor;
     if (cursor >= declaration.size() || declaration[cursor] == '}') break;
     const std::size_t start = cursor;
@@ -213,27 +212,56 @@ std::string compact_impl_interface(std::string_view declaration) {
     if (stop >= declaration.size() || terminator == '}') break;
     std::string signature(declaration.substr(start, stop - start));
     while (!signature.empty() && std::isspace(static_cast<unsigned char>(signature.back()))) signature.pop_back();
-    if (!signature.empty()) {
-      const auto body = without_visibility(signature);
-      const bool function = body.starts_with("fn ") || body.starts_with("async fn ") ||
-                            body.starts_with("unsafe fn ") || body.starts_with("unsafe async fn ") ||
-                            body.starts_with("const fn ") || body.starts_with("extern fn ");
-      if (function) result += "@interface " + signature + "; ";
-      else result += signature + "; ";
+    const auto body = without_visibility(signature);
+    const bool function = body.starts_with("fn ") || body.starts_with("async fn ") ||
+                          body.starts_with("unsafe fn ") || body.starts_with("unsafe async fn ") ||
+                          body.starts_with("const fn ") || body.starts_with("extern fn ");
+    // Generic method bodies are part of the semantic interface because the
+    // consuming module may need to monomorphize them. Ordinary methods only
+    // need their signature; importing their complete body makes large module
+    // graphs repeatedly re-analyze the same implementation code.
+    bool generic_function = false;
+    if (function) {
+      const auto fn_at = body.find("fn ");
+      const auto open_paren = body.find('(', fn_at == std::string_view::npos ? 0 : fn_at + 3);
+      const auto generic_at = body.find('<', fn_at == std::string_view::npos ? 0 : fn_at + 3);
+      generic_function = generic_at != std::string_view::npos &&
+                         (open_paren == std::string_view::npos || generic_at < open_paren);
     }
 
-    if (terminator == ';') { cursor = stop + 1; continue; }
-    int body_depth = 1;
-    cursor = stop + 1;
-    for (; cursor < declaration.size() && body_depth > 0; ++cursor) {
-      if (declaration[cursor] == '{') ++body_depth;
-      else if (declaration[cursor] == '}') --body_depth;
+    if (terminator == ';') {
+      if (!signature.empty()) result += (function ? "@interface " : "") + signature + "; ";
+      cursor = stop + 1;
+      continue;
     }
+
+    int body_depth = 1;
+    std::size_t body_end = stop + 1;
+    for (; body_end < declaration.size() && body_depth > 0; ++body_end) {
+      if (declaration[body_end] == '{') ++body_depth;
+      else if (declaration[body_end] == '}') --body_depth;
+    }
+    if (function && generic_function) {
+      result.append(declaration.substr(start, body_end - start));
+      result.push_back(' ');
+    } else if (!signature.empty()) {
+      result += (function ? "@interface " : "") + signature + "; ";
+    }
+    cursor = body_end;
   }
 
   if (result.size() >= 2 && result.ends_with("{ ")) result.pop_back();
   result += '}';
   return result;
+}
+
+std::string compact_imported_semantic_declaration(std::string_view declaration) {
+  const auto body = semantic_body(declaration);
+  // Generic impl bodies are required for downstream specialization. Concrete
+  // impls can be reduced to method signatures (plus any generic method bodies)
+  // when they are injected into another module's semantic input.
+  if (body.starts_with("impl ")) return compact_impl_interface(declaration);
+  return std::string(declaration);
 }
 
 bool visible_on_surface(SourceVisibility visibility, SemanticSurface surface) {
@@ -2027,7 +2055,8 @@ void write_local_semantic_module(const ProjectGraph& graph,
   if (declarations.empty() && module.imports.empty()) return;
   output << "namespace " << module_namespace(graph, module) << " {\n";
   emit_module_import_bindings(graph, module, output);
-  for (const auto& declaration : declarations) output << declaration << "\n";
+  for (const auto& declaration : declarations)
+    output << compact_imported_semantic_declaration(declaration) << "\n";
   output << "}\n";
 }
 

@@ -176,21 +176,15 @@ std::optional<ExecutionResult> run_interpreter(
     return ExecutionResult{false, result.value->type(), result.value->bits() & type_mask(result.value->type())};
 }
 
-#if defined(_WIN32)
-constexpr auto host_abi = forge::codegen::x86_64::Abi::windows;
-#else
-constexpr auto host_abi = forge::codegen::x86_64::Abi::system_v;
-#endif
-
 std::optional<ExecutionResult> run_jit(
     const forge::ir::Module& module,
     const forge::ir::Function& function,
     std::span<const std::uint64_t> arguments) {
-#if !(defined(__x86_64__) || defined(_M_X64) || defined(__amd64__))
+#if !(defined(__x86_64__) || defined(_M_X64) || defined(__amd64__) || defined(__aarch64__) || defined(_M_ARM64))
     (void)module;
     (void)function;
     (void)arguments;
-    std::cerr << "error: the JIT currently requires an x86-64 host\n";
+    std::cerr << "error: the JIT currently requires an x86-64 or AArch64 host\n";
     return std::nullopt;
 #else
     if (!(function.return_type.is_integer() || function.return_type.kind() == forge::ir::TypeKind::void_)) {
@@ -207,6 +201,19 @@ std::optional<ExecutionResult> run_jit(
         print_diagnostics(verification);
         return std::nullopt;
     }
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+    constexpr auto host_abi = forge::codegen::aarch64::Abi::darwin;
+#else
+    constexpr auto host_abi = forge::codegen::aarch64::Abi::aapcs64;
+#endif
+#else
+#if defined(_WIN32)
+    constexpr auto host_abi = forge::codegen::x86_64::Abi::windows;
+#else
+    constexpr auto host_abi = forge::codegen::x86_64::Abi::system_v;
+#endif
+#endif
     auto loaded = forge::jit::load(*lowered.module, host_abi);
     if (!loaded.ok()) {
         print_diagnostics(loaded.diagnostics);

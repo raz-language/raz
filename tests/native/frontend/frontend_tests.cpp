@@ -53,6 +53,16 @@ void test_basic_tokens() {
   require(!diagnostics.has_errors(), "valid source has no diagnostics");
 }
 
+void test_function_is_an_identifier() {
+  raz::compiler::SourceManager sources;
+  raz::compiler::DiagnosticEngine diagnostics;
+  const auto kinds = lex("fn main() { i64 function = 42; return function; }", diagnostics, sources);
+  require(kinds.size() > 7, "function identifier token sequence");
+  require(kinds[6] == raz::compiler::TokenKind::identifier,
+          "`function` remains an ordinary identifier");
+  require(!diagnostics.has_errors(), "function identifier lexes without diagnostics");
+}
+
 void test_literals_and_comments() {
   raz::compiler::SourceManager sources;
   raz::compiler::DiagnosticEngine diagnostics;
@@ -83,6 +93,7 @@ void test_diagnostics_and_locations() {
 
 int main() {
   test_basic_tokens();
+  test_function_is_an_identifier();
   test_literals_and_comments();
   test_diagnostics_and_locations();
   std::cout << "frontend tests passed\n";

@@ -208,8 +208,11 @@ AggregateAbiClassification classify_aapcs64(
     result.alignment = alignment;
     result.register_count = static_cast<std::uint8_t>((size + 7U) / 8U);
     result.classes.assign(result.register_count, AbiValueClass::integer);
-    result.piece_widths.assign(result.register_count, 8U);
-    if (result.register_count != 0 && size <= 4U) result.piece_widths[0] = 4U;
+    result.piece_widths.reserve(result.register_count);
+    for (std::size_t piece = 0; piece < result.register_count; ++piece) {
+        const auto occupied = std::min<std::size_t>(8U, size - piece * 8U);
+        result.piece_widths.push_back(static_cast<std::uint8_t>(occupied <= 4U ? 4U : 8U));
+    }
     return result;
 }
 
@@ -248,7 +251,9 @@ std::optional<AggregateAbiClassification> classify_aggregate(
     switch (abi) {
     case NativeAbi::system_v_x86_64: return classify_sysv(layout->first, layout->second, leaves);
     case NativeAbi::windows_x64: return classify_windows(layout->first, layout->second);
-    case NativeAbi::aapcs64: return classify_aapcs64(layout->first, layout->second, leaves);
+    case NativeAbi::aapcs64:
+    case NativeAbi::darwin_arm64:
+        return classify_aapcs64(layout->first, layout->second, leaves);
     }
     return std::nullopt;
 }
@@ -261,11 +266,27 @@ FunctionAbiClassification classify_function(
     FunctionAbiClassification result;
     result.variadic = function.variadic;
 
+    const bool generic_aapcs64 = abi == NativeAbi::aapcs64;
+    const bool darwin_arm64 = abi == NativeAbi::darwin_arm64;
+    const bool arm64 = generic_aapcs64 || darwin_arm64;
     std::size_t integer_used = 0;
     std::size_t floating_used = 0;
     std::size_t windows_slots = 0;
-    const std::size_t integer_limit = abi == NativeAbi::system_v_x86_64 ? 6U : abi == NativeAbi::aapcs64 ? 8U : 4U;
-    const std::size_t floating_limit = abi == NativeAbi::system_v_x86_64 ? 8U : abi == NativeAbi::aapcs64 ? 8U : 4U;
+    std::size_t stack_offset = 0;
+    const std::size_t integer_limit = abi == NativeAbi::system_v_x86_64 ? 6U : arm64 ? 8U : 4U;
+    const std::size_t floating_limit = abi == NativeAbi::system_v_x86_64 ? 8U : arm64 ? 8U : 4U;
+
+    const auto append_stack_argument = [&](std::size_t size, std::size_t alignment) {
+        if (darwin_arm64) {
+            const auto natural_alignment = std::max<std::size_t>(1U, alignment);
+            stack_offset = align_to(stack_offset, natural_alignment);
+            stack_offset += std::max<std::size_t>(size, 1U);
+        } else {
+            const auto stack_alignment = arm64 ? std::max<std::size_t>(8U, alignment) : std::size_t{8U};
+            stack_offset = align_to(stack_offset, stack_alignment);
+            stack_offset += stack_slot_size(size);
+        }
+    };
 
     for (const auto& parameter : function.parameters) {
         AggregateAbiClassification classification;
@@ -289,12 +310,12 @@ FunctionAbiClassification classify_function(
                 if (floating) ++floating_used;
                 else ++integer_used;
             } else {
-                result.stack_bytes += 8U;
+                stack_offset += 8U;
             }
             ++windows_slots;
         } else if (classification.passed_indirectly) {
             if (integer_used < integer_limit) ++integer_used;
-            else result.stack_bytes += 8U;
+            else append_stack_argument(data_layout.pointer_size, data_layout.pointer_alignment);
         } else {
             std::size_t needed_integer = 0;
             std::size_t needed_floating = 0;
@@ -302,11 +323,28 @@ FunctionAbiClassification classify_function(
                 if (classification.classes[piece] == AbiValueClass::sse) ++needed_floating;
                 else ++needed_integer;
             }
+
+            // Generic AAPCS64 C.4 rounds NCRN to an even register for an
+            // integer-class argument requiring 16-byte alignment. Darwin arm64
+            // intentionally omits this rule.
+            if (generic_aapcs64 && needed_integer != 0U && classification.alignment >= 16U && integer_used < integer_limit)
+                integer_used = (integer_used + 1U) & ~std::size_t{1U};
+
             if (integer_used + needed_integer <= integer_limit && floating_used + needed_floating <= floating_limit) {
                 integer_used += needed_integer;
                 floating_used += needed_floating;
             } else {
-                result.stack_bytes += stack_slot_size(classification.size);
+                append_stack_argument(classification.size, classification.alignment);
+                // AAPCS64 C.3/C.13 exhaust the corresponding register bank when
+                // an HFA/HVA or small composite cannot fit in the remaining
+                // registers. Later arguments must not resume allocation in the
+                // unused tail of that bank. Darwin follows the same all-or-stack
+                // rule for fixed aggregate arguments, while retaining its own
+                // natural-width stack layout.
+                if (arm64) {
+                    if (needed_floating != 0U) floating_used = floating_limit;
+                    if (needed_integer != 0U) integer_used = integer_limit;
+                }
             }
         }
         result.parameters.push_back(std::move(classification));
@@ -314,6 +352,7 @@ FunctionAbiClassification classify_function(
 
     result.integer_registers = integer_used;
     result.floating_registers = floating_used;
+    result.stack_bytes = stack_offset;
     return result;
 }
 

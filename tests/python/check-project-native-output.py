@@ -18,7 +18,11 @@ def require(path: str, needle: str, label: str) -> None:
     checks += 1
 
 require("compiler/src/driver/project.rz", "fn project_default_native_paths(", "native path helper")
-require("compiler/src/driver/project.rz", "raz_compiler_project_native_path_i64(", "platform artifact path bridge")
+require("compiler/src/driver/project.rz", "fn project_path_copy(", "Raz-owned native path copy")
+require("compiler/src/driver/project.rz", "fn project_path_literal(", "Raz-owned native path literal assembly")
+require("compiler/src/driver/project.rz", "fn project_create_native_profile_category(", "native profile category creation")
+require("compiler/src/driver/project.rz", 'project_path_literal(artifact_path, artifact_capacity, &mut artifact_cursor, "/bin/")', "canonical executable category")
+require("compiler/src/driver/project.rz", 'project_path_literal(object_path, object_capacity, &mut object_cursor, "/obj/")', "canonical object category")
 require("compiler/src/driver/project.rz", "raz_compiler_rt_path_exists_ascii(build.object_path, build.object_length) == 0", "native object existence invariant")
 require("compiler/src/driver/project.rz", "raz_compiler_rt_path_exists_ascii(artifact_path, artifact_length) != 0", "final executable existence invariant")
 require("compiler/src/driver/cli.rz", "fn cli_print_native_path_failure()", "native path diagnostic")

@@ -366,6 +366,57 @@ fn project_native_build_destroy(ProjectNativeBuild&mut build) {
     build.object_length = 0;
 }
 
+fn project_path_copy(i64 output, i64 capacity, i64&mut cursor, i64 source, i64 length) -> bool {
+    if (output == 0 || source == 0 || capacity <= 0 || length < 0 || *cursor < 0 || *cursor + length > capacity) {
+        return false;
+    }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(output, *cursor + index, raz_compiler_rt_arena_get(source, index));
+        index += 1;
+    }
+    *cursor += length;
+    return true;
+}
+
+fn project_path_literal(i64 output, i64 capacity, i64&mut cursor, string literal) -> bool {
+    if (output == 0 || capacity <= 0 || *cursor < 0) {
+        return false;
+    }
+    i64 length = compiler_literal_length(literal);
+    if (*cursor + length > capacity) {
+        return false;
+    }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(output, *cursor + index, compiler_literal_byte(literal, index));
+        index += 1;
+    }
+    *cursor += length;
+    return true;
+}
+
+fn project_create_native_profile_category(
+    i64 profile_path,
+    i64 profile_length,
+    string category,
+    i64 scratch,
+    i64 scratch_capacity,
+) -> bool {
+    if (profile_path == 0 || profile_length <= 0 || scratch == 0 || scratch_capacity <= 0) {
+        return false;
+    }
+    i64 cursor = 0;
+    if (
+        !project_path_copy(scratch, scratch_capacity, &mut cursor, profile_path, profile_length) ||
+        !project_path_literal(scratch, scratch_capacity, &mut cursor, "/") ||
+        !project_path_literal(scratch, scratch_capacity, &mut cursor, category)
+    ) {
+        return false;
+    }
+    return raz_compiler_rt_create_dir_ascii(scratch, cursor) == 0;
+}
+
 fn project_default_native_paths(
     i64 manifest_path,
     i64 manifest_path_length,
@@ -390,61 +441,99 @@ fn project_default_native_paths(
 
     i64 manifest = raz_compiler_rt_arena_create(65536);
     i64 package_name = raz_compiler_rt_arena_create(4096);
+    i64 project_root = raz_compiler_rt_arena_create(8192);
+    i64 profile_path = raz_compiler_rt_arena_create(8192);
+    i64 scratch = raz_compiler_rt_arena_create(8192);
 
-    if (manifest == 0 || package_name == 0) {
-        if (manifest != 0) {
-            raz_compiler_rt_arena_destroy(manifest);
-        }
-        if (package_name != 0) {
-            raz_compiler_rt_arena_destroy(package_name);
-        }
+    if (manifest == 0 || package_name == 0 || project_root == 0 || profile_path == 0 || scratch == 0) {
+        if (scratch != 0) { raz_compiler_rt_arena_destroy(scratch); }
+        if (profile_path != 0) { raz_compiler_rt_arena_destroy(profile_path); }
+        if (project_root != 0) { raz_compiler_rt_arena_destroy(project_root); }
+        if (package_name != 0) { raz_compiler_rt_arena_destroy(package_name); }
+        if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
         return false;
     }
 
     i64 manifest_length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536, );
     i64 package_name_length = -1;
-
     if (manifest_length > 0) {
         package_name_length = manifest_package_name(manifest, manifest_length, package_name, 4096);
     }
-    if (manifest_length <= 0 || package_name_length <= 0) {
+    i64 project_root_length = path_dirname(manifest_path, manifest_path_length, project_root, 8192);
+    if (manifest_length <= 0 || package_name_length <= 0 || project_root_length <= 0) {
+        raz_compiler_rt_arena_destroy(scratch);
+        raz_compiler_rt_arena_destroy(profile_path);
+        raz_compiler_rt_arena_destroy(project_root);
         raz_compiler_rt_arena_destroy(package_name);
         raz_compiler_rt_arena_destroy(manifest);
         return false;
     }
 
-    i64 profile = 0;
-
-    if (release_profile) {
-        profile = 1;
+    // Keep target layout construction in Raz itself. This is language/project
+    // semantics, not a host ABI concern, and using the same spelling here as
+    // bootstrap guarantees Stage-0, self-hosted repro builds, and installed Raz
+    // all produce target/<profile>/{bin,lib,obj,ir,modules,packages}.
+    i64 profile_length = 0;
+    bool profile_ok =
+        project_path_copy(profile_path, 8192, &mut profile_length, project_root, project_root_length) &&
+        project_path_literal(profile_path, 8192, &mut profile_length, "/target/");
+    if (profile_ok) {
+        if (release_profile) {
+            profile_ok = project_path_literal(profile_path, 8192, &mut profile_length, "release");
+        } else {
+            profile_ok = project_path_literal(profile_path, 8192, &mut profile_length, "debug");
+        }
     }
-    i64 final_artifact_length = raz_compiler_project_native_path_i64(
-        manifest_path,
-        manifest_path_length,
-        package_name,
-        package_name_length,
-        profile,
-        0,
-        artifact_path,
-        artifact_capacity,
-    );
-    i64 final_object_length = raz_compiler_project_native_path_i64(
-        manifest_path,
-        manifest_path_length,
-        package_name,
-        package_name_length,
-        profile,
-        1,
-        object_path,
-        object_capacity,
-    );
-    raz_compiler_rt_arena_destroy(package_name);
-    raz_compiler_rt_arena_destroy(manifest);
-    if (final_artifact_length <= 0 || final_object_length <= 0) {
+    if (
+        !profile_ok ||
+        raz_compiler_rt_create_dir_ascii(profile_path, profile_length) != 0 ||
+        !project_create_native_profile_category(profile_path, profile_length, "bin", scratch, 8192) ||
+        !project_create_native_profile_category(profile_path, profile_length, "lib", scratch, 8192) ||
+        !project_create_native_profile_category(profile_path, profile_length, "obj", scratch, 8192) ||
+        !project_create_native_profile_category(profile_path, profile_length, "ir", scratch, 8192) ||
+        !project_create_native_profile_category(profile_path, profile_length, "modules", scratch, 8192) ||
+        !project_create_native_profile_category(profile_path, profile_length, "packages", scratch, 8192)
+    ) {
+        raz_compiler_rt_arena_destroy(scratch);
+        raz_compiler_rt_arena_destroy(profile_path);
+        raz_compiler_rt_arena_destroy(project_root);
+        raz_compiler_rt_arena_destroy(package_name);
+        raz_compiler_rt_arena_destroy(manifest);
         return false;
     }
-    *artifact_length = final_artifact_length;
-    *object_length = final_object_length;
+
+    i64 artifact_cursor = 0;
+    bool artifact_ok =
+        project_path_copy(artifact_path, artifact_capacity, &mut artifact_cursor, profile_path, profile_length) &&
+        project_path_literal(artifact_path, artifact_capacity, &mut artifact_cursor, "/bin/") &&
+        project_path_copy(artifact_path, artifact_capacity, &mut artifact_cursor, package_name, package_name_length);
+    if (artifact_ok && raz_compiler_rt_host_platform() == 1) {
+        artifact_ok = project_path_literal(artifact_path, artifact_capacity, &mut artifact_cursor, ".exe");
+    }
+
+    i64 object_cursor = 0;
+    bool object_ok =
+        project_path_copy(object_path, object_capacity, &mut object_cursor, profile_path, profile_length) &&
+        project_path_literal(object_path, object_capacity, &mut object_cursor, "/obj/") &&
+        project_path_copy(object_path, object_capacity, &mut object_cursor, package_name, package_name_length);
+    if (object_ok) {
+        if (raz_compiler_rt_host_platform() == 1) {
+            object_ok = project_path_literal(object_path, object_capacity, &mut object_cursor, ".obj");
+        } else {
+            object_ok = project_path_literal(object_path, object_capacity, &mut object_cursor, ".o");
+        }
+    }
+
+    raz_compiler_rt_arena_destroy(scratch);
+    raz_compiler_rt_arena_destroy(profile_path);
+    raz_compiler_rt_arena_destroy(project_root);
+    raz_compiler_rt_arena_destroy(package_name);
+    raz_compiler_rt_arena_destroy(manifest);
+    if (!artifact_ok || !object_ok || artifact_cursor <= 0 || object_cursor <= 0) {
+        return false;
+    }
+    *artifact_length = artifact_cursor;
+    *object_length = object_cursor;
     return true;
 }
 

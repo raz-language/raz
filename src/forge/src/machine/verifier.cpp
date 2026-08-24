@@ -4,6 +4,7 @@
 #include "forge/machine/verifier.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -103,16 +104,30 @@ std::uint16_t packed_token(const std::string& program, std::size_t offset) {
         (static_cast<unsigned>(static_cast<unsigned char>(program[offset + 1U])) << 8U));
 }
 
-// Only the lane-wise integer operations with a direct packed encoding are
-// admissible; anything else would have no legal vector form to lower to.
+// Only lane-wise operations with a direct packed encoding are admissible;
+// anything else would have no legal vector form to lower to. The packed
+// pseudo names retain their historical i32/i64 spelling because they describe
+// lane width, not the arithmetic domain.
 bool packed_operation_supported(Opcode operation, bool wide) {
     if (wide)
         return operation == Opcode::add_i64 || operation == Opcode::sub_i64 ||
                operation == Opcode::and_i64 || operation == Opcode::or_i64 ||
-               operation == Opcode::xor_i64;
+               operation == Opcode::xor_i64 || operation == Opcode::add_f64 ||
+               operation == Opcode::sub_f64 || operation == Opcode::mul_f64 ||
+               operation == Opcode::div_f64;
     return operation == Opcode::add_i32 || operation == Opcode::sub_i32 ||
            operation == Opcode::and_i32 || operation == Opcode::or_i32 ||
-           operation == Opcode::xor_i32;
+           operation == Opcode::xor_i32 || operation == Opcode::add_f32 ||
+           operation == Opcode::sub_f32 || operation == Opcode::mul_f32 ||
+           operation == Opcode::div_f32;
+}
+
+bool packed_operation_is_float(Opcode operation, bool wide) {
+    if (wide)
+        return operation == Opcode::add_f64 || operation == Opcode::sub_f64 ||
+               operation == Opcode::mul_f64 || operation == Opcode::div_f64;
+    return operation == Opcode::add_f32 || operation == Opcode::sub_f32 ||
+           operation == Opcode::mul_f32 || operation == Opcode::div_f32;
 }
 
 void verify_packed_binary(const Instruction& ins, const std::string& name, Diagnostics& diagnostics) {
@@ -134,21 +149,27 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
 
     if (arbitrary_chain) {
         if (ins.symbol.size() < 6U || (ins.symbol.size() & 1U) != 0U) {
-            error(diagnostics, "packed integer chain must contain at least three encoded operations in @" + name);
+            error(diagnostics, "packed chain must contain at least three encoded operations in @" + name);
             return;
         }
         const auto operation_count = ins.symbol.size() / 2U;
         if (ins.inputs.size() != operation_count + 2U)
-            error(diagnostics, "packed integer chain source/operation mismatch in @" + name);
+            error(diagnostics, "packed chain source/operation mismatch in @" + name);
+        std::optional<bool> floating;
         for (std::size_t offset = 0; offset + 1U < ins.symbol.size(); offset += 2U) {
-            if (!packed_operation_supported(static_cast<Opcode>(packed_token(ins.symbol, offset)), wide))
-                error(diagnostics, "unsupported packed integer chain operation in @" + name);
+            const auto operation = static_cast<Opcode>(packed_token(ins.symbol, offset));
+            if (!packed_operation_supported(operation, wide))
+                error(diagnostics, "unsupported packed chain operation in @" + name);
+            const auto operation_floating = packed_operation_is_float(operation, wide);
+            if (floating && *floating != operation_floating)
+                error(diagnostics, "packed chain cannot mix integer and floating operations in @" + name);
+            floating = operation_floating;
         }
     }
 
     if (arbitrary_dag) {
         if (ins.symbol.size() < 10U || (ins.symbol.size() & 1U) != 0U) {
-            error(diagnostics, "packed integer DAG must contain a valid postfix program in @" + name);
+            error(diagnostics, "packed DAG must contain a valid postfix program in @" + name);
             return;
         }
         // Walk the postfix program as an abstract stack machine: a source token
@@ -157,6 +178,7 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
         std::size_t max_stack_depth = 0U;
         std::size_t max_source = 0U;
         bool saw_source = false;
+        std::optional<bool> floating;
         for (std::size_t offset = 0; offset + 1U < ins.symbol.size(); offset += 2U) {
             const auto token = packed_token(ins.symbol, offset);
             if ((token & 0x8000U) != 0U) {
@@ -166,30 +188,36 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
                 saw_source = true;
                 continue;
             }
-            if (!packed_operation_supported(static_cast<Opcode>(token), wide))
-                error(diagnostics, "unsupported packed integer DAG operation in @" + name);
-            if (stack_depth < 2U) error(diagnostics, "packed integer DAG postfix stack underflow in @" + name);
+            const auto operation = static_cast<Opcode>(token);
+            if (!packed_operation_supported(operation, wide))
+                error(diagnostics, "unsupported packed DAG operation in @" + name);
+            const auto operation_floating = packed_operation_is_float(operation, wide);
+            if (floating && *floating != operation_floating)
+                error(diagnostics, "packed DAG cannot mix integer and floating operations in @" + name);
+            floating = operation_floating;
+            if (stack_depth < 2U) error(diagnostics, "packed DAG postfix stack underflow in @" + name);
             else --stack_depth;
         }
         if (stack_depth != 1U)
-            error(diagnostics, "packed integer DAG postfix stack must end at depth one in @" + name);
+            error(diagnostics, "packed DAG postfix stack must end at depth one in @" + name);
         // Every live intermediate needs its own vector register.
         if (max_stack_depth > 8U)
-            error(diagnostics, "packed integer DAG exceeds supported vector evaluation depth in @" + name);
+            error(diagnostics, "packed DAG exceeds supported vector evaluation depth in @" + name);
         const auto source_count = saw_source ? max_source + 1U : 0U;
         if (source_count == 0U || ins.inputs.size() != source_count + 1U)
-            error(diagnostics, "packed integer DAG source/program mismatch in @" + name);
+            error(diagnostics, "packed DAG source/program mismatch in @" + name);
     }
 
     if (reusable_dag) {
         if (ins.symbol.size() < 18U || (ins.symbol.size() % 6U) != 0U) {
-            error(diagnostics, "packed reusable integer DAG must contain fixed-size node records in @" + name);
+            error(diagnostics, "packed reusable DAG must contain fixed-size node records in @" + name);
             return;
         }
         // Fixed six-byte records: a tag, then two operand node indices.
         const auto node_count = ins.symbol.size() / 6U;
         std::size_t max_source = 0U;
         bool saw_source = false;
+        std::optional<bool> floating;
         for (std::size_t node = 0; node < node_count; ++node) {
             const auto tag = packed_token(ins.symbol, node * 6U);
             const auto lhs = packed_token(ins.symbol, node * 6U + 2U);
@@ -199,8 +227,13 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
                 max_source = std::max(max_source, static_cast<std::size_t>(tag & 0x7fffU));
                 continue;
             }
-            if (!packed_operation_supported(static_cast<Opcode>(tag), wide))
+            const auto operation = static_cast<Opcode>(tag);
+            if (!packed_operation_supported(operation, wide))
                 error(diagnostics, "unsupported packed reusable DAG operation in @" + name);
+            const auto operation_floating = packed_operation_is_float(operation, wide);
+            if (floating && *floating != operation_floating)
+                error(diagnostics, "packed reusable DAG cannot mix integer and floating operations in @" + name);
+            floating = operation_floating;
             // Referencing only earlier nodes keeps the graph acyclic, so it can
             // be evaluated in a single forward pass.
             if (lhs >= node || rhs >= node)
@@ -214,16 +247,29 @@ void verify_packed_binary(const Instruction& ins, const std::string& name, Diagn
     if (!arbitrary_chain && !arbitrary_dag && !reusable_dag) {
         const auto operation = static_cast<Opcode>(chained ? (ins.argument_index & 0xffffU) : ins.argument_index);
         if (!packed_operation_supported(operation, wide))
-            error(diagnostics, "unsupported packed integer operation in @" + name);
+            error(diagnostics, "unsupported packed operation in @" + name);
         if (chained) {
             const auto second = static_cast<Opcode>((ins.argument_index >> 16U) & 0xffffU);
             if (!packed_operation_supported(second, wide))
-                error(diagnostics, "unsupported second packed integer operation in @" + name);
+                error(diagnostics, "unsupported second packed operation in @" + name);
+            if (packed_operation_is_float(operation, wide) != packed_operation_is_float(second, wide))
+                error(diagnostics, "packed chained map cannot mix integer and floating operations in @" + name);
         }
     }
 
-    if (ins.immediate < 2 || ins.immediate > 8 || (ins.immediate & (ins.immediate - 1)) != 0)
-        error(diagnostics, "invalid packed integer lane count in @" + name);
+    if (ins.immediate < 2 || ins.immediate > 16) {
+        error(diagnostics, "invalid packed lane count in @" + name);
+        return;
+    }
+
+    // Packed maps/chains may end in a scalar lane or an 8-byte NEON D-register
+    // tail, so requiring powers of two here incorrectly rejects profitable
+    // 3/6/10/... lane groups. DAG encodings are evaluated chunk-wise and need
+    // at least a complete 64-bit tail because they do not have a scalar postfix
+    // evaluator. Keep that stricter invariant only for those two pseudo forms.
+    if ((arbitrary_dag || reusable_dag) &&
+        ((static_cast<std::uint64_t>(ins.immediate) * (wide ? 8U : 4U)) & 7U) != 0U)
+        error(diagnostics, "packed DAG tail must cover at least 64 bits in @" + name);
 }
 
 std::size_t expected_inputs(Opcode opcode) {
@@ -345,6 +391,45 @@ Diagnostics verify_module(const Module& module) {
         if (function.register_widths.size() != function.register_count) error(diagnostics, "machine register-width table mismatch in @" + function.name);
         if (function.register_classes.size() != function.register_count) error(diagnostics, "machine register-class table mismatch in @" + function.name);
         if (function.argument_widths.size() != function.argument_count || function.argument_classes.size() != function.argument_count) error(diagnostics, "machine argument metadata mismatch in @" + function.name);
+        const auto verify_argument_groups = [&](const std::vector<std::uint8_t>& sizes,
+                                                const std::vector<std::uint8_t>& alignments,
+                                                std::size_t slot_count, std::size_t first_slot,
+                                                const std::string& owner) {
+            if (sizes.empty() && alignments.empty()) return;
+            if (sizes.size() != slot_count || alignments.size() != slot_count) {
+                error(diagnostics, "machine argument-group metadata mismatch in " + owner);
+                return;
+            }
+            std::size_t cursor = first_slot;
+            while (cursor < slot_count) {
+                const auto group = static_cast<std::size_t>(sizes[cursor]);
+                const auto alignment = alignments[cursor];
+                const bool valid_alignment = alignment == 1U || alignment == 2U || alignment == 4U ||
+                    alignment == 8U || alignment == 16U;
+                if (group == 0U || cursor + group > slot_count || !valid_alignment) {
+                    error(diagnostics, "invalid machine argument group in " + owner +
+                        " at slot " + std::to_string(cursor) + " (group=" + std::to_string(group) +
+                        ", alignment=" + std::to_string(alignments[cursor]) +
+                        ", slots=" + std::to_string(slot_count) + ")");
+                    return;
+                }
+                for (std::size_t piece = 1U; piece < group; ++piece) {
+                    if (sizes[cursor + piece] != 0U || alignments[cursor + piece] != 0U) {
+                        error(diagnostics, "invalid machine argument-group continuation in " + owner);
+                        return;
+                    }
+                }
+                cursor += group;
+            }
+        };
+        verify_argument_groups(function.argument_group_sizes, function.argument_group_alignments,
+                               function.argument_count, 0U, "@" + function.name);
+        for (const auto width : function.argument_widths) {
+            if (width != 1U && width != 2U && width != 4U && width != 8U && width != 16U) {
+                error(diagnostics, "invalid machine argument width in @" + function.name);
+                break;
+            }
+        }
         for (const auto& block : function.blocks) {
             if (!blocks.emplace(block.name, &block).second) error(diagnostics, "duplicate machine block " + block.name + " in @" + function.name);
             for (auto reg : block.parameters) {
@@ -401,6 +486,44 @@ Diagnostics verify_module(const Module& module) {
                 for (auto reg : ins.inputs) if (reg >= function.register_count) error(diagnostics, "input virtual register out of range in @" + function.name);
                 if ((ins.opcode == Opcode::call_i32 || ins.opcode == Opcode::call_i64 || ins.opcode == Opcode::call_f32 || ins.opcode == Opcode::call_f64 || ins.opcode == Opcode::call_void || ins.opcode == Opcode::call_aggregate || ins.opcode == Opcode::load_function_address || (ins.opcode == Opcode::load_global_address || ins.opcode == Opcode::load_tls_address)) && ins.symbol.empty()) error(diagnostics, "call has empty target in @" + function.name);
                 if ((ins.opcode == Opcode::call_indirect_i32 || ins.opcode == Opcode::call_indirect_i64 || ins.opcode == Opcode::call_indirect_f32 || ins.opcode == Opcode::call_indirect_f64 || ins.opcode == Opcode::call_indirect_void) && ins.inputs.empty()) error(diagnostics, "indirect call has no target in @" + function.name);
+                if (ins.opcode == Opcode::call_i32 || ins.opcode == Opcode::call_i64 ||
+                    ins.opcode == Opcode::call_f32 || ins.opcode == Opcode::call_f64 ||
+                    ins.opcode == Opcode::call_void || ins.opcode == Opcode::call_aggregate ||
+                    ins.opcode == Opcode::call_indirect_i32 || ins.opcode == Opcode::call_indirect_i64 ||
+                    ins.opcode == Opcode::call_indirect_f32 || ins.opcode == Opcode::call_indirect_f64 ||
+                    ins.opcode == Opcode::call_indirect_void) {
+                    std::size_t first_argument = (ins.opcode == Opcode::call_indirect_i32 ||
+                        ins.opcode == Opcode::call_indirect_i64 || ins.opcode == Opcode::call_indirect_f32 ||
+                        ins.opcode == Opcode::call_indirect_f64 || ins.opcode == Opcode::call_indirect_void) ? 1U : 0U;
+                    if (ins.indirect_result || ins.opcode == Opcode::call_aggregate) ++first_argument;
+                    verify_argument_groups(ins.argument_group_sizes, ins.argument_group_alignments,
+                                           ins.inputs.size(), std::min(first_argument, ins.inputs.size()),
+                                           "call in @" + function.name);
+                    const auto ordinary_argument_count = ins.inputs.size() - std::min(first_argument, ins.inputs.size());
+                    if (!ins.argument_widths.empty()) {
+                        if (ins.argument_widths.size() != ins.inputs.size()) {
+                            error(diagnostics, "machine call argument-width metadata mismatch in @" + function.name);
+                        } else {
+                            for (std::size_t slot = first_argument; slot < ins.argument_widths.size(); ++slot) {
+                                const auto width = ins.argument_widths[slot];
+                                if (width != 1U && width != 2U && width != 4U && width != 8U && width != 16U) {
+                                    error(diagnostics, "invalid machine call argument width in @" + function.name);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!ins.variadic_call && ins.variadic_named_input_count != 0U)
+                        error(diagnostics, "non-variadic machine call has variadic boundary metadata in @" + function.name);
+                    if (ins.variadic_call && ins.variadic_named_input_count > ordinary_argument_count)
+                        error(diagnostics, "variadic machine call named-argument boundary is out of range in @" + function.name);
+                    if (ins.variadic_call && !ins.argument_group_sizes.empty() &&
+                        ins.variadic_named_input_count < ordinary_argument_count) {
+                        const auto boundary = first_argument + ins.variadic_named_input_count;
+                        if (boundary < ins.argument_group_sizes.size() && ins.argument_group_sizes[boundary] == 0U)
+                            error(diagnostics, "variadic machine call boundary splits an argument group in @" + function.name);
+                    }
+                }
                 const auto stack_access_size = [&]() -> std::int64_t {
                     switch (ins.opcode) {
                     case Opcode::load_stack_i8: case Opcode::store_stack_i8: return 1;

@@ -64,10 +64,16 @@ constexpr std::uint32_t fmov_x_d_mask = 0xFFFFFC00U, fmov_x_d = 0x9E660000U;
 constexpr std::uint32_t vector_form_mask = 0xFFC00000U;
 constexpr std::uint32_t ldr_q_scaled = 0x3DC00000U, str_q_scaled = 0x3D800000U;
 constexpr std::uint32_t ldur_q = 0x3CC00000U, stur_q = 0x3C800000U;
+constexpr std::uint32_t ldr_d_scaled = 0xFD400000U, str_d_scaled = 0xFD000000U;
+constexpr std::uint32_t ldur_d = 0xFC400000U, stur_d = 0xFC000000U;
 constexpr std::uint32_t neon_binary_mask = 0xFFE0FC00U;
 constexpr std::uint32_t neon_add_2d = 0x4EE08400U, neon_add_4s = 0x4EA08400U;
-constexpr std::uint32_t neon_sub_4s = 0x6EA08400U, neon_eor_16b = 0x6E201C00U;
+constexpr std::uint32_t neon_sub_2d = 0x6EE08400U, neon_sub_4s = 0x6EA08400U, neon_eor_16b = 0x6E201C00U;
 constexpr std::uint32_t neon_mov_16b = 0x4EA01C00U;
+constexpr std::uint32_t neon_fadd_4s = 0x4E20D400U, neon_fadd_2d = 0x4E60D400U;
+constexpr std::uint32_t neon_fsub_4s = 0x4EA0D400U, neon_fsub_2d = 0x4EE0D400U;
+constexpr std::uint32_t neon_fmul_4s = 0x6E20DC00U, neon_fmul_2d = 0x6E60DC00U;
+constexpr std::uint32_t neon_fdiv_4s = 0x6E20FC00U, neon_fdiv_2d = 0x6E60FC00U;
 
 std::string metadata16(std::initializer_list<std::uint16_t> tokens) {
     std::string blob;
@@ -211,9 +217,10 @@ void test_vector_chain() {
           "each i64 chain chunk performs its vector exclusive-or");
 }
 
-void test_chain_scalar_tail() {
-    // Two i32 lanes are eight bytes, below one vector, so the whole pack is the
-    // scalar tail. It must still be encoded rather than rejected.
+void test_chain_half_vector_tail() {
+    // Two i32 lanes are exactly one D register. NEON has no predicate mask, so
+    // Forge uses a narrow SIMD load/store for the active half of the Q register
+    // rather than issuing eight separate scalar source loads.
     auto function = pointer_function("chain_i32_tail", 5U);
     Instruction chain;
     chain.opcode = Opcode::binary_i32_contiguous_chain;
@@ -230,10 +237,15 @@ void test_chain_scalar_tail() {
     if (stream.empty()) return;
     check(count_masked(stream, vector_form_mask, ldr_q_scaled) +
           count_masked(stream, vector_form_mask, ldur_q) == 0U,
-          "a sub-vector chain emits no 128-bit loads");
-    // Two lanes, each loading four sources and storing one result.
-    check(count_masked(stream, 0xFFC00000U, 0xB9400000U) >= 8U,
-          "the scalar chain tail loads every source lane with a 32-bit load");
+          "a half-vector chain emits no 128-bit loads");
+    check(count_masked(stream, vector_form_mask, ldr_d_scaled) +
+          count_masked(stream, vector_form_mask, ldur_d) == 4U,
+          "a half-vector chain loads each source once through a D register");
+    check(count_masked(stream, vector_form_mask, str_d_scaled) +
+          count_masked(stream, vector_form_mask, stur_d) == 1U,
+          "a half-vector chain stores exactly the active 64-bit tail");
+    check(count_masked(stream, neon_binary_mask, neon_add_4s) == 1U,
+          "a half-vector i32 tail remains in NEON for arithmetic");
 }
 
 void test_postfix_dag() {
@@ -295,9 +307,13 @@ void test_reusable_dag_materializes_shared_node_once() {
     check(count_masked(stream, vector_form_mask, ldr_q_scaled) +
           count_masked(stream, vector_form_mask, ldur_q) == 3U,
           "the reusable DAG loads each distinct source once per chunk");
-    // Retaining the shared value forces a copy before the destructive operation.
-    check(count_masked(stream, neon_binary_mask, neon_mov_16b) >= 1U,
-          "a retained DAG node is copied aside before being consumed destructively");
+    // A64 has a true three-operand SIMD form, so retaining the shared value does
+    // not require the copy that a destructive two-operand evaluator would need.
+    check(count_masked(stream, neon_binary_mask, neon_sub_2d) == 1U &&
+          count_masked(stream, neon_binary_mask, neon_eor_16b) == 1U,
+          "the reusable DAG consumes its shared node with three-operand NEON operations");
+    check(count_masked(stream, neon_binary_mask, neon_mov_16b) == 0U,
+          "the reusable DAG avoids a redundant vector copy");
 }
 
 void test_packed_spill_reload() {
@@ -426,6 +442,273 @@ std::size_t count_opcode(const Function& function, Opcode opcode) {
         for (const auto& instruction : block.instructions)
             if (instruction.opcode == opcode) ++total;
     return total;
+}
+
+void test_floating_opcode_matrix() {
+    struct Case { Opcode operation; bool wide; std::uint32_t encoding; const char* name; };
+    const Case cases[] = {
+        {Opcode::add_f32, false, neon_fadd_4s, "f32 add"},
+        {Opcode::sub_f32, false, neon_fsub_4s, "f32 sub"},
+        {Opcode::mul_f32, false, neon_fmul_4s, "f32 mul"},
+        {Opcode::div_f32, false, neon_fdiv_4s, "f32 div"},
+        {Opcode::add_f64, true, neon_fadd_2d, "f64 add"},
+        {Opcode::sub_f64, true, neon_fsub_2d, "f64 sub"},
+        {Opcode::mul_f64, true, neon_fmul_2d, "f64 mul"},
+        {Opcode::div_f64, true, neon_fdiv_2d, "f64 div"},
+    };
+    for (const auto& entry : cases) {
+        auto function = pointer_function(std::string("packed_") + entry.name, 3U);
+        Instruction packed;
+        packed.opcode = entry.wide ? Opcode::binary_i64_contiguous_map2 : Opcode::binary_i32_contiguous_map2;
+        packed.inputs = {0U, 1U, 2U};
+        packed.immediate = entry.wide ? 2 : 4;
+        packed.argument_index = static_cast<std::uint32_t>(entry.operation);
+        packed.vector_bits = 128U;
+        function.blocks.back().instructions.push_back(std::move(packed));
+        terminate_void(function);
+        const auto stream = encode_words(std::move(function), entry.name);
+        if (stream.empty()) continue;
+        check(count_masked(stream, neon_binary_mask, entry.encoding) == 1U,
+              std::string("AArch64 emits native NEON ") + entry.name);
+    }
+}
+
+void test_floating_expression_slp() {
+    const std::string scalar_source = R"(
+module @float_scalar_slp {
+  global @a: i8[64] align 16 = zero
+  global @dst: i8[64] align 16 = zero
+  func @scale4(%scale: f32) -> void {
+  entry:
+    %abase = global.address ptr @a
+    %dbase = global.address ptr @dst
+    %a0p = ptr.offset ptr %abase, 0
+    %d0p = ptr.offset ptr %dbase, 0
+    %a0 = load f32 %a0p align 4
+    %r0 = mul f32 %a0, %scale
+    store f32 %r0, %d0p align 4
+    %a1p = ptr.offset ptr %abase, 4
+    %d1p = ptr.offset ptr %dbase, 4
+    %a1 = load f32 %a1p align 4
+    %r1 = mul f32 %a1, %scale
+    store f32 %r1, %d1p align 4
+    %a2p = ptr.offset ptr %abase, 8
+    %d2p = ptr.offset ptr %dbase, 8
+    %a2 = load f32 %a2p align 4
+    %r2 = mul f32 %a2, %scale
+    store f32 %r2, %d2p align 4
+    %a3p = ptr.offset ptr %abase, 12
+    %d3p = ptr.offset ptr %dbase, 12
+    %a3 = load f32 %a3p align 4
+    %r3 = mul f32 %a3, %scale
+    store f32 %r3, %d3p align 4
+    return
+  }
+}
+)";
+    forge::machine::LowerResult scalar_lowered;
+    const auto* scalar_function = lower_one(scalar_source, "scale4", scalar_lowered, "four-lane f32 scalar map");
+    if (scalar_function != nullptr) {
+        const auto* packed = find_opcode(*scalar_function, Opcode::binary_i32_contiguous_map);
+        check(packed != nullptr && static_cast<Opcode>(packed->argument_index) == Opcode::mul_f32,
+              "AArch64 forms a packed f32 scalar-broadcast map");
+        auto encoded = forge::codegen::aarch64::encode(*scalar_lowered.module);
+        check(encoded.ok(), "packed f32 scalar map encodes for AArch64");
+        if (encoded.ok() && !encoded.functions.empty()) {
+            const auto stream = words(encoded.functions.front().code);
+            check(count_masked(stream, neon_binary_mask, neon_fmul_4s) == 1U,
+                  "packed f32 scalar map emits FMUL v.4s");
+        }
+    }
+
+    const std::string f32_source = R"(
+module @float_slp32 {
+  global @a: i8[64] align 16 = zero
+  global @b: i8[64] align 16 = zero
+  global @dst: i8[64] align 16 = zero
+  func @map4() -> void {
+  entry:
+    %abase = global.address ptr @a
+    %bbase = global.address ptr @b
+    %dbase = global.address ptr @dst
+    %a0p = ptr.offset ptr %abase, 0
+    %b0p = ptr.offset ptr %bbase, 0
+    %d0p = ptr.offset ptr %dbase, 0
+    %a0 = load f32 %a0p align 4
+    %b0 = load f32 %b0p align 4
+    %r0 = add f32 %a0, %b0
+    store f32 %r0, %d0p align 4
+    %a1p = ptr.offset ptr %abase, 4
+    %b1p = ptr.offset ptr %bbase, 4
+    %d1p = ptr.offset ptr %dbase, 4
+    %a1 = load f32 %a1p align 4
+    %b1 = load f32 %b1p align 4
+    %r1 = add f32 %a1, %b1
+    store f32 %r1, %d1p align 4
+    %a2p = ptr.offset ptr %abase, 8
+    %b2p = ptr.offset ptr %bbase, 8
+    %d2p = ptr.offset ptr %dbase, 8
+    %a2 = load f32 %a2p align 4
+    %b2 = load f32 %b2p align 4
+    %r2 = add f32 %a2, %b2
+    store f32 %r2, %d2p align 4
+    %a3p = ptr.offset ptr %abase, 12
+    %b3p = ptr.offset ptr %bbase, 12
+    %d3p = ptr.offset ptr %dbase, 12
+    %a3 = load f32 %a3p align 4
+    %b3 = load f32 %b3p align 4
+    %r3 = add f32 %a3, %b3
+    store f32 %r3, %d3p align 4
+    return
+  }
+}
+)";
+    forge::machine::LowerResult lowered32;
+    const auto* function32 = lower_one(f32_source, "map4", lowered32, "four-lane f32 expression SLP");
+    if (function32 != nullptr) {
+        const auto* packed = find_opcode(*function32, Opcode::binary_i32_contiguous_map2);
+        check(packed != nullptr, "AArch64 forms a packed f32 map2 expression");
+        if (packed != nullptr) {
+            check(static_cast<Opcode>(packed->argument_index) == Opcode::add_f32,
+                  "the packed f32 map records floating add semantics");
+            check(packed->immediate == 4, "the packed f32 map covers one complete Q register");
+        }
+        check(count_opcode(*function32, Opcode::add_f32) == 0U,
+              "f32 SLP removes the scalar add instructions");
+        auto encoded = forge::codegen::aarch64::encode(*lowered32.module);
+        check(encoded.ok(), "packed f32 map encodes for AArch64");
+        if (encoded.ok() && !encoded.functions.empty()) {
+            const auto stream = words(encoded.functions.front().code);
+            check(count_masked(stream, neon_binary_mask, neon_fadd_4s) == 1U,
+                  "packed f32 map emits FADD v.4s");
+        }
+    }
+
+    const std::string f64_source = R"(
+module @float_slp64 {
+  global @a: i8[64] align 16 = zero
+  global @b: i8[64] align 16 = zero
+  global @c: i8[64] align 16 = zero
+  global @dst: i8[64] align 16 = zero
+  func @map2d() -> void {
+  entry:
+    %abase = global.address ptr @a
+    %bbase = global.address ptr @b
+    %cbase = global.address ptr @c
+    %dbase = global.address ptr @dst
+    %a0p = ptr.offset ptr %abase, 0
+    %b0p = ptr.offset ptr %bbase, 0
+    %c0p = ptr.offset ptr %cbase, 0
+    %d0p = ptr.offset ptr %dbase, 0
+    %a0 = load f64 %a0p align 8
+    %b0 = load f64 %b0p align 8
+    %c0 = load f64 %c0p align 8
+    %s0 = add f64 %a0, %b0
+    %r0 = mul f64 %s0, %c0
+    store f64 %r0, %d0p align 8
+    %a1p = ptr.offset ptr %abase, 8
+    %b1p = ptr.offset ptr %bbase, 8
+    %c1p = ptr.offset ptr %cbase, 8
+    %d1p = ptr.offset ptr %dbase, 8
+    %a1 = load f64 %a1p align 8
+    %b1 = load f64 %b1p align 8
+    %c1 = load f64 %c1p align 8
+    %s1 = add f64 %a1, %b1
+    %r1 = mul f64 %s1, %c1
+    store f64 %r1, %d1p align 8
+    return
+  }
+}
+)";
+    forge::machine::LowerResult lowered64;
+    const auto* function64 = lower_one(f64_source, "map2d", lowered64, "two-lane f64 chained SLP");
+    if (function64 != nullptr) {
+        const auto* packed = find_opcode(*function64, Opcode::binary_i64_contiguous_map3);
+        check(packed != nullptr, "AArch64 forms a packed two-operation f64 map");
+        if (packed != nullptr) {
+            check(static_cast<Opcode>(packed->argument_index & 0xffffU) == Opcode::add_f64 &&
+                  static_cast<Opcode>((packed->argument_index >> 16U) & 0xffffU) == Opcode::mul_f64,
+                  "the packed f64 map retains add-then-multiply semantics");
+        }
+        auto encoded = forge::codegen::aarch64::encode(*lowered64.module);
+        check(encoded.ok(), "packed f64 chained map encodes for AArch64");
+        if (encoded.ok() && !encoded.functions.empty()) {
+            const auto stream = words(encoded.functions.front().code);
+            check(count_masked(stream, neon_binary_mask, neon_fadd_2d) == 1U,
+                  "packed f64 map emits FADD v.2d");
+            check(count_masked(stream, neon_binary_mask, neon_fmul_2d) == 1U,
+                  "packed f64 map emits FMUL v.2d");
+        }
+    }
+
+    const auto build_tail_map = [](std::string_view module_name, std::string_view function_name,
+                                   std::string_view type, std::size_t lanes) {
+        const auto lane_bytes = type == "f64" ? 8U : 4U;
+        std::string source = "module @" + std::string(module_name) + " {\n"
+            "  global @a: i8[64] align 16 = zero\n"
+            "  global @b: i8[64] align 16 = zero\n"
+            "  global @dst: i8[64] align 16 = zero\n"
+            "  func @" + std::string(function_name) + "() -> void {\n"
+            "  entry:\n"
+            "    %abase = global.address ptr @a\n"
+            "    %bbase = global.address ptr @b\n"
+            "    %dbase = global.address ptr @dst\n";
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            const auto suffix = std::to_string(lane);
+            const auto offset = std::to_string(lane * lane_bytes);
+            source += "    %ap" + suffix + " = ptr.offset ptr %abase, " + offset + "\n";
+            source += "    %bp" + suffix + " = ptr.offset ptr %bbase, " + offset + "\n";
+            source += "    %dp" + suffix + " = ptr.offset ptr %dbase, " + offset + "\n";
+            source += "    %a" + suffix + " = load " + std::string(type) + " %ap" + suffix + " align " + std::to_string(lane_bytes) + "\n";
+            source += "    %b" + suffix + " = load " + std::string(type) + " %bp" + suffix + " align " + std::to_string(lane_bytes) + "\n";
+            source += "    %r" + suffix + " = add " + std::string(type) + " %a" + suffix + ", %b" + suffix + "\n";
+            source += "    store " + std::string(type) + " %r" + suffix + ", %dp" + suffix + " align " + std::to_string(lane_bytes) + "\n";
+        }
+        source += "    return\n  }\n}\n";
+        return source;
+    };
+
+    {
+        forge::machine::LowerResult lowered;
+        const auto source = build_tail_map("float_tail32", "map6", "f32", 6U);
+        const auto* function = lower_one(source, "map6", lowered, "six-lane f32 tail SLP");
+        if (function != nullptr) {
+            const auto* packed = find_opcode(*function, Opcode::binary_i32_contiguous_map2);
+            check(packed != nullptr && packed->immediate == 6,
+                  "AArch64 keeps a six-lane f32 run in one packed pseudo");
+            auto encoded = forge::codegen::aarch64::encode(*lowered.module);
+            check(encoded.ok(), "six-lane f32 tail pack encodes for AArch64");
+            if (encoded.ok() && !encoded.functions.empty()) {
+                const auto stream = words(encoded.functions.front().code);
+                check(count_masked(stream, neon_binary_mask, neon_fadd_4s) == 2U,
+                      "six-lane f32 pack uses one Q add and one D-tail add");
+                check(count_masked(stream, vector_form_mask, str_d_scaled) +
+                      count_masked(stream, vector_form_mask, stur_d) == 1U,
+                      "six-lane f32 pack stores its two-lane tail through D");
+            }
+        }
+    }
+
+    {
+        forge::machine::LowerResult lowered;
+        const auto source = build_tail_map("float_tail64", "map3", "f64", 3U);
+        const auto* function = lower_one(source, "map3", lowered, "three-lane f64 tail SLP");
+        if (function != nullptr) {
+            const auto* packed = find_opcode(*function, Opcode::binary_i64_contiguous_map2);
+            check(packed != nullptr && packed->immediate == 3,
+                  "AArch64 keeps a three-lane f64 run in one packed pseudo");
+            auto encoded = forge::codegen::aarch64::encode(*lowered.module);
+            check(encoded.ok(), "three-lane f64 tail pack encodes for AArch64");
+            if (encoded.ok() && !encoded.functions.empty()) {
+                const auto stream = words(encoded.functions.front().code);
+                check(count_masked(stream, neon_binary_mask, neon_fadd_2d) == 2U,
+                      "three-lane f64 pack uses one Q add and one D-tail add");
+                check(count_masked(stream, vector_form_mask, str_d_scaled) +
+                      count_masked(stream, vector_form_mask, stur_d) == 1U,
+                      "three-lane f64 pack stores its one-lane tail through D");
+            }
+        }
+    }
 }
 
 // Four contiguous i32 lanes summed as a balanced tree, the canonical shape.
@@ -718,13 +1001,15 @@ module @reject_three {
 } // namespace
 
 int main() {
+    test_floating_opcode_matrix();
+    test_floating_expression_slp();
     test_reduction_is_formed_and_wired_correctly();
     test_reduction_shapes_that_must_be_recognized();
     test_reduction_shapes_that_must_be_rejected();
     test_i32_reduction();
     test_i64_reduction_uses_two_accumulators();
     test_vector_chain();
-    test_chain_scalar_tail();
+    test_chain_half_vector_tail();
     test_postfix_dag();
     test_reusable_dag_materializes_shared_node_once();
     test_packed_spill_reload();

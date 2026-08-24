@@ -12,6 +12,9 @@ All notable user-visible changes to Raz are documented here.
 
 ## Unreleased
 
+- Build/check output now has an explicit Cargo-style package identity contract: every dependency actually compiled is announced as `Compiling <name> v<version>` / `Checking <name> v<version>` before the root package, while fully restored artifact-cache builds remain `Fresh` rather than claiming recompilation.
+
+- Fixed the Forge O2 self-host regression that could miscompile installed-project native path preparation. SCCP now treats unmodelled result-producing operations (including calls) as overdefined instead of lattice-bottom binary expressions, and comparison folds preserve their `i1` result type. Release bootstrap now runs the self-hosted compiler against fresh debug/release native projects and verifies canonical `target/<profile>/{obj,bin}` output plus execution.
 - Fixed the C bindgen carrier type for inline anonymous struct/union fields.
   Alignment 4 and 2 emitted `u64` while still dividing the aggregate size by 4
   and 2, so `struct { int x; int y; }` became `u64[2]` instead of `u32[2]`.

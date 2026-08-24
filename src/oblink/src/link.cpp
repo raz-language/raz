@@ -488,7 +488,7 @@ void index_archive_member_symbols(ArchiveInput& archive, std::size_t index) {
 }
 
 ArchiveInput read_archive(const std::filesystem::path& path, std::vector<std::byte> bytes) {
-  ArchiveInput archive{path, std::move(bytes), {}, {}, false};
+  ArchiveInput archive{path, std::move(bytes), {}, {}, false, {}};
   std::optional<std::pair<std::size_t, std::size_t>> first_linker_member;
   std::unordered_map<std::size_t, std::size_t> member_by_header_offset;
   std::size_t off = 8U;
@@ -1748,7 +1748,7 @@ LinkResult link(const std::vector<std::filesystem::path>& inputs, const LinkOpti
       for (const auto& [name, address] : globals)
         symbols.emplace_back(outputs[address.output].rva + address.offset, name);
       std::sort(symbols.begin(), symbols.end());
-      for (const auto& [rva, name] : symbols) map << "  " << hex_rva(rva) << ' ' << name << '\n';
+      for (const auto& [symbol_rva, name] : symbols) map << "  " << hex_rva(symbol_rva) << ' ' << name << '\n';
       if (!map) throw std::runtime_error("failed while writing link map: " + options.map_output.string());
     }
 

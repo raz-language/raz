@@ -4,12 +4,15 @@
 #include "forge/codegen/aarch64/encoder.hpp"
 #include "forge/codegen/aarch64/register_allocation.hpp"
 
+#include "forge/target/aarch64_immediate.hpp"
+
 #include "forge/machine/verifier.hpp"
 
 #include <algorithm>
 #include <array>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -24,6 +27,10 @@ void add_error(Diagnostics& diagnostics, std::string message) {
 
 constexpr std::uint32_t align16(std::uint32_t value) noexcept {
     return (value + 15U) & ~15U;
+}
+
+constexpr std::uint32_t align_to(std::uint32_t value, std::uint32_t alignment) noexcept {
+    return alignment <= 1U ? value : (value + alignment - 1U) & ~(alignment - 1U);
 }
 
 class Buffer {
@@ -47,8 +54,6 @@ private:
 
 constexpr std::uint8_t sp = 31U;
 constexpr std::uint8_t fp = 29U;
-constexpr std::uint8_t lr = 30U;
-constexpr std::uint8_t zr = 31U;
 constexpr std::uint8_t scratch0 = 9U;
 constexpr std::uint8_t scratch1 = 10U;
 constexpr std::uint8_t scratch2 = 11U;
@@ -112,14 +117,54 @@ std::uint32_t store_base(unsigned width) {
     }
 }
 
+std::uint32_t unscaled_load_base(unsigned width) {
+    switch (width) {
+    case 1: return 0x38400000U; // ldurb w
+    case 2: return 0x78400000U; // ldurh w
+    case 4: return 0xB8400000U; // ldur w
+    default: return 0xF8400000U; // ldur x
+    }
+}
+
+std::uint32_t unscaled_store_base(unsigned width) {
+    switch (width) {
+    case 1: return 0x38000000U; // sturb w
+    case 2: return 0x78000000U; // sturh w
+    case 4: return 0xB8000000U; // stur w
+    default: return 0xF8000000U; // stur x
+    }
+}
+
+bool emit_direct_integer_memory(Buffer& out, bool load, std::uint8_t value, std::uint8_t base,
+                                std::int64_t displacement, unsigned width) {
+    if (displacement >= -256 && displacement <= 255) {
+        const auto imm9 = static_cast<std::uint32_t>(displacement) & 0x1FFU;
+        out.word((load ? unscaled_load_base(width) : unscaled_store_base(width)) |
+                 (imm9 << 12U) | (static_cast<std::uint32_t>(base) << 5U) | value);
+        return true;
+    }
+    if (displacement >= 0 && width != 0U && (displacement % static_cast<std::int64_t>(width)) == 0) {
+        const auto scaled = static_cast<std::uint64_t>(displacement) / width;
+        if (scaled <= 4095U) {
+            out.word((load ? load_base(width) : store_base(width)) |
+                     (static_cast<std::uint32_t>(scaled) << 10U) |
+                     (static_cast<std::uint32_t>(base) << 5U) | value);
+            return true;
+        }
+    }
+    return false;
+}
+
 void emit_load_integer(Buffer& out, std::uint8_t destination, std::uint8_t base,
                        std::int64_t displacement, unsigned width) {
+    if (emit_direct_integer_memory(out, true, destination, base, displacement, width)) return;
     emit_address(out, address_scratch, base, displacement);
     out.word(load_base(width) | (static_cast<std::uint32_t>(address_scratch) << 5U) | destination);
 }
 
 void emit_store_integer(Buffer& out, std::uint8_t source, std::uint8_t base,
                         std::int64_t displacement, unsigned width) {
+    if (emit_direct_integer_memory(out, false, source, base, displacement, width)) return;
     emit_address(out, address_scratch, base, displacement);
     out.word(store_base(width) | (static_cast<std::uint32_t>(address_scratch) << 5U) | source);
 }
@@ -144,12 +189,40 @@ void emit_store_float(Buffer& out, std::uint8_t source, std::uint8_t base,
 // vectorize them without exposing target-specific vector types in Forge IR.
 void emit_load_neon128(Buffer& out, std::uint8_t destination, std::uint8_t base,
                        std::int64_t displacement) {
+    if (displacement >= -256 && displacement <= 255) {
+        const auto imm9 = static_cast<std::uint32_t>(displacement) & 0x1FFU;
+        out.word(0x3CC00000U | (imm9 << 12U) |
+                 (static_cast<std::uint32_t>(base) << 5U) | destination); // ldur q
+        return;
+    }
+    if (displacement >= 0 && (displacement & 15) == 0) {
+        const auto scaled = static_cast<std::uint64_t>(displacement) >> 4U;
+        if (scaled <= 4095U) {
+            out.word(0x3DC00000U | (static_cast<std::uint32_t>(scaled) << 10U) |
+                     (static_cast<std::uint32_t>(base) << 5U) | destination);
+            return;
+        }
+    }
     emit_address(out, address_scratch, base, displacement);
     out.word(0x3DC00000U | (static_cast<std::uint32_t>(address_scratch) << 5U) | destination);
 }
 
 void emit_store_neon128(Buffer& out, std::uint8_t source, std::uint8_t base,
                         std::int64_t displacement) {
+    if (displacement >= -256 && displacement <= 255) {
+        const auto imm9 = static_cast<std::uint32_t>(displacement) & 0x1FFU;
+        out.word(0x3C800000U | (imm9 << 12U) |
+                 (static_cast<std::uint32_t>(base) << 5U) | source); // stur q
+        return;
+    }
+    if (displacement >= 0 && (displacement & 15) == 0) {
+        const auto scaled = static_cast<std::uint64_t>(displacement) >> 4U;
+        if (scaled <= 4095U) {
+            out.word(0x3D800000U | (static_cast<std::uint32_t>(scaled) << 10U) |
+                     (static_cast<std::uint32_t>(base) << 5U) | source);
+            return;
+        }
+    }
     emit_address(out, address_scratch, base, displacement);
     out.word(0x3D800000U | (static_cast<std::uint32_t>(address_scratch) << 5U) | source);
 }
@@ -160,6 +233,46 @@ std::uint16_t packed_token(const std::string& program, std::size_t offset) noexc
         (static_cast<unsigned>(static_cast<unsigned char>(program[offset + 1U])) << 8U));
 }
 
+void emit_load_neon64(Buffer& out, std::uint8_t destination, std::uint8_t base,
+                      std::int64_t displacement) {
+    if (displacement >= -256 && displacement <= 255) {
+        const auto imm9 = static_cast<std::uint32_t>(displacement) & 0x1FFU;
+        out.word(0xFC400000U | (imm9 << 12U) |
+                 (static_cast<std::uint32_t>(base) << 5U) | destination); // ldur d
+        return;
+    }
+    if (displacement >= 0 && (displacement & 7) == 0) {
+        const auto scaled = static_cast<std::uint64_t>(displacement) >> 3U;
+        if (scaled <= 4095U) {
+            out.word(0xFD400000U | (static_cast<std::uint32_t>(scaled) << 10U) |
+                     (static_cast<std::uint32_t>(base) << 5U) | destination); // ldr d
+            return;
+        }
+    }
+    emit_address(out, address_scratch, base, displacement);
+    out.word(0xFD400000U | (static_cast<std::uint32_t>(address_scratch) << 5U) | destination);
+}
+
+void emit_store_neon64(Buffer& out, std::uint8_t source, std::uint8_t base,
+                       std::int64_t displacement) {
+    if (displacement >= -256 && displacement <= 255) {
+        const auto imm9 = static_cast<std::uint32_t>(displacement) & 0x1FFU;
+        out.word(0xFC000000U | (imm9 << 12U) |
+                 (static_cast<std::uint32_t>(base) << 5U) | source); // stur d
+        return;
+    }
+    if (displacement >= 0 && (displacement & 7) == 0) {
+        const auto scaled = static_cast<std::uint64_t>(displacement) >> 3U;
+        if (scaled <= 4095U) {
+            out.word(0xFD000000U | (static_cast<std::uint32_t>(scaled) << 10U) |
+                     (static_cast<std::uint32_t>(base) << 5U) | source); // str d
+            return;
+        }
+    }
+    emit_address(out, address_scratch, base, displacement);
+    out.word(0xFD000000U | (static_cast<std::uint32_t>(address_scratch) << 5U) | source);
+}
+
 bool neon_integer_operation_supported(machine::Opcode opcode, bool wide) noexcept {
     if (wide)
         return opcode == machine::Opcode::add_i64 || opcode == machine::Opcode::sub_i64 ||
@@ -168,6 +281,18 @@ bool neon_integer_operation_supported(machine::Opcode opcode, bool wide) noexcep
     return opcode == machine::Opcode::add_i32 || opcode == machine::Opcode::sub_i32 ||
            opcode == machine::Opcode::and_i32 || opcode == machine::Opcode::or_i32 ||
            opcode == machine::Opcode::xor_i32;
+}
+
+bool neon_float_operation_supported(machine::Opcode opcode, bool wide) noexcept {
+    if (wide)
+        return opcode == machine::Opcode::add_f64 || opcode == machine::Opcode::sub_f64 ||
+               opcode == machine::Opcode::mul_f64 || opcode == machine::Opcode::div_f64;
+    return opcode == machine::Opcode::add_f32 || opcode == machine::Opcode::sub_f32 ||
+           opcode == machine::Opcode::mul_f32 || opcode == machine::Opcode::div_f32;
+}
+
+bool neon_packed_operation_supported(machine::Opcode opcode, bool wide) noexcept {
+    return neon_integer_operation_supported(opcode, wide) || neon_float_operation_supported(opcode, wide);
 }
 
 void emit_neon_integer_binary(Buffer& out, machine::Opcode opcode, std::uint8_t destination,
@@ -190,9 +315,41 @@ void emit_neon_integer_binary(Buffer& out, machine::Opcode opcode, std::uint8_t 
              (static_cast<std::uint32_t>(left) << 5U) | destination);
 }
 
+void emit_neon_float_binary(Buffer& out, machine::Opcode opcode, std::uint8_t destination,
+                            std::uint8_t left, std::uint8_t right, bool wide) {
+    std::uint32_t base = 0U;
+    switch (opcode) {
+    case machine::Opcode::add_f32: case machine::Opcode::add_f64:
+        base = wide ? 0x4E60D400U : 0x4E20D400U; break;
+    case machine::Opcode::sub_f32: case machine::Opcode::sub_f64:
+        base = wide ? 0x4EE0D400U : 0x4EA0D400U; break;
+    case machine::Opcode::mul_f32: case machine::Opcode::mul_f64:
+        base = wide ? 0x6E60DC00U : 0x6E20DC00U; break;
+    case machine::Opcode::div_f32: case machine::Opcode::div_f64:
+        base = wide ? 0x6E60FC00U : 0x6E20FC00U; break;
+    default: return;
+    }
+    out.word(base | (static_cast<std::uint32_t>(right) << 16U) |
+             (static_cast<std::uint32_t>(left) << 5U) | destination);
+}
+
+void emit_neon_packed_binary(Buffer& out, machine::Opcode opcode, std::uint8_t destination,
+                             std::uint8_t left, std::uint8_t right, bool wide) {
+    if (neon_float_operation_supported(opcode, wide))
+        emit_neon_float_binary(out, opcode, destination, left, right, wide);
+    else
+        emit_neon_integer_binary(out, opcode, destination, left, right, wide);
+}
+
 void emit_neon_broadcast_integer(Buffer& out, std::uint8_t destination, std::uint8_t source, bool wide) {
     // dup vD.2d, xN / dup vD.4s, wN
     out.word((wide ? 0x4E080C00U : 0x4E040C00U) |
+             (static_cast<std::uint32_t>(source) << 5U) | destination);
+}
+
+void emit_neon_broadcast_float(Buffer& out, std::uint8_t destination, std::uint8_t source, bool wide) {
+    // dup vD.2d, vN.d[0] / dup vD.4s, vN.s[0]
+    out.word((wide ? 0x4E080400U : 0x4E040400U) |
              (static_cast<std::uint32_t>(source) << 5U) | destination);
 }
 
@@ -281,6 +438,24 @@ bool emit_integer_immediate(Buffer& out, machine::Opcode opcode, std::uint8_t de
         const auto base = wide ? (subtract ? 0xD1000000U : 0x91000000U)
                                : (subtract ? 0x51000000U : 0x11000000U);
         out.word(base | (shift12 ? 0x00400000U : 0U) | (imm12 << 10U) |
+                 (static_cast<std::uint32_t>(source) << 5U) | destination);
+        return true;
+    }
+
+    if (opcode == machine::Opcode::and_i32 || opcode == machine::Opcode::and_i64 ||
+        opcode == machine::Opcode::or_i32 || opcode == machine::Opcode::or_i64 ||
+        opcode == machine::Opcode::xor_i32 || opcode == machine::Opcode::xor_i64) {
+        const auto encoded = forge::target::encode_aarch64_logical_immediate(
+            static_cast<std::uint64_t>(immediate), wide ? 64U : 32U);
+        if (!encoded) return false;
+        std::uint32_t base = wide ? 0x92000000U : 0x12000000U;
+        if (opcode == machine::Opcode::or_i32 || opcode == machine::Opcode::or_i64)
+            base = wide ? 0xB2000000U : 0x32000000U;
+        else if (opcode == machine::Opcode::xor_i32 || opcode == machine::Opcode::xor_i64)
+            base = wide ? 0xD2000000U : 0x52000000U;
+        out.word(base | (static_cast<std::uint32_t>(encoded->n) << 22U) |
+                 (static_cast<std::uint32_t>(encoded->immr) << 16U) |
+                 (static_cast<std::uint32_t>(encoded->imms) << 10U) |
                  (static_cast<std::uint32_t>(source) << 5U) | destination);
         return true;
     }
@@ -405,31 +580,71 @@ struct ArgumentLocation {
     std::uint32_t stack_offset{};
 };
 
-std::vector<ArgumentLocation> function_argument_locations(const machine::Function& function) {
+std::vector<ArgumentLocation> function_argument_locations(const machine::Function& function, Abi abi) {
     std::vector<ArgumentLocation> result(function.argument_count);
     std::uint8_t integer_index = 0;
     std::uint8_t floating_index = 0;
     std::uint32_t stack_offset = 0;
-    for (std::size_t index = 0; index < function.argument_count; ++index) {
+    const auto slot_width = [&](std::size_t index) -> std::uint32_t {
+        if (index < function.argument_classes.size() &&
+            function.argument_classes[index] == machine::RegisterClass::vector) return 16U;
+        return index < function.argument_widths.size() && function.argument_widths[index] != 0U
+            ? function.argument_widths[index] : 8U;
+    };
+    for (std::size_t index = 0; index < function.argument_count;) {
         if (function.indirect_result_parameter && index == 0U) {
             result[index] = {ArgumentLocation::Kind::indirect_result, 8U, 0U};
+            ++index;
             continue;
         }
-        const auto register_class = index < function.argument_classes.size()
-            ? function.argument_classes[index] : machine::RegisterClass::integer;
-        const bool vector = register_class == machine::RegisterClass::vector;
-        const bool simd = register_class == machine::RegisterClass::floating || vector;
-        if (simd && floating_index < 8U) {
-            result[index] = {ArgumentLocation::Kind::floating_register, floating_index++, 0U};
-        } else if (!simd && integer_index < 8U) {
-            result[index] = {ArgumentLocation::Kind::integer_register, integer_index++, 0U};
-        } else {
-            if (vector) stack_offset = align16(stack_offset);
-            result[index] = {ArgumentLocation::Kind::stack, 0U, stack_offset};
-            stack_offset += vector ? 16U : 8U;
-            if (simd) floating_index = 8U;
-            else integer_index = 8U;
+        auto group = index < function.argument_group_sizes.size() && function.argument_group_sizes[index] != 0U
+            ? static_cast<std::size_t>(function.argument_group_sizes[index]) : std::size_t{1};
+        group = std::min(group, static_cast<std::size_t>(function.argument_count) - index);
+        bool all_simd = true;
+        bool vector = false;
+        std::uint32_t group_bytes = 0U;
+        for (std::size_t piece = 0; piece < group; ++piece) {
+            const auto slot = index + piece;
+            const auto register_class = slot < function.argument_classes.size()
+                ? function.argument_classes[slot] : machine::RegisterClass::integer;
+            all_simd = all_simd && (register_class == machine::RegisterClass::floating ||
+                                    register_class == machine::RegisterClass::vector);
+            vector = vector || register_class == machine::RegisterClass::vector;
+            group_bytes += slot_width(slot);
         }
+        const auto natural_alignment = index < function.argument_group_alignments.size() &&
+            function.argument_group_alignments[index] != 0U
+            ? static_cast<std::uint32_t>(function.argument_group_alignments[index]) : 8U;
+        if (!all_simd && abi == Abi::aapcs64 && natural_alignment >= 16U && integer_index < 8U)
+            integer_index = static_cast<std::uint8_t>((integer_index + 1U) & ~1U);
+        const bool registers_fit = all_simd
+            ? static_cast<std::size_t>(floating_index) + group <= 8U
+            : static_cast<std::size_t>(integer_index) + group <= 8U;
+        if (registers_fit) {
+            for (std::size_t piece = 0; piece < group; ++piece) {
+                result[index + piece] = all_simd
+                    ? ArgumentLocation{ArgumentLocation::Kind::floating_register, floating_index++, 0U}
+                    : ArgumentLocation{ArgumentLocation::Kind::integer_register, integer_index++, 0U};
+            }
+        } else {
+            // AAPCS64 C.3/C.13: once an HFA/HVA or small composite cannot fit,
+            // exhaust that register bank and place the whole argument on the
+            // stack. The pieces remain contiguous in their in-memory layout.
+            if (all_simd) floating_index = 8U;
+            else integer_index = 8U;
+            const auto stack_alignment = abi == Abi::darwin ? natural_alignment
+                : std::max<std::uint32_t>(8U, natural_alignment);
+            stack_offset = align_to(stack_offset, stack_alignment);
+            std::uint32_t piece_offset = 0U;
+            for (std::size_t piece = 0; piece < group; ++piece) {
+                result[index + piece] = {ArgumentLocation::Kind::stack, 0U, stack_offset + piece_offset};
+                piece_offset += slot_width(index + piece);
+            }
+            stack_offset += abi == Abi::darwin ? std::max(group_bytes, 1U)
+                                                : align_to(std::max(group_bytes, 1U), 8U);
+        }
+        (void)vector;
+        index += group;
     }
     return result;
 }
@@ -458,29 +673,64 @@ std::size_t call_argument_begin(const machine::Instruction& instruction) noexcep
     return begin;
 }
 
-std::uint32_t call_stack_bytes(const machine::Function& function, const machine::Instruction& instruction) {
+std::uint32_t call_stack_bytes(const machine::Function& function, const machine::Instruction& instruction, Abi abi) {
     std::uint8_t integer_index = 0;
     std::uint8_t simd_index = 0;
     std::uint32_t stack = 0;
-    for (std::size_t index = call_argument_begin(instruction); index < instruction.inputs.size(); ++index) {
-        const auto reg = instruction.inputs[index];
-        const auto register_class = reg < function.register_classes.size()
-            ? function.register_classes[reg] : machine::RegisterClass::integer;
-        const bool simd = register_class == machine::RegisterClass::floating ||
-                          register_class == machine::RegisterClass::vector;
-        const bool vector = register_class == machine::RegisterClass::vector;
-        if (simd && simd_index < 8U) ++simd_index;
-        else if (!simd && integer_index < 8U) ++integer_index;
-        else {
-            if (vector) {
-                stack = align16(stack);
-                stack += 16U;
-            } else {
-                stack += 8U;
-            }
-            if (simd) simd_index = 8U;
-            else integer_index = 8U;
+    const auto argument_begin = call_argument_begin(instruction);
+    const auto value_width = [&](std::size_t input_index) -> std::uint32_t {
+        if (input_index < instruction.argument_widths.size() && instruction.argument_widths[input_index] != 0U)
+            return instruction.argument_widths[input_index];
+        const auto reg = instruction.inputs[input_index];
+        if (reg < function.register_classes.size() &&
+            function.register_classes[reg] == machine::RegisterClass::vector) return 16U;
+        return reg < function.register_widths.size() && function.register_widths[reg] != 0U
+            ? function.register_widths[reg] : 8U;
+    };
+    for (std::size_t index = argument_begin; index < instruction.inputs.size();) {
+        auto group = index < instruction.argument_group_sizes.size() && instruction.argument_group_sizes[index] != 0U
+            ? static_cast<std::size_t>(instruction.argument_group_sizes[index]) : std::size_t{1};
+        group = std::min(group, instruction.inputs.size() - index);
+        bool all_simd = true;
+        std::uint32_t group_bytes = 0U;
+        for (std::size_t piece = 0; piece < group; ++piece) {
+            const auto reg = instruction.inputs[index + piece];
+            const auto register_class = reg < function.register_classes.size()
+                ? function.register_classes[reg] : machine::RegisterClass::integer;
+            all_simd = all_simd && (register_class == machine::RegisterClass::floating ||
+                                    register_class == machine::RegisterClass::vector);
+            group_bytes += value_width(index + piece);
         }
+        const auto natural_alignment = index < instruction.argument_group_alignments.size() &&
+            instruction.argument_group_alignments[index] != 0U
+            ? static_cast<std::uint32_t>(instruction.argument_group_alignments[index]) : 8U;
+        if (!all_simd && abi == Abi::aapcs64 && natural_alignment >= 16U && integer_index < 8U)
+            integer_index = static_cast<std::uint8_t>((integer_index + 1U) & ~1U);
+        const bool darwin_variadic_tail = abi == Abi::darwin && instruction.variadic_call &&
+            index - argument_begin >= instruction.variadic_named_input_count;
+        const bool registers_fit = !darwin_variadic_tail && (all_simd
+            ? static_cast<std::size_t>(simd_index) + group <= 8U
+            : static_cast<std::size_t>(integer_index) + group <= 8U);
+        if (registers_fit) {
+            if (all_simd) simd_index = static_cast<std::uint8_t>(simd_index + group);
+            else integer_index = static_cast<std::uint8_t>(integer_index + group);
+        } else {
+            // Generic AAPCS64 exhausts a register bank when an aggregate/HFA
+            // cannot fit. Darwin's anonymous variadic tail is different: the
+            // stack placement is a platform rule, not register exhaustion.
+            if (!darwin_variadic_tail) {
+                if (all_simd) simd_index = 8U;
+                else integer_index = 8U;
+            }
+            const auto stack_alignment = darwin_variadic_tail
+                ? std::max<std::uint32_t>(8U, natural_alignment)
+                : abi == Abi::darwin ? natural_alignment : std::max<std::uint32_t>(8U, natural_alignment);
+            stack = align_to(stack, stack_alignment);
+            stack += abi == Abi::darwin && !darwin_variadic_tail
+                ? std::max(group_bytes, 1U)
+                : align_to(std::max(group_bytes, 1U), 8U);
+        }
+        index += group;
     }
     return align16(stack);
 }
@@ -510,14 +760,11 @@ bool patch_cbz19(Buffer& out, std::size_t offset, std::size_t target, std::uint8
 }
 
 bool unsupported_vector_opcode(machine::Opcode opcode) noexcept {
-    // Phase 9 supports 128-bit vector spills, reductions, chains and postfix
-    // DAGs. Wider SVE/NEON spill pseudos and reusable-DAG caching still require
-    // separate target lowering and remain explicit errors rather than silently
-    // scalarizing or truncating a value.
-    return opcode == machine::Opcode::binary_i32_contiguous_dag_reuse ||
-           opcode == machine::Opcode::binary_i64_contiguous_dag_reuse ||
-           opcode == machine::Opcode::load_stack_v256 || opcode == machine::Opcode::load_stack_v512 ||
-           opcode == machine::Opcode::store_stack_v256 || opcode == machine::Opcode::store_stack_v512;
+    // Wider logical vectors still have no single-register representation, but
+    // stack transfers are decomposed into deterministic Q-register chunks by
+    // the encoder. Keep this gate for genuinely unsupported vector opcodes.
+    (void)opcode;
+    return false;
 }
 
 EncodedFunction encode_function(const machine::Function& function, Abi abi, Diagnostics& diagnostics) {
@@ -533,7 +780,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
     for (const auto& block : function.blocks) {
         max_edge_arguments = std::max(max_edge_arguments, static_cast<std::uint32_t>(block.parameters.size()));
         for (const auto& instruction : block.instructions) {
-            if (is_call(instruction.opcode)) max_outgoing = std::max(max_outgoing, call_stack_bytes(function, instruction));
+            if (is_call(instruction.opcode)) max_outgoing = std::max(max_outgoing, call_stack_bytes(function, instruction, abi));
             for (const auto& successor : instruction.successors)
                 max_edge_arguments = std::max(max_edge_arguments, static_cast<std::uint32_t>(successor.arguments.size()));
             if (unsupported_vector_opcode(instruction.opcode)) {
@@ -568,6 +815,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
     encoded.vector_spilled_value_count = allocation.vector_spilled_value_count;
     encoded.spill_bytes = allocation.spill_bytes;
     encoded.frame_bytes_saved = allocation.frame_bytes_saved;
+    encoded.abi_outgoing_stack_bytes = max_outgoing;
     encoded.callee_saved_register_count = static_cast<std::uint32_t>(
         allocation.used_integer_callee_saved.size() + allocation.used_floating_callee_saved.size());
 
@@ -698,7 +946,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
         out.word(0xD65F03C0U); // ret
     };
 
-    const auto argument_locations = function_argument_locations(function);
+    const auto argument_locations = function_argument_locations(function, abi);
     std::unordered_map<std::string, const machine::Block*> block_lookup;
     for (const auto& block : function.blocks) block_lookup.emplace(block.name, &block);
     std::unordered_map<std::string, std::size_t> labels;
@@ -769,39 +1017,80 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
         std::uint8_t integer_index = 0;
         std::uint8_t simd_index = 0;
         std::uint32_t stack_offset = 0;
-        for (; cursor < instruction.inputs.size(); ++cursor) {
-            const auto reg = instruction.inputs[cursor];
-            const bool vector = vector_value(reg);
-            const bool floating = floating_value(reg);
-            const bool simd = vector || floating;
-            if (simd && simd_index < 8U) {
-                if (vector) load_vector_value(reg, simd_index);
-                else load_float_value(reg, simd_index);
-                ++simd_index;
-                ++encoded.abi_register_argument_count;
-            } else if (!simd && integer_index < 8U) {
-                load_integer_value(reg, integer_index++);
-                ++encoded.abi_register_argument_count;
-            } else {
-                if (vector) {
-                    stack_offset = align16(stack_offset);
-                    load_vector_value(reg, 0U);
-                    emit_store_neon128(out, 0U, sp, stack_offset);
-                    stack_offset += 16U;
-                    simd_index = 8U;
-                } else if (floating) {
-                    load_float_value(reg, 0U);
-                    emit_store_float(out, 0U, sp, stack_offset, register_width(reg) == 8U);
-                    stack_offset += 8U;
-                    simd_index = 8U;
-                } else {
-                    load_integer_value(reg, scratch0);
-                    emit_store_integer(out, scratch0, sp, stack_offset, register_width(reg));
-                    stack_offset += 8U;
-                    integer_index = 8U;
-                }
-                ++encoded.abi_stack_argument_count;
+        const auto argument_begin = cursor;
+        const auto argument_width = [&](std::size_t input_index) -> std::uint32_t {
+            if (input_index < instruction.argument_widths.size() && instruction.argument_widths[input_index] != 0U)
+                return instruction.argument_widths[input_index];
+            const auto reg = instruction.inputs[input_index];
+            return vector_value(reg) ? 16U : register_width(reg);
+        };
+        while (cursor < instruction.inputs.size()) {
+            auto group = cursor < instruction.argument_group_sizes.size() &&
+                instruction.argument_group_sizes[cursor] != 0U
+                ? static_cast<std::size_t>(instruction.argument_group_sizes[cursor]) : std::size_t{1};
+            group = std::min(group, instruction.inputs.size() - cursor);
+            bool all_simd = true;
+            std::uint32_t group_bytes = 0U;
+            for (std::size_t piece = 0; piece < group; ++piece) {
+                const auto reg = instruction.inputs[cursor + piece];
+                all_simd = all_simd && (floating_value(reg) || vector_value(reg));
+                group_bytes += argument_width(cursor + piece);
             }
+            const auto natural_alignment = cursor < instruction.argument_group_alignments.size() &&
+                instruction.argument_group_alignments[cursor] != 0U
+                ? static_cast<std::uint32_t>(instruction.argument_group_alignments[cursor]) : 8U;
+            if (!all_simd && abi == Abi::aapcs64 && natural_alignment >= 16U && integer_index < 8U)
+                integer_index = static_cast<std::uint8_t>((integer_index + 1U) & ~1U);
+            const bool darwin_variadic_tail = abi == Abi::darwin && instruction.variadic_call &&
+                cursor - argument_begin >= instruction.variadic_named_input_count;
+            const bool registers_fit = !darwin_variadic_tail && (all_simd
+                ? static_cast<std::size_t>(simd_index) + group <= 8U
+                : static_cast<std::size_t>(integer_index) + group <= 8U);
+            if (registers_fit) {
+                for (std::size_t piece = 0; piece < group; ++piece) {
+                    const auto reg = instruction.inputs[cursor + piece];
+                    if (all_simd) {
+                        if (vector_value(reg)) load_vector_value(reg, simd_index);
+                        else load_float_value(reg, simd_index);
+                        ++simd_index;
+                    } else {
+                        load_integer_value(reg, integer_index++);
+                    }
+                    ++encoded.abi_register_argument_count;
+                }
+            } else {
+                if (!darwin_variadic_tail) {
+                    if (all_simd) simd_index = 8U;
+                    else integer_index = 8U;
+                }
+                const auto stack_alignment = darwin_variadic_tail
+                    ? std::max<std::uint32_t>(8U, natural_alignment)
+                    : abi == Abi::darwin ? natural_alignment : std::max<std::uint32_t>(8U, natural_alignment);
+                stack_offset = align_to(stack_offset, stack_alignment);
+                std::uint32_t piece_offset = 0U;
+                for (std::size_t piece = 0; piece < group; ++piece) {
+                    const auto reg = instruction.inputs[cursor + piece];
+                    const auto width = argument_width(cursor + piece);
+                    if (vector_value(reg)) {
+                        load_vector_value(reg, 0U);
+                        emit_store_neon128(out, 0U, sp, stack_offset + piece_offset);
+                        piece_offset += width;
+                    } else if (floating_value(reg)) {
+                        load_float_value(reg, 0U);
+                        emit_store_float(out, 0U, sp, stack_offset + piece_offset, width == 8U);
+                        piece_offset += width;
+                    } else {
+                        load_integer_value(reg, scratch0);
+                        emit_store_integer(out, scratch0, sp, stack_offset + piece_offset, width);
+                        piece_offset += width;
+                    }
+                    ++encoded.abi_stack_argument_count;
+                }
+                stack_offset += abi == Abi::darwin && !darwin_variadic_tail
+                    ? std::max(group_bytes, 1U)
+                    : align_to(std::max(group_bytes, 1U), 8U);
+            }
+            cursor += group;
         }
 
         if (indirect) {
@@ -867,11 +1156,18 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 const auto& location = argument_locations[instruction.argument_index];
                 const bool floating = instruction.opcode == O::load_argument_f32 || instruction.opcode == O::load_argument_f64;
                 const bool wide_float = instruction.opcode == O::load_argument_f64;
+                const auto abi_width = instruction.argument_index < function.argument_widths.size() &&
+                    function.argument_widths[instruction.argument_index] != 0U
+                    ? static_cast<unsigned>(function.argument_widths[instruction.argument_index])
+                    : register_width(instruction.result);
                 if (location.kind == ArgumentLocation::Kind::indirect_result) {
                     emit_copy_x(out, scratch0, 8U);
                     store_integer_result(instruction.result, scratch0);
                 } else if (location.kind == ArgumentLocation::Kind::integer_register) {
-                    emit_copy_x(out, scratch0, location.index);
+                    if (abi_width <= 4U) emit_copy_w(out, scratch0, location.index);
+                    else emit_copy_x(out, scratch0, location.index);
+                    if (abi_width == 1U || abi_width == 2U)
+                        emit_zero_extend(out, scratch0, scratch0, abi_width * 8U);
                     store_integer_result(instruction.result, scratch0);
                 } else if (location.kind == ArgumentLocation::Kind::floating_register) {
                     store_float_result(instruction.result, location.index);
@@ -879,7 +1175,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                     emit_load_float(out, 0U, fp, 16 + static_cast<std::int64_t>(location.stack_offset), wide_float);
                     store_float_result(instruction.result, 0U);
                 } else {
-                    emit_load_integer(out, scratch0, fp, 16 + static_cast<std::int64_t>(location.stack_offset), register_width(instruction.result));
+                    emit_load_integer(out, scratch0, fp, 16 + static_cast<std::int64_t>(location.stack_offset), abi_width);
                     store_integer_result(instruction.result, scratch0);
                 }
                 break;
@@ -1181,6 +1477,38 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 emit_store_neon128(out, 0U, fp, instruction.immediate);
                 break;
             }
+            case O::load_stack_v256: case O::load_stack_v512: {
+                const auto width = instruction.opcode == O::load_stack_v256 ? 32U : 64U;
+                if (!instruction.inputs.empty() || !vector_value(instruction.result) ||
+                    instruction.result >= function.register_widths.size() ||
+                    function.register_widths[instruction.result] != width ||
+                    allocation.location(instruction.result).kind != AllocationKind::stack_slot) {
+                    add_error(diagnostics, "malformed AArch64 wide-vector stack load in @" + function.name);
+                    return encoded;
+                }
+                const auto home = spill_offset(instruction.result);
+                for (unsigned chunk = 0; chunk < width; chunk += 16U) {
+                    emit_load_neon128(out, 0U, fp, instruction.immediate + static_cast<std::int64_t>(chunk));
+                    emit_store_neon128(out, 0U, fp, home + static_cast<std::int64_t>(chunk));
+                }
+                break;
+            }
+            case O::store_stack_v256: case O::store_stack_v512: {
+                const auto width = instruction.opcode == O::store_stack_v256 ? 32U : 64U;
+                if (instruction.inputs.size() != 1U || !vector_value(instruction.inputs[0]) ||
+                    instruction.inputs[0] >= function.register_widths.size() ||
+                    function.register_widths[instruction.inputs[0]] != width ||
+                    allocation.location(instruction.inputs[0]).kind != AllocationKind::stack_slot) {
+                    add_error(diagnostics, "malformed AArch64 wide-vector stack store in @" + function.name);
+                    return encoded;
+                }
+                const auto home = spill_offset(instruction.inputs[0]);
+                for (unsigned chunk = 0; chunk < width; chunk += 16U) {
+                    emit_load_neon128(out, 0U, fp, home + static_cast<std::int64_t>(chunk));
+                    emit_store_neon128(out, 0U, fp, instruction.immediate + static_cast<std::int64_t>(chunk));
+                }
+                break;
+            }
             case O::load_ptr_i8: case O::load_ptr_i16: case O::load_ptr_i32: case O::load_ptr_i64: {
                 const unsigned width = instruction.opcode == O::load_ptr_i8 ? 1U : instruction.opcode == O::load_ptr_i16 ? 2U : instruction.opcode == O::load_ptr_i32 ? 4U : 8U;
                 load_integer_value(instruction.inputs.at(0), scratch1);
@@ -1224,29 +1552,46 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                                      instruction.opcode == O::binary_i64_contiguous_inplace;
                 const auto lane_bytes = wide ? 8U : 4U;
                 const auto operation = legacy_add ? O::add_i64 : static_cast<O>(instruction.argument_index);
+                const bool floating = neon_float_operation_supported(operation, wide);
                 if (instruction.inputs.size() != (inplace ? 2U : 3U) || instruction.immediate < 2 ||
-                    instruction.immediate > 16 || (instruction.immediate & (instruction.immediate - 1)) != 0 ||
-                    !neon_integer_operation_supported(operation, wide)) {
+                    instruction.immediate > 16 ||
+                    !neon_packed_operation_supported(operation, wide)) {
                     add_error(diagnostics, "malformed AArch64 NEON scalar-map pack in @" + function.name);
                     return encoded;
                 }
                 const auto source = integer_source_register(instruction.inputs[0], scratch0);
                 const auto destination = inplace ? source : integer_source_register(instruction.inputs[1], scratch2);
                 const auto scalar_index = inplace ? 1U : 2U;
-                const auto scalar = integer_source_register(instruction.inputs[scalar_index], scratch1);
-                emit_neon_broadcast_integer(out, 1U, scalar, wide);
+                const auto scalar = floating
+                    ? floating_source_register(instruction.inputs[scalar_index], 1U)
+                    : integer_source_register(instruction.inputs[scalar_index], scratch1);
+                if (floating) emit_neon_broadcast_float(out, 1U, scalar, wide);
+                else emit_neon_broadcast_integer(out, 1U, scalar, wide);
                 const auto total_bytes = static_cast<std::int64_t>(instruction.immediate) * lane_bytes;
                 std::int64_t offset = 0;
                 for (; offset + 16 <= total_bytes; offset += 16) {
                     emit_load_neon128(out, 0U, source, offset);
-                    emit_neon_integer_binary(out, operation, 0U, 0U, 1U, wide);
+                    emit_neon_packed_binary(out, operation, 0U, 0U, 1U, wide);
                     emit_store_neon128(out, 0U, destination, offset);
                     ++encoded.neon_vector_operation_count;
                 }
+                if (offset + 8 <= total_bytes) {
+                    emit_load_neon64(out, 0U, source, offset);
+                    emit_neon_packed_binary(out, operation, 0U, 0U, 1U, wide);
+                    emit_store_neon64(out, 0U, destination, offset);
+                    ++encoded.neon_vector_operation_count;
+                    offset += 8;
+                }
                 for (; offset < total_bytes; offset += lane_bytes) {
-                    emit_load_integer(out, scratch3, source, offset, lane_bytes);
-                    emit_integer_binary(out, operation, scratch3, scratch3, scalar, wide);
-                    emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    if (floating) {
+                        emit_load_float(out, 0U, source, offset, wide);
+                        emit_float_binary(out, operation, 0U, 0U, 1U, wide);
+                        emit_store_float(out, 0U, destination, offset, wide);
+                    } else {
+                        emit_load_integer(out, scratch3, source, offset, lane_bytes);
+                        emit_integer_binary(out, operation, scratch3, scratch3, scalar, wide);
+                        emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    }
                 }
                 break;
             }
@@ -1254,9 +1599,9 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 const bool wide = instruction.opcode == O::binary_i64_contiguous_map2;
                 const auto lane_bytes = wide ? 8U : 4U;
                 const auto operation = static_cast<O>(instruction.argument_index);
+                const bool floating = neon_float_operation_supported(operation, wide);
                 if (instruction.inputs.size() != 3U || instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0 ||
-                    !neon_integer_operation_supported(operation, wide)) {
+                    !neon_packed_operation_supported(operation, wide)) {
                     add_error(diagnostics, "malformed AArch64 NEON vector-map pack in @" + function.name);
                     return encoded;
                 }
@@ -1268,15 +1613,30 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 for (; offset + 16 <= total_bytes; offset += 16) {
                     emit_load_neon128(out, 0U, source_a, offset);
                     emit_load_neon128(out, 1U, source_b, offset);
-                    emit_neon_integer_binary(out, operation, 0U, 0U, 1U, wide);
+                    emit_neon_packed_binary(out, operation, 0U, 0U, 1U, wide);
                     emit_store_neon128(out, 0U, destination, offset);
                     ++encoded.neon_vector_operation_count;
                 }
+                if (offset + 8 <= total_bytes) {
+                    emit_load_neon64(out, 0U, source_a, offset);
+                    emit_load_neon64(out, 1U, source_b, offset);
+                    emit_neon_packed_binary(out, operation, 0U, 0U, 1U, wide);
+                    emit_store_neon64(out, 0U, destination, offset);
+                    ++encoded.neon_vector_operation_count;
+                    offset += 8;
+                }
                 for (; offset < total_bytes; offset += lane_bytes) {
-                    emit_load_integer(out, scratch3, source_a, offset, lane_bytes);
-                    emit_load_integer(out, vector_scalar_scratch, source_b, offset, lane_bytes);
-                    emit_integer_binary(out, operation, scratch3, scratch3, vector_scalar_scratch, wide);
-                    emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    if (floating) {
+                        emit_load_float(out, 0U, source_a, offset, wide);
+                        emit_load_float(out, 1U, source_b, offset, wide);
+                        emit_float_binary(out, operation, 0U, 0U, 1U, wide);
+                        emit_store_float(out, 0U, destination, offset, wide);
+                    } else {
+                        emit_load_integer(out, scratch3, source_a, offset, lane_bytes);
+                        emit_load_integer(out, vector_scalar_scratch, source_b, offset, lane_bytes);
+                        emit_integer_binary(out, operation, scratch3, scratch3, vector_scalar_scratch, wide);
+                        emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    }
                 }
                 break;
             }
@@ -1285,9 +1645,10 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 const auto lane_bytes = wide ? 8U : 4U;
                 const auto first = static_cast<O>(instruction.argument_index & 0xffffU);
                 const auto second = static_cast<O>((instruction.argument_index >> 16U) & 0xffffU);
+                const bool floating = neon_float_operation_supported(first, wide);
                 if (instruction.inputs.size() != 4U || instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0 ||
-                    !neon_integer_operation_supported(first, wide) || !neon_integer_operation_supported(second, wide)) {
+                    !neon_packed_operation_supported(first, wide) || !neon_packed_operation_supported(second, wide) ||
+                    floating != neon_float_operation_supported(second, wide)) {
                     add_error(diagnostics, "malformed AArch64 NEON chained-map pack in @" + function.name);
                     return encoded;
                 }
@@ -1300,21 +1661,40 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 for (; offset + 16 <= total_bytes; offset += 16) {
                     emit_load_neon128(out, 0U, source_a, offset);
                     emit_load_neon128(out, 1U, source_b, offset);
-                    emit_neon_integer_binary(out, first, 0U, 0U, 1U, wide);
+                    emit_neon_packed_binary(out, first, 0U, 0U, 1U, wide);
                     emit_load_neon128(out, 1U, source_c, offset);
-                    emit_neon_integer_binary(out, second, 0U, 0U, 1U, wide);
+                    emit_neon_packed_binary(out, second, 0U, 0U, 1U, wide);
                     emit_store_neon128(out, 0U, destination, offset);
                     encoded.neon_vector_operation_count += 2U;
                 }
                 // i64 packs are always a multiple of 16 bytes. The only tail
                 // shape here is two i32 lanes (8 bytes), handled scalarly.
+                if (offset + 8 <= total_bytes) {
+                    emit_load_neon64(out, 0U, source_a, offset);
+                    emit_load_neon64(out, 1U, source_b, offset);
+                    emit_neon_packed_binary(out, first, 0U, 0U, 1U, wide);
+                    emit_load_neon64(out, 1U, source_c, offset);
+                    emit_neon_packed_binary(out, second, 0U, 0U, 1U, wide);
+                    emit_store_neon64(out, 0U, destination, offset);
+                    encoded.neon_vector_operation_count += 2U;
+                    offset += 8;
+                }
                 for (; offset < total_bytes; offset += lane_bytes) {
-                    emit_load_integer(out, vector_scalar_scratch, source_a, offset, lane_bytes);
-                    emit_load_integer(out, indirect_call_scratch, source_b, offset, lane_bytes);
-                    emit_integer_binary(out, first, vector_scalar_scratch, vector_scalar_scratch, indirect_call_scratch, wide);
-                    emit_load_integer(out, indirect_call_scratch, source_c, offset, lane_bytes);
-                    emit_integer_binary(out, second, vector_scalar_scratch, vector_scalar_scratch, indirect_call_scratch, wide);
-                    emit_store_integer(out, vector_scalar_scratch, destination, offset, lane_bytes);
+                    if (floating) {
+                        emit_load_float(out, 0U, source_a, offset, wide);
+                        emit_load_float(out, 1U, source_b, offset, wide);
+                        emit_float_binary(out, first, 0U, 0U, 1U, wide);
+                        emit_load_float(out, 1U, source_c, offset, wide);
+                        emit_float_binary(out, second, 0U, 0U, 1U, wide);
+                        emit_store_float(out, 0U, destination, offset, wide);
+                    } else {
+                        emit_load_integer(out, vector_scalar_scratch, source_a, offset, lane_bytes);
+                        emit_load_integer(out, indirect_call_scratch, source_b, offset, lane_bytes);
+                        emit_integer_binary(out, first, vector_scalar_scratch, vector_scalar_scratch, indirect_call_scratch, wide);
+                        emit_load_integer(out, indirect_call_scratch, source_c, offset, lane_bytes);
+                        emit_integer_binary(out, second, vector_scalar_scratch, vector_scalar_scratch, indirect_call_scratch, wide);
+                        emit_store_integer(out, vector_scalar_scratch, destination, offset, lane_bytes);
+                    }
                 }
                 break;
             }
@@ -1348,19 +1728,25 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 const auto lane_bytes = wide ? 8U : 4U;
                 if (instruction.symbol.size() < 6U || (instruction.symbol.size() & 1U) != 0U ||
                     instruction.inputs.size() != instruction.symbol.size() / 2U + 2U ||
-                    instruction.immediate < 2 || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    instruction.immediate < 2 || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed AArch64 NEON integer chain in @" + function.name);
                     return encoded;
                 }
                 std::vector<O> operations;
                 operations.reserve(instruction.symbol.size() / 2U);
+                std::optional<bool> floating;
                 for (std::size_t offset = 0; offset + 1U < instruction.symbol.size(); offset += 2U) {
                     const auto operation = static_cast<O>(packed_token(instruction.symbol, offset));
-                    if (!neon_integer_operation_supported(operation, wide)) {
-                        add_error(diagnostics, "unsupported AArch64 NEON integer chain operation in @" + function.name);
+                    if (!neon_packed_operation_supported(operation, wide)) {
+                        add_error(diagnostics, "unsupported AArch64 NEON chain operation in @" + function.name);
                         return encoded;
                     }
+                    const auto operation_floating = neon_float_operation_supported(operation, wide);
+                    if (floating && *floating != operation_floating) {
+                        add_error(diagnostics, "mixed integer/floating AArch64 NEON chain in @" + function.name);
+                        return encoded;
+                    }
+                    floating = operation_floating;
                     operations.push_back(operation);
                 }
                 const auto source_count = operations.size() + 1U;
@@ -1372,23 +1758,47 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                     for (std::size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
                         pointer = integer_source_register(instruction.inputs[operation_index + 1U], scratch0);
                         emit_load_neon128(out, 1U, pointer, offset);
-                        emit_neon_integer_binary(out, operations[operation_index], 0U, 0U, 1U, wide);
+                        emit_neon_packed_binary(out, operations[operation_index], 0U, 0U, 1U, wide);
                         ++encoded.neon_vector_operation_count;
                     }
                     const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
                     emit_store_neon128(out, 0U, destination, offset);
                 }
-                for (; offset < total_bytes; offset += lane_bytes) {
+                if (offset + 8 <= total_bytes) {
                     auto pointer = integer_source_register(instruction.inputs[0], scratch0);
-                    emit_load_integer(out, scratch3, pointer, offset, lane_bytes);
+                    emit_load_neon64(out, 0U, pointer, offset);
                     for (std::size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
                         pointer = integer_source_register(instruction.inputs[operation_index + 1U], scratch0);
-                        emit_load_integer(out, vector_scalar_scratch, pointer, offset, lane_bytes);
-                        emit_integer_binary(out, operations[operation_index], scratch3, scratch3,
-                                            vector_scalar_scratch, wide);
+                        emit_load_neon64(out, 1U, pointer, offset);
+                        emit_neon_packed_binary(out, operations[operation_index], 0U, 0U, 1U, wide);
+                        ++encoded.neon_vector_operation_count;
                     }
                     const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
-                    emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    emit_store_neon64(out, 0U, destination, offset);
+                    offset += 8;
+                }
+                for (; offset < total_bytes; offset += lane_bytes) {
+                    auto pointer = integer_source_register(instruction.inputs[0], scratch0);
+                    if (floating.value_or(false)) {
+                        emit_load_float(out, 0U, pointer, offset, wide);
+                        for (std::size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
+                            pointer = integer_source_register(instruction.inputs[operation_index + 1U], scratch0);
+                            emit_load_float(out, 1U, pointer, offset, wide);
+                            emit_float_binary(out, operations[operation_index], 0U, 0U, 1U, wide);
+                        }
+                        const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
+                        emit_store_float(out, 0U, destination, offset, wide);
+                    } else {
+                        emit_load_integer(out, scratch3, pointer, offset, lane_bytes);
+                        for (std::size_t operation_index = 0; operation_index < operations.size(); ++operation_index) {
+                            pointer = integer_source_register(instruction.inputs[operation_index + 1U], scratch0);
+                            emit_load_integer(out, vector_scalar_scratch, pointer, offset, lane_bytes);
+                            emit_integer_binary(out, operations[operation_index], scratch3, scratch3,
+                                                vector_scalar_scratch, wide);
+                        }
+                        const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
+                        emit_store_integer(out, scratch3, destination, offset, lane_bytes);
+                    }
                 }
                 break;
             }
@@ -1396,8 +1806,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 const bool wide = instruction.opcode == O::binary_i64_contiguous_dag;
                 const auto lane_bytes = wide ? 8U : 4U;
                 if (instruction.symbol.size() < 10U || (instruction.symbol.size() & 1U) != 0U ||
-                    instruction.immediate < (wide ? 2 : 4) || instruction.immediate > 16 ||
-                    (instruction.immediate & (instruction.immediate - 1)) != 0) {
+                    instruction.immediate < (wide ? 2 : 4) || instruction.immediate > 16) {
                     add_error(diagnostics, "malformed AArch64 NEON integer DAG in @" + function.name);
                     return encoded;
                 }
@@ -1405,15 +1814,25 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                 program.reserve(instruction.symbol.size() / 2U);
                 std::size_t max_source = 0U;
                 bool saw_source = false;
+                std::optional<bool> floating;
                 for (std::size_t metadata_offset = 0; metadata_offset + 1U < instruction.symbol.size(); metadata_offset += 2U) {
                     const auto token = packed_token(instruction.symbol, metadata_offset);
                     program.push_back(token);
                     if ((token & 0x8000U) != 0U) {
                         saw_source = true;
                         max_source = std::max(max_source, static_cast<std::size_t>(token & 0x7fffU));
-                    } else if (!neon_integer_operation_supported(static_cast<O>(token), wide)) {
-                        add_error(diagnostics, "unsupported AArch64 NEON integer DAG operation in @" + function.name);
-                        return encoded;
+                    } else {
+                        const auto operation = static_cast<O>(token);
+                        if (!neon_packed_operation_supported(operation, wide)) {
+                            add_error(diagnostics, "unsupported AArch64 NEON DAG operation in @" + function.name);
+                            return encoded;
+                        }
+                        const auto operation_floating = neon_float_operation_supported(operation, wide);
+                        if (floating && *floating != operation_floating) {
+                            add_error(diagnostics, "mixed integer/floating AArch64 NEON DAG in @" + function.name);
+                            return encoded;
+                        }
+                        floating = operation_floating;
                     }
                 }
                 const auto source_count = saw_source ? max_source + 1U : 0U;
@@ -1422,12 +1841,13 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                     return encoded;
                 }
                 const auto total_bytes = static_cast<std::int64_t>(instruction.immediate) * lane_bytes;
-                if ((total_bytes & 15) != 0) {
-                    add_error(diagnostics, "AArch64 NEON integer DAG requires full 128-bit chunks in @" + function.name);
+                if ((total_bytes & 7) != 0) {
+                    add_error(diagnostics, "AArch64 NEON DAG tail must cover at least 64 bits in @" + function.name);
                     return encoded;
                 }
                 const std::array<std::uint8_t, 8> vector_stack_registers{0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
-                for (std::int64_t offset = 0; offset < total_bytes; offset += 16) {
+                for (std::int64_t offset = 0; offset < total_bytes;) {
+                    const auto chunk_bytes = std::min<std::int64_t>(16, total_bytes - offset);
                     std::vector<std::uint8_t> stack;
                     stack.reserve(vector_stack_registers.size());
                     for (const auto token : program) {
@@ -1439,7 +1859,8 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                             }
                             const auto target = vector_stack_registers[stack.size()];
                             const auto pointer = integer_source_register(instruction.inputs[source_index], scratch0);
-                            emit_load_neon128(out, target, pointer, offset);
+                            if (chunk_bytes == 16) emit_load_neon128(out, target, pointer, offset);
+                            else emit_load_neon64(out, target, pointer, offset);
                             stack.push_back(target);
                             continue;
                         }
@@ -1451,7 +1872,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                         const auto right = stack.back();
                         stack.pop_back();
                         const auto left = stack.back();
-                        emit_neon_integer_binary(out, operation, left, left, right, wide);
+                        emit_neon_packed_binary(out, operation, left, left, right, wide);
                         ++encoded.neon_vector_operation_count;
                     }
                     if (stack.size() != 1U) {
@@ -1459,7 +1880,155 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
                         return encoded;
                     }
                     const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
-                    emit_store_neon128(out, stack.front(), destination, offset);
+                    if (chunk_bytes == 16) emit_store_neon128(out, stack.front(), destination, offset);
+                    else emit_store_neon64(out, stack.front(), destination, offset);
+                    offset += chunk_bytes;
+                }
+                break;
+            }
+            case O::binary_i32_contiguous_dag_reuse: case O::binary_i64_contiguous_dag_reuse: {
+                const bool wide = instruction.opcode == O::binary_i64_contiguous_dag_reuse;
+                const auto lane_bytes = wide ? 8U : 4U;
+                if (instruction.symbol.size() < 18U || (instruction.symbol.size() % 6U) != 0U ||
+                    instruction.immediate < (wide ? 2 : 4) || instruction.immediate > 16) {
+                    add_error(diagnostics, "malformed AArch64 reusable NEON integer DAG in @" + function.name);
+                    return encoded;
+                }
+                struct DagNode { std::uint16_t tag{}, lhs{}, rhs{}; };
+                std::vector<DagNode> nodes;
+                nodes.reserve(instruction.symbol.size() / 6U);
+                std::size_t max_source = 0U;
+                bool saw_source = false;
+                std::optional<bool> floating;
+                for (std::size_t at = 0; at < instruction.symbol.size(); at += 6U) {
+                    DagNode node{packed_token(instruction.symbol, at), packed_token(instruction.symbol, at + 2U),
+                                 packed_token(instruction.symbol, at + 4U)};
+                    if ((node.tag & 0x8000U) != 0U) {
+                        saw_source = true;
+                        max_source = std::max(max_source, static_cast<std::size_t>(node.tag & 0x7fffU));
+                    } else {
+                        const auto operation = static_cast<O>(node.tag);
+                        if (node.lhs >= nodes.size() || node.rhs >= nodes.size() ||
+                            !neon_packed_operation_supported(operation, wide)) {
+                            add_error(diagnostics, "invalid AArch64 reusable NEON DAG node in @" + function.name);
+                            return encoded;
+                        }
+                        const auto operation_floating = neon_float_operation_supported(operation, wide);
+                        if (floating && *floating != operation_floating) {
+                            add_error(diagnostics, "mixed integer/floating AArch64 reusable NEON DAG in @" + function.name);
+                            return encoded;
+                        }
+                        floating = operation_floating;
+                    }
+                    nodes.push_back(node);
+                }
+                const auto source_count = saw_source ? max_source + 1U : 0U;
+                if (source_count == 0U || instruction.inputs.size() != source_count + 1U) {
+                    add_error(diagnostics, "malformed AArch64 reusable NEON DAG source list in @" + function.name);
+                    return encoded;
+                }
+                const auto total_bytes = static_cast<std::int64_t>(instruction.immediate) * lane_bytes;
+                if ((total_bytes & 7) != 0) {
+                    add_error(diagnostics, "AArch64 reusable NEON DAG tail must cover at least 64 bits in @" + function.name);
+                    return encoded;
+                }
+
+                std::vector<std::uint32_t> base_uses(nodes.size(), 0U);
+                for (const auto& node : nodes) {
+                    if ((node.tag & 0x8000U) != 0U) continue;
+                    ++base_uses[node.lhs];
+                    ++base_uses[node.rhs];
+                }
+
+                // v0-v7 are encoder scratch registers. v24-v31 are caller-saved
+                // and intentionally outside the allocator's v16-v23 vector bank,
+                // giving reusable DAGs sixteen Q temporaries without clobbering a
+                // live machine value.
+                constexpr std::array<std::uint8_t, 16> dag_pool{
+                    0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U,
+                    24U, 25U, 26U, 27U, 28U, 29U, 30U, 31U};
+                for (std::int64_t offset = 0; offset < total_bytes;) {
+                    const auto chunk_bytes = std::min<std::int64_t>(16, total_bytes - offset);
+                    std::array<bool, dag_pool.size()> busy{};
+                    std::vector<int> node_register(nodes.size(), -1);
+                    auto remaining_uses = base_uses;
+                    const auto allocate_q = [&]() -> int {
+                        for (std::size_t index = 0; index < dag_pool.size(); ++index) {
+                            if (busy[index]) continue;
+                            busy[index] = true;
+                            return static_cast<int>(dag_pool[index]);
+                        }
+                        return -1;
+                    };
+                    const auto release_q = [&](int reg) {
+                        for (std::size_t index = 0; index < dag_pool.size(); ++index) {
+                            if (dag_pool[index] == reg) {
+                                busy[index] = false;
+                                return;
+                            }
+                        }
+                    };
+
+                    for (std::size_t id = 0; id < nodes.size(); ++id) {
+                        const auto& node = nodes[id];
+                        if ((node.tag & 0x8000U) != 0U) {
+                            const auto source_index = static_cast<std::size_t>(node.tag & 0x7fffU);
+                            if (source_index >= source_count) {
+                                add_error(diagnostics, "AArch64 reusable NEON DAG source overflow in @" + function.name);
+                                return encoded;
+                            }
+                            const auto reg = allocate_q();
+                            if (reg < 0) {
+                                add_error(diagnostics, "AArch64 reusable NEON DAG exceeded Q-register budget in @" + function.name);
+                                return encoded;
+                            }
+                            const auto pointer = integer_source_register(instruction.inputs[source_index], scratch0);
+                            if (chunk_bytes == 16) emit_load_neon128(out, static_cast<std::uint8_t>(reg), pointer, offset);
+                            else emit_load_neon64(out, static_cast<std::uint8_t>(reg), pointer, offset);
+                            node_register[id] = reg;
+                            continue;
+                        }
+
+                        const auto lhs = node.lhs;
+                        const auto rhs = node.rhs;
+                        const auto lhs_reg = node_register[lhs];
+                        const auto rhs_reg = node_register[rhs];
+                        if (lhs_reg < 0 || rhs_reg < 0) {
+                            add_error(diagnostics, "AArch64 reusable NEON DAG references an unavailable value in @" + function.name);
+                            return encoded;
+                        }
+
+                        const auto lhs_consumptions = lhs == rhs ? 2U : 1U;
+                        int destination = -1;
+                        if (remaining_uses[lhs] == lhs_consumptions) destination = lhs_reg;
+                        else if (lhs != rhs && remaining_uses[rhs] == 1U) destination = rhs_reg;
+                        else destination = allocate_q();
+                        if (destination < 0) {
+                            add_error(diagnostics, "AArch64 reusable NEON DAG exceeded Q-register budget in @" + function.name);
+                            return encoded;
+                        }
+
+                        emit_neon_packed_binary(out, static_cast<O>(node.tag), static_cast<std::uint8_t>(destination),
+                                               static_cast<std::uint8_t>(lhs_reg),
+                                               static_cast<std::uint8_t>(rhs_reg), wide);
+                        ++encoded.neon_vector_operation_count;
+
+                        if (remaining_uses[lhs] != 0U) --remaining_uses[lhs];
+                        if (remaining_uses[rhs] != 0U) --remaining_uses[rhs];
+                        if (remaining_uses[lhs] == 0U && lhs_reg != destination) release_q(lhs_reg);
+                        if (lhs != rhs && remaining_uses[rhs] == 0U && rhs_reg != destination) release_q(rhs_reg);
+                        node_register[id] = destination;
+                    }
+
+                    const auto root = node_register.back();
+                    if (root < 0) {
+                        add_error(diagnostics, "AArch64 reusable NEON DAG has no result in @" + function.name);
+                        return encoded;
+                    }
+                    const auto destination = integer_source_register(instruction.inputs[source_count], scratch0);
+                    if (chunk_bytes == 16) emit_store_neon128(out, static_cast<std::uint8_t>(root), destination, offset);
+                    else emit_store_neon64(out, static_cast<std::uint8_t>(root), destination, offset);
+                    offset += chunk_bytes;
                 }
                 break;
             }
@@ -1620,6 +2189,420 @@ ImageEncodeResult encode_image(const machine::Module& module, Abi abi) {
     std::sort(result.image.relocations.begin(), result.image.relocations.end(),
               [](const auto& left, const auto& right) { return left.offset < right.offset; });
     return result;
+}
+
+std::optional<std::uintptr_t> checked_address_offset(std::uintptr_t base, std::size_t offset) noexcept {
+    if (offset > std::numeric_limits<std::uintptr_t>::max() - base) return std::nullopt;
+    return base + static_cast<std::uintptr_t>(offset);
+}
+
+std::optional<std::uintptr_t> checked_address_addend(std::uintptr_t base, std::int64_t addend) noexcept {
+    if (addend >= 0) {
+        const auto amount = static_cast<std::uint64_t>(addend);
+        if (amount > std::numeric_limits<std::uintptr_t>::max() - base) return std::nullopt;
+        return base + static_cast<std::uintptr_t>(amount);
+    }
+    // Avoid negating INT64_MIN in signed arithmetic.
+    const auto amount = static_cast<std::uint64_t>(-(addend + 1)) + 1U;
+    if (amount > base) return std::nullopt;
+    return base - static_cast<std::uintptr_t>(amount);
+}
+
+Diagnostics materialize_jit_external_globals(
+    EncodedModuleImage& image,
+    const ExternalResolver& global_resolver) {
+    Diagnostics diagnostics;
+    if (image.external_globals.empty()) return diagnostics;
+    if (!global_resolver) {
+        add_error(diagnostics, "AArch64 JIT module has unresolved external globals and no resolver");
+        return diagnostics;
+    }
+    if (!image.jit_external_global_slots.empty()) {
+        add_error(diagnostics, "AArch64 JIT external-global table was materialized more than once");
+        return diagnostics;
+    }
+
+    // Resolve every address before mutating the image. A failed host lookup must
+    // not leave a half-materialized pointer table behind if the caller wants to
+    // report/retry the load with a different resolver.
+    std::vector<std::pair<std::string, std::uintptr_t>> resolved;
+    resolved.reserve(image.external_globals.size());
+    for (const auto& symbol : image.external_globals) {
+        const auto address = global_resolver(symbol);
+        if (!address) {
+            add_error(diagnostics, "unresolved AArch64 JIT external global @" + symbol);
+            continue;
+        }
+        resolved.emplace_back(symbol, *address);
+    }
+    if (!diagnostics.empty()) return diagnostics;
+
+    image.jit_external_global_slots.reserve(resolved.size());
+    for (const auto& [symbol, address] : resolved) {
+        while ((image.read_only_data.size() & 7U) != 0U) image.read_only_data.push_back(std::byte{0});
+        const auto offset = image.read_only_data.size();
+        const auto bits = static_cast<std::uint64_t>(address);
+        for (unsigned shift = 0U; shift < 64U; shift += 8U)
+            image.read_only_data.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(bits >> shift)));
+        image.jit_external_global_slots.push_back({symbol, offset});
+    }
+    return diagnostics;
+}
+
+Diagnostics materialize_jit_tls(
+    EncodedModuleImage& image,
+    const JitTlsDescriptorResolver& descriptor_resolver,
+    std::uintptr_t helper_address) {
+    Diagnostics diagnostics;
+    const auto is_tls_page = [](RelocationKind kind) noexcept {
+        return kind == RelocationKind::tlsie_adr_gottprel_page21 ||
+               kind == RelocationKind::tlvp_load_page21;
+    };
+    const auto is_tls_low = [](RelocationKind kind) noexcept {
+        return kind == RelocationKind::tlsie_ld64_gottprel_lo12_nc ||
+               kind == RelocationKind::tlvp_load_pageoff12;
+    };
+    const auto matching_low = [](RelocationKind page) noexcept {
+        return page == RelocationKind::tlsie_adr_gottprel_page21
+            ? RelocationKind::tlsie_ld64_gottprel_lo12_nc
+            : RelocationKind::tlvp_load_pageoff12;
+    };
+
+    if (!image.jit_tls_thunks.empty()) {
+        add_error(diagnostics, "AArch64 JIT TLS thunks were materialized more than once");
+        return diagnostics;
+    }
+    bool has_tls_relocations = false;
+    for (const auto& relocation : image.relocations)
+        has_tls_relocations = has_tls_relocations || is_tls_page(relocation.kind) || is_tls_low(relocation.kind);
+    if (!has_tls_relocations) return diagnostics;
+    if (!descriptor_resolver) {
+        add_error(diagnostics, "AArch64 JIT TLS references have no descriptor resolver");
+        return diagnostics;
+    }
+    if (helper_address == 0U) {
+        add_error(diagnostics, "AArch64 JIT TLS runtime helper address is null");
+        return diagnostics;
+    }
+
+    struct Site {
+        std::size_t page_index{};
+        std::size_t low_index{};
+        std::size_t offset{};
+        std::string symbol;
+        bool darwin{};
+        std::uint8_t destination{};
+    };
+    std::vector<Site> sites;
+    std::unordered_set<std::size_t> consumed_low;
+    std::unordered_map<std::string, std::uintptr_t> descriptors;
+    std::vector<std::string> descriptor_order;
+
+    const auto read_word = [&](std::size_t offset) -> std::uint32_t {
+        std::uint32_t value = 0U;
+        for (unsigned index = 0U; index < 4U; ++index)
+            value |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(image.code[offset + index])) << (index * 8U);
+        return value;
+    };
+
+    for (std::size_t page_index = 0U; page_index < image.relocations.size(); ++page_index) {
+        const auto& page = image.relocations[page_index];
+        if (!is_tls_page(page.kind)) continue;
+        if ((page.offset & 3U) != 0U || page.offset + 16U > image.code.size()) {
+            add_error(diagnostics, "malformed AArch64 JIT TLS sequence for @" + page.symbol);
+            continue;
+        }
+        std::optional<std::size_t> low_index;
+        for (std::size_t candidate = 0U; candidate < image.relocations.size(); ++candidate) {
+            const auto& low = image.relocations[candidate];
+            if (low.kind == matching_low(page.kind) && low.symbol == page.symbol && low.offset == page.offset + 4U) {
+                if (low_index) {
+                    add_error(diagnostics, "duplicate AArch64 JIT TLS low relocation for @" + page.symbol);
+                    break;
+                }
+                low_index = candidate;
+            }
+        }
+        if (!low_index) {
+            add_error(diagnostics, "incomplete AArch64 JIT TLS relocation pair for @" + page.symbol);
+            continue;
+        }
+        consumed_low.insert(*low_index);
+        const bool darwin = page.kind == RelocationKind::tlvp_load_page21;
+        const auto destination = darwin ? std::uint8_t{0U}
+            : static_cast<std::uint8_t>(read_word(page.offset) & 0x1FU);
+        sites.push_back({page_index, *low_index, page.offset, page.symbol, darwin, destination});
+        if (!descriptors.contains(page.symbol)) {
+            const auto descriptor = descriptor_resolver(page.symbol);
+            if (!descriptor || *descriptor == 0U)
+                add_error(diagnostics, "unresolved AArch64 JIT TLS descriptor @" + page.symbol);
+            else {
+                descriptors.emplace(page.symbol, *descriptor);
+                descriptor_order.push_back(page.symbol);
+            }
+        }
+    }
+    for (std::size_t index = 0U; index < image.relocations.size(); ++index) {
+        if (is_tls_low(image.relocations[index].kind) && !consumed_low.contains(index))
+            add_error(diagnostics, "orphan AArch64 JIT TLS low relocation for @" + image.relocations[index].symbol);
+    }
+    if (!diagnostics.empty()) return diagnostics;
+
+    auto code = image.code;
+    auto relocations = image.relocations;
+    std::vector<JitTlsThunk> thunks;
+    thunks.reserve(descriptors.size());
+    std::unordered_map<std::string, std::size_t> veneer_offsets;
+    veneer_offsets.reserve(descriptors.size());
+
+    const auto append_word = [&](std::uint32_t word) {
+        for (unsigned index = 0U; index < 4U; ++index)
+            code.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(word >> (index * 8U))));
+    };
+    const auto append_absolute = [&](std::uint8_t reg, std::uintptr_t address) {
+        const auto bits = static_cast<std::uint64_t>(address);
+        const auto half = [&](unsigned shift) -> std::uint32_t {
+            return static_cast<std::uint32_t>((bits >> shift) & 0xFFFFU);
+        };
+        append_word(0xD2800000U | (half(0U) << 5U) | reg);
+        append_word(0xF2A00000U | (half(16U) << 5U) | reg);
+        append_word(0xF2C00000U | (half(32U) << 5U) | reg);
+        append_word(0xF2E00000U | (half(48U) << 5U) | reg);
+    };
+    for (const auto& symbol : descriptor_order) {
+        const auto descriptor = descriptors.at(symbol);
+        const auto offset = code.size();
+        veneer_offsets.emplace(symbol, offset);
+        append_absolute(0U, descriptor);      // x0 = opaque TLS descriptor
+        append_absolute(16U, helper_address); // x16 = runtime helper
+        append_word(0xD61F0200U);             // br x16; helper returns to original BL caller
+        thunks.push_back({symbol, offset, descriptor});
+    }
+
+    const auto write_word = [&](std::size_t offset, std::uint32_t word) {
+        for (unsigned index = 0U; index < 4U; ++index)
+            code[offset + index] = static_cast<std::byte>(static_cast<std::uint8_t>(word >> (index * 8U)));
+    };
+    for (const auto& site : sites) {
+        const auto found = veneer_offsets.find(site.symbol);
+        if (found == veneer_offsets.end()) {
+            add_error(diagnostics, "missing AArch64 JIT TLS veneer @" + site.symbol);
+            continue;
+        }
+        const auto delta = static_cast<std::int64_t>(found->second) - static_cast<std::int64_t>(site.offset);
+        if ((delta & 3) != 0 || delta < -(std::int64_t{1} << 27) || delta >= (std::int64_t{1} << 27)) {
+            add_error(diagnostics, "AArch64 JIT TLS veneer is outside BL range @" + site.symbol);
+            continue;
+        }
+        const auto words = delta / 4;
+        write_word(site.offset, 0x94000000U | (static_cast<std::uint32_t>(words) & 0x03FFFFFFU));
+        write_word(site.offset + 4U, site.destination == 0U
+            ? 0xD503201FU
+            : 0xAA0003E0U | static_cast<std::uint32_t>(site.destination)); // mov xD,x0
+        write_word(site.offset + 8U, 0xD503201FU);
+        write_word(site.offset + 12U, 0xD503201FU);
+    }
+    if (!diagnostics.empty()) return diagnostics;
+
+    std::vector<Relocation> kept;
+    kept.reserve(relocations.size() - sites.size() * 2U);
+    for (const auto& relocation : relocations) {
+        if (is_tls_page(relocation.kind) || is_tls_low(relocation.kind)) continue;
+        kept.push_back(relocation);
+    }
+    image.code = std::move(code);
+    image.relocations = std::move(kept);
+    image.jit_tls_thunks = std::move(thunks);
+    return diagnostics;
+}
+
+Diagnostics resolve_jit_relocations(
+    EncodedModuleImage& image,
+    std::uintptr_t code_address,
+    std::uintptr_t read_only_data_address,
+    std::uintptr_t writable_data_address,
+    const ExternalResolver& resolver,
+    const ExternalResolver& global_resolver) {
+    Diagnostics diagnostics;
+    if (code_address == 0U) {
+        add_error(diagnostics, "AArch64 JIT code base is null");
+        return diagnostics;
+    }
+    std::unordered_map<std::string, std::uintptr_t> defined;
+    defined.reserve(image.entries.size() + image.globals.size());
+    for (const auto& [name, offset] : image.entries) {
+        if (offset > image.code.size()) {
+            add_error(diagnostics, "AArch64 JIT function entry is outside the code image @" + name);
+            continue;
+        }
+        const auto address = checked_address_offset(code_address, offset);
+        if (!address) {
+            add_error(diagnostics, "AArch64 JIT function address overflows the process address space @" + name);
+            continue;
+        }
+        defined.emplace(name, *address);
+    }
+    for (const auto& global : image.globals) {
+        std::uintptr_t base = 0U;
+        std::size_t size = 0U;
+        switch (global.section) {
+        case DataSection::read_only:
+            base = read_only_data_address;
+            size = image.read_only_data.size();
+            break;
+        case DataSection::writable:
+            base = writable_data_address;
+            size = image.writable_data.size();
+            break;
+        case DataSection::tls:
+            // JIT TLS accesses are rewritten to runtime thunks before generic
+            // relocation resolution, so no process-static address exists here.
+            continue;
+        }
+        if (global.data_offset > size) {
+            add_error(diagnostics, "AArch64 JIT global offset is outside its data image @" + global.name);
+            continue;
+        }
+        const auto address = checked_address_offset(base, global.data_offset);
+        if (!address) {
+            add_error(diagnostics, "AArch64 JIT global address overflows the process address space @" + global.name);
+            continue;
+        }
+        defined.emplace(global.name, *address);
+    }
+    if (!diagnostics.empty()) return diagnostics;
+
+    std::unordered_set<std::string> external_globals(
+        image.external_globals.begin(), image.external_globals.end());
+    std::unordered_map<std::string, std::uintptr_t> jit_external_global_slots;
+    jit_external_global_slots.reserve(image.jit_external_global_slots.size());
+    for (const auto& slot : image.jit_external_global_slots) {
+        if (slot.data_offset + 8U > image.read_only_data.size()) {
+            add_error(diagnostics, "AArch64 JIT external-global slot is outside read-only data @" + slot.symbol);
+            continue;
+        }
+        if ((slot.data_offset & 7U) != 0U) {
+            add_error(diagnostics, "AArch64 JIT external-global slot is misaligned @" + slot.symbol);
+            continue;
+        }
+        const auto address = checked_address_offset(read_only_data_address, slot.data_offset);
+        if (!address) {
+            add_error(diagnostics, "AArch64 JIT external-global slot address overflows the process address space @" + slot.symbol);
+            continue;
+        }
+        jit_external_global_slots.emplace(slot.symbol, *address);
+    }
+    if (!diagnostics.empty()) return diagnostics;
+
+    const auto read_word = [&](std::size_t offset) -> std::uint32_t {
+        std::uint32_t value = 0U;
+        for (unsigned index = 0; index < 4U; ++index)
+            value |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(image.code[offset + index])) << (index * 8U);
+        return value;
+    };
+    const auto write_word = [&](std::size_t offset, std::uint32_t value) {
+        for (unsigned index = 0; index < 4U; ++index)
+            image.code[offset + index] = static_cast<std::byte>(static_cast<std::uint8_t>(value >> (index * 8U)));
+    };
+    const auto external_address = [&](const Relocation& relocation) -> std::optional<std::uintptr_t> {
+        if (external_globals.contains(relocation.symbol)) {
+            if (!global_resolver) return std::nullopt;
+            return global_resolver(relocation.symbol);
+        }
+        if (!resolver) return std::nullopt;
+        return resolver(relocation.symbol);
+    };
+
+    for (const auto& relocation : image.relocations) {
+        if ((relocation.offset & 3U) != 0U || relocation.offset + 4U > image.code.size()) {
+            add_error(diagnostics, "malformed AArch64 JIT relocation for @" + relocation.symbol);
+            continue;
+        }
+        if (relocation.kind == RelocationKind::tlsie_adr_gottprel_page21 ||
+            relocation.kind == RelocationKind::tlsie_ld64_gottprel_lo12_nc ||
+            relocation.kind == RelocationKind::tlvp_load_page21 ||
+            relocation.kind == RelocationKind::tlvp_load_pageoff12) {
+            add_error(diagnostics, "AArch64 JIT TLS relocation was not materialized for @" + relocation.symbol);
+            continue;
+        }
+
+        std::optional<std::uintptr_t> target;
+        const auto jit_slot = jit_external_global_slots.find(relocation.symbol);
+        if (jit_slot != jit_external_global_slots.end()) target = jit_slot->second;
+        else if (const auto found = defined.find(relocation.symbol); found != defined.end()) target = found->second;
+        else target = external_address(relocation);
+        if (!target) {
+            add_error(diagnostics, "unresolved AArch64 JIT symbol @" + relocation.symbol);
+            continue;
+        }
+        const auto target_value = checked_address_addend(*target, relocation.addend);
+        if (!target_value) {
+            add_error(diagnostics, "AArch64 JIT relocation addend overflows the process address space @" + relocation.symbol);
+            continue;
+        }
+        const auto pc_value = checked_address_offset(code_address, relocation.offset);
+        if (!pc_value) {
+            add_error(diagnostics, "AArch64 JIT relocation PC overflows the process address space @" + relocation.symbol);
+            continue;
+        }
+        const auto pc = *pc_value;
+        auto word = read_word(relocation.offset);
+
+        switch (relocation.kind) {
+        case RelocationKind::call26: {
+            const auto delta = static_cast<std::int64_t>(*target_value) - static_cast<std::int64_t>(pc);
+            if ((delta & 3) != 0 || delta < -(std::int64_t{1} << 27) || delta >= (std::int64_t{1} << 27)) {
+                add_error(diagnostics, "AArch64 JIT call target is outside BL range @" + relocation.symbol);
+                break;
+            }
+            const auto words = delta / 4;
+            word = (word & 0xFC000000U) | (static_cast<std::uint32_t>(words) & 0x03FFFFFFU);
+            write_word(relocation.offset, word);
+            break;
+        }
+        case RelocationKind::adr_prel_pg_hi21: {
+            const auto target_page = static_cast<std::int64_t>(*target_value & ~std::uintptr_t{0xFFFU});
+            const auto pc_page = static_cast<std::int64_t>(pc & ~std::uintptr_t{0xFFFU});
+            const auto page_delta = (target_page - pc_page) / 4096;
+            if (page_delta < -(std::int64_t{1} << 20) || page_delta >= (std::int64_t{1} << 20)) {
+                add_error(diagnostics, "AArch64 JIT address target is outside ADRP range @" + relocation.symbol);
+                break;
+            }
+            const auto immediate = static_cast<std::uint64_t>(page_delta) & 0x1FFFFFU;
+            const auto immlo = static_cast<std::uint32_t>(immediate & 0x3U);
+            const auto immhi = static_cast<std::uint32_t>((immediate >> 2U) & 0x7FFFFU);
+            word &= ~((0x3U << 29U) | (0x7FFFFU << 5U));
+            word |= (immlo << 29U) | (immhi << 5U);
+            write_word(relocation.offset, word);
+            break;
+        }
+        case RelocationKind::add_abs_lo12_nc:
+            if (jit_slot != jit_external_global_slots.end()) {
+                const auto low12 = static_cast<std::uint32_t>(*target_value & 0xFFFU);
+                if ((low12 & 7U) != 0U) {
+                    add_error(diagnostics, "AArch64 JIT external-global slot is not 8-byte aligned @" + relocation.symbol);
+                    break;
+                }
+                const auto rd = word & 0x1FU;
+                const auto rn = (word >> 5U) & 0x1FU;
+                // The encoder's global-address sequence is ADRP rd; ADD rd,rd,#lo12.
+                // Replace ADD with LDR Xrd,[Xrn,#slot_lo12] so the nearby table
+                // yields the unrestricted absolute host-global address.
+                word = 0xF9400000U | ((low12 / 8U) << 10U) | (rn << 5U) | rd;
+            } else {
+                word &= ~(0xFFFU << 10U);
+                word |= static_cast<std::uint32_t>(*target_value & 0xFFFU) << 10U;
+            }
+            write_word(relocation.offset, word);
+            break;
+        case RelocationKind::tlsie_adr_gottprel_page21:
+        case RelocationKind::tlsie_ld64_gottprel_lo12_nc:
+        case RelocationKind::tlvp_load_page21:
+        case RelocationKind::tlvp_load_pageoff12:
+            break;
+        }
+    }
+    return diagnostics;
 }
 
 std::string format_hex(const std::vector<std::byte>& code) {

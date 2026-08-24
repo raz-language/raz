@@ -194,7 +194,11 @@ fn hir_parse_function(HirBuilder&mut builder) -> bool {
     raz_compiler_rt_arena_set(builder.module.function_closure_capture_starts, function_index, 0);
     raz_compiler_rt_arena_set(builder.module.function_closure_capture_counts, function_index, 0);
     if (!reparsing_generic) {
-        raz_compiler_rt_arena_set(builder.module.function_inherent_structs, function_index, -1);
+        raz_compiler_rt_arena_set(
+            builder.module.function_inherent_structs,
+            function_index,
+            builder.pending_inherent_target,
+        );
         raz_compiler_rt_arena_set(builder.module.function_inherent_source_offsets, function_index, -1);
         raz_compiler_rt_arena_set(builder.module.function_inherent_body_parsed, function_index, 1);
     }
@@ -2044,20 +2048,26 @@ fn hir_parse_struct_declaration(HirBuilder&mut builder) -> bool {
         hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
         return false;
     }
-    if (builder.module.struct_count >= 256) {
-        hir_fail(builder, DiagnosticCode::TooManyItems);
-        return false;
-    }
-    if (hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)) {
-        hir_fail(builder, DiagnosticCode::DuplicateName);
-        return false;
-    }
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+    bool predeclared =
+        structure >= 0 &&
+        raz_compiler_rt_arena_get(builder.module.struct_name_offsets, structure) == builder.current.offset &&
+        raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure) == -1;
 
-    i64 structure = builder.module.struct_count;
-
-    builder.module.struct_count += 1;
-    raz_compiler_rt_arena_set(builder.module.struct_name_offsets, structure, builder.current.offset);
-    raz_compiler_rt_arena_set(builder.module.struct_name_lengths, structure, builder.current.length);
+    if (!predeclared) {
+        if (builder.module.struct_count >= 256) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+        if (hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)) {
+            hir_fail(builder, DiagnosticCode::DuplicateName);
+            return false;
+        }
+        structure = builder.module.struct_count;
+        builder.module.struct_count += 1;
+        raz_compiler_rt_arena_set(builder.module.struct_name_offsets, structure, builder.current.offset);
+        raz_compiler_rt_arena_set(builder.module.struct_name_lengths, structure, builder.current.length);
+    }
     raz_compiler_rt_arena_set(
         builder.module.struct_field_starts,
         structure,
@@ -2534,25 +2544,35 @@ fn hir_parse_enum_declaration(HirBuilder&mut builder) -> bool {
     i64 name_offset = builder.current.offset;
     i64 name_length = builder.current.length;
 
-    if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+    i64 enumeration = hir_find_enum(builder, name_offset, name_length);
+    bool predeclared =
+        enumeration >= 0 &&
+        raz_compiler_rt_arena_get(builder.module.enum_name_offsets, enumeration) == name_offset &&
+        raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration) == -1;
+
+    if (!predeclared && hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
         hir_fail(builder, DiagnosticCode::DuplicateName);
         return false;
     }
     hir_advance(builder);
     if (builder.current.kind == TokenKind::Less) {
+        if (predeclared) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
         hir_advance(builder);
         return hir_parse_generic_enum_template(builder, source_offset, name_offset, name_length);
     }
-    if (builder.module.enum_count >= 256) {
-        hir_fail(builder, DiagnosticCode::TooManyItems);
-        return false;
+    if (!predeclared) {
+        if (builder.module.enum_count >= 256) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+        enumeration = builder.module.enum_count;
+        builder.module.enum_count += 1;
+        raz_compiler_rt_arena_set(builder.module.enum_name_offsets, enumeration, name_offset);
+        raz_compiler_rt_arena_set(builder.module.enum_name_lengths, enumeration, name_length);
     }
-
-    i64 enumeration = builder.module.enum_count;
-
-    builder.module.enum_count += 1;
-    raz_compiler_rt_arena_set(builder.module.enum_name_offsets, enumeration, name_offset);
-    raz_compiler_rt_arena_set(builder.module.enum_name_lengths, enumeration, name_length);
     raz_compiler_rt_arena_set(
         builder.module.enum_member_starts,
         enumeration,

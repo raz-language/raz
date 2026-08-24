@@ -386,7 +386,7 @@ int forge_function_set_target_feature(forge_function_t* function, const char* ta
 
 int forge_function_copy_body_from(forge_function_t* handle, const forge_module_t* source_module,
                                   const char* source_function_name) {
-    auto* destination = function_of(handle);
+    auto* destination = resolve(handle);
     if (!destination || !source_module || !source_module->value || !source_function_name) {
         set_error("invalid function body copy request");
         return 0;
@@ -1157,8 +1157,9 @@ size_t forge_module_function_abi_json(const forge_module_t* module,
     const auto found = std::find_if(module->value->functions().begin(), module->value->functions().end(),
         [&](const forge::ir::Function& function) { return function.name == function_name; });
     if (found == module->value->functions().end()) { set_error("function not found"); return 0; }
-    const auto native_abi = (abi == FORGE_ABI_AAPCS64 || abi == FORGE_ABI_DARWIN_ARM64)
-        ? forge::target::NativeAbi::aapcs64
+    const auto native_abi = abi == FORGE_ABI_DARWIN_ARM64
+        ? forge::target::NativeAbi::darwin_arm64
+        : abi == FORGE_ABI_AAPCS64 ? forge::target::NativeAbi::aapcs64
         : abi == FORGE_ABI_WINDOWS_X64 ? forge::target::NativeAbi::windows_x64
                                        : forge::target::NativeAbi::system_v_x86_64;
     const auto classified = forge::target::classify_function(*module->value, *found, native_abi);

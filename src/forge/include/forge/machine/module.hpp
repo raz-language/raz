@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace forge::machine {
@@ -220,6 +221,39 @@ struct Instruction {
     // This bit marks a call whose first machine input is that hidden result
     // pointer, allowing target encoders to keep the shared call IR intact.
     bool indirect_result{};
+    // Native variadic calls need the source-level boundary between named and
+    // anonymous arguments after aggregate values have been flattened into
+    // machine inputs. Generic AAPCS64 still allocates anonymous arguments
+    // through x0-x7/v0-v7, while Darwin arm64 places the anonymous tail on the
+    // stack. `variadic_named_input_count` counts only ordinary call-argument
+    // inputs (it excludes an indirect target and hidden aggregate-result
+    // destination prefixes).
+    bool variadic_call{};
+    std::uint32_t variadic_named_input_count{};
+    // AAPCS64 needs source-level argument boundaries after aggregate values have
+    // been flattened into machine pieces. A nonzero entry marks the first input
+    // of one argument and gives its piece count; continuation entries are zero.
+    // Alignments are normalized stack alignments (8 or 16 bytes).
+    std::vector<std::uint8_t> argument_group_sizes;
+    std::vector<std::uint8_t> argument_group_alignments;
+    // ABI storage width for each call input. Prefix inputs such as an indirect
+    // target or hidden result destination use zero. Keeping source widths here
+    // lets Darwin arm64 pack fixed stack arguments at their natural byte size
+    // while generic AAPCS64 can still round stack slots according to the PCS.
+    std::vector<std::uint8_t> argument_widths;
+
+    Instruction() = default;
+    Instruction(Opcode opcode_value, VirtualRegister result_value,
+                std::vector<VirtualRegister> input_values = {}, std::int64_t immediate_value = 0,
+                std::uint32_t argument_index_value = 0, std::string symbol_value = {},
+                std::vector<Successor> successor_values = {}, std::uint16_t vector_bits_value = 0,
+                std::uint8_t vector_mask_lanes_value = 0, bool indirect_result_value = false,
+                bool variadic_call_value = false, std::uint32_t variadic_named_input_count_value = 0)
+        : opcode(opcode_value), result(result_value), inputs(std::move(input_values)),
+          immediate(immediate_value), argument_index(argument_index_value), symbol(std::move(symbol_value)),
+          successors(std::move(successor_values)), vector_bits(vector_bits_value),
+          vector_mask_lanes(vector_mask_lanes_value), indirect_result(indirect_result_value),
+          variadic_call(variadic_call_value), variadic_named_input_count(variadic_named_input_count_value) {}
 };
 
 struct Block {
@@ -239,6 +273,11 @@ struct Function {
     bool indirect_result_parameter{};
     std::vector<std::uint8_t> argument_widths;
     std::vector<RegisterClass> argument_classes;
+    // Same convention as Instruction::argument_group_sizes, indexed by machine
+    // argument slot. This prevents AAPCS64 composites/HFAs from being partially
+    // allocated when only part of a register bank remains.
+    std::vector<std::uint8_t> argument_group_sizes;
+    std::vector<std::uint8_t> argument_group_alignments;
     VirtualRegister register_count{};
     std::vector<std::uint8_t> register_widths;
     std::vector<RegisterClass> register_classes;

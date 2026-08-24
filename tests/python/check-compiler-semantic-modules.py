@@ -25,7 +25,6 @@ for forbidden_text in (
     'line.startswith("namespace raz_compiler_")',
     'line.startswith("public import raz_compiler_")',
     'line.startswith("import raz_compiler_")',
-    "host-source-order.txt",
 ):
     if forbidden_text in bootstrap_driver:
         print(f"compiler-semantic-modules: FAIL: bootstrap contains legacy module handling: {forbidden_text}")

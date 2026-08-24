@@ -399,6 +399,19 @@ void test_reusable_dag() {
              "reuse", Opcode::binary_i32_contiguous_dag_reuse, true);
 }
 
+void test_six_lane_chain_tail() {
+    // Six i32 lanes are one full Q register plus a two-lane D-register tail.
+    // The AArch64 packer should keep the whole contiguous run together while
+    // the host x86 JIT provides an executable semantic cross-check.
+    Expression expression;
+    expression.nodes = {Expression::source(0), Expression::source(1), Expression::op("add", 0, 1),
+                        Expression::source(2), Expression::op("xor", 2, 3),
+                        Expression::source(3), Expression::op("sub", 4, 5)};
+    run_case("a six-lane chain with a half-vector tail",
+             wrap_module(build_fixture("chain6", 6, 4, expression, false), 4),
+             "chain6", Opcode::binary_i32_contiguous_chain, true);
+}
+
 void test_eight_lane_chain() {
     Expression expression;
     expression.nodes = {Expression::source(0), Expression::source(1), Expression::op("and", 0, 1),
@@ -503,6 +516,7 @@ int main() {
     test_chain();
     test_dag();
     test_reusable_dag();
+    test_six_lane_chain_tail();
     test_eight_lane_chain();
     test_opaque_destination_is_not_packed();
     test_packed_store_is_not_dead_code();

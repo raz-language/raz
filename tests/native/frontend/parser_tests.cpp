@@ -99,6 +99,22 @@ fn main() -> i64 {
           "return value is a cast expression");
 }
 
+void test_function_identifier_variable() {
+  raz::compiler::SourceManager sources;
+  raz::compiler::DiagnosticEngine diagnostics;
+  const auto tree = parse(R"(
+fn main() -> i64 {
+  i64 function = 42;
+  return function;
+}
+)", diagnostics, sources);
+  require(!diagnostics.has_errors(), "`function` is valid as a local identifier");
+  const auto& body = tree.root().children[0].children.back();
+  require(body.children.size() == 2, "function identifier body has two statements");
+  require(body.children[0].kind == raz::compiler::SyntaxKind::variable_declaration,
+          "function identifier parses as variable declaration");
+}
+
 void test_recovery() {
   raz::compiler::SourceManager sources;
   raz::compiler::DiagnosticEngine diagnostics;
@@ -114,6 +130,7 @@ int main() {
   test_postfix_and_assignment();
   test_immediate_closure();
   test_numeric_cast();
+  test_function_identifier_variable();
   test_recovery();
   std::cout << "parser tests passed\n";
   return 0;

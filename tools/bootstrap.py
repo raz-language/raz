@@ -24,6 +24,63 @@ EXE = ".exe" if IS_WINDOWS else ""
 OBJ = ".obj" if IS_WINDOWS else ".o"
 
 
+BOOTSTRAP_LEGACY_SCRATCH_NAMES = {"host-source-order.txt", "stage1-diagnostic.txt"}
+PROFILE_OUTPUT_DIRECTORIES = ("bin", "lib", "obj", "ir", "modules", "packages")
+
+
+def ensure_profile_output_layout(project_root: Path, profile: str) -> dict[str, Path]:
+    """Create the same target/<profile> layout used by normal Raz project builds.
+
+    Bootstrap generations must not invent a second artifact layout.  Keeping this
+    helper in the Python driver mirrors both the C++ Stage-0 build driver and the
+    Raz production compiler's project-native path bridge.
+    """
+    profile_root = project_root / "target" / profile
+    paths = {name: profile_root / name for name in PROFILE_OUTPUT_DIRECTORIES}
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def remove_legacy_bootstrap_scratch(project_root: Path) -> int:
+    """Delete obsolete bootstrap marker files that may survive incremental targets.
+
+    Older bootstrap/compiler revisions wrote these files into compiler projects.
+    target/ is intentionally preserved between runs, so simply removing their
+    writers is insufficient: existing workspaces need a one-time migration cleanup.
+    """
+    removed = 0
+    if not project_root.exists():
+        return removed
+    for name in BOOTSTRAP_LEGACY_SCRATCH_NAMES:
+        for path in project_root.rglob(name):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                raise RuntimeError(f"Could not remove legacy bootstrap scratch artifact {path}: {exc}") from exc
+    return removed
+
+
+def remove_legacy_flat_profile_artifacts(project_root: Path, profile: str) -> int:
+    """Remove pre-canonical repro artifacts from target/<profile> itself.
+
+    Passes before the unified target-layout contract placed the recursive compiler
+    object and executable directly in the profile root.  Normal Raz builds have
+    always used obj/ and bin/, so delete only those known legacy bootstrap names.
+    """
+    profile_root = project_root / "target" / profile
+    removed = 0
+    for name in (f"compiler{OBJ}", f"raz-compiler{EXE}"):
+        path = profile_root / name
+        if path.is_file():
+            path.unlink()
+            removed += 1
+    return removed
+
+
 def normalized_host_arch() -> str:
     machine = platform.machine().lower()
     if machine in {"x86_64", "amd64"}:
@@ -546,11 +603,38 @@ def _link_or_copy_stage_source(source: str, destination: str) -> str:
         return shutil.copy2(source, destination)
 
 
+def _canonical_compiler_inputs() -> list[Path]:
+    """Return only files that are semantic inputs to the compiler project.
+
+    Bootstrap workspaces must not mirror arbitrary files from ``compiler/``.
+    Keeping the input set explicit prevents generated diagnostics, profiling
+    traces, or obsolete ordering metadata from leaking into target/bootstrap.
+    """
+    root = ROOT / "compiler"
+    inputs: list[Path] = []
+    for name in ("raz.toml", "raz.lock"):
+        path = root / name
+        if path.is_file():
+            inputs.append(path)
+    inputs.extend(sorted(path for path in (root / "src").rglob("*") if path.is_file()))
+    return inputs
+
+
+def _copy_compiler_project_inputs(build_dir: Path, copy_function=shutil.copy2) -> None:
+    """Materialize the canonical compiler project without copying root artifacts."""
+    root = ROOT / "compiler"
+    for source in _canonical_compiler_inputs():
+        relative = source.relative_to(root)
+        destination = build_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_function(str(source), str(destination))
+
+
 def _compiler_source_digest() -> str:
     """Fingerprint canonical compiler inputs independently of project caches."""
     root = ROOT / "compiler"
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and "target" not in p.parts and ".raz" not in p.parts):
+    for path in _canonical_compiler_inputs():
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(4, "little"))
         digest.update(relative)
@@ -592,12 +676,8 @@ def prepare_seed_compiler_project(build_dir: Path) -> None:
             shutil.rmtree(child)
         else:
             child.unlink(missing_ok=True)
-    shutil.copytree(
-        ROOT / "compiler",
-        build_dir,
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".raz", "target"),
-    )
+    _copy_compiler_project_inputs(build_dir)
+    remove_legacy_bootstrap_scratch(build_dir)
     _refresh_bootstrap_input_cache(build_dir, _compiler_source_digest())
 
 
@@ -621,13 +701,8 @@ def prepare_self_host_build(build_dir: Path, seed_project: Path, reset_cache: bo
             shutil.rmtree(child)
         else:
             child.unlink(missing_ok=True)
-    shutil.copytree(
-        ROOT / "compiler",
-        build_dir,
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".raz", "target"),
-        copy_function=_link_or_copy_stage_source,
-    )
+    _copy_compiler_project_inputs(build_dir, _link_or_copy_stage_source)
+    remove_legacy_bootstrap_scratch(build_dir)
 
     # Seed only the assembled-project input cache on a first self-host build.
     # This avoids re-walking/re-reading 100+ unchanged modules but deliberately
@@ -648,15 +723,53 @@ def prepare_reproducibility_verification(build_dir: Path) -> None:
     """Create an independent second generation for explicit reproducibility checks."""
     if build_dir.exists():
         shutil.rmtree(build_dir)
-    shutil.copytree(
-        ROOT / "compiler",
-        build_dir,
-        ignore=shutil.ignore_patterns(".raz", "target"),
-        copy_function=_link_or_copy_stage_source,
-    )
+    build_dir.mkdir(parents=True, exist_ok=True)
+    _copy_compiler_project_inputs(build_dir, _link_or_copy_stage_source)
+    remove_legacy_bootstrap_scratch(build_dir)
+
+
+def bootstrap_seed_jobs(requested: int) -> int:
+    """Choose seed concurrency conservatively because Stage-0 semantic workers are memory-heavy."""
+    total = 0
+    try:
+        if IS_WINDOWS:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                total = int(status.ullTotalPhys)
+        elif hasattr(os, "sysconf"):
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            total = int(pages) * int(page_size)
+    except (OSError, ValueError, AttributeError):
+        total = 0
+
+    if total <= 0:
+        return max(1, min(requested, 4))
+    # The frozen Stage-0 frontend can transiently use multiple GiB on large
+    # dependency closures. Reserve ~3 GiB per concurrent seed worker. Normal
+    # self-host builds use the Raz compiler and keep the user's requested jobs.
+    memory_jobs = max(1, total // (3 * 1024 * 1024 * 1024))
+    return max(1, min(requested, int(memory_jobs), 8))
 
 
 def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str], interval: int, env: dict[str, str] | None = None) -> None:
+    remove_legacy_bootstrap_scratch(build_dir)
     print(f"[RUN] {label}\n      {compiler} {' '.join(args)}", flush=True)
     diagnostic = build_dir / "compiler-diagnostic.txt"
     diagnostic.unlink(missing_ok=True)
@@ -680,6 +793,10 @@ def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str]
             print(f"      [{elapsed:6.1f}s] still compiling; {state}", flush=True)
     if proc.returncode:
         raise RuntimeError(f"{label} failed with exit code {proc.returncode}. Diagnostic: {last_diag or 'none'}")
+    diagnostic.unlink(missing_ok=True)
+    removed = remove_legacy_bootstrap_scratch(build_dir)
+    if removed:
+        print(f"      removed {removed} legacy bootstrap scratch artifact(s)", flush=True)
     print(f"      completed in {time.monotonic() - started:.3f}s", flush=True)
 
 
@@ -864,9 +981,9 @@ def main() -> int:
 
         compiler_project = qualification / "compiler-project"
         prepare_seed_compiler_project(compiler_project)
-        stage_target = compiler_project / "target" / args.bootstrap_profile
-        stage_target.mkdir(parents=True, exist_ok=True)
-        stage_object = stage_target / f"compiler{OBJ}"
+        stage_layout = ensure_profile_output_layout(compiler_project, args.bootstrap_profile)
+        remove_legacy_flat_profile_artifacts(compiler_project, args.bootstrap_profile)
+        stage_object = stage_layout["obj"] / f"raz-compiler{OBJ}"
         invoke_compiler(
             "LLVM stage-0 -> production compiler object",
             stage0,
@@ -952,7 +1069,12 @@ def main() -> int:
                 "debug = false\n"
                 "incremental = true\n"
             )
-        seed_command = [str(host_driver), "build", str(compiler_project), "--profile", seed_profile]
+        seed_jobs = bootstrap_seed_jobs(args.jobs)
+        print(f"Stage-0 seed jobs: {seed_jobs} (requested {args.jobs})", flush=True)
+        seed_command = [
+            str(host_driver), "build", str(compiler_project), "--profile", seed_profile,
+            "--jobs", str(seed_jobs),
+        ]
         # A newly regenerated Stage 0 is a different bootstrap implementation;
         # force one seed rebuild so an artifact produced by an older Stage 0 can
         # never be accepted solely because the Raz source fingerprint is unchanged.
@@ -960,12 +1082,15 @@ def main() -> int:
         # reuse the seed project's own incremental cache.
         if stage0_rebuilt:
             seed_command.append("--force")
-        run(
+        invoke_compiler(
             f"Stage-0 compiler -> Raz seed (O{args.seed_opt})",
-            seed_command,
-            env=env,
+            host_driver,
+            compiler_project,
+            seed_command[1:],
+            args.status_interval,
+            env,
         )
-        built = compiler_project / "target" / seed_profile / f"raz-compiler{EXE}"
+        built = compiler_project / "target" / seed_profile / "bin" / f"raz-compiler{EXE}"
         if not built.is_file():
             raise RuntimeError(f"Production compiler was not produced: {built}")
         candidate_dir = qualification / "candidate"
@@ -1023,9 +1148,9 @@ def main() -> int:
     self_host_dir = qualification / "repro-1"
     prepare_self_host_build(self_host_dir, compiler_project, stage0_rebuilt)
     banner("Raz self-host build")
-    stage_target = self_host_dir / "target" / args.bootstrap_profile
-    stage_target.mkdir(parents=True, exist_ok=True)
-    obj = stage_target / f"compiler{OBJ}"
+    stage_layout = ensure_profile_output_layout(self_host_dir, args.bootstrap_profile)
+    remove_legacy_flat_profile_artifacts(self_host_dir, args.bootstrap_profile)
+    obj = stage_layout["obj"] / f"raz-compiler{OBJ}"
     obj_argument = obj.relative_to(self_host_dir).as_posix()
     if llvm_seed_bootstrap:
         generation_args = [
@@ -1059,9 +1184,14 @@ def main() -> int:
     minimum_object_size = 100_000 if llvm_seed_bootstrap else 500_000
     if not obj.is_file() or obj.stat().st_size < minimum_object_size:
         raise RuntimeError(f"Self-host compiler object is missing or unexpectedly small: {obj}")
-    self_host_compiler = stage_target / f"raz-compiler{EXE}"
+    self_host_compiler = stage_layout["bin"] / f"raz-compiler{EXE}"
     link_stage(compiler, obj, runtime, bridge, forge, self_host_compiler, env, runtime_deps, oblink)
     run("Validate Raz self-host compiler", [str(self_host_compiler), "--version"], cwd=self_host_dir, env=env)
+    run(
+        "Self-host native project output",
+        [sys.executable, str(ROOT / "tests" / "python" / "check-selfhost-native-project.py"), "--raz", str(self_host_compiler)],
+        env=env,
+    )
     generated.append((1, obj, self_host_compiler, digest(obj)))
 
     verification_hash = ""
@@ -1071,9 +1201,9 @@ def main() -> int:
         banner("Reproducibility verification generation")
         verify_dir = qualification / "repro-2"
         prepare_reproducibility_verification(verify_dir)
-        verify_target = verify_dir / "target" / args.bootstrap_profile
-        verify_target.mkdir(parents=True, exist_ok=True)
-        verify_obj = verify_target / f"compiler{OBJ}"
+        verify_layout = ensure_profile_output_layout(verify_dir, args.bootstrap_profile)
+        remove_legacy_flat_profile_artifacts(verify_dir, args.bootstrap_profile)
+        verify_obj = verify_layout["obj"] / f"raz-compiler{OBJ}"
         verify_argument = verify_obj.relative_to(verify_dir).as_posix()
         if llvm_seed_bootstrap:
             verify_args = [
@@ -1095,7 +1225,7 @@ def main() -> int:
         )
         if not verify_obj.is_file() or verify_obj.stat().st_size < minimum_object_size:
             raise RuntimeError(f"Reproducibility object is missing or unexpectedly small: {verify_obj}")
-        verify_compiler = verify_target / f"raz-compiler{EXE}"
+        verify_compiler = verify_layout["bin"] / f"raz-compiler{EXE}"
         link_stage(compiler, verify_obj, runtime, bridge, forge, verify_compiler, env, runtime_deps, oblink)
         run("Validate reproducibility compiler", [str(verify_compiler), "--version"], cwd=verify_dir, env=env)
         verify_digest = digest(verify_obj)

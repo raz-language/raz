@@ -1680,8 +1680,8 @@ pass::PassResult BranchThreadingPass::run(ir::Function& function,
                 if (const auto found = constants.find(condition); found != constants.end())
                     condition_value = found->second;
                 else if (const auto substitution = substitutions.find(condition); substitution != substitutions.end()) {
-                    if (const auto found = predecessor_constants.find(substitution->second); found != predecessor_constants.end())
-                        condition_value = found->second;
+                    if (const auto predecessor_found = predecessor_constants.find(substitution->second); predecessor_found != predecessor_constants.end())
+                        condition_value = predecessor_found->second;
                     else condition_value = number(substitution->second);
                 }
                 if (!condition_value) continue;
@@ -1883,6 +1883,14 @@ pass::PassResult AlgebraicSimplificationPass::run(ir::Function& function,
                 result.changed = true;
                 ++result.operations_rewritten;
             };
+            const auto make_boolean_const = [&](long long value) {
+                operation.opcode = "const";
+                operation.type = ir::i1_type();
+                operation.operands = {std::to_string(value != 0 ? 1 : 0)};
+                constants[operation.result] = {value != 0 ? 1 : 0, block.name, index};
+                result.changed = true;
+                ++result.operations_rewritten;
+            };
             if ((operation.opcode == "neg" || operation.opcode == "not") &&
                 operation.operands.size() == 1U) {
                 const auto definition = definitions.find(operation.operands.front());
@@ -1955,15 +1963,11 @@ pass::PassResult AlgebraicSimplificationPass::run(ir::Function& function,
                 else if ((operation.opcode == "cmp.eq" || operation.opcode == "cmp.le" ||
                           operation.opcode == "cmp.ge" || operation.opcode == "cmp.ule" ||
                           operation.opcode == "cmp.uge") && same_value && operation.type.is_integer()) {
-                    operation.opcode = "const";
-                    operation.operands = {"1"};
-                    constants[operation.result] = {1, block.name, index};
-                    result.changed = true;
-                    ++result.operations_rewritten;
+                    make_boolean_const(1);
                 } else if ((operation.opcode == "cmp.ne" || operation.opcode == "cmp.lt" ||
                             operation.opcode == "cmp.gt" || operation.opcode == "cmp.ult" ||
                             operation.opcode == "cmp.ugt") && same_value && operation.type.is_integer()) {
-                    make_zero();
+                    make_boolean_const(0);
                 } else if (operation.opcode == "mul" && right == 1)
                     make_copy(operation.operands[0]);
                 else if (operation.opcode == "mul" && left == 1)
@@ -2128,6 +2132,23 @@ pass::PassResult SparseConditionalConstantPropagationPass::run(
             if (operand.kind != LatticeKind::constant) return operand;
             return {LatticeKind::constant, operation.opcode == "neg" ? -operand.constant : ~operand.constant};
         }
+        // Only the scalar binary opcodes below participate in SCCP's
+        // integer evaluator.  An arbitrary result-producing instruction with
+        // two textual operands (notably `call @fn(%arg)`, but also pointer and
+        // address operations) is *not* an unevaluated binary expression: its
+        // runtime value is unknown to SCCP and must therefore be overdefined.
+        // Leaving such a value at lattice bottom lets a constant arriving on
+        // another executable phi/block-parameter edge win the meet, which can
+        // incorrectly prune live control flow.  This exact case miscompiled
+        // Raz's native output-path preparation at -O2.
+        static const std::unordered_set<std::string> binary_evaluable{
+            "add", "sub", "mul", "div", "div.signed", "div.unsigned",
+            "rem.signed", "rem.unsigned", "and", "or", "xor", "shl",
+            "shr.signed", "shr.unsigned", "cmp.eq", "cmp.ne", "cmp.lt",
+            "cmp.le", "cmp.gt", "cmp.ge", "cmp.ult", "cmp.ule", "cmp.ugt",
+            "cmp.uge"};
+        if (!binary_evaluable.contains(operation.opcode))
+            return {LatticeKind::overdefined, 0};
         if (operation.operands.size() != 2) return {LatticeKind::overdefined, 0};
         const auto left = value_of(operation.operands[0]);
         const auto right = value_of(operation.operands[1]);
@@ -2239,7 +2260,10 @@ pass::PassResult SparseConditionalConstantPropagationPass::run(
             if (operation.result.empty() || operation.opcode == "const") continue;
             const auto fact = value_of(operation.result);
             if (fact.kind != LatticeKind::constant) continue;
-            operation.opcode = "const"; operation.operands = {std::to_string(fact.constant)};
+            const bool comparison = operation.opcode.starts_with("cmp.");
+            operation.opcode = "const";
+            if (comparison) operation.type = ir::i1_type();
+            operation.operands = {std::to_string(fact.constant)};
             result.changed = true; ++result.operations_rewritten; result.touch_block(block.name);
         }
         if (block.operations.empty()) continue;

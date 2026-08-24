@@ -1368,9 +1368,46 @@ fn hir_parse_dyn_trait_call(
         i64 argument = raz_compiler_rt_arena_get(pending_arguments, index);
         i64 parameter = parameter_start + index + 1;
         i64 parameter_structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter);
+        i64 parameter_slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, parameter);
+        i64 parameter_reference = raz_compiler_rt_arena_get(builder.module.parameter_references, parameter);
         i64 argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
 
-        if (parameter_structure >= 0) {
+        // Dynamic dispatch uses the same explicit-argument coercion contract as
+        // an ordinary/inherent call. The receiver itself is erased into the dyn
+        // handle, but every user argument still has to preserve references,
+        // mutable references, slices, and aggregate identity from the selected
+        // trait method signature.
+        if (parameter_slice != 0) {
+            i64 sliced = -1;
+
+            if (
+                !hir_coerce_slice(
+                    builder,
+                    argument,
+                    raz_compiler_rt_arena_get(builder.module.parameter_slice_mutable, parameter),
+                    &mut sliced,
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            argument = sliced;
+            argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+        }
+        if (parameter_reference != 0) {
+            if (
+                !hir_require_reference_type(
+                    builder,
+                    &mut argument,
+                    parameter_reference,
+                    parameter_structure,
+                    raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+        } else if (parameter_structure >= 0) {
             if (argument_structure != parameter_structure) {
                 raz_compiler_rt_arena_destroy(pending_arguments);
                 hir_fail(builder, DiagnosticCode::ExpectedToken);
@@ -1450,9 +1487,34 @@ fn hir_parse_dyn_trait_call(
         raz_compiler_rt_arena_get(builder.module.function_return_types, representative),
     );
     raz_compiler_rt_arena_set(
+        builder.module.node_references,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_references, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_reference_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_reference_mutable, representative),
+    );
+    raz_compiler_rt_arena_set(
         builder.module.node_type_structs,
         call,
         raz_compiler_rt_arena_get(builder.module.function_return_type_structs, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slices,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slices, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slice_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slice_mutable, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_function_types,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_function_types, representative),
     );
     *out = call;
     return true;

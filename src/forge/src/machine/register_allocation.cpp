@@ -1011,8 +1011,8 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
                 [](const IntegerActive& left, const IntegerActive& right) { return left.interval.end < right.interval.end; });
             continue;
         }
-        const bool interval_crosses_call = crosses_call(interval);
-        if (const auto selected = take_integer_register(interval_crosses_call)) {
+        const bool current_interval_crosses_call = crosses_call(interval);
+        if (const auto selected = take_integer_register(current_interval_crosses_call)) {
             const auto physical = *selected;
             allocation.locations[interval.virtual_register] = {
                 LocationKind::physical_register, physical, FloatingPhysicalRegister::xmm2, 0};
@@ -1022,8 +1022,8 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
         } else {
             auto candidate = std::min_element(integer_active.begin(), integer_active.end(),
                 [&](const IntegerActive& left, const IntegerActive& right) {
-                    const bool left_eligible = !interval_crosses_call || is_callee_saved(left.physical);
-                    const bool right_eligible = !interval_crosses_call || is_callee_saved(right.physical);
+                    const bool left_eligible = !current_interval_crosses_call || is_callee_saved(left.physical);
+                    const bool right_eligible = !current_interval_crosses_call || is_callee_saved(right.physical);
                     if (left_eligible != right_eligible) return left_eligible;
                     const auto left_priority = spill_priority(left.interval);
                     const auto right_priority = spill_priority(right.interval);
@@ -1031,7 +1031,7 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
                     return left.interval.end > right.interval.end;
                 });
             if (candidate != integer_active.end() &&
-                (!interval_crosses_call || is_callee_saved(candidate->physical)) &&
+                (!current_interval_crosses_call || is_callee_saved(candidate->physical)) &&
                 should_spill_active(*candidate, interval)) {
                 const auto physical = candidate->physical;
                 spill(candidate->interval.virtual_register);
@@ -1285,10 +1285,16 @@ RegisterAllocation allocate_linear_scan(const Function& function) {
         for (VirtualRegister other = 0; other < function.register_count && safe; ++other) {
             if (std::binary_search(feeders.begin(), feeders.end(), other)) continue;
             const auto& location = allocation.locations[other];
-            if (location.kind == LocationKind::physical_register &&
-                location.physical == source_location.physical &&
-                segments_overlap(allocation.intervals[result], allocation.intervals[other]))
-                safe = false;
+            if (location.kind != LocationKind::physical_register ||
+                location.physical != source_location.physical)
+                continue;
+            for (const auto member : feeders) {
+                if (member < function.register_count &&
+                    segments_overlap(allocation.intervals[member], allocation.intervals[other])) {
+                    safe = false;
+                    break;
+                }
+            }
         }
         if (!safe) continue;
         for (const auto member : feeders) {

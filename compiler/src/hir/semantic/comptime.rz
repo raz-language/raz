@@ -2306,6 +2306,260 @@ fn hir_header_is_type_generic(HirBuilder&mut builder) -> bool {
     return type_generic;
 }
 
+fn hir_predeclare_skip_declaration(HirBuilder&mut builder) -> bool {
+    i64 brace_depth = 0;
+    i64 paren_depth = 0;
+    i64 bracket_depth = 0;
+    bool saw_body = false;
+
+    while (builder.current.kind != TokenKind::End) {
+        TokenKind kind = builder.current.kind;
+
+        if (kind == TokenKind::LeftBrace) {
+            brace_depth += 1;
+            saw_body = true;
+        } else if (kind == TokenKind::RightBrace) {
+            if (brace_depth <= 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            brace_depth -= 1;
+        } else if (kind == TokenKind::LeftParen) {
+            paren_depth += 1;
+        } else if (kind == TokenKind::RightParen && paren_depth > 0) {
+            paren_depth -= 1;
+        } else if (kind == TokenKind::LeftBracket) {
+            bracket_depth += 1;
+        } else if (kind == TokenKind::RightBracket && bracket_depth > 0) {
+            bracket_depth -= 1;
+        }
+
+        bool body_done = saw_body && kind == TokenKind::RightBrace && brace_depth == 0;
+        bool declaration_done =
+            !saw_body && kind == TokenKind::Semicolon &&
+            brace_depth == 0 && paren_depth == 0 && bracket_depth == 0;
+
+        hir_advance(builder);
+        if (body_done || declaration_done) {
+            return true;
+        }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_predeclare_struct_name(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 name_offset = builder.current.offset;
+    i64 name_length = builder.current.length;
+
+    hir_advance(builder);
+    if (builder.current.kind == TokenKind::Less) {
+        // Generic aggregate templates need their complete parameter metadata
+        // before instantiation, so their normal semantic declaration remains
+        // authoritative. Concrete aggregate names are the forward-reference
+        // problem this phase solves.
+        return hir_predeclare_skip_declaration(builder);
+    }
+    if (builder.module.struct_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+
+    i64 structure = builder.module.struct_count;
+
+    builder.module.struct_count += 1;
+    raz_compiler_rt_arena_set(builder.module.struct_name_offsets, structure, name_offset);
+    raz_compiler_rt_arena_set(builder.module.struct_name_lengths, structure, name_length);
+    // -1 is the explicit predeclaration marker. The real declaration replaces
+    // it with the field start while preserving this stable structure identity.
+    raz_compiler_rt_arena_set(builder.module.struct_field_starts, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_field_counts, structure, 0);
+    raz_compiler_rt_arena_set(builder.module.struct_drop_functions, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_clone_functions, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_generic_template_indices, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_generic_type_structs, structure, -1);
+    return hir_predeclare_skip_declaration(builder);
+}
+
+fn hir_predeclare_enum_body(HirBuilder&mut builder, i64 enumeration) -> bool {
+    i64 brace_depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+        TokenKind kind = builder.current.kind;
+
+        if (kind == TokenKind::LeftBrace) {
+            brace_depth += 1;
+        } else if (kind == TokenKind::RightBrace) {
+            if (brace_depth <= 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            brace_depth -= 1;
+        } else if (kind == TokenKind::LeftParen && brace_depth == 1) {
+            // Payload-bearing enums have aggregate ABI identity. Record this
+            // before earlier function signatures are lowered.
+            raz_compiler_rt_arena_set(builder.module.enum_has_payload, enumeration, 1);
+        }
+
+        bool done = kind == TokenKind::RightBrace && brace_depth == 0;
+
+        hir_advance(builder);
+        if (done) {
+            return true;
+        }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_predeclare_enum_name(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 name_offset = builder.current.offset;
+    i64 name_length = builder.current.length;
+
+    hir_advance(builder);
+    if (builder.current.kind == TokenKind::Less) {
+        return hir_predeclare_skip_declaration(builder);
+    }
+    if (builder.module.enum_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    if (hir_namespace_has_top_level_name(builder, name_offset, name_length)) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+
+    i64 enumeration = builder.module.enum_count;
+
+    builder.module.enum_count += 1;
+    raz_compiler_rt_arena_set(builder.module.enum_name_offsets, enumeration, name_offset);
+    raz_compiler_rt_arena_set(builder.module.enum_name_lengths, enumeration, name_length);
+    raz_compiler_rt_arena_set(builder.module.enum_member_starts, enumeration, -1);
+    raz_compiler_rt_arena_set(builder.module.enum_member_counts, enumeration, 0);
+    raz_compiler_rt_arena_set(builder.module.enum_has_payload, enumeration, 0);
+    raz_compiler_rt_arena_set(builder.module.enum_generic_template_indices, enumeration, -1);
+    return hir_predeclare_enum_body(builder, enumeration);
+}
+
+fn hir_predeclare_is_graph_directive(HirBuilder&mut builder) -> bool {
+    return
+        token_is_raz_package(&builder.scan.input, &builder.current) ||
+        token_is_raz_module(&builder.scan.input, &builder.current) ||
+        token_is_raz_dependency(&builder.scan.input, &builder.current) ||
+        token_is_namespace(&builder.scan.input, &builder.current) ||
+        token_is_import(&builder.scan.input, &builder.current);
+}
+
+fn hir_predeclare_aggregate_step(HirBuilder&mut builder) -> bool {
+    if (builder.current.kind == TokenKind::RightBrace && builder.namespace_scope_count > 0) {
+        i64 namespace_end = builder.current.offset;
+
+        hir_advance(builder);
+        return hir_pop_namespace(builder, namespace_end);
+    }
+
+    i64 saved_scan_offset = builder.scan.offset;
+    TokenKind saved_kind = builder.current.kind;
+    i64 saved_offset = builder.current.offset;
+    i64 saved_length = builder.current.length;
+
+    if (!hir_parse_pending_attributes(builder)) {
+        return false;
+    }
+
+    bool public_symbol = false;
+    bool private_symbol = false;
+
+    if (builder.current.kind == TokenKind::Identifier && token_is_public(&builder.scan.input, &builder.current)) {
+        public_symbol = true;
+        hir_advance(builder);
+    } else if (builder.current.kind == TokenKind::Identifier && token_is_private(&builder.scan.input, &builder.current)) {
+        private_symbol = true;
+        hir_advance(builder);
+    }
+    if (builder.current.kind == TokenKind::End) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 visibility = 0;
+
+    if (public_symbol) {
+        visibility = 1;
+    } else if (private_symbol) {
+        visibility = 2;
+    }
+    if (!hir_record_declaration_visibility(builder, builder.current.offset, visibility)) {
+        return false;
+    }
+
+    if (hir_predeclare_is_graph_directive(builder)) {
+        // Reuse the canonical package/module/namespace/import parser. Segment,
+        // import, dependency, and visibility insertion are replay-idempotent.
+        builder.scan.offset = saved_scan_offset;
+        init_token(&mut builder.current, saved_kind, saved_offset, saved_length);
+        return hir_skip_top_level_declaration(builder);
+    }
+    if (token_is_struct(&builder.scan.input, &builder.current)) {
+        bool parsed = hir_predeclare_struct_name(builder);
+        hir_clear_pending_attributes(builder);
+        return parsed;
+    }
+    if (token_is_enum(&builder.scan.input, &builder.current)) {
+        bool parsed = hir_predeclare_enum_name(builder);
+        hir_clear_pending_attributes(builder);
+        return parsed;
+    }
+
+    bool skipped = hir_predeclare_skip_declaration(builder);
+
+    hir_clear_pending_attributes(builder);
+    return skipped;
+}
+
+fn hir_predeclare_aggregate_graph(HirBuilder&mut builder, Source input) -> bool {
+    while (builder.current.kind != TokenKind::End) {
+        if (!hir_predeclare_aggregate_step(builder)) {
+            return false;
+        }
+    }
+    if (builder.namespace_scope_count != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    init_lexer(&mut builder.scan, input);
+    hir_advance(builder);
+    builder.current_namespace_hash = 0;
+    builder.current_package_hash = 0;
+    builder.current_module_id = 0;
+    builder.namespace_scope_count = 0;
+    builder.namespace_lookup_target_hash = -1;
+    builder.namespace_lookup_target_package_hash = -1;
+    hir_clear_pending_attributes(builder);
+    return true;
+}
+
 fn hir_skip_top_level_declaration(HirBuilder&mut builder) -> bool {
     if (!hir_parse_pending_attributes(builder)) {
         return false;
@@ -3343,7 +3597,7 @@ fn build_hir_with_check_hints(Source input, HirIncrementalCheckHints&mut hints, 
 
     init_hir_builder(&mut builder, input, out);
 
-    bool success = true;
+    bool success = hir_predeclare_aggregate_graph(&mut builder, input);
 
     // Phase 1 declares ordinary function signatures while parsing all other
     // top-level declarations normally. This mirrors the native frontend's

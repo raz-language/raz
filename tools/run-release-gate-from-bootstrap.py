@@ -35,7 +35,7 @@ def main() -> int:
     args = ap.parse_args()
 
     qualification = ROOT / 'target/bootstrap'
-    compiler = qualification / 'repro-1' / 'target' / args.bootstrap_profile / f'raz-compiler{EXE}'
+    compiler = qualification / 'repro-1' / 'target' / args.bootstrap_profile / 'bin' / f'raz-compiler{EXE}'
     if not compiler.is_file():
         raise SystemExit(f'release artifacts: self-hosted compiler not found: {compiler}')
 

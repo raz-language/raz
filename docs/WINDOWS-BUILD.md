@@ -57,4 +57,4 @@ target/bootstrap/
 └─ repro-2/        # only with --verify-reproducibility
 ```
 
-On Windows the normal final compiler is `target/bootstrap/repro-1/target/<profile>/raz-compiler.exe`. When `--verify-reproducibility` is requested, `repro-2` is the independent comparison generation rather than the everyday bootstrap artifact. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.
+On Windows the normal final compiler is `target/bootstrap/repro-1/target/<profile>/bin/raz-compiler.exe`. When `--verify-reproducibility` is requested, `repro-2` is the independent comparison generation rather than the everyday bootstrap artifact. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.

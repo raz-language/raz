@@ -43,7 +43,7 @@ checks = {
     'Windows fallback filters foreign LIB paths': 'windows_native_library_environment' in build_driver and 'lower.find("strawberry")' in build_driver and 'lower.find("mingw")' in build_driver and 'lower.find("msys")' in build_driver,
     'Forge bridge fallback filters foreign LIB paths': 'windows_native_library_environment' in forge_bridge and 'execute_windows_msvc_fallback' in forge_bridge,
     'ObLink fallback sees native_link_command declaration': build_driver.find('std::string native_link_command(const std::vector<std::filesystem::path>& inputs,') < build_driver.find('bool execute_native_link_command('),
-    'self-host artifacts stay under bootstrap qualification target': 'self_host_dir = qualification / "repro-1"' in bootstrap and 'stage_target = self_host_dir / "target" / args.bootstrap_profile' in bootstrap and 'obj = stage_target / f"compiler{OBJ}"' in bootstrap and 'self_host_compiler = stage_target / f"raz-compiler{EXE}"' in bootstrap,
+    'self-host artifacts stay under canonical bootstrap target layout': 'self_host_dir = qualification / "repro-1"' in bootstrap and 'stage_layout = ensure_profile_output_layout(self_host_dir, args.bootstrap_profile)' in bootstrap and 'obj = stage_layout["obj"] / f"raz-compiler{OBJ}"' in bootstrap and 'self_host_compiler = stage_layout["bin"] / f"raz-compiler{EXE}"' in bootstrap,
     'CMake debug preset lives under build': '${sourceDir}/build/debug' in presets,
     'CMake release preset lives under build': '${sourceDir}/build/release' in presets,
     'ObLink parses Microsoft short import objects': 'parse_import_object' in oblink_link and '0xffffU' in oblink_link,

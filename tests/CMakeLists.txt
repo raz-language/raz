@@ -1748,6 +1748,10 @@ add_test(NAME raz-bootstrap-fixed-point
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-bootstrap-fixed-point.py)
 set_tests_properties(raz-bootstrap-fixed-point PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
 
+add_test(NAME raz-bootstrap-target-layout
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-bootstrap-target-layout.py)
+set_tests_properties(raz-bootstrap-target-layout PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
 add_test(NAME raz-compiler-trait-solver
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-compiler-trait-solver.py
     --raz $<TARGET_FILE:raz_host>

@@ -11,6 +11,7 @@
 
 #include "forge/codegen/aarch64/encoder.hpp"
 #include "forge/codegen/aarch64/register_allocation.hpp"
+#include "forge/target/aarch64_immediate.hpp"
 #include "forge/ir/parser.hpp"
 #include "forge/ir/verifier.hpp"
 #include "forge/machine/lower.hpp"
@@ -26,6 +27,22 @@ void check(bool condition, const char* message) {
 }
 
 int main() {
+    {
+        const auto and64 = forge::target::encode_aarch64_logical_immediate(0xffU, 64U);
+        const auto or64 = forge::target::encode_aarch64_logical_immediate(0xff00U, 64U);
+        const auto xor64 = forge::target::encode_aarch64_logical_immediate(0x0fU, 64U);
+        const auto and32 = forge::target::encode_aarch64_logical_immediate(0xffU, 32U);
+        check(and64 && and64->n == 1U && and64->immr == 0U && and64->imms == 7U,
+              "AArch64 logical immediate encodes #0xff for 64-bit AND");
+        check(or64 && or64->n == 1U && or64->immr == 56U && or64->imms == 7U,
+              "AArch64 logical immediate encodes #0xff00 for 64-bit ORR");
+        check(xor64 && xor64->n == 1U && xor64->immr == 0U && xor64->imms == 3U,
+              "AArch64 logical immediate encodes #0xf for 64-bit EOR");
+        check(and32 && and32->n == 0U && and32->immr == 0U && and32->imms == 7U,
+              "AArch64 logical immediate encodes #0xff for 32-bit AND");
+        check(!forge::target::encode_aarch64_logical_immediate(0x12345U, 64U),
+              "AArch64 logical immediate rejects a non-bitmask constant");
+    }
     const std::string source = R"(
 module @a64_codegen {
   global @counter: i64 = 7
@@ -157,7 +174,15 @@ module @a64_immediates {
     %seven = const i64 7
     %subtracted = sub i64 %shifted %seven
     %selected = select i64 %less %subtracted %shifted
-    return %selected
+    %mask = const i64 255
+    %masked = and i64 %selected %mask
+    %or_mask = const i64 65280
+    %ored = or i64 %masked %or_mask
+    %xor_mask = const i64 15
+    %xored = xor i64 %ored %xor_mask
+    %illegal_mask = const i64 74565
+    %kept = and i64 %xored %illegal_mask
+    return %kept
   }
 }
 )";
@@ -170,22 +195,256 @@ module @a64_immediates {
         if (immediate_lowered.ok()) {
             bool saw_immediate = false;
             bool saw_compare_immediate = false;
+            std::size_t logical_immediate_count = 0U;
+            bool saw_illegal_logical_register = false;
             for (const auto& block : immediate_lowered.module->functions.front().blocks) {
                 for (const auto& instruction : block.instructions) {
                     saw_immediate = saw_immediate || instruction.symbol == "$imm";
                     saw_compare_immediate = saw_compare_immediate || instruction.symbol == "$cmpimm";
+                    if ((instruction.opcode == forge::machine::Opcode::and_i64 ||
+                         instruction.opcode == forge::machine::Opcode::or_i64 ||
+                         instruction.opcode == forge::machine::Opcode::xor_i64) &&
+                        instruction.symbol == "$imm")
+                        ++logical_immediate_count;
+                    saw_illegal_logical_register = saw_illegal_logical_register ||
+                        (instruction.opcode == forge::machine::Opcode::and_i64 &&
+                         instruction.symbol != "$imm");
                 }
             }
             check(saw_immediate, "AArch64 lowering selects arithmetic/shift immediate pseudos");
             check(saw_compare_immediate, "AArch64 lowering selects compare immediate pseudos");
+            check(logical_immediate_count == 3U,
+                  "AArch64 lowering selects all legal AND/OR/XOR logical immediates");
+            check(saw_illegal_logical_register,
+                  "AArch64 lowering leaves a non-encodable logical mask in a register");
             auto immediate_encoded = forge::codegen::aarch64::encode(*immediate_lowered.module);
             check(immediate_encoded.ok(), "AArch64 immediate-selected function encodes");
             if (immediate_encoded.ok() && !immediate_encoded.functions.empty()) {
                 const auto& stats = immediate_encoded.functions.front();
-                check(stats.immediate_form_count >= 4U,
-                      "AArch64 encoder emits native add/sub/shift/cmp immediate forms");
-                check(stats.elided_dead_constant_count >= 4U,
-                      "folded AArch64 constants are not materialized into registers");
+                check(stats.immediate_form_count >= 7U,
+                      "AArch64 encoder emits native arithmetic/shift/cmp/logical immediate forms");
+                check(stats.elided_dead_constant_count >= 7U,
+                      "AArch64 constants folded into immediate forms are not materialized into registers");
+            }
+        }
+    }
+
+
+    const std::string aggregate_boundary_source = R"(
+module @a64_aggregate_boundary {
+  struct @Trio32 { a: i32, b: i32, c: i32 }
+  struct @Hfa3 { a: f32, b: f32, c: f32 }
+  extern c func @take_trio(%x0: i64, %x1: i64, %x2: i64, %x3: i64, %x4: i64, %x5: i64, %x6: i64, %value: owned struct @Trio32, %tail: i64) -> i64
+  extern c func @take_hfa(%v0: f32, %v1: f32, %v2: f32, %v3: f32, %v4: f32, %v5: f32, %v6: f32, %value: owned struct @Hfa3, %tail: f32) -> f32
+
+  func @call_trio(%x0: i64, %x1: i64, %x2: i64, %x3: i64, %x4: i64, %x5: i64, %x6: i64, %tail: i64) -> i64 {
+  entry:
+    %value = stack.alloc.struct ptr @Trio32
+    %result = call i64 @take_trio(%x0, %x1, %x2, %x3, %x4, %x5, %x6, %value, %tail)
+    return %result
+  }
+
+  func @call_hfa(%v0: f32, %v1: f32, %v2: f32, %v3: f32, %v4: f32, %v5: f32, %v6: f32, %tail: f32) -> f32 {
+  entry:
+    %value = stack.alloc.struct ptr @Hfa3
+    %result = call f32 @take_hfa(%v0, %v1, %v2, %v3, %v4, %v5, %v6, %value, %tail)
+    return %result
+  }
+}
+)";
+    auto aggregate_boundary_parsed = forge::ir::parse_module(aggregate_boundary_source);
+    check(aggregate_boundary_parsed.ok(), "AAPCS64 aggregate-boundary IR parses");
+    if (aggregate_boundary_parsed.ok()) {
+        check(forge::ir::verify_module(*aggregate_boundary_parsed.module).empty(),
+              "AAPCS64 aggregate-boundary IR verifies");
+        auto aggregate_boundary_lowered = forge::machine::lower_module(
+            *aggregate_boundary_parsed.module, {forge::machine::TargetArchitecture::aarch64});
+        check(aggregate_boundary_lowered.ok(), "AAPCS64 aggregate-boundary IR lowers");
+        if (aggregate_boundary_lowered.ok()) {
+            const auto* trio_call = static_cast<const forge::machine::Instruction*>(nullptr);
+            const auto* hfa_call = static_cast<const forge::machine::Instruction*>(nullptr);
+            for (const auto& function : aggregate_boundary_lowered.module->functions) {
+                for (const auto& block : function.blocks) {
+                    for (const auto& instruction : block.instructions) {
+                        if (instruction.symbol == "take_trio") trio_call = &instruction;
+                        if (instruction.symbol == "take_hfa") hfa_call = &instruction;
+                    }
+                }
+            }
+            check(trio_call != nullptr && trio_call->argument_group_sizes.size() == trio_call->inputs.size(),
+                  "AAPCS64 direct composite call retains argument-group metadata");
+            if (trio_call) {
+                check(trio_call->inputs.size() == 10U && trio_call->argument_group_sizes[7] == 2U &&
+                      trio_call->argument_group_sizes[8] == 0U && trio_call->argument_group_sizes[9] == 1U,
+                      "AAPCS64 12-byte composite remains one two-piece machine argument");
+            }
+            check(hfa_call != nullptr && hfa_call->argument_group_sizes.size() == hfa_call->inputs.size(),
+                  "AAPCS64 HFA call retains argument-group metadata");
+            if (hfa_call) {
+                check(hfa_call->inputs.size() == 11U && hfa_call->argument_group_sizes[7] == 3U &&
+                      hfa_call->argument_group_sizes[8] == 0U && hfa_call->argument_group_sizes[9] == 0U &&
+                      hfa_call->argument_group_sizes[10] == 1U,
+                      "AAPCS64 three-member HFA remains one three-piece machine argument");
+            }
+
+            auto aggregate_boundary_encoded = forge::codegen::aarch64::encode(*aggregate_boundary_lowered.module);
+            check(aggregate_boundary_encoded.ok(), "AAPCS64 aggregate-boundary functions encode");
+            if (aggregate_boundary_encoded.ok()) {
+                const auto find_function = [&](const char* name) -> const forge::codegen::aarch64::EncodedFunction* {
+                    const auto it = std::find_if(aggregate_boundary_encoded.functions.begin(),
+                                                 aggregate_boundary_encoded.functions.end(),
+                        [&](const auto& function) { return function.name == name; });
+                    return it == aggregate_boundary_encoded.functions.end() ? nullptr : &*it;
+                };
+                const auto* trio = find_function("call_trio");
+                const auto* hfa = find_function("call_hfa");
+                check(trio != nullptr && trio->abi_register_argument_count == 7U &&
+                      trio->abi_stack_argument_count == 3U,
+                      "AAPCS64 does not split a two-piece composite across x7 and the stack");
+                check(hfa != nullptr && hfa->abi_register_argument_count == 7U &&
+                      hfa->abi_stack_argument_count == 4U,
+                      "AAPCS64 does not split a three-member HFA across v7 and the stack");
+            }
+        }
+    }
+
+    const std::string variadic_source = R"(
+module @a64_variadic {
+  extern variadic c func @variadic_sink(%fixed: i64) -> i64
+  variadic c signature @VariadicCallback(%fixed: i64) -> i64
+  func @call_variadic(%fixed: i64, %single: f32, %wide: f64, %tail: i64) -> i64 {
+  entry:
+    %result = call i64 @variadic_sink(%fixed, %single, %wide, %tail)
+    return %result
+  }
+  func @call_variadic_indirect(%target: ptr, %fixed: i64, %single: f32, %wide: f64, %tail: i64) -> i64 {
+  entry:
+    %result = call.indirect i64 %target as @VariadicCallback(%fixed, %single, %wide, %tail)
+    return %result
+  }
+}
+)";
+    auto variadic_parsed = forge::ir::parse_module(variadic_source);
+    check(variadic_parsed.ok(), "AArch64 variadic IR parses");
+    if (variadic_parsed.ok()) {
+        check(forge::ir::verify_module(*variadic_parsed.module).empty(),
+              "AArch64 variadic IR verifies");
+        auto variadic_lowered = forge::machine::lower_module(
+            *variadic_parsed.module, {forge::machine::TargetArchitecture::aarch64});
+        check(variadic_lowered.ok(), "AArch64 variadic IR lowers");
+        if (variadic_lowered.ok()) {
+            const auto& function = variadic_lowered.module->functions.front();
+            const forge::machine::Instruction* call = nullptr;
+            std::size_t float_extensions = 0U;
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode == forge::machine::Opcode::float_extend) ++float_extensions;
+                    if (instruction.symbol == "variadic_sink") call = &instruction;
+                }
+            }
+            check(call != nullptr && call->variadic_call && call->variadic_named_input_count == 1U,
+                  "AArch64 variadic lowering preserves the named/anonymous boundary");
+            check(float_extensions == 1U,
+                  "C variadic lowering promotes an anonymous f32 argument to f64");
+            if (call && call->inputs.size() == 4U) {
+                const auto promoted = call->inputs[1];
+                check(promoted < function.register_widths.size() && function.register_widths[promoted] == 8U &&
+                      promoted < function.register_classes.size() &&
+                      function.register_classes[promoted] == forge::machine::RegisterClass::floating,
+                      "C variadic f32 promotion reaches the call as an eight-byte FP value");
+            } else {
+                check(false, "AArch64 variadic call keeps four machine arguments");
+            }
+
+            const auto& indirect_function = variadic_lowered.module->functions[1];
+            const forge::machine::Instruction* indirect_call = nullptr;
+            std::size_t indirect_float_extensions = 0U;
+            for (const auto& block : indirect_function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode == forge::machine::Opcode::float_extend) ++indirect_float_extensions;
+                    if (instruction.opcode == forge::machine::Opcode::call_indirect_i64) indirect_call = &instruction;
+                }
+            }
+            check(indirect_call != nullptr && indirect_call->variadic_call &&
+                  indirect_call->variadic_named_input_count == 1U && indirect_call->inputs.size() == 5U,
+                  "typed indirect variadic lowering preserves the named/anonymous boundary");
+            check(indirect_float_extensions == 1U,
+                  "typed indirect C variadic lowering promotes anonymous f32 to f64");
+
+            auto generic_variadic = forge::codegen::aarch64::encode(
+                *variadic_lowered.module, forge::codegen::aarch64::Abi::aapcs64);
+            check(generic_variadic.ok(), "generic AAPCS64 variadic call encodes");
+            if (generic_variadic.ok() && generic_variadic.functions.size() == 2U) {
+                check(generic_variadic.functions[0].abi_register_argument_count == 4U &&
+                      generic_variadic.functions[0].abi_stack_argument_count == 0U,
+                      "generic AAPCS64 keeps variadic scalar arguments in available registers");
+                check(generic_variadic.functions[1].abi_register_argument_count == 4U &&
+                      generic_variadic.functions[1].abi_stack_argument_count == 0U,
+                      "generic AAPCS64 keeps typed indirect variadic arguments in available registers");
+            }
+
+            auto darwin_variadic = forge::codegen::aarch64::encode(
+                *variadic_lowered.module, forge::codegen::aarch64::Abi::darwin);
+            check(darwin_variadic.ok(), "Darwin arm64 variadic call encodes");
+            if (darwin_variadic.ok() && darwin_variadic.functions.size() == 2U) {
+                check(darwin_variadic.functions[0].abi_register_argument_count == 1U &&
+                      darwin_variadic.functions[0].abi_stack_argument_count == 3U,
+                      "Darwin arm64 places every anonymous variadic argument on the stack");
+                check(darwin_variadic.functions[1].abi_register_argument_count == 1U &&
+                      darwin_variadic.functions[1].abi_stack_argument_count == 3U,
+                      "Darwin arm64 stacks the typed-indirect anonymous variadic tail");
+            }
+        }
+    }
+
+    const std::string darwin_stack_source = R"(
+module @a64_darwin_stack {
+  extern c func @narrow11(%a0: i8, %a1: i8, %a2: i8, %a3: i8, %a4: i8, %a5: i8, %a6: i8, %a7: i8, %a8: i8, %a9: i8, %a10: i8) -> i32
+  func @call_narrow11(%a0: i8, %a1: i8, %a2: i8, %a3: i8, %a4: i8, %a5: i8, %a6: i8, %a7: i8, %a8: i8, %a9: i8, %a10: i8) -> i32 {
+  entry:
+    %result = call i32 @narrow11(%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7, %a8, %a9, %a10)
+    return %result
+  }
+}
+)";
+    auto darwin_stack_parsed = forge::ir::parse_module(darwin_stack_source);
+    check(darwin_stack_parsed.ok(), "Darwin narrow-stack IR parses");
+    if (darwin_stack_parsed.ok()) {
+        check(forge::ir::verify_module(*darwin_stack_parsed.module).empty(),
+              "Darwin narrow-stack IR verifies");
+        auto darwin_stack_lowered = forge::machine::lower_module(
+            *darwin_stack_parsed.module, {forge::machine::TargetArchitecture::aarch64});
+        check(darwin_stack_lowered.ok(), "Darwin narrow-stack IR lowers");
+        if (darwin_stack_lowered.ok()) {
+            const auto& function = darwin_stack_lowered.module->functions.front();
+            check(function.argument_widths.size() == 11U &&
+                  std::all_of(function.argument_widths.begin(), function.argument_widths.end(),
+                              [](std::uint8_t width) { return width == 1U; }),
+                  "AArch64 lowering retains one-byte ABI widths for i8 parameters");
+            const forge::machine::Instruction* call = nullptr;
+            for (const auto& block : function.blocks)
+                for (const auto& instruction : block.instructions)
+                    if (instruction.symbol == "narrow11") call = &instruction;
+            check(call != nullptr && call->argument_widths.size() == call->inputs.size() &&
+                  std::all_of(call->argument_widths.begin(), call->argument_widths.end(),
+                              [](std::uint8_t width) { return width == 1U; }),
+                  "AArch64 call lowering retains one-byte ABI widths for fixed i8 arguments");
+
+            auto generic_stack = forge::codegen::aarch64::encode(
+                *darwin_stack_lowered.module, forge::codegen::aarch64::Abi::aapcs64);
+            auto darwin_stack = forge::codegen::aarch64::encode(
+                *darwin_stack_lowered.module, forge::codegen::aarch64::Abi::darwin);
+            check(generic_stack.ok() && darwin_stack.ok(),
+                  "generic and Darwin narrow-stack calls encode");
+            if (generic_stack.ok() && darwin_stack.ok() &&
+                !generic_stack.functions.empty() && !darwin_stack.functions.empty()) {
+                check(generic_stack.functions.front().abi_stack_argument_count == 3U &&
+                      darwin_stack.functions.front().abi_stack_argument_count == 3U,
+                      "both AArch64 ABIs spill three i8 arguments after x0-x7");
+                check(generic_stack.functions.front().abi_outgoing_stack_bytes == 32U,
+                      "generic AAPCS64 rounds three narrow stack arguments to 8-byte slots");
+                check(darwin_stack.functions.front().abi_outgoing_stack_bytes == 16U,
+                      "Darwin arm64 tightly packs three fixed i8 stack arguments before final SP alignment");
             }
         }
     }

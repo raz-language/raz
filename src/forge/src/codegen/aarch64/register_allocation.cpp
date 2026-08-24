@@ -37,6 +37,16 @@ ValueBank value_bank(const machine::Function& function, machine::VirtualRegister
     return ValueBank::integer;
 }
 
+bool vector_register_eligible(const machine::Function& function, machine::VirtualRegister reg) noexcept {
+    if (value_bank(function, reg) != ValueBank::vector) return true;
+    const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{16U};
+    // AArch64's architectural SIMD register is 128 bits wide. Forge represents
+    // v256/v512 values as one logical virtual register, so those values need a
+    // multi-Q stack home until the machine IR grows an explicit register-tuple
+    // representation.
+    return width <= 16U;
+}
+
 std::uint16_t spill_size(const machine::Function& function, machine::VirtualRegister reg) noexcept {
     if (value_bank(function, reg) != ValueBank::vector) return 8U;
     const auto width = reg < function.register_widths.size() ? function.register_widths[reg] : std::uint8_t{16U};
@@ -57,7 +67,7 @@ bool is_call(machine::Opcode opcode) noexcept {
     switch (opcode) {
     case machine::Opcode::call_i32: case machine::Opcode::call_i64:
     case machine::Opcode::call_f32: case machine::Opcode::call_f64:
-    case machine::Opcode::call_void: case machine::Opcode::call_aggregate:
+    case machine::Opcode::call_void: case machine::Opcode::call_aggregate: case machine::Opcode::load_tls_address:
     case machine::Opcode::call_indirect_i32: case machine::Opcode::call_indirect_i64:
     case machine::Opcode::call_indirect_f32: case machine::Opcode::call_indirect_f64:
     case machine::Opcode::call_indirect_void: return true;
@@ -169,6 +179,10 @@ RegisterAllocation allocate_registers(const machine::Function& function) {
         if (incoming.use_count == 0U && reg < dead_constant_candidate.size() && dead_constant_candidate[reg])
             continue;
         const auto bank = value_bank(function, reg);
+        if (bank == ValueBank::vector && !vector_register_eligible(function, reg)) {
+            spill(reg);
+            continue;
+        }
         if (bank == ValueBank::vector && vector_crosses_call[reg]) {
             spill(reg);
             continue;
@@ -271,6 +285,7 @@ RegisterAllocation allocate_registers(const machine::Function& function) {
         auto& location = allocation.locations[reg];
         if (location.kind != AllocationKind::stack_slot || allocation.intervals[reg].use_count == 0U) continue;
         const auto bank = value_bank(function, reg);
+        if (bank == ValueBank::vector && !vector_register_eligible(function, reg)) continue;
         if (bank == ValueBank::vector && vector_crosses_call[reg]) continue;
         const auto kind = bank == ValueBank::integer ? AllocationKind::integer_register :
                           bank == ValueBank::floating ? AllocationKind::floating_register :
@@ -354,6 +369,8 @@ RegisterAllocation allocate_registers(const machine::Function& function) {
             allocation.locations[owner].spill_offset = color.offset;
     }
     allocation.spill_slot_count = static_cast<std::uint32_t>(colors.size());
+    allocation.spill_slot_sizes.reserve(colors.size());
+    for (const auto& color : colors) allocation.spill_slot_sizes.push_back(color.size);
     allocation.reused_spill_slot_count = allocation.spilled_value_count > allocation.spill_slot_count
         ? allocation.spilled_value_count - allocation.spill_slot_count : 0U;
     allocation.spill_bytes = align_up(cursor, 16U);

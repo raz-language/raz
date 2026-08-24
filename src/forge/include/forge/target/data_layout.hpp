@@ -54,6 +54,10 @@ public:
     Endianness endianness{Endianness::little};
 
     [[nodiscard]] static DataLayout host() noexcept;
+    [[nodiscard]] constexpr bool is_valid() const noexcept {
+        return is_power_of_two(pointer_size) && is_power_of_two(pointer_alignment) &&
+               pointer_alignment <= pointer_size;
+    }
     [[nodiscard]] std::optional<std::size_t> size_of(ir::Type type) const noexcept;
     [[nodiscard]] std::optional<std::size_t> alignment_of(ir::Type type) const noexcept;
 

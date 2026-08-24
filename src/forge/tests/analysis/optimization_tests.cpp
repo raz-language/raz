@@ -125,6 +125,102 @@ dead:
         }
 
 
+        // Comparison operations carry their operand type in textual Forge IR,
+        // but their SSA result is always i1.  Any pass that folds a comparison
+        // to `const` must therefore retag the operation as i1; otherwise a
+        // subsequent branch/return sees an invalid integer-width result.  This
+        // was exposed by the Raz self-host compiler at -O2.
+        constexpr auto comparison_fold_source = R"(module @comparison_fold {
+func @sccp_compare() -> i1 {
+entry:
+  %one = const i64 1
+  %zero = const i64 0
+  %different = cmp.ne i64 %one %zero
+  return %different
+}
+func @algebraic_compare(%value: i64) -> i1 {
+entry:
+  %same = cmp.eq i64 %value %value
+  return %same
+}
+})";
+        {
+            auto comparison_fold = forge::ir::parse_module(comparison_fold_source);
+            require(comparison_fold.ok(), "comparison-fold fixture failed to parse");
+            auto& sccp_candidate = comparison_fold.module->functions()[0];
+            forge::analysis::FunctionAnalysisManager sccp_analyses(sccp_candidate);
+            forge::transforms::SparseConditionalConstantPropagationPass sccp;
+            require(sccp.run(sccp_candidate, sccp_analyses).changed,
+                    "SCCP did not fold constant comparison");
+            auto& algebraic_candidate = comparison_fold.module->functions()[1];
+            forge::analysis::FunctionAnalysisManager algebraic_analyses(algebraic_candidate);
+            forge::transforms::AlgebraicSimplificationPass algebraic;
+            require(algebraic.run(algebraic_candidate, algebraic_analyses).changed,
+                    "algebraic simplification did not fold same-value comparison");
+            const auto optimized = forge::ir::print_module(*comparison_fold.module);
+            require(optimized.find("%different = const i1 1") != std::string::npos,
+                    "SCCP comparison fold lost i1 result type");
+            require(optimized.find("%same = const i1 1") != std::string::npos,
+                    "algebraic comparison fold lost i1 result type");
+            const auto verification = forge::ir::verify_module(*comparison_fold.module);
+            require(verification.empty(), "comparison folding produced invalid IR");
+        }
+
+
+
+        // SCCP must conservatively classify unmodelled result-producing
+        // operations as overdefined even when their textual operand vector has
+        // length two.  A one-argument call is represented as {callee, arg}; an
+        // older evaluator accidentally treated that shape like a binary scalar
+        // expression, left the result at lattice bottom, and then allowed a
+        // constant from another executable block-parameter edge to dominate the
+        // meet.  The resulting -O2 IR pruned the live success path in Raz's
+        // project output-path preparation.
+        constexpr auto opaque_call_phi_source = R"(module @opaque_call_phi {
+extern func @opaque(%x: i64) -> i64
+func @preserve_dynamic_edge(%choose: i1) -> i64 {
+entry:
+  %zero = const i64 0
+  %one = const i64 1
+  branch %choose, first(), second()
+first:
+  jump join(%one)
+second:
+  %value = call i64 @opaque(%one)
+  %iszero = cmp.eq i64 %value %zero
+  %dynamic = select i64 %iszero %one %zero
+  jump join(%dynamic)
+join(%flag: i64):
+  %failed = cmp.ne i64 %flag %zero
+  branch %failed, failure(), success()
+failure:
+  return %zero
+success:
+  return %one
+}
+})";
+        {
+            auto opaque_call_phi = forge::ir::parse_module(opaque_call_phi_source);
+            require(opaque_call_phi.ok(), "opaque-call SCCP fixture failed to parse");
+            forge::pass::PassManager opaque_call_pipeline;
+            opaque_call_pipeline.add<forge::transforms::SparseConditionalConstantPropagationPass>()
+                                .add<forge::transforms::AlgebraicSimplificationPass>()
+                                .add<forge::transforms::CopyPropagationPass>()
+                                .add<forge::transforms::DeadCodeEliminationPass>()
+                                .add<forge::transforms::SparseConditionalConstantPropagationPass>()
+                                .add<forge::transforms::SimplifyCFGPass>();
+            (void)opaque_call_pipeline.run(*opaque_call_phi.module);
+            const auto optimized = forge::ir::print_module(*opaque_call_phi.module);
+            require(optimized.find("call i64 @opaque") != std::string::npos,
+                    "SCCP incorrectly discarded dynamic call path");
+            require(optimized.find("failure") != std::string::npos &&
+                        optimized.find("success") != std::string::npos,
+                    "SCCP incorrectly constant-folded block parameter fed by opaque call");
+            const auto verification = forge::ir::verify_module(*opaque_call_phi.module);
+            require(verification.empty(), "opaque-call SCCP regression produced invalid IR");
+        }
+
+
         // Edge-sensitive SCCP regression: the entry choice is dynamic, so both
         // left and right blocks are executable.  The right block nevertheless
         // has a constant-false edge to `impossible`, which means only `left`

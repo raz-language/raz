@@ -25,7 +25,7 @@ def main() -> int:
     parser.add_argument("--baseline-dir", type=Path)
     args = parser.parse_args()
 
-    compiler = ROOT / "target/bootstrap/repro-1/target" / args.bootstrap_profile / f"raz-compiler{EXE}"
+    compiler = ROOT / "target/bootstrap/repro-1/target" / args.bootstrap_profile / "bin" / f"raz-compiler{EXE}"
     if not compiler.is_file():
         raise SystemExit(f"performance artifacts: self-hosted compiler not found: {compiler}")
     args.output_dir.mkdir(parents=True, exist_ok=True)

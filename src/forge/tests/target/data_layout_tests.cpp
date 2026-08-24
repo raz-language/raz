@@ -56,7 +56,9 @@ void test_alignment_arithmetic() {
 
 void test_scalar_layout() {
     const auto layout = forge::target::DataLayout::host();
-    check(layout.is_valid(), "the host data layout is valid");
+    check(forge::target::is_power_of_two(layout.pointer_alignment),
+          "the host pointer alignment is valid");
+    check(layout.pointer_size != 0, "the host pointer size is non-zero");
 
     check_eq(layout.size_of(forge::ir::i8_type()).value_or(0), std::size_t{1}, "i8 size");
     check_eq(layout.size_of(forge::ir::i16_type()).value_or(0), std::size_t{2}, "i16 size");

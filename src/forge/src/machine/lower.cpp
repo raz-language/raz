@@ -219,6 +219,29 @@ unsigned integer_width(ir::Type type) {
     default: return 0;
     }
 }
+
+std::uint8_t abi_scalar_width(ir::Type type) noexcept {
+    switch (type.kind()) {
+    case ir::TypeKind::i1:
+    case ir::TypeKind::i8: return 1U;
+    case ir::TypeKind::i16: return 2U;
+    case ir::TypeKind::i32:
+    case ir::TypeKind::f32: return 4U;
+    case ir::TypeKind::i64:
+    case ir::TypeKind::f64:
+    case ir::TypeKind::ptr: return 8U;
+    case ir::TypeKind::void_: return 0U;
+    }
+    return 0U;
+}
+
+bool uses_c_variadic_promotions(const ir::Function& function) noexcept {
+    if (!function.variadic) return false;
+    return function.calling_convention == ir::CallingConvention::c ||
+           function.calling_convention == ir::CallingConvention::platform ||
+           function.calling_convention == ir::CallingConvention::system_v ||
+           function.calling_convention == ir::CallingConvention::windows_x64;
+}
 }
 
 LowerResult lower_module(const ir::Module& source, LowerOptions options) {
@@ -352,6 +375,8 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
             if (!direct_native_return) {
                 lowered.argument_widths.push_back(8U);
                 lowered.argument_classes.push_back(RegisterClass::integer);
+                lowered.argument_group_sizes.push_back(1U);
+                lowered.argument_group_alignments.push_back(8U);
             }
         }
         for (std::size_t parameter_index = 0; parameter_index < function.parameters.size(); ++parameter_index) {
@@ -371,15 +396,22 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                 // register classes; otherwise Result<f64, E> can incorrectly
                 // consume an XMM argument slot while the callee expects a pointer.
                 if (aggregate_parameters[parameter_index].direct) {
+                    const auto group_alignment = static_cast<std::uint8_t>(classified->alignment >= 16U ? 16U : 8U);
                     for (std::size_t piece = 0; piece < classified->register_count; ++piece) {
-                        lowered.argument_widths.push_back(8U);
+                        const auto width = piece < classified->piece_widths.size() && classified->piece_widths[piece] != 0U
+                            ? classified->piece_widths[piece] : std::uint8_t{8};
+                        lowered.argument_widths.push_back(width);
                         lowered.argument_classes.push_back(abi_register_class(classified->classes[piece]));
+                        lowered.argument_group_sizes.push_back(piece == 0U ? classified->register_count : 0U);
+                        lowered.argument_group_alignments.push_back(piece == 0U ? group_alignment : 0U);
                     }
                     continue;
                 }
             }
-            lowered.argument_widths.push_back(parameter.type == ir::Type(ir::TypeKind::f64) || parameter.type == ir::Type(ir::TypeKind::i64) || parameter.type == ir::Type(ir::TypeKind::ptr) ? 8U : 4U);
+            lowered.argument_widths.push_back(abi_scalar_width(parameter.type));
             lowered.argument_classes.push_back(parameter.type.is_float() ? RegisterClass::floating : RegisterClass::integer);
+            lowered.argument_group_sizes.push_back(1U);
+            lowered.argument_group_alignments.push_back(abi_scalar_width(parameter.type));
         }
         if (failed) continue;
         lowered.argument_count = static_cast<std::uint32_t>(lowered.argument_widths.size());
@@ -527,13 +559,14 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                     const auto width = aggregate.classification.piece_widths[piece] == 0U
                         ? std::uint8_t{8} : aggregate.classification.piece_widths[piece];
                     const auto value_type = floating && width == 4U ? ir::Type(ir::TypeKind::f32)
-                        : floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64);
+                        : floating ? ir::Type(ir::TypeKind::f64)
+                        : width == 4U ? ir::Type(ir::TypeKind::i32) : ir::Type(ir::TypeKind::i64);
                     const auto value = allocate_register(value_type);
                     entry.instructions.push_back({floating ? (width == 4U ? Opcode::load_argument_f32 : Opcode::load_argument_f64)
-                                                                : Opcode::load_argument_i64,
+                                                                : (width == 4U ? Opcode::load_argument : Opcode::load_argument_i64),
                         value, {}, 0, argument_index++, {}, {}});
                     entry.instructions.push_back({floating ? (width == 4U ? Opcode::store_ptr_f32 : Opcode::store_ptr_f64)
-                                                               : Opcode::store_ptr_i64,
+                                                               : (width == 4U ? Opcode::store_ptr_i32 : Opcode::store_ptr_i64),
                         0, {value, destination}, static_cast<std::int64_t>(piece_offset), 0, {}, {}});
                     piece_offset += width;
                 }
@@ -598,6 +631,25 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
             const auto block_index = lowering_order[lowering_index];
             const auto& block = function.blocks[block_index];
             auto& machine_block = lowered.blocks[block_index];
+            // Most aggregate address operations stay as zero-cost static frame
+            // addresses so field/array folding does not consume virtual registers.
+            // Materialize one only when an ordinary SSA consumer actually needs
+            // a pointer value. Cache that vreg for subsequent consumers.
+            const auto resolve_input_register = [&](const std::string& operand, VirtualRegister& value) -> bool {
+                if (const auto found = registers.find(operand); found != registers.end()) {
+                    value = found->second;
+                    return true;
+                }
+                if (const auto address = addresses.find(operand); address != addresses.end()) {
+                    value = allocate_register(ir::Type(ir::TypeKind::ptr));
+                    machine_block.instructions.push_back({Opcode::load_stack_address, value, {},
+                        -static_cast<std::int64_t>(address->second.object_base + address->second.object_size - address->second.offset), 0, {}, {}});
+                    registers.emplace(operand, value);
+                    return true;
+                }
+                error(result.diagnostics, "undefined lowering operand '" + operand + "' in @" + function.name);
+                return false;
+            };
             const auto append_control_successors = [&](const ir::Operation& operation, Instruction& target_instruction) -> bool {
                 for (std::size_t successor_index = 0; successor_index < operation.successors.size(); ++successor_index) {
                     const auto target_lookup = block_indices.find(operation.successors[successor_index]);
@@ -779,6 +831,19 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                             instruction.inputs.push_back(target_register->second);
 
                             const auto append_indirect_arguments = [&](std::size_t first_argument) -> bool {
+                                const auto argument_input_begin = instruction.inputs.size();
+                                instruction.variadic_call = signature.variadic;
+                                std::size_t named_input_count = 0U;
+                                const auto append_indirect_scalar = [&](VirtualRegister value, std::uint8_t width) {
+                                    const auto start = instruction.inputs.size();
+                                    instruction.inputs.push_back(value);
+                                    instruction.argument_group_sizes.resize(instruction.inputs.size(), 0U);
+                                    instruction.argument_group_alignments.resize(instruction.inputs.size(), 0U);
+                                    instruction.argument_widths.resize(instruction.inputs.size(), 0U);
+                                    instruction.argument_group_sizes[start] = 1U;
+                                    instruction.argument_group_alignments[start] = std::max<std::uint8_t>(width, 1U);
+                                    instruction.argument_widths[start] = width;
+                                };
                                 const auto argument_count = operation.operands.size() - first_argument;
                                 for (std::size_t index = 0; index < argument_count; ++index) {
                                     const auto& operand = operation.operands[first_argument + index];
@@ -794,9 +859,27 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                         machine_block.instructions.push_back({Opcode::load_stack_address, materialized_source, {},
                                             -static_cast<std::int64_t>(address->second.object_base + address->second.object_size - address->second.offset), 0, {}, {}});
                                     }
-                                    const auto source_register = source_it == registers.end() ? materialized_source : source_it->second;
+                                    auto source_register = source_it == registers.end() ? materialized_source : source_it->second;
+                                    const bool anonymous_variadic = signature.variadic && index >= signature.parameters.size();
+                                    const auto type_it = value_types.find(operand);
+                                    auto argument_width = source_it == registers.end() ? std::uint8_t{8}
+                                        : type_it != value_types.end() ? abi_scalar_width(type_it->second) : std::uint8_t{8};
+                                    if (anonymous_variadic && uses_c_variadic_promotions(signature)) {
+                                        if (type_it != value_types.end() && type_it->second == ir::Type(ir::TypeKind::f32)) {
+                                            const auto promoted = allocate_register(ir::Type(ir::TypeKind::f64));
+                                            machine_block.instructions.push_back({Opcode::float_extend, promoted, {source_register}, 0, 0, {}, {}});
+                                            source_register = promoted;
+                                            argument_width = 8U;
+                                        } else if (argument_width < 4U) {
+                                            argument_width = 4U;
+                                        }
+                                    }
                                     if (index >= signature.parameters.size() || !signature.parameters[index].owned) {
-                                        instruction.inputs.push_back(source_register);
+                                        if (index < signature.parameters.size() && !signature.parameters[index].is_aggregate())
+                                            argument_width = abi_scalar_width(signature.parameters[index].type);
+                                        append_indirect_scalar(source_register, argument_width);
+                                        if (index < signature.parameters.size())
+                                            named_input_count = instruction.inputs.size() - argument_input_begin;
                                         continue;
                                     }
                                     const auto& parameter = signature.parameters[index];
@@ -816,8 +899,11 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                     const auto count = allocate_register(ir::Type(ir::TypeKind::i64));
                                     machine_block.instructions.push_back({Opcode::load_immediate_i64, count, {}, static_cast<std::int64_t>(size_it->second), 0, {}, {}});
                                     machine_block.instructions.push_back({Opcode::call_void, 0, {destination, source_register, count}, 0, 0, "__forge_memmove", {}});
-                                    instruction.inputs.push_back(destination);
+                                    append_indirect_scalar(destination, 8U);
+                                    named_input_count = instruction.inputs.size() - argument_input_begin;
                                 }
+                                if (instruction.variadic_call)
+                                    instruction.variadic_named_input_count = static_cast<std::uint32_t>(named_input_count);
                                 return true;
                             };
 
@@ -839,8 +925,17 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                     machine_block.instructions.push_back({Opcode::load_stack_address, destination, {}, -static_cast<std::int64_t>(base + allocated), 0, {}, {}});
                                     instruction.opcode = Opcode::call_indirect_void;
                                     instruction.inputs.push_back(destination);
-                                    if (function_native_abi(signature, target_architecture) == target::NativeAbi::aapcs64)
+                                    if (function_native_abi(signature, target_architecture) == target::NativeAbi::aapcs64) {
                                         instruction.indirect_result = true;
+                                    } else {
+                                        // SysV/Win64 indirect aggregate returns pass the hidden
+                                        // destination pointer as the first ordinary ABI argument.
+                                        // Slot zero is the indirect function target, so retain
+                                        // metadata for the hidden sret pointer at slot one.
+                                        instruction.argument_group_sizes = {0U, 1U};
+                                        instruction.argument_group_alignments = {0U, 8U};
+                                        instruction.argument_widths = {0U, 8U};
+                                    }
                                     failed = !append_indirect_arguments(2);
                                 }
                             } else {
@@ -869,6 +964,22 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                     }
                 } else if (operation.opcode == "call") {
                     const auto append_call_arguments = [&](Instruction& call_instruction, const ir::Function* target) -> bool {
+                        const auto argument_input_begin = call_instruction.inputs.size();
+                        call_instruction.variadic_call = target != nullptr && target->variadic;
+                        std::size_t named_input_count = 0U;
+                        const auto mark_argument_group = [&](std::size_t start, std::size_t count, std::uint8_t alignment) {
+                            call_instruction.argument_group_sizes.resize(call_instruction.inputs.size(), 0U);
+                            call_instruction.argument_group_alignments.resize(call_instruction.inputs.size(), 0U);
+                            call_instruction.argument_widths.resize(call_instruction.inputs.size(), 0U);
+                            call_instruction.argument_group_sizes[start] = static_cast<std::uint8_t>(count);
+                            call_instruction.argument_group_alignments[start] = alignment;
+                        };
+                        const auto append_scalar_argument = [&](VirtualRegister value, std::uint8_t width) {
+                            const auto start = call_instruction.inputs.size();
+                            call_instruction.inputs.push_back(value);
+                            mark_argument_group(start, 1U, std::max<std::uint8_t>(width, 1U));
+                            call_instruction.argument_widths[start] = width;
+                        };
                         const auto argument_count = operation.operands.size() - 1U;
                         for (std::size_t index = 0; index < argument_count; ++index) {
                             const auto& operand = operation.operands[index + 1U];
@@ -884,7 +995,26 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                 machine_block.instructions.push_back({Opcode::load_stack_address, materialized_source, {},
                                     -static_cast<std::int64_t>(address->second.object_base + address->second.object_size - address->second.offset), 0, {}, {}});
                             }
-                            const auto source_register = source_it == registers.end() ? materialized_source : source_it->second;
+                            auto source_register = source_it == registers.end() ? materialized_source : source_it->second;
+                            const bool anonymous_variadic = target != nullptr && target->variadic &&
+                                index >= target->parameters.size();
+                            const auto type_it = value_types.find(operand);
+                            auto argument_width = source_it == registers.end() ? std::uint8_t{8}
+                                : type_it != value_types.end() ? abi_scalar_width(type_it->second) : std::uint8_t{8};
+                            if (anonymous_variadic && uses_c_variadic_promotions(*target)) {
+                                if (type_it != value_types.end() && type_it->second == ir::Type(ir::TypeKind::f32)) {
+                                    const auto promoted = allocate_register(ir::Type(ir::TypeKind::f64));
+                                    machine_block.instructions.push_back({Opcode::float_extend, promoted, {source_register}, 0, 0, {}, {}});
+                                    source_register = promoted;
+                                    argument_width = 8U;
+                                } else if (argument_width < 4U) {
+                                    // Forge integer types are bit-vectors rather than signed
+                                    // source-language types. i1/i8/i16 values are already
+                                    // canonical in a 32-bit vreg, so the C integer promotion
+                                    // only changes the ABI storage width here.
+                                    argument_width = 4U;
+                                }
+                            }
                             if (target && index < target->parameters.size() && target->parameters[index].is_aggregate()) {
                                 const auto& aggregate_parameter = target->parameters[index];
                                 const auto classified = target::classify_aggregate(source, aggregate_parameter.aggregate_kind,
@@ -894,25 +1024,36 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                     return false;
                                 }
                                 if (uses_native_aggregate_abi(*target) && classified->register_passed()) {
+                                    const auto group_start = call_instruction.inputs.size();
                                     std::uint32_t piece_offset = 0;
                                     for (std::size_t piece = 0; piece < classified->register_count; ++piece) {
                                         const bool floating = classified->classes[piece] == target::AbiValueClass::sse;
                                         const auto width = classified->piece_widths[piece] == 0U
                                             ? std::uint8_t{8} : classified->piece_widths[piece];
                                         const auto value_type = floating && width == 4U ? ir::Type(ir::TypeKind::f32)
-                                            : floating ? ir::Type(ir::TypeKind::f64) : ir::Type(ir::TypeKind::i64);
+                                            : floating ? ir::Type(ir::TypeKind::f64)
+                                            : width == 4U ? ir::Type(ir::TypeKind::i32) : ir::Type(ir::TypeKind::i64);
                                         const auto value = allocate_register(value_type);
                                         machine_block.instructions.push_back({floating ? (width == 4U ? Opcode::load_ptr_f32 : Opcode::load_ptr_f64)
-                                                                                  : Opcode::load_ptr_i64,
+                                                                                  : (width == 4U ? Opcode::load_ptr_i32 : Opcode::load_ptr_i64),
                                             value, {source_register}, static_cast<std::int64_t>(piece_offset), 0, {}, {}});
                                         call_instruction.inputs.push_back(value);
+                                        call_instruction.argument_widths.resize(call_instruction.inputs.size(), 0U);
+                                        call_instruction.argument_widths.back() = width;
                                         piece_offset += width;
                                     }
+                                    mark_argument_group(group_start, classified->register_count,
+                                        static_cast<std::uint8_t>(classified->alignment >= 16U ? 16U : 8U));
+                                    named_input_count = call_instruction.inputs.size() - argument_input_begin;
                                     continue;
                                 }
                             }
                             if (!target || index >= target->parameters.size() || !target->parameters[index].owned) {
-                                call_instruction.inputs.push_back(source_register);
+                                if (target && index < target->parameters.size() && !target->parameters[index].is_aggregate())
+                                    argument_width = abi_scalar_width(target->parameters[index].type);
+                                append_scalar_argument(source_register, argument_width);
+                                if (target && index < target->parameters.size())
+                                    named_input_count = call_instruction.inputs.size() - argument_input_begin;
                                 continue;
                             }
                             const auto& parameter = target->parameters[index];
@@ -932,8 +1073,12 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                             const auto count = allocate_register(ir::Type(ir::TypeKind::i64));
                             machine_block.instructions.push_back({Opcode::load_immediate_i64, count, {}, static_cast<std::int64_t>(size_it->second), 0, {}, {}});
                             machine_block.instructions.push_back({Opcode::call_void, 0, {destination, source_register, count}, 0, 0, "__forge_memmove", {}});
-                            call_instruction.inputs.push_back(destination);
+                            append_scalar_argument(destination, 8U);
+                            if (target && index < target->parameters.size())
+                                named_input_count = call_instruction.inputs.size() - argument_input_begin;
                         }
+                        if (call_instruction.variadic_call)
+                            call_instruction.variadic_named_input_count = static_cast<std::uint32_t>(named_input_count);
                         return true;
                     };
                     if (operation.operands.empty() || !operation.operands.front().starts_with("@")) {
@@ -966,6 +1111,14 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                                 instruction.argument_index = encode_aggregate_return(*return_classification);
                             } else if (function_native_abi(target, target_architecture) == target::NativeAbi::aapcs64) {
                                 instruction.indirect_result = true;
+                            } else {
+                                // SysV/Win64 lower an indirect aggregate return as the first
+                                // ordinary machine argument. Preserve that hidden sret pointer
+                                // as an argument group so later AAPCS64-oriented group
+                                // verification does not mistake the prefix for missing metadata.
+                                instruction.argument_group_sizes = {1U};
+                                instruction.argument_group_alignments = {8U};
+                                instruction.argument_widths = {8U};
                             }
                             failed = !append_call_arguments(instruction, &target);
                         }
@@ -1415,7 +1568,14 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                         failed = true;
                     }
                     if (!failed && instruction.opcode != Opcode::load_immediate && instruction.opcode != Opcode::load_immediate_i64 && instruction.opcode != Opcode::load_immediate_f32 && instruction.opcode != Opcode::load_immediate_f64) {
-                        if (!append_inputs(operation, registers, instruction, result.diagnostics, function.name)) failed = true;
+                        for (const auto& operand : operation.operands) {
+                            VirtualRegister input{};
+                            if (!resolve_input_register(operand, input)) {
+                                failed = true;
+                                break;
+                            }
+                            instruction.inputs.push_back(input);
+                        }
 
                         // x86-64 performs i8/i16 scalar arithmetic in 32-bit registers.  The
                         // low bits already preserve wrapping add/sub/mul/bitwise semantics, but

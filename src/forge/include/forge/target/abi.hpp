@@ -14,7 +14,7 @@
 
 namespace forge::target {
 
-enum class NativeAbi : std::uint8_t { system_v_x86_64, windows_x64, aapcs64 };
+enum class NativeAbi : std::uint8_t { system_v_x86_64, windows_x64, aapcs64, darwin_arm64 };
 enum class AbiValueClass : std::uint8_t { integer, sse, memory, indirect };
 
 [[nodiscard]] constexpr std::string_view abi_value_class_name(AbiValueClass value) noexcept {
