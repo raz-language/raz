@@ -63,7 +63,8 @@ require("src/bootstrap/compiler/backend/forge/forge_bridge.cpp", "std::filesyste
 require("src/bootstrap/CMakeLists.txt", 'RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>"', "bridge runtime path")
 require("compiler/src/raz_driver/src/cli.rz", "fn cli_release_option(", "release option")
 require("docs/CLI.md", "target/debug/bin/<package>", "CLI native artifact docs")
-require("docs/CLI.md", "These artifact-category directories are **lazy**", "CLI lazy artifact directory contract")
+require("docs/CLI.md", "A normal modular Forge executable build therefore materializes `bin/` and `packages/`", "CLI modular Forge artifact layout")
+require("docs/CLI.md", "does **not** create an empty `obj/`", "CLI lazy obj fallback contract")
 require("docs/GETTING-STARTED.md", "target/debug/bin/hello.exe", "getting-started Windows artifact docs")
 
 require("src/bootstrap/tools/raz/detail/cli_options.hpp", 'std::string target = "host";', "implicit host target default")
