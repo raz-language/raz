@@ -4,10 +4,10 @@
 
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-cfg = (root/'compiler/src/backend/wasm/cfg.rz').read_text()
-codegen = (root/'compiler/src/backend/wasm/codegen.rz').read_text()
-writer = (root/'compiler/src/backend/wasm/writer.rz').read_text()
-memory = (root/'compiler/src/backend/wasm/memory.rz').read_text()
+cfg = (root/'compiler/src/raz_codegen_wasm/src/wasm/cfg.rz').read_text()
+codegen = (root/'compiler/src/raz_codegen_wasm/src/wasm/codegen.rz').read_text()
+writer = (root/'compiler/src/raz_codegen_wasm/src/wasm/writer.rz').read_text()
+memory = (root/'compiler/src/raz_codegen_wasm/src/wasm/memory.rz').read_text()
 checks = {
     'linear fast path classifier': 'fn wasm_function_can_emit_linear' in cfg,
     'table demand classifier': 'fn wasm_module_needs_table' in cfg,

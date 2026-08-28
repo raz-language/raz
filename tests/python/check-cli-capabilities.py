@@ -29,26 +29,24 @@ def main() -> int:
     ns = ap.parse_args()
     root = Path(ns.root).resolve()
     work = Path(ns.work).resolve()
-    project = work / 'compiler'
     shutil.rmtree(work, ignore_errors=True)
-    shutil.copytree(root / 'compiler', project)
+    work.mkdir(parents=True)
     env = os.environ.copy()
     env['RAZ_LINKER'] = ns.linker
-    run([ns.raz, 'build', str(project), '--profile', 'debug', '--force'], cwd=root, env=env)
-    compiler = project / 'target' / 'debug' / ('raz-compiler.exe' if os.name == 'nt' else 'raz-compiler')
+    compiler = Path(ns.raz).resolve()
     if not compiler.is_file():
         raise RuntimeError(f'missing production compiler: {compiler}')
 
     general = run([str(compiler), '--help'], cwd=work, env=env).stdout
-    require(general, 'Commands:', 'build', 'forge', 'llvm', '--backend=forge', '--backend=llvm', '--llvm', '--forge')
+    require(general, 'Compiler commands:', 'build', 'forge', 'llvm', '--backend=forge|llvm|wasm|rxe', 'Toolchain commands:')
     llvm_help = run([str(compiler), 'llvm', '--help'], cwd=work, env=env).stdout
     require(llvm_help, '--emit=llvm', '--emit=obj', '--emit=exe', '--target=<triple>', '--cpu=<name>', '--features=<a,b,...>', '--linker=<driver>')
     backends = run([str(compiler), 'backends'], cwd=work, env=env).stdout
     require(backends, 'forge', 'llvm', 'built-in')
     targets = run([str(compiler), 'targets'], cwd=work, env=env).stdout
-    require(targets, 'Forge native:', 'LLVM native:', 'x86_64-pc-windows-msvc', 'aarch64-unknown-linux-gnu', 'arm64-apple-macos')
+    require(targets, 'Forge native/object:', 'LLVM native:', 'x86_64-pc-windows-msvc', 'aarch64-unknown-linux-gnu', 'arm64-apple-macos')
     doctor = run([str(compiler), 'doctor'], cwd=work, env=env).stdout
-    require(doctor, 'Raz compiler', 'Forge backend', 'LLVM backend', 'Host:')
+    require(doctor, 'Raz compiler', 'Forge backend', 'Linker (ObLink)', 'Raz toolchain is ready')
     version = run([str(compiler), '--version'], cwd=work, env=env).stdout
     require(version, 'raz 1.0.0', 'Forge backend: built-in', 'LLVM IR emitter: built-in', 'LLVM toolchain: external clang/clang++')
 

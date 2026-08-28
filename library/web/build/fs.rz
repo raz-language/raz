@@ -1,0 +1,83 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::build::fs;
+
+import alloc::string;
+
+// Build-time host primitives used only while Raz executes the static page
+// generator. They are deliberately isolated from web::std, which is the
+// browser/WASM standard library.
+extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;
+extern fn raz_rt_file_open(usize path, i64 length, i64 flags) -> usize;
+extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_file_close(usize handle);
+extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_remove_one(usize path, i64 length) -> i64;
+
+const i64 write_flag = 2;
+const i64 append_flag = 4;
+const i64 create_flag = 8;
+const i64 truncate_flag = 16;
+
+fn separator(i64 value) -> bool {
+    return value == 47 || value == 92;
+}
+
+public fn create_dir_all(usize path, i64 length) -> bool {
+    if (path == 0 || length <= 0) { return false; }
+    i64 start = 0;
+    i64 index = 0;
+    while (index <= length) {
+        bool boundary = index == length;
+        if (!boundary) { boundary = separator(raz_rt_load_u8(path + index)); }
+        if (boundary && index > start) {
+            i64 status = raz_rt_create_dir_one(path, index);
+            if (status < 0) { return false; }
+            start = index + 1;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn write_string(String& path, String& value) -> bool {
+    usize handle = raz_rt_file_open(path.as_ptr(), path.len(), write_flag | create_flag | truncate_flag);
+    if (handle == 0) { return false; }
+    i64 written = 0;
+    while (written < value.len()) {
+        i64 count = raz_rt_file_write(handle, value.as_ptr() + written, value.len() - written);
+        if (count <= 0) {
+            raz_rt_file_close(handle);
+            return false;
+        }
+        written += count;
+    }
+    raz_rt_file_close(handle);
+    return true;
+}
+
+/// Appends generated metadata without truncating earlier route contributions.
+/// Used for compiler-private web build manifests such as browser event roots.
+public fn append_string(String& path, String& value) -> bool {
+    usize handle = raz_rt_file_open(path.as_ptr(), path.len(), write_flag | create_flag | append_flag);
+    if (handle == 0) { return false; }
+    i64 written = 0;
+    while (written < value.len()) {
+        i64 count = raz_rt_file_write(handle, value.as_ptr() + written, value.len() - written);
+        if (count <= 0) {
+            raz_rt_file_close(handle);
+            return false;
+        }
+        written += count;
+    }
+    raz_rt_file_close(handle);
+    return true;
+}
+
+/// Removes one generated file when present. Missing files are already clean and
+/// therefore count as success. This is intentionally non-recursive: the compiler
+/// owns dist/ lifecycle while the page writer only replaces sibling artifacts.
+public fn remove_file_if_present(String& path) -> bool {
+    return raz_rt_remove_one(path.as_ptr(), path.len()) >= 0;
+}

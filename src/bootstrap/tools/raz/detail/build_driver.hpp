@@ -2010,10 +2010,25 @@ void collect_dependency_semantics(const ProjectGraph& graph, const Options& opti
   deduplicate_preserving_order(declarations);
 }
 
-void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Options& options,
-                                           std::ofstream& output) {
+void write_namespaced_dependency_semantics_impl(
+    const ProjectGraph& graph, const Options& options, std::ofstream& output,
+    std::set<std::filesystem::path>& emitted_packages) {
   for (const auto& dependency : graph.dependencies) {
-    write_namespaced_dependency_semantics(dependency, options, output);
+    // Dependency graphs are not trees. A package can be reachable through more
+    // than one edge (for example backend -> frontend and backend -> middle ->
+    // frontend). Materialize a dependency package's semantic namespaces once,
+    // otherwise the semantic analyzer sees every declaration in that package
+    // twice and reports duplicate top-level declarations.
+    const auto canonical = std::filesystem::weakly_canonical(dependency.manifest.root);
+    if (emitted_packages.contains(canonical)) continue;
+
+    // Emit transitive prerequisites first so imports inside this dependency's
+    // interfaces can resolve in the single-pass semantic analyzer. Mark the
+    // package only after its prerequisites have been walked; cycles are already
+    // rejected by project discovery, so this preserves a stable topological view.
+    write_namespaced_dependency_semantics_impl(dependency, options, output, emitted_packages);
+    if (!emitted_packages.insert(canonical).second) continue;
+
     const auto module_root = project_module_root(dependency, options);
     for (const auto& dependency_module : dependency.modules) {
       const auto interface_path = module_root / (sanitize(dependency_module.logical_name) + ".dmi");
@@ -2025,6 +2040,12 @@ void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Opti
       output << "}\n";
     }
   }
+}
+
+void write_namespaced_dependency_semantics(const ProjectGraph& graph, const Options& options,
+                                           std::ofstream& output) {
+  std::set<std::filesystem::path> emitted_packages;
+  write_namespaced_dependency_semantics_impl(graph, options, output, emitted_packages);
 }
 
 void write_local_semantic_module(const ProjectGraph& graph,

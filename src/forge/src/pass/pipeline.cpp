@@ -77,26 +77,12 @@ void build_standard_pipeline(PassManager& pipeline, OptimizationLevel level) {
     }
 
     if (level == OptimizationLevel::o3) {
-        pipeline.add<transforms::SparseConditionalConstantPropagationPass>()
-                .add<transforms::LoopReductionPass>()
-                .add<transforms::LoopInvariantGuardHoistingPass>()
-                .add<transforms::ConstantTripLoopUnrollPass>()
-                .add<transforms::LoopInvariantCodeMotionPass>()
-                .add<transforms::CommonSubexpressionEliminationPass>()
-                .add<transforms::ScalarStackPromotionPass>()
-                .add<transforms::MergeParameterSimplificationPass>()
-                .add<transforms::MemoryForwardingPass>()
-                .add<transforms::DeadStoreEliminationPass>()
-                .add<transforms::IfConversionPass>()
-                .add<transforms::MergeParameterSimplificationPass>()
-                .add<transforms::SparseConditionalConstantPropagationPass>()
-                .add<transforms::AlgebraicSimplificationPass>()
-                .add<transforms::CommonSubexpressionEliminationPass>()
-                .add<transforms::CopyPropagationPass>()
-                .add<transforms::DeadCodeEliminationPass>()
-                .add<transforms::BranchThreadingPass>()
-                .add<transforms::SimplifyCFGPass>()
-                .add<transforms::ScalarCleanupFixpointPass>();
+        // Correctness guard: the common O2 pipeline above is the current
+        // production-safe baseline. Extra O3 transforms are re-enabled only
+        // after their aggregate/reference semantics pass RivetKV and compiler
+        // self-host stress coverage. O3 must never trade language semantics
+        // for optimization strength.
+        return;
     }
 }
 } // namespace forge::pass

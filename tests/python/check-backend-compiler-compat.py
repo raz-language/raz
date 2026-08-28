@@ -105,11 +105,11 @@ wasm_codegen = SRC / "backend" / "wasm" / "codegen.rz"
 wasm_text = module_text.get(wasm_codegen, "")
 if re.search(r"raz_rt_write_ascii_i64\s*\(\s*&mut\s+output_path", wasm_text, re.S):
     failures.append(
-        "compiler/src/backend/wasm/codegen.rz: output_path is an arena handle; use raz_compiler_rt_write_ascii instead of borrowing the handle variable"
+        "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz: output_path is an arena handle; use raz_compiler_rt_write_ascii instead of borrowing the handle variable"
     )
 if "raz_compiler_rt_write_ascii(" not in wasm_text:
     failures.append(
-        "compiler/src/backend/wasm/codegen.rz: expected canonical raz_compiler_rt_write_ascii output path"
+        "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz: expected canonical raz_compiler_rt_write_ascii output path"
     )
 
 # Calls to compiler-defined helpers must resolve through the module's explicit

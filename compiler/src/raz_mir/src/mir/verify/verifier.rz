@@ -1,0 +1,57 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir::verify::verifier;
+
+public import raz_mir::analysis::cfg;
+
+fn verify_mir_cfg(MirModule& mir) -> bool {
+    MirCfg cfg;
+
+    if (!build_mir_cfg(mir, &mut cfg)) {
+        return false;
+    }
+    destroy_mir_cfg(&mut cfg);
+    return true;
+}
+
+// Backend-neutral structural verification. Ownership/dataflow verification is
+// intentionally layered on top of this foundation rather than encoded in backends.
+public fn verify_mir_structure(MirModule& mir) -> bool {
+    if (mir.function_count < 0 || mir.instruction_count < 0 || mir.global_count < 0) {
+        return false;
+    }
+    if (
+        mir.function_instruction_starts == 0 ||
+        mir.function_instruction_counts == 0 ||
+        mir.opcodes == 0 ||
+        mir.op_types == 0 ||
+        mir.op_a == 0 ||
+        mir.op_b == 0 ||
+        mir.op_c == 0 ||
+        mir.op_d == 0
+    ) {
+        return false;
+    }
+
+    i64 function_index = 0;
+    i64 previous_end = 0;
+
+    while (function_index < mir.function_count) {
+        i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+        i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+
+        if (start < 0 || count < 0 || start + count > mir.instruction_count) {
+            return false;
+        }
+        if (function_index > 0 && start < previous_end) {
+            return false;
+        }
+        previous_end = start + count;
+        function_index += 1;
+    }
+    if (mir.call_argument_count < 0 || mir.call_argument_count > 524288) {
+        return false;
+    }
+    return verify_mir_cfg(mir);
+}

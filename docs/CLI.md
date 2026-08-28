@@ -68,7 +68,7 @@ arguments that begin with `-` are preserved exactly. Direct-source interpreter
 runs (`raz run file.rz`) do not create a child process and therefore reject a
 post-separator argv; use a package/native run when the program needs arguments.
 
-For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug executables go to `target/debug/bin/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/bin/<package>`. Native objects live under `target/<profile>/obj/`, static/shared libraries under `target/<profile>/lib/`, backend IR under `target/<profile>/ir/`, semantic module metadata under `target/<profile>/modules/`, and distributable package archives under `target/<profile>/packages/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
+For a project build with no explicit output path, `raz build` emits a native executable rather than Forge IR. Debug executables go to `target/debug/bin/<package>` (`.exe` on Windows), while `raz build --release` writes `target/release/bin/<package>`. Native objects live under `target/<profile>/obj/`, static/shared libraries under `target/<profile>/lib/`, backend IR under `target/<profile>/ir/`, semantic module metadata under `target/<profile>/modules/`, and distributable package archives under `target/<profile>/packages/`. These artifact-category directories are **lazy**: Raz creates a category only when that command actually writes an artifact into it. A normal Forge executable build therefore materializes `bin/` and `obj/`; an LLVM executable build materializes `bin/`; `raz pack` materializes `release/packages/`; and empty `ir/`, `lib/`, `modules/`, or `packages/` directories are not left behind. `raz check` needs no profile artifact tree and normally writes only incremental state under `target/cache/`. Supplying an explicit output continues to honor that output for compiler/bootstrap workflows, and `raz forge` remains the explicit way to request `.fir` output.
 
 
 ## C interoperability
@@ -98,7 +98,7 @@ Use `raz forge --help` or `raz llvm --help` for backend-specific target, optimiz
 ## Project commands
 
 ```text
-raz new <name>
+raz new <name> [--web]
 raz init [path]
 raz clean
 raz fmt [--check] [file-or-directory]
@@ -353,3 +353,19 @@ The JSON form uses the `raz-diagnostic-catalog-v1` schema and is suitable for ID
 `raz vendor` materializes the exact registry and pinned Git dependency graph from `raz.lock` into `vendor/` and writes `.raz-vendor`. While the marker is present, normal builds resolve registry packages from `vendor/registry/<checksum>` and Git materializations from `vendor/git/` without consulting the network or the global package store. `raz vendor --check` verifies the vendored registry tree against lockfile checksums and confirms every tracked Git dependency is present. Re-run `raz vendor` after `raz update`.
 
 `raz pack` writes its default `.dpk` to `target/release/packages/`; pass an explicit path to override it.
+
+
+## Web projects
+
+Create a static-first Raz web project with:
+
+```text
+raz new my-site --web
+cd my-site
+raz dev
+raz build --release
+```
+
+`raz dev` serves `dist/`, watches the project, debounces changes, and rebuilds through the same incremental compiler graph used by `raz build`. A successful CSS-only rebuild hot-refreshes stylesheets without discarding browser state; structural, JavaScript, or Wasm changes trigger a normal reload. Failed builds preserve the last successful bundle and show a browser error banner until the project builds again. The compatibility text endpoint `/__raz/status` remains available, while `/__raz/status.json` reports the build version, failure state, last rebuild duration, and reload kind for development tooling. Unknown extensionless paths fall back to the application shell for History API routing.
+
+The release build writes ordinary deployable files to `dist/`. The compatibility spelling `raz new my-site --target web` is also accepted.

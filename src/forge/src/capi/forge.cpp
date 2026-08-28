@@ -18,7 +18,7 @@
 #include "forge/object/macho.hpp"
 #include "forge/object/incremental.hpp"
 #include "forge/pass/pipeline.hpp"
-#include "forge/target/abi.hpp"
+#include "forge/platform/abi.hpp"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -122,13 +122,13 @@ forge::pass::OptimizationLevel optimization_level_of(forge_optimization_level_t 
     using forge::pass::OptimizationLevel;
     switch (value) {
     case FORGE_OPT_O0: return OptimizationLevel::o0;
-    case FORGE_OPT_O1: return OptimizationLevel::o1;
-    case FORGE_OPT_O2: return OptimizationLevel::o2;
-    case FORGE_OPT_O3: return OptimizationLevel::o3;
+    case FORGE_OPT_O1: return forge::pass::OptimizationLevel::o1;
+    case FORGE_OPT_O2: return forge::pass::OptimizationLevel::o2;
+    case FORGE_OPT_O3: return forge::pass::OptimizationLevel::o3;
     case FORGE_OPT_OS: return OptimizationLevel::os;
     case FORGE_OPT_OZ: return OptimizationLevel::oz;
     }
-    return OptimizationLevel::o2;
+    return forge::pass::OptimizationLevel::o2;
 }
 
 size_t copy_text(std::string_view text, char* output, size_t capacity) {
@@ -649,7 +649,19 @@ int forge_module_optimize(forge_module_t* module, forge_optimization_level_t lev
             return 0;
         }
         forge::pass::PassManager pipeline;
-        forge::pass::build_standard_pipeline(pipeline, optimization_level_of(level));
+        auto effective_level = optimization_level_of(level);
+        // Very large whole-program modules can become dramatically slower in native
+        // lowering after the full O2 scalar pipeline expands/promotes large compiler
+        // functions. Keep O2/O3 semantics, but use the compile-time-oriented O1 IR
+        // cleanup once the module is compiler-sized. Ordinary applications retain the
+        // full requested optimization pipeline. Machine lowering/optimization still
+        // runs normally after this IR cleanup tier.
+        constexpr std::size_t kLargeModuleFunctionThreshold = 1024;
+        if ((effective_level == forge::pass::OptimizationLevel::o2 || effective_level == forge::pass::OptimizationLevel::o3) &&
+            module->value->functions().size() >= kLargeModuleFunctionThreshold) {
+            effective_level = forge::pass::OptimizationLevel::o1;
+        }
+        forge::pass::build_standard_pipeline(pipeline, effective_level);
         // The C API already verifies the complete module immediately before and
         // after the optimization pipeline. Verifying the whole module after
         // every function pass makes compiler-sized modules effectively O(F^2)

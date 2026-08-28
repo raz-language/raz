@@ -1,0 +1,429 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_web::codegen;
+
+public import forge::writer;
+public import wasm::codegen;
+
+
+extern fn raz_rt_file_size(usize path, i64 length) -> i64;
+
+fn web_path_dirname(i64 path, i64 length, i64 output, i64 capacity) -> i64 {
+    if (path == 0 || output == 0 || length <= 0 || capacity <= 0) { return -1; }
+    i64 end = length;
+    while (
+        end > 0 &&
+        raz_compiler_rt_arena_get(path, end - 1) != 47 &&
+        raz_compiler_rt_arena_get(path, end - 1) != 92
+    ) {
+        end -= 1;
+    }
+    if (end == 0) {
+        raz_compiler_rt_arena_set(output, 0, 46);
+        return 1;
+    }
+    i64 count = end - 1;
+    if (count <= 0) { count = 1; }
+    if (count > capacity) { return -1; }
+    i64 i = 0;
+    while (i < count) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(path, i));
+        i += 1;
+    }
+    return count;
+}
+
+fn web_path_join(i64 left, i64 left_length, i64 right, i64 right_length, i64 output, i64 capacity) -> i64 {
+    if (left == 0 || right == 0 || output == 0 || left_length <= 0 || right_length <= 0) { return -1; }
+    bool slash = raz_compiler_rt_arena_get(left, left_length - 1) != 47 && raz_compiler_rt_arena_get(left, left_length - 1) != 92;
+    i64 needed = left_length + right_length;
+    if (slash) { needed += 1; }
+    if (needed > capacity) { return -1; }
+    i64 i = 0;
+    while (i < left_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(left, i));
+        i += 1;
+    }
+    i64 cursor = left_length;
+    if (slash) {
+        raz_compiler_rt_arena_set(output, cursor, 47);
+        cursor += 1;
+    }
+    i = 0;
+    while (i < right_length) {
+        raz_compiler_rt_arena_set(output, cursor + i, raz_compiler_rt_arena_get(right, i));
+        i += 1;
+    }
+    return cursor + right_length;
+}
+
+fn web_create_dir_ascii(i64 path, i64 path_length) -> i64 {
+    usize bytes = compiler_ascii_pack(path, 0, path_length);
+    if (path_length > 0 && bytes == 0) { return -1; }
+    i64 result = raz_rt_create_dir_one(bytes, path_length);
+    if (bytes != 0) { raz_rt_dealloc_aligned(bytes, 8); }
+    // Existing directories are success for artifact emission.
+    if (result == 1 || result == 0) { return 0; }
+    return result;
+}
+
+// Web is an application target of Raz, not a separate language or a fifth code backend.
+// It deliberately reuses the normal frontend, HIR, MIR, optimizer, and Wasm backend;
+// this module owns only browser bundle emission and the thin browser host boundary.
+
+fn web_copy_literal(i64 output, i64 capacity, string text) -> i64 {
+    if (output == 0 || capacity <= 0) { return -1; }
+    i64 length = compiler_literal_length(text);
+    if (length > capacity) { return -1; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    return length;
+}
+
+fn web_join_literal(i64 left, i64 left_length, string right_text, i64 output, i64 capacity) -> i64 {
+    i64 right_length = compiler_literal_length(right_text);
+    i64 right = raz_compiler_rt_arena_create(right_length);
+    if (right == 0) { return -1; }
+    i64 copied = web_copy_literal(right, right_length, right_text);
+    if (copied != right_length) {
+        raz_compiler_rt_arena_destroy(right);
+        return -1;
+    }
+    i64 result = web_path_join(left, left_length, right, right_length, output, capacity);
+    raz_compiler_rt_arena_destroy(right);
+    return result;
+}
+
+fn web_writer_html_escaped_arena(ForgeWriter&mut out, i64 data, i64 length) {
+    i64 i = 0;
+    while (i < length) {
+        i64 value = raz_compiler_rt_arena_get(data, i);
+        if (value == 38) { writer_literal(out, "&amp;"); }
+        else if (value == 60) { writer_literal(out, "&lt;"); }
+        else if (value == 62) { writer_literal(out, "&gt;"); }
+        else if (value == 34) { writer_literal(out, "&quot;"); }
+        else { writer_put(out, value); }
+        i += 1;
+    }
+}
+
+fn web_append_file(ForgeWriter&mut out, i64 path, i64 path_length) -> bool {
+    if (path == 0 || path_length <= 0) { return true; }
+    usize packed = compiler_ascii_pack(path, 0, path_length);
+    if (packed == 0) { return false; }
+    i64 size = raz_rt_file_size(packed, path_length);
+    raz_rt_dealloc_aligned(packed, 8);
+    if (size < 0 || size > 16777216) { return false; }
+    if (size == 0) { return true; }
+    i64 data = raz_compiler_rt_arena_create(size);
+    if (data == 0) { return false; }
+    i64 read = raz_compiler_rt_read_ascii(path, path_length, data, size);
+    if (read != size) { raz_compiler_rt_arena_destroy(data); return false; }
+    i64 i = 0;
+    while (i < read) { writer_put(out, raz_compiler_rt_arena_get(data, i)); i += 1; }
+    raz_compiler_rt_arena_destroy(data);
+    return !out.failed;
+}
+
+fn web_copy_text_file(i64 source, i64 source_length, i64 destination, i64 destination_length) -> bool {
+    if (source == 0 || source_length <= 0) { return false; }
+    ForgeWriter out;
+    writer_init_capacity(&mut out, 65536);
+    if (out.failed) { return false; }
+    bool ok = web_append_file(&mut out, source, source_length);
+    if (ok) { ok = raz_compiler_rt_write_ascii(destination, destination_length, out.data, out.length) == out.length; }
+    writer_destroy(&mut out);
+    return ok;
+}
+
+fn web_write_index(i64 path, i64 path_length, i64 title, i64 title_length) -> bool {
+    ForgeWriter out;
+    writer_init_capacity(&mut out, 4096);
+    if (out.failed) { return false; }
+    writer_literal(&mut out, "<!doctype html>\n");
+    writer_literal(&mut out, "<html lang=\"en\">\n<head>\n");
+    writer_literal(&mut out, "  <meta charset=\"utf-8\">\n");
+    writer_literal(&mut out, "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    writer_literal(&mut out, "  <title>");
+    web_writer_html_escaped_arena(&mut out, title, title_length);
+    writer_literal(&mut out, "</title>\n");
+    writer_literal(&mut out, "  <link rel=\"stylesheet\" href=\"./assets/app.css\">\n");
+    writer_literal(&mut out, "</head>\n<body>\n");
+    writer_literal(&mut out, "  <div id=\"app\" data-raz-root></div>\n");
+    writer_literal(&mut out, "  <script type=\"module\" src=\"./assets/app.js\"></script>\n");
+    writer_literal(&mut out, "</body>\n</html>\n");
+    bool ok = !out.failed && raz_compiler_rt_write_ascii(path, path_length, out.data, out.length) == out.length;
+    writer_destroy(&mut out);
+    return ok;
+}
+
+fn web_write_css(i64 path, i64 path_length, i64 extra_path, i64 extra_path_length) -> bool {
+    ForgeWriter out;
+    writer_init_capacity(&mut out, 4096);
+    if (out.failed) { return false; }
+    writer_literal(&mut out, "html, body { margin: 0; min-height: 100%; }\n");
+    writer_literal(&mut out, "#app[data-raz-root] { min-height: 100vh; }\n");
+    if (extra_path_length > 0) { writer_literal(&mut out, "\n/* User CSS from raz.toml [web].css */\n"); if (!web_append_file(&mut out, extra_path, extra_path_length)) { writer_destroy(&mut out); return false; } writer_literal(&mut out, "\n"); }
+    bool ok = !out.failed && raz_compiler_rt_write_ascii(path, path_length, out.data, out.length) == out.length;
+    writer_destroy(&mut out);
+    return ok;
+}
+
+fn web_compact_generated_js(ForgeWriter&mut output, ForgeWriter& input) -> bool {
+    i64 cursor = 0;
+    while (cursor < input.length) {
+        i64 line_start = cursor;
+        while (cursor < input.length && raz_compiler_rt_arena_get(input.data, cursor) != 10) { cursor += 1; }
+        i64 line_end = cursor;
+        while (line_start < line_end && (raz_compiler_rt_arena_get(input.data, line_start) == 32 || raz_compiler_rt_arena_get(input.data, line_start) == 9)) { line_start += 1; }
+        while (line_end > line_start && (raz_compiler_rt_arena_get(input.data, line_end - 1) == 32 || raz_compiler_rt_arena_get(input.data, line_end - 1) == 9 || raz_compiler_rt_arena_get(input.data, line_end - 1) == 13)) { line_end -= 1; }
+        bool comment = line_end - line_start >= 2 && raz_compiler_rt_arena_get(input.data, line_start) == 47 && raz_compiler_rt_arena_get(input.data, line_start + 1) == 47;
+        if (!comment) {
+            i64 i = line_start;
+            while (i < line_end) { writer_put(output, raz_compiler_rt_arena_get(input.data, i)); i += 1; }
+        }
+        if (cursor < input.length) { cursor += 1; }
+    }
+    return !output.failed;
+}
+
+fn web_write_loader(i64 path, i64 path_length, i64 extra_path, i64 extra_path_length, bool release_profile) -> bool {
+    ForgeWriter out;
+    writer_init_capacity(&mut out, 32768);
+    if (out.failed) { return false; }
+
+    writer_literal(&mut out, "// Generated by the Raz web backend.\n");
+    writer_literal(&mut out, "const decoder = new TextDecoder();\n");
+    writer_literal(&mut out, "const encoder = new TextEncoder();\n");
+    writer_literal(&mut out, "let instance = null;\n");
+    writer_literal(&mut out, "let renderedRevision = null;\n");
+    writer_literal(&mut out, "let renderedStructureRevision = null;\n");
+    writer_literal(&mut out, "let renderedRawJs = null;\n");
+    writer_literal(&mut out, "const memory = () => instance.exports.memory;\n");
+    writer_literal(&mut out, "const view = () => new DataView(memory().buffer);\n");
+    writer_literal(&mut out, "const number = (value) => typeof value === 'bigint' ? Number(value) : value;\n");
+    writer_literal(&mut out, "const text = (ptr, len) => { ptr = number(ptr); len = number(len); if (!ptr || len <= 0) return ''; return decoder.decode(new Uint8Array(memory().buffer, ptr, len)); };\n");
+    writer_literal(&mut out, "const exportedText = (prefix) => { const p = instance.exports[prefix + '_ptr']; const n = instance.exports[prefix + '_len']; return p && n ? text(p(), n()) : ''; };\n");
+    writer_literal(&mut out, "const cstr = (ptr) => { ptr = number(ptr); if (!ptr) return ''; const bytes = new Uint8Array(memory().buffer); let end = ptr; while (end < bytes.length && bytes[end] !== 0) end++; return decoder.decode(bytes.subarray(ptr, end)); };\n");
+    writer_literal(&mut out, "const unsupported = () => 52;\n");
+    writer_literal(&mut out, "const wasi = {\n");
+    writer_literal(&mut out, "  fd_write(fd, iovs, count, written) {\n");
+    writer_literal(&mut out, "    const dv = view(); let total = 0; let value = '';\n");
+    writer_literal(&mut out, "    for (let i = 0; i < count; i++) { const p = dv.getUint32(iovs + i * 8, true); const n = dv.getUint32(iovs + i * 8 + 4, true); total += n; value += decoder.decode(new Uint8Array(memory().buffer, p, n)); }\n");
+    writer_literal(&mut out, "    dv.setUint32(written, total, true);\n");
+    writer_literal(&mut out, "    if (fd === 1) console.log(value.replace(/\\n$/, '')); else console.error(value.replace(/\\n$/, ''));\n");
+    writer_literal(&mut out, "    return 0;\n  },\n");
+    writer_literal(&mut out, "  fd_read(fd, iovs, count, read) { view().setUint32(read, 0, true); return 0; },\n");
+    writer_literal(&mut out, "  args_sizes_get(argc, size) { const dv = view(); dv.setUint32(argc, 0, true); dv.setUint32(size, 0, true); return 0; },\n");
+    writer_literal(&mut out, "  args_get() { return 0; },\n");
+    writer_literal(&mut out, "  environ_sizes_get(count, size) { const dv = view(); dv.setUint32(count, 0, true); dv.setUint32(size, 0, true); return 0; },\n");
+    writer_literal(&mut out, "  environ_get() { return 0; },\n");
+    writer_literal(&mut out, "  clock_time_get(id, precision, outPtr) { view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true); return 0; },\n");
+    writer_literal(&mut out, "  random_get(ptr, len) { crypto.getRandomValues(new Uint8Array(memory().buffer, ptr, len)); return 0; },\n");
+    writer_literal(&mut out, "  proc_exit(code) { if (code !== 0) throw new Error(`Raz program exited with status ${code}`); },\n");
+    writer_literal(&mut out, "  path_open: unsupported, fd_close: unsupported, path_filestat_get: unsupported,\n");
+    writer_literal(&mut out, "  fd_seek: unsupported, fd_tell: unsupported, fd_sync: unsupported, fd_filestat_get: unsupported,\n");
+    writer_literal(&mut out, "  poll_oneoff: unsupported, fd_prestat_get: unsupported, fd_prestat_dir_name: unsupported,\n");
+    writer_literal(&mut out, "  fd_readdir: unsupported, path_create_directory: unsupported, path_unlink_file: unsupported,\n");
+    writer_literal(&mut out, "  path_remove_directory: unsupported, path_rename: unsupported\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const razWeb = {\n");
+    writer_literal(&mut out, "  dom_set_text: (id, value) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.textContent = cstr(value); return 1n; },\n");
+    writer_literal(&mut out, "  dom_set_text_i64: (id, value) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.textContent = String(value); return 1n; },\n");
+    writer_literal(&mut out, "  dom_toggle_class: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.classList.toggle(cstr(name)); return 1n; },\n");
+    writer_literal(&mut out, "  dom_set_text_ptr: (id, value) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.textContent = cstr(value); return 1n; },\n");
+    writer_literal(&mut out, "  dom_set_text_i64_ptr: (id, value) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.textContent = String(value); return 1n; },\n");
+    writer_literal(&mut out, "  dom_toggle_class_ptr: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.classList.toggle(cstr(name)); return 1n; },\n");
+    writer_literal(&mut out, "  event_value_length: () => 0n, event_value_write: () => 0n, event_key_length: () => 0n, event_key_write: () => 0n, event_checked: () => 0n, event_prevent_default: () => 0n,\n");
+    writer_literal(&mut out, "  event_code_length: () => 0n, event_code_write: () => 0n, event_repeat: () => 0n, event_alt_key: () => 0n, event_ctrl_key: () => 0n, event_shift_key: () => 0n, event_meta_key: () => 0n, event_button: () => -1n, event_client_x: () => 0n, event_client_y: () => 0n, event_stop_propagation: () => 0n,\n");
+    writer_literal(&mut out, "  dom_set_attribute: (id, name, value) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.setAttribute(cstr(name), cstr(value)); return 1n; },\n");
+    writer_literal(&mut out, "  dom_remove_attribute: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.removeAttribute(cstr(name)); return 1n; },\n");
+    writer_literal(&mut out, "  dom_add_class: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.classList.add(cstr(name)); return 1n; },\n");
+    writer_literal(&mut out, "  dom_remove_class: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.classList.remove(cstr(name)); return 1n; },\n");
+    writer_literal(&mut out, "  dom_focus: (id) => { const el = document.getElementById(cstr(id)); if (!el) return 0n; el.focus(); return 1n; },\n");
+    writer_literal(&mut out, "  dom_set_value: (id, value) => { const el = document.getElementById(cstr(id)); if (!el || !('value' in el)) return 0n; el.value = cstr(value); return 1n; }, dom_blur: (id) => { const el = document.getElementById(cstr(id)); if (!el || typeof el.blur !== 'function') return 0n; el.blur(); return 1n; }, dom_click: (id) => { const el = document.getElementById(cstr(id)); if (!el || typeof el.click !== 'function') return 0n; el.click(); return 1n; }, dom_exists: (id) => document.getElementById(cstr(id)) ? 1n : 0n,\n");
+    writer_literal(&mut out, "  dom_value_length: (id) => { const el = document.getElementById(cstr(id)); if (!el || !(\'value\' in el)) return -1n; return BigInt(encoder.encode(String(el.value)).length); }, dom_value_write: (id, outPtr, cap) => { const el = document.getElementById(cstr(id)); if (!el || !(\'value\' in el)) return -1n; const b = encoder.encode(String(el.value)); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n");
+    writer_literal(&mut out, "  dom_text_length: (id) => { const el = document.getElementById(cstr(id)); if (!el) return -1n; return BigInt(encoder.encode(el.textContent || \'\').length); }, dom_text_write: (id, outPtr, cap) => { const el = document.getElementById(cstr(id)); if (!el) return -1n; const b = encoder.encode(el.textContent || \'\'); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n");
+    writer_literal(&mut out, "  dom_attribute_length: (id, name) => { const el = document.getElementById(cstr(id)); if (!el) return -1n; const v = el.getAttribute(cstr(name)); return v === null ? -1n : BigInt(encoder.encode(v).length); }, dom_attribute_write: (id, name, outPtr, cap) => { const el = document.getElementById(cstr(id)); if (!el) return -1n; const v = el.getAttribute(cstr(name)); if (v === null) return -1n; const b = encoder.encode(v); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n");
+    writer_literal(&mut out, "  timer_set_timeout: (handler, delay) => { const name = cstr(handler); const id = setTimeout(() => { const fn = instance && instance.exports[name]; if (typeof fn === 'function') fn(); }, Math.max(0, number(delay))); return BigInt(id); }, timer_clear_timeout: (id) => { clearTimeout(number(id)); return 1n; }, timer_set_interval: (handler, delay) => { const name = cstr(handler); const id = setInterval(() => { const fn = instance && instance.exports[name]; if (typeof fn === 'function') fn(); }, Math.max(1, number(delay))); return BigInt(id); }, timer_clear_interval: (id) => { clearInterval(number(id)); return 1n; },\n");
+    writer_literal(&mut out, "  storage_set: (key, value) => { try { localStorage.setItem(cstr(key), cstr(value)); return 1n; } catch { return 0n; } }, storage_remove: (key) => { try { localStorage.removeItem(cstr(key)); return 1n; } catch { return 0n; } }, storage_clear: () => { try { localStorage.clear(); return 1n; } catch { return 0n; } },\n");
+    writer_literal(&mut out, "  storage_value_length: (key) => { const v = localStorage.getItem(cstr(key)); return v === null ? -1n : BigInt(encoder.encode(v).length); }, storage_value_write: (key, outPtr, cap) => { const v = localStorage.getItem(cstr(key)); if (v === null) return -1n; const b = encoder.encode(v); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n");
+    writer_literal(&mut out, "  session_storage_set: (key, value) => { try { sessionStorage.setItem(cstr(key), cstr(value)); return 1n; } catch { return 0n; } }, session_storage_remove: (key) => { try { sessionStorage.removeItem(cstr(key)); return 1n; } catch { return 0n; } }, session_storage_clear: () => { try { sessionStorage.clear(); return 1n; } catch { return 0n; } }, session_storage_value_length: (key) => { const v = sessionStorage.getItem(cstr(key)); return v === null ? -1n : BigInt(encoder.encode(v).length); }, session_storage_value_write: (key, outPtr, cap) => { const v = sessionStorage.getItem(cstr(key)); if (v === null) return -1n; const b = encoder.encode(v); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n");
+    writer_literal(&mut out, "  location_href_length: () => BigInt(encoder.encode(location.href).length), location_href_write: (outPtr, cap) => { const b = encoder.encode(location.href); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, location_origin_length: () => BigInt(encoder.encode(location.origin).length), location_origin_write: (outPtr, cap) => { const b = encoder.encode(location.origin); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, location_pathname_length: () => BigInt(encoder.encode(location.pathname).length), location_pathname_write: (outPtr, cap) => { const b = encoder.encode(location.pathname); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, location_search_length: () => BigInt(encoder.encode(location.search).length), location_search_write: (outPtr, cap) => { const b = encoder.encode(location.search); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, location_hash_length: () => BigInt(encoder.encode(location.hash).length), location_hash_write: (outPtr, cap) => { const b = encoder.encode(location.hash); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, location_assign: (url) => { location.assign(cstr(url)); return 1n; }, location_replace: (url) => { location.replace(cstr(url)); return 1n; }, location_reload: () => { location.reload(); return 1n; },\n");
+    writer_literal(&mut out, "  url_query_value_length: (name) => { const p = new URLSearchParams(location.search); const key = cstr(name); if (!p.has(key)) return -1n; return BigInt(encoder.encode(p.get(key) || '').length); }, url_query_value_write: (name, outPtr, cap) => { const p = new URLSearchParams(location.search); const key = cstr(name); if (!p.has(key)) return -1n; const b = encoder.encode(p.get(key) || ''); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, url_query_has: (name) => new URLSearchParams(location.search).has(cstr(name)) ? 1n : 0n, url_encode_length: (value) => BigInt(encoder.encode(encodeURIComponent(cstr(value))).length), url_encode_write: (value, outPtr, cap) => { const b = encoder.encode(encodeURIComponent(cstr(value))); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); }, url_decode_length: (value) => { try { return BigInt(encoder.encode(decodeURIComponent(cstr(value))).length); } catch { return -1n; } }, url_decode_write: (value, outPtr, cap) => { try { const b = encoder.encode(decodeURIComponent(cstr(value))); const n = Math.min(b.length, number(cap)); if (n) new Uint8Array(memory().buffer, number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); } catch { return -1n; } },\n");
+    writer_literal(&mut out, "  history_push: (url) => { history.pushState(null, '', cstr(url)); return 1n; }, history_replace: (url) => { history.replaceState(null, '', cstr(url)); return 1n; }, history_back: () => { history.back(); return 1n; }, history_forward: () => { history.forward(); return 1n; },\n");
+    writer_literal(&mut out, "  clipboard_write: (value) => { if (!navigator.clipboard) return 0n; void navigator.clipboard.writeText(cstr(value)); return 1n; }\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const root = document.querySelector('[data-raz-root]');\n");
+    writer_literal(&mut out, "const runtimeStyle = document.createElement('style');\n");
+    writer_literal(&mut out, "runtimeStyle.dataset.razRuntimeStyle = ''; document.head.append(runtimeStyle);\n");
+    writer_literal(&mut out, "const componentStyles = new Map();\n");
+    writer_literal(&mut out, "const syncAttributes = (current, next) => {\n");
+    writer_literal(&mut out, "  for (const attr of [...current.attributes]) if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);\n");
+    writer_literal(&mut out, "  for (const attr of [...next.attributes]) if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);\n");
+    writer_literal(&mut out, "  if (current instanceof HTMLInputElement) { const wanted = next.getAttribute('value') ?? ''; if (current !== document.activeElement && current.value !== wanted) current.value = wanted; if (current.type === 'checkbox') { const checked = next.hasAttribute('checked'); if (current.checked !== checked) current.checked = checked; } }\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const nodeKey = (node) => node?.nodeType === Node.ELEMENT_NODE ? node.getAttribute('data-raz-key') : null;\n");
+    writer_literal(&mut out, "const patchChildren = (current, next) => { let index = 0; while (index < next.childNodes.length || index < current.childNodes.length) { const newChild = next.childNodes[index]; let oldChild = current.childNodes[index]; if (!newChild) { oldChild.remove(); continue; } const key = nodeKey(newChild); if (key !== null && nodeKey(oldChild) !== key) { let match = null; for (let scan = index + 1; scan < current.childNodes.length; scan++) { if (nodeKey(current.childNodes[scan]) === key) { match = current.childNodes[scan]; break; } } if (match) { current.insertBefore(match, oldChild ?? null); oldChild = match; } } if (!oldChild) { current.append(newChild.cloneNode(true)); index++; continue; } patchNode(oldChild, newChild); index++; } };\n");
+    writer_literal(&mut out, "const componentKey = node => node?.nodeType === Node.ELEMENT_NODE ? node.getAttribute('data-raz-component') : null;\n");
+    writer_literal(&mut out, "const patchNode = (current, next) => {\n");
+    writer_literal(&mut out, "  if (!current || !next || current.nodeType !== next.nodeType || (current.nodeType === 1 && current.tagName !== next.tagName) || (nodeKey(current) !== null && nodeKey(next) !== null && nodeKey(current) !== nodeKey(next))) { const replacement = next.cloneNode(true); current?.replaceWith(replacement); return replacement; }\n");
+    writer_literal(&mut out, "  if (current.isEqualNode?.(next)) return current;\n");
+    writer_literal(&mut out, "  if (current.nodeType === Node.TEXT_NODE) { if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue; return current; }\n");
+    writer_literal(&mut out, "  if (current.nodeType !== Node.ELEMENT_NODE) return current; const boundary = componentKey(current); if (boundary !== null && boundary === componentKey(next)) { syncAttributes(current, next); patchChildren(current, next); return current; } syncAttributes(current, next); patchChildren(current, next); return current;\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const patchRoot = (html) => { const template = document.createElement('template'); template.innerHTML = html; patchChildren(root, template.content); };\n");
+    writer_literal(&mut out, "const syncComponent = (scope) => {\n");
+    writer_literal(&mut out, "  const publishedScope = instance.exports.raz_web_component_scope; if (!publishedScope || number(publishedScope()) !== scope) return false;\n");
+    writer_literal(&mut out, "  const current = root.querySelector(`[data-raz-component-scope=\"${scope}\"]`); if (!current) return false; const template = document.createElement('template'); template.innerHTML = exportedText('raz_web_component_html'); const next = template.content.firstElementChild; if (!next) return false; patchNode(current, next);\n");
+    writer_literal(&mut out, "  const css = exportedText('raz_web_component_css'); let style = componentStyles.get(scope); if (!style) { style = document.createElement('style'); style.dataset.razComponentStyle = String(scope); document.head.append(style); componentStyles.set(scope, style); } if (style.textContent !== css) style.textContent = css; return true;\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const renderOwnedScope = (scope) => { const renderComponent = instance.exports.raz_web_render_component; if (scope <= 0 || typeof renderComponent !== 'function') return false; const status = renderComponent(BigInt(scope)); return number(status) >= 0 && syncComponent(scope); };\n");
+    writer_literal(&mut out, "let bindingIndexRevision = null; let bindingIndex = new Map(); let derivedBindings = [];\n");
+    writer_literal(&mut out, "const addBinding = (slot, kind, node) => { const key = String(slot); let list = bindingIndex.get(key); if (!list) { list = []; bindingIndex.set(key, list); } list.push([kind, node]); };\n");
+    writer_literal(&mut out, "const rebuildBindingIndex = (structureRevision) => { bindingIndex = new Map(); derivedBindings = []; for (const node of root.querySelectorAll('[data-raz-bind-string]')) addBinding(node.getAttribute('data-raz-bind-string'), 'text-string', node); for (const node of root.querySelectorAll('[data-raz-bind-i64]')) addBinding(node.getAttribute('data-raz-bind-i64'), 'text-i64', node); for (const node of root.querySelectorAll('input[data-raz-state-string]')) addBinding(node.getAttribute('data-raz-state-string'), 'input-string', node); for (const node of root.querySelectorAll('input[data-raz-state-i64]')) addBinding(node.getAttribute('data-raz-state-i64'), 'input-i64', node); for (const node of root.querySelectorAll('input[data-raz-state-bool]')) addBinding(node.getAttribute('data-raz-state-bool'), 'input-bool', node); derivedBindings = [...root.querySelectorAll('[data-raz-bind-derived-i64]')]; bindingIndexRevision = structureRevision; };\n");
+    writer_literal(&mut out, "const ensureBindingIndex = () => { const structureFn = instance.exports.raz_web_structure_revision; const revision = structureFn ? structureFn() : null; if (bindingIndexRevision !== revision) rebuildBindingIndex(revision); return true; };\n");
+    writer_literal(&mut out, "const applyStateBindings = (changedSlot = null) => {\n");
+    writer_literal(&mut out, "  const i64Value = instance.exports.raz_web_state_i64; const derivedI64 = instance.exports.raz_web_derived_i64; const boolValue = instance.exports.raz_web_state_bool; const stringPtr = instance.exports.raz_web_state_string_ptr; const stringLen = instance.exports.raz_web_state_string_len; if (!i64Value || !boolValue || !stringPtr || !stringLen || !ensureBindingIndex()) return false;\n");
+    writer_literal(&mut out, "  const entries = changedSlot === null ? [...bindingIndex.values()].flat() : (bindingIndex.get(String(changedSlot)) ?? []); for (const [kind, node] of entries) { const slotText = node.getAttribute(kind.startsWith('text-') ? (kind === 'text-string' ? 'data-raz-bind-string' : 'data-raz-bind-i64') : (kind === 'input-string' ? 'data-raz-state-string' : kind === 'input-i64' ? 'data-raz-state-i64' : 'data-raz-state-bool')); const slot = BigInt(slotText); const prefix = node.getAttribute('data-raz-prefix') ?? ''; if (kind === 'text-string') { const wanted = prefix + text(stringPtr(slot), stringLen(slot)); if (node.textContent !== wanted) node.textContent = wanted; } else if (kind === 'text-i64') { const wanted = prefix + String(number(i64Value(slot))); if (node.textContent !== wanted) node.textContent = wanted; } else if (kind === 'input-string') { const wanted = text(stringPtr(slot), stringLen(slot)); if (node.value !== wanted) node.value = wanted; } else if (kind === 'input-i64') { const wanted = String(number(i64Value(slot))); if (node.value !== wanted) node.value = wanted; } else { const wanted = number(boolValue(slot)) !== 0; if (node.checked !== wanted) node.checked = wanted; } }\n");
+    writer_literal(&mut out, "  if (derivedI64) for (const node of derivedBindings) { const id = BigInt(node.getAttribute('data-raz-bind-derived-i64')); if (changedSlot !== null && node.getAttribute('data-raz-derived-left') !== String(changedSlot) && node.getAttribute('data-raz-derived-right') !== String(changedSlot)) continue; const prefix = node.getAttribute('data-raz-prefix') ?? ''; const wanted = prefix + String(number(derivedI64(id))); if (node.textContent !== wanted) node.textContent = wanted; } return true;\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const syncView = (force = false) => {\n");
+    writer_literal(&mut out, "  const revisionFn = instance.exports.raz_web_revision;\n");
+    writer_literal(&mut out, "  if (!revisionFn) return;\n");
+    writer_literal(&mut out, "  const revision = revisionFn();\n");
+    writer_literal(&mut out, "  if (!force && renderedRevision === revision) return;\n");
+    writer_literal(&mut out, "  const active = document.activeElement && root.contains(document.activeElement) ? document.activeElement : null;\n");
+    writer_literal(&mut out, "  const activeInput = active?.getAttribute?.('data-raz-input') ?? active?.getAttribute?.('data-raz-number') ?? null; const selectionStart = active?.selectionStart ?? null; const selectionEnd = active?.selectionEnd ?? null;\n");
+    writer_literal(&mut out, "  const structureFn = instance.exports.raz_web_structure_revision; const structureRevision = structureFn ? structureFn() : null; const bindingFastPath = renderedStructureRevision !== null && structureRevision !== null && renderedStructureRevision === structureRevision;\n");
+    writer_literal(&mut out, "  if (!bindingFastPath || !applyStateBindings()) patchRoot(exportedText('raz_web_html'));\n");
+    writer_literal(&mut out, "  runtimeStyle.textContent = exportedText('raz_web_css');\n");
+    writer_literal(&mut out, "  const title = exportedText('raz_web_title'); if (title) document.title = title;\n");
+    writer_literal(&mut out, "  const rawJs = exportedText('raz_web_js'); if (rawJs !== renderedRawJs) { renderedRawJs = rawJs; if (rawJs) (0, eval)(rawJs); }\n");
+    writer_literal(&mut out, "  if (activeInput) { const next = root.querySelector(`[data-raz-input=\"${activeInput}\"], [data-raz-number=\"${activeInput}\"]`); if (next) { next.focus({ preventScroll: true }); if (selectionStart !== null && next.setSelectionRange) next.setSelectionRange(selectionStart, selectionEnd); } }\n");
+    writer_literal(&mut out, "  if (renderedStructureRevision !== structureRevision) bindingIndexRevision = null; renderedRevision = revision; renderedStructureRevision = structureRevision;\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const runMain = () => {\n");
+    writer_literal(&mut out, "  const main = instance.exports.main; if (typeof main !== 'function') throw new Error('Raz web project has no main function');\n");
+    writer_literal(&mut out, "  const begin = instance.exports.raz_web_begin_render; if (typeof begin === 'function') begin();\n");
+    writer_literal(&mut out, "  const component = main(); const publish = instance.exports.raz_web_publish_main; if (typeof publish !== 'function') throw new Error('Raz web runtime publisher is missing');\n");
+    writer_literal(&mut out, "  const status = publish(component); if (number(status) < 0) throw new Error('Raz web main returned an invalid Component');\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const withHostBytes = (bytes, fn) => {\n");
+    writer_literal(&mut out, "  const alloc = instance.exports.raz_web_host_alloc; const free = instance.exports.raz_web_host_free; if (!alloc || !free) throw new Error('Raz web host byte ABI is missing');\n");
+    writer_literal(&mut out, "  const ptr = bytes.length ? alloc(BigInt(bytes.length)) : 0n; if (bytes.length && !number(ptr)) throw new Error('Raz web host allocation failed');\n");
+    writer_literal(&mut out, "  if (bytes.length) new Uint8Array(memory().buffer, number(ptr), bytes.length).set(bytes);\n");
+    writer_literal(&mut out, "  try { return fn(ptr, BigInt(bytes.length)); } finally { if (number(ptr)) free(ptr); }\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const withHostText = (value, fn) => withHostBytes(encoder.encode(value), fn);\n");
+    writer_literal(&mut out, "const setRoute = (value) => { const set = instance.exports.raz_web_route_set; if (set) withHostText(value, (ptr, len) => set(ptr, len)); };\n");
+    writer_literal(&mut out, "const browserRoute = () => location.pathname;\n");
+    writer_literal(&mut out, "const pumpHttp = async () => {\n");
+    writer_literal(&mut out, "  const next = instance.exports.raz_web_http_pending_next; const urlPtr = instance.exports.raz_web_http_url_ptr; const urlLen = instance.exports.raz_web_http_url_len; const methodFn = instance.exports.raz_web_http_method; const bodyPtr = instance.exports.raz_web_http_body_ptr; const bodyLen = instance.exports.raz_web_http_body_len; const complete = instance.exports.raz_web_http_complete;\n");
+    writer_literal(&mut out, "  if (!next || !urlPtr || !urlLen || !methodFn || !bodyPtr || !bodyLen || !complete) return; const scopeFn = instance.exports.raz_web_http_render_scope; let cursor = 0; let changed = false; let fullRender = false; const scopes = new Set();\n");
+    writer_literal(&mut out, "  while (true) { const id = number(next(BigInt(cursor))); if (!id) break; cursor = id; const url = text(urlPtr(BigInt(id)), urlLen(BigInt(id)));\n");
+    writer_literal(&mut out, "    try { const method = number(methodFn(BigInt(id))); const options = {}; const names = ['', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE']; if (method > 1 && method < names.length) options.method = names[method]; if (method === 2 || method === 3 || method === 4) { const bp = number(bodyPtr(BigInt(id))); const bl = number(bodyLen(BigInt(id))); options.body = new Uint8Array(memory().buffer, bp, bl).slice(); options.headers = { 'content-type': 'text/plain; charset=utf-8' }; } const response = await fetch(url, options); const bytes = new Uint8Array(await response.arrayBuffer()); withHostBytes(bytes, (ptr, len) => complete(BigInt(id), BigInt(response.status), ptr, len)); }\n");
+    writer_literal(&mut out, "    catch { complete(BigInt(id), 0n, 0n, 0n); } changed = true; const scope = scopeFn ? number(scopeFn(BigInt(id))) : -1; if (scope < 0) fullRender = true; else if (scope > 0) scopes.add(scope); }\n");
+    writer_literal(&mut out, "  if (changed) { if (fullRender) { runMain(); syncView(true); } else { for (const scope of scopes) { if (!renderOwnedScope(scope)) { fullRender = true; break; } } if (fullRender) { runMain(); syncView(true); } } }\n");
+    writer_literal(&mut out, "};\n");
+    writer_literal(&mut out, "const dispatchNode = (node, attribute) => {\n");
+    writer_literal(&mut out, "  if (!node) return; const raw = node.getAttribute(attribute); if (!raw) return;\n");
+    writer_literal(&mut out, "  let result; if (attribute === 'data-raz-input') { const dispatch = instance.exports.raz_web_dispatch_text; if (!dispatch) return; result = withHostText(node.value ?? '', (ptr, len) => dispatch(BigInt(raw), ptr, len)); }\n");
+    writer_literal(&mut out, "  else if (attribute === 'data-raz-number') { const dispatch = instance.exports.raz_web_dispatch_i64; if (!dispatch) return; let value; try { value = BigInt(node.value || '0'); } catch { return; } result = dispatch(BigInt(raw), value); }\n");
+    writer_literal(&mut out, "  else if (attribute === 'data-raz-check') { const dispatch = instance.exports.raz_web_dispatch_bool; if (!dispatch) return; result = dispatch(BigInt(raw), node.checked ? 1n : 0n); }\n");
+    writer_literal(&mut out, "  else { const dispatch = instance.exports.raz_web_dispatch; if (!dispatch) return; result = dispatch(BigInt(raw)); }\n");
+    writer_literal(&mut out, "  if (number(result) < 0) throw new Error(`Raz web event ${raw} failed`); const requiresRender = instance.exports.raz_web_event_requires_render; const stateSlotFn = instance.exports.raz_web_event_state_slot; const changedSlot = stateSlotFn ? number(stateSlotFn(BigInt(raw))) : null; if (requiresRender && number(requiresRender(BigInt(raw))) === 0 && applyStateBindings(changedSlot)) { void pumpHttp(); return; } const scopeFn = instance.exports.raz_web_event_render_scope; const scope = scopeFn ? number(scopeFn(BigInt(raw))) : -1; if (scope > 0 && renderOwnedScope(scope)) { void pumpHttp(); return; } runMain(); syncView(true); void pumpHttp();\n");
+    writer_literal(&mut out, "};\n");
+    // Event delegation keeps listener count constant across Raz rerenders.
+    writer_literal(&mut out, "root.addEventListener('input', (event) => { const node = event.target.closest?.('[data-raz-input], [data-raz-number]'); if (!node || !root.contains(node)) return; dispatchNode(node, node.hasAttribute('data-raz-number') ? 'data-raz-number' : 'data-raz-input'); });\n");
+    writer_literal(&mut out, "root.addEventListener('change', (event) => { const node = event.target.closest?.('[data-raz-check]'); if (node && root.contains(node)) dispatchNode(node, 'data-raz-check'); });\n");
+    writer_literal(&mut out, "root.addEventListener('submit', (event) => { const node = event.target.closest?.('form[data-raz-submit]'); if (!node || !root.contains(node)) return; event.preventDefault(); dispatchNode(node, 'data-raz-submit'); });\n");
+    writer_literal(&mut out, "const syncRouteChange = () => { const scopeFn = instance.exports.raz_web_route_render_scope; const scope = scopeFn ? number(scopeFn()) : -1; if (scope === 0) return; if (scope > 0 && renderOwnedScope(scope)) { void pumpHttp(); return; } runMain(); syncView(true); void pumpHttp(); };\n");
+    writer_literal(&mut out, "root.addEventListener('click', (event) => { const action = event.target.closest?.('[data-raz-click]'); if (action && root.contains(action)) { dispatchNode(action, 'data-raz-click'); return; } const node = event.target.closest?.('a[data-raz-nav]'); if (!node || !root.contains(node) || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; const url = new URL(node.getAttribute('data-raz-nav'), location.href); if (url.origin !== location.origin) return; event.preventDefault(); history.pushState(null, '', url); setRoute(browserRoute()); syncRouteChange(); });\n");
+    writer_literal(&mut out, "addEventListener('popstate', () => { setRoute(browserRoute()); syncRouteChange(); });\n");
+    writer_literal(&mut out, "const wasmUrl = new URL('./app.wasm', import.meta.url);\n");
+    writer_literal(&mut out, "const imports = { wasi_snapshot_preview1: wasi, raz_web: razWeb };\n");
+    writer_literal(&mut out, "let loaded; try { loaded = await WebAssembly.instantiateStreaming(fetch(wasmUrl), imports); } catch { const response = await fetch(wasmUrl); const bytes = await response.arrayBuffer(); loaded = await WebAssembly.instantiate(bytes, imports); }\n");
+    writer_literal(&mut out, "instance = loaded.instance;\n");
+    writer_literal(&mut out, "setRoute(browserRoute());\n");
+    // Web applications are not WASI commands: `_start` terminates through\n    // `proc_exit` and intentionally traps if the host returns. Invoke Raz's\n    // exported `main` directly and keep the instance alive for DOM events.\n    writer_literal(&mut out, "runMain();\n");
+    writer_literal(&mut out, "syncView(true);\n");
+    writer_literal(&mut out, "await pumpHttp();\n");
+    writer_literal(&mut out, "globalThis.Raz = Object.freeze({ wasm: instance.exports, root, sync: () => { renderedStructureRevision = null; syncView(true); }, route: (value) => { history.pushState(null, '', value); setRoute(browserRoute()); syncRouteChange(); } });\n");
+
+    if (release_profile) {
+        ForgeWriter compact;
+        writer_init_capacity(&mut compact, out.length);
+        if (compact.failed || !web_compact_generated_js(&mut compact, &out)) { writer_destroy(&mut compact); writer_destroy(&mut out); return false; }
+        if (extra_path_length > 0) { writer_newline(&mut compact); if (!web_append_file(&mut compact, extra_path, extra_path_length)) { writer_destroy(&mut compact); writer_destroy(&mut out); return false; } writer_newline(&mut compact); }
+        bool ok = !compact.failed && raz_compiler_rt_write_ascii(path, path_length, compact.data, compact.length) == compact.length;
+        writer_destroy(&mut compact);
+        writer_destroy(&mut out);
+        return ok;
+    }
+
+    if (extra_path_length > 0) { writer_literal(&mut out, "\n// User JavaScript from raz.toml [web].javascript\n"); if (!web_append_file(&mut out, extra_path, extra_path_length)) { writer_destroy(&mut out); return false; } writer_literal(&mut out, "\n"); }
+    bool ok = !out.failed && raz_compiler_rt_write_ascii(path, path_length, out.data, out.length) == out.length;
+    writer_destroy(&mut out);
+    return ok;
+}
+
+public fn emit_web_application(
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+    i64 output_path,
+    i64 output_path_length,
+    i64 title,
+    i64 title_length,
+    i64 custom_index,
+    i64 custom_index_length,
+    i64 extra_css,
+    i64 extra_css_length,
+    i64 extra_javascript,
+    i64 extra_javascript_length,
+    bool release_profile,
+) -> bool {
+    if (output_path == 0 || output_path_length <= 0) { return false; }
+
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 assets = raz_compiler_rt_arena_create(8192);
+    i64 wasm_path = raz_compiler_rt_arena_create(8192);
+    i64 js_path = raz_compiler_rt_arena_create(8192);
+    i64 css_path = raz_compiler_rt_arena_create(8192);
+    if (root == 0 || assets == 0 || wasm_path == 0 || js_path == 0 || css_path == 0) {
+        if (root != 0) { raz_compiler_rt_arena_destroy(root); }
+        if (assets != 0) { raz_compiler_rt_arena_destroy(assets); }
+        if (wasm_path != 0) { raz_compiler_rt_arena_destroy(wasm_path); }
+        if (js_path != 0) { raz_compiler_rt_arena_destroy(js_path); }
+        if (css_path != 0) { raz_compiler_rt_arena_destroy(css_path); }
+        return false;
+    }
+
+    i64 root_length = web_path_dirname(output_path, output_path_length, root, 8192);
+    i64 assets_length = web_join_literal(root, root_length, "assets", assets, 8192);
+    i64 wasm_length = web_join_literal(assets, assets_length, "app.wasm", wasm_path, 8192);
+    i64 js_length = web_join_literal(assets, assets_length, "app.js", js_path, 8192);
+    i64 css_length = web_join_literal(assets, assets_length, "app.css", css_path, 8192);
+
+    bool success =
+        root_length > 0 && assets_length > 0 && wasm_length > 0 && js_length > 0 && css_length > 0 &&
+        web_create_dir_ascii(root, root_length) == 0 &&
+        web_create_dir_ascii(assets, assets_length) == 0 &&
+        emit_web_wasm_module(source, hir, mir, wasm_path, wasm_length) &&
+        web_write_loader(js_path, js_length, extra_javascript, extra_javascript_length, release_profile) &&
+        web_write_css(css_path, css_length, extra_css, extra_css_length) &&
+        ((custom_index_length > 0 && web_copy_text_file(custom_index, custom_index_length, output_path, output_path_length)) ||
+         (custom_index_length <= 0 && web_write_index(output_path, output_path_length, title, title_length)));
+
+    raz_compiler_rt_arena_destroy(css_path);
+    raz_compiler_rt_arena_destroy(js_path);
+    raz_compiler_rt_arena_destroy(wasm_path);
+    raz_compiler_rt_arena_destroy(assets);
+    raz_compiler_rt_arena_destroy(root);
+    return success;
+}

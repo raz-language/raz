@@ -56,6 +56,56 @@ with tempfile.TemporaryDirectory(prefix="raz-bootstrap-layout-") as raw:
     if not canonical_object.is_file() or not canonical_binary.is_file():
         raise SystemExit("bootstrap-target-layout: canonical artifact locations are unusable")
 
+
+with tempfile.TemporaryDirectory(prefix="raz-bootstrap-final-layout-") as raw:
+    root = Path(raw)
+    qualification = root / "target" / "bootstrap"
+    canonical_profile = root / "canonical" / "target" / "release"
+    (canonical_profile / "bin").mkdir(parents=True)
+    (canonical_profile / "packages" / "123").mkdir(parents=True)
+    (canonical_profile / "bin" / f"raz-compiler{bootstrap.EXE}").write_bytes(b"compiler")
+    (canonical_profile / "packages" / f"42{bootstrap.OBJ}").write_bytes(b"dependency")
+    (canonical_profile / "packages" / "123" / f"7{bootstrap.OBJ}").write_bytes(b"root")
+    (canonical_profile / "packages" / ".units").write_text("1 1 3\n", encoding="utf-8")
+
+    for name in (
+        "candidate", "compiler-project", "compiler-package-layout", "repro-1",
+        "production-runtime-regressions", "web-static", "web-assets",
+    ):
+        path = qualification / name
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+
+    # Empty profile directories are normal during the build but must not survive
+    # successful product finalization.
+    (canonical_profile / "obj").mkdir()
+    (canonical_profile / "ir").mkdir()
+    (canonical_profile / "modules").mkdir()
+
+    staging, staged_profile = bootstrap.prepare_bootstrap_final_tree(qualification, canonical_profile)
+    if staged_profile != staging / "release":
+        raise SystemExit("bootstrap-target-layout: final staging profile is not release/")
+    retained = bootstrap.retain_user_facing_compiler(staged_profile)
+    if retained.name != f"raz{bootstrap.EXE}":
+        raise SystemExit("bootstrap-target-layout: retained compiler did not use public raz name")
+    bootstrap.prune_empty_directories(staged_profile)
+    (staging / "BUILD-SUMMARY.txt").write_text("qualified\n", encoding="utf-8")
+    bootstrap.promote_bootstrap_final_tree(qualification, staging)
+
+    final_children = {path.name for path in qualification.iterdir()}
+    if final_children != {"release", "BUILD-SUMMARY.txt"}:
+        raise SystemExit(f"bootstrap-target-layout: successful bootstrap retained scratch: {sorted(final_children)}")
+    if not (qualification / "release" / "bin" / f"raz{bootstrap.EXE}").is_file():
+        raise SystemExit("bootstrap-target-layout: final production raz executable was not promoted")
+    if (qualification / "release" / "bin" / f"raz-compiler{bootstrap.EXE}").exists():
+        raise SystemExit("bootstrap-target-layout: internal raz-compiler executable leaked into retained target")
+    if any((qualification / "release" / name).exists() for name in ("obj", "ir", "modules")):
+        raise SystemExit("bootstrap-target-layout: empty artifact directories survived finalization")
+    if not (qualification / "release" / "packages" / f"42{bootstrap.OBJ}").is_file():
+        raise SystemExit("bootstrap-target-layout: canonical dependency package object was not promoted")
+    if any((qualification / name).exists() for name in ("compiler-project", "repro-1", "web-static")):
+        raise SystemExit("bootstrap-target-layout: disposable qualification workspace survived finalization")
+
 # Bootstrap materialization must include semantic compiler inputs only.
 input_names = {path.name for path in bootstrap._canonical_compiler_inputs()}
 if input_names & bootstrap.BOOTSTRAP_LEGACY_SCRATCH_NAMES:

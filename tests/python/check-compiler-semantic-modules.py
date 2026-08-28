@@ -39,8 +39,8 @@ if entry not in sources:
     print("compiler-semantic-modules: FAIL: compiler/src/main.rz is missing")
     sys.exit(1)
 
-namespace_re = re.compile(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
-import_re = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+namespace_re = re.compile(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*;")
+import_re = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*;")
 namespaces: dict[str, Path] = {}
 imports_by_path: dict[Path, set[str]] = {}
 for path in sources:
@@ -60,7 +60,7 @@ for path, imports in imports_by_path.items():
     for dependency in imports:
         if dependency.startswith("raz_compiler_") and dependency not in namespaces:
             print(
-                "compiler-semantic-modules: FAIL: unresolved compiler import "
+                "compiler-semantic-modules: FAIL: unresolved same-package compiler import "
                 f"{dependency} in {path.relative_to(compiler)}"
             )
             sys.exit(1)

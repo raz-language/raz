@@ -574,13 +574,145 @@ void collect_defined(const coff::Object& object, std::unordered_set<std::string>
       defined.insert(symbol.name);
 }
 
-void collect_required(const coff::Object& object, const std::unordered_set<std::string>& defined,
+using SectionMask = std::vector<std::vector<bool>>;
+
+bool linker_discarded_section(const coff::Section& section) {
+  return section.name == ".drectve" || section.name.rfind(".debug", 0) == 0 ||
+         (section.characteristics & 0x00000800U) != 0U; // IMAGE_SCN_LNK_REMOVE
+}
+
+std::string resolve_alias_name(std::string name,
+                               const std::unordered_map<std::string, std::string>& aliases) {
+  std::unordered_set<std::string> visited;
+  while (visited.insert(name).second) {
+    const auto it = aliases.find(name);
+    if (it == aliases.end()) break;
+    name = it->second;
+  }
+  return name;
+}
+
+// Compute the /OPT:REF-style section closure used both while selecting archive
+// members and for the final image.  Non-COMDAT sections are conservative roots:
+// they may carry startup tables or compiler metadata whose liveness is not
+// encoded as an ordinary symbol edge.  Runtime/C++ functions and data are built
+// with /Gy+/Gw, so independently discardable code/data arrive as COMDATs and
+// are retained only when reachable from a root or another live section.
+SectionMask compute_live_sections(
+    const std::vector<coff::Object>& objects,
+    const SectionMask* eligible,
+    const std::string& entry,
+    const std::unordered_set<std::string>& forced_symbols,
+    const std::unordered_map<std::string, std::string>& aliases) {
+  SectionMask live(objects.size());
+  for (std::size_t oi = 0; oi < objects.size(); ++oi)
+    live[oi].assign(objects[oi].sections.size(), false);
+
+  auto section_eligible = [&](std::size_t oi, std::size_t si) {
+    return oi < objects.size() && si < objects[oi].sections.size() &&
+           (eligible == nullptr ||
+            (oi < eligible->size() && si < (*eligible)[oi].size() && (*eligible)[oi][si])) &&
+           !linker_discarded_section(objects[oi].sections[si]);
+  };
+
+  struct Definition { std::size_t object{}; std::size_t section{}; };
+  std::unordered_map<std::string, Definition> definitions;
+  for (std::size_t oi = 0; oi < objects.size(); ++oi) {
+    for (const auto& symbol : objects[oi].symbols) {
+      if (symbol.name.empty() || symbol.storage_class != 2U || symbol.section_number <= 0) continue;
+      const auto si = static_cast<std::size_t>(symbol.section_number - 1);
+      if (!section_eligible(oi, si)) continue;
+      // Duplicate COMDAT selection has already chosen one definition when an
+      // eligibility mask is supplied.  During archive discovery, stable input
+      // order is sufficient; the final selected mask recomputes the exact root.
+      definitions.emplace(symbol.name, Definition{oi, si});
+    }
+  }
+
+  auto mark = [&](std::size_t oi, std::size_t si) {
+    if (!section_eligible(oi, si) || live[oi][si]) return false;
+    live[oi][si] = true;
+    return true;
+  };
+
+  // Sections that are not independently discardable remain conservative roots.
+  // With /Gy+/Gw, ordinary C/C++ function and global bodies become COMDATs.
+  for (std::size_t oi = 0; oi < objects.size(); ++oi)
+    for (std::size_t si = 0; si < objects[oi].sections.size(); ++si)
+      if (section_eligible(oi, si) && !objects[oi].sections[si].is_comdat()) mark(oi, si);
+
+  auto mark_named_root = [&](std::string name) {
+    if (name.empty()) return;
+    name = resolve_alias_name(std::move(name), aliases);
+    if (const auto it = definitions.find(name); it != definitions.end())
+      mark(it->second.object, it->second.section);
+  };
+  mark_named_root(entry);
+  for (const auto& name : forced_symbols) mark_named_root(name);
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (std::size_t oi = 0; oi < objects.size(); ++oi) {
+      for (std::size_t si = 0; si < objects[oi].sections.size(); ++si) {
+        if (!live[oi][si]) continue;
+        const auto& section = objects[oi].sections[si];
+        for (const auto& relocation : section.relocations) {
+          if (relocation.symbol_index >= objects[oi].symbols.size()) continue;
+          const auto& symbol = objects[oi].symbols[relocation.symbol_index];
+          if (symbol.section_number > 0) {
+            const auto target = static_cast<std::size_t>(symbol.section_number - 1);
+            if (section_eligible(oi, target)) {
+              changed |= mark(oi, target);
+            } else if (symbol.storage_class == 2U && !symbol.name.empty()) {
+              // A relocation may name this object's copy of a COMDAT that lost
+              // duplicate selection. Follow the symbol name to the prevailing
+              // selected definition instead of treating the dead local copy as
+              // the end of the reachability edge.
+              const auto name = resolve_alias_name(symbol.name, aliases);
+              if (const auto it = definitions.find(name); it != definitions.end())
+                changed |= mark(it->second.object, it->second.section);
+            }
+            continue;
+          }
+          if (symbol.section_number != 0 || symbol.name.empty()) continue;
+          const auto name = resolve_alias_name(symbol.name, aliases);
+          if (const auto it = definitions.find(name); it != definitions.end())
+            changed |= mark(it->second.object, it->second.section);
+          if (symbol.storage_class == 105U && symbol.weak_default_index < objects[oi].symbols.size()) {
+            const auto& fallback = objects[oi].symbols[symbol.weak_default_index];
+            if (!fallback.name.empty()) {
+              const auto fallback_name = resolve_alias_name(fallback.name, aliases);
+              if (const auto it = definitions.find(fallback_name); it != definitions.end())
+                changed |= mark(it->second.object, it->second.section);
+            }
+          }
+        }
+      }
+    }
+
+    // IMAGE_COMDAT_SELECT_ASSOCIATIVE metadata (unwind records, CFG metadata,
+    // etc.) follows its parent section and must survive whenever the parent does.
+    for (std::size_t oi = 0; oi < objects.size(); ++oi) {
+      for (std::size_t si = 0; si < objects[oi].sections.size(); ++si) {
+        const auto& section = objects[oi].sections[si];
+        if (!section_eligible(oi, si) ||
+            section.comdat_selection != coff::comdat_select_associative ||
+            section.comdat_associative_section == 0U) continue;
+        const auto parent = static_cast<std::size_t>(section.comdat_associative_section - 1U);
+        if (parent < live[oi].size() && live[oi][parent]) changed |= mark(oi, si);
+      }
+    }
+  }
+  return live;
+}
+
+void collect_required(const coff::Object& object, const std::vector<bool>& live_sections,
+                      const std::unordered_set<std::string>& defined,
                       std::unordered_set<std::string>& required) {
-  for (const auto& section : object.sections) {
-    // Debug sections never reach the image, so the symbols their relocations
-    // name are not live. Counting them would drag archive members into the link
-    // for the sake of records that are about to be dropped.
-    if (section.name.rfind(".debug", 0) == 0) continue;
+  for (std::size_t si = 0; si < object.sections.size(); ++si) {
+    if (si >= live_sections.size() || !live_sections[si]) continue;
+    const auto& section = object.sections[si];
     for (const auto& reloc : section.relocations) {
       if (reloc.symbol_index >= object.symbols.size()) continue;
       const auto& symbol = object.symbols[reloc.symbol_index];
@@ -895,7 +1027,10 @@ LoadedInputs load_link_objects(const std::vector<std::filesystem::path>& inputs,
     }
 
     std::unordered_set<std::string> required;
-    for (const auto& object : loaded.objects) collect_required(object, defined, required);
+    const auto live_sections = compute_live_sections(
+        loaded.objects, nullptr, loaded.entry, loaded.forced_symbols, loaded.aliases);
+    for (std::size_t oi = 0; oi < loaded.objects.size(); ++oi)
+      collect_required(loaded.objects[oi], live_sections[oi], defined, required);
     for (const auto& forced : loaded.forced_symbols)
       if (!defined.contains(forced)) required.insert(forced);
     bool alias_added = true;
@@ -1202,7 +1337,13 @@ LinkResult link(const std::vector<std::filesystem::path>& inputs, const LinkOpti
     LoadedInputs loaded = load_link_objects(inputs, options);
     result.trace = std::move(loaded.trace);
     auto& objects = loaded.objects;
-    const auto selected_sections = select_coff_sections(objects);
+    auto selected_sections = select_coff_sections(objects);
+    const auto live_sections = compute_live_sections(
+        objects, &selected_sections, loaded.entry, loaded.forced_symbols, loaded.aliases);
+    for (std::size_t oi = 0; oi < objects.size(); ++oi)
+      for (std::size_t si = 0; si < objects[oi].sections.size(); ++si)
+        if (objects[oi].sections[si].is_comdat() && !live_sections[oi][si])
+          selected_sections[oi][si] = false;
 
     // A PE has exactly one import directory, and ObLink builds it from
     // Microsoft short-import members. MinGW-style import libraries instead ship

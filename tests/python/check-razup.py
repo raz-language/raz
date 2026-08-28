@@ -7,11 +7,11 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-source = (ROOT / 'compiler/src/driver/razup.rz').read_text(encoding='utf-8')
-main = (ROOT / 'compiler/src/main.rz').read_text(encoding='utf-8')
-host = (ROOT / 'compiler/src/driver/host_support.rz').read_text(encoding='utf-8')
+source = (ROOT / 'compiler/src/raz_driver/src/razup.rz').read_text(encoding='utf-8')
+main = (ROOT / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+host = (ROOT / 'compiler/src/raz_driver/src/host_support.rz').read_text(encoding='utf-8')
 runtime = (ROOT / 'src/runtime/platform_threads_crypto.cpp').read_text(encoding='utf-8')
-transport = (ROOT / 'compiler/src/driver/registry_transport.rz').read_text(encoding='utf-8')
+transport = (ROOT / 'compiler/src/raz_driver/src/registry_transport.rz').read_text(encoding='utf-8')
 sys.path.insert(0, str(ROOT / 'tools'))
 from compiler_sources import relative_sources
 order = relative_sources(ROOT)
@@ -27,9 +27,9 @@ for token in required:
         raise SystemExit(f'razup: missing contract: {token}')
 if 'razup_invoked()' not in main or 'return razup_command(process_argc);' not in main:
     raise SystemExit('razup: main command-image dispatch is not wired')
-if 'src/driver/razup.rz' not in order or order[-1] != 'src/main.rz':
+if 'src/raz_driver/src/razup.rz' not in order or order[-1] != 'src/main.rz':
     raise SystemExit('razup: canonical semantic source set is incomplete')
-if order.index('src/driver/razup.rz') > order.index('src/main.rz'):
+if order.index('src/raz_driver/src/razup.rz') > order.index('src/main.rz'):
     raise SystemExit('razup: driver must precede the semantic entrypoint in deterministic qualification materialization')
 for token in ('raz_rt_host_arch', 'raz_rt_sha256'):
     if token not in host or token not in runtime:

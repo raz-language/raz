@@ -1,0 +1,48 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::copy_prop;
+
+public import raz_mir_opt::transform::remap;
+
+// Numeric cast opcode 40 is a semantic copy when source and destination MIR
+// types are identical. Collect every redundant copy first, then rewrite all
+// consumers in one pass. The old implementation rescanned the complete MIR for
+// every copy, making copy propagation quadratic on copy-heavy functions.
+fn propagate_mir_copies(MirModule&mut mir) -> bool {
+    i64 replacements = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (replacements == 0) {
+        return false;
+    }
+
+    bool changed = false;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get_unchecked(mir.opcodes, ip) == 40) {
+            i64 source = raz_compiler_rt_arena_get_unchecked(mir.op_a, ip);
+
+            if (source >= 0 && source < mir.instruction_count) {
+                i64 target_type = raz_compiler_rt_arena_get_unchecked(mir.op_types, ip);
+                i64 source_type = raz_compiler_rt_arena_get_unchecked(mir.op_types, source);
+
+                if (target_type == source_type && source != ip) {
+                    // Encode source + 1 because zero means "not replaced" in the
+                    // allocator's already-zero-filled replacement table.
+                    raz_compiler_rt_arena_set_unchecked(replacements, ip, source + 1);
+                    changed = true;
+                }
+            }
+        }
+        ip += 1;
+    }
+
+    bool ok = true;
+
+    if (changed) {
+        ok = mir_apply_value_replacements(mir, replacements);
+    }
+    raz_compiler_rt_arena_destroy(replacements);
+    return ok;
+}

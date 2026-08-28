@@ -187,7 +187,7 @@ Start with:
 
 ## Native ABI and libraries
 
-Forge exposes System V AMD64, Windows x64, and AAPCS64 aggregate ABI classification through `<forge/target/abi.hpp>`. Frontends can inspect integer/SSE classes, indirect passing, register consumption, stack bytes, and variadic state before lowering language-level signatures.
+Forge exposes System V AMD64, Windows x64, and AAPCS64 aggregate ABI classification through `<forge/platform/abi.hpp>`. Frontends can inspect integer/SSE classes, indirect passing, register consumption, stack bytes, and variadic state before lowering language-level signatures.
 
 Function declarations also carry calling-convention, linkage, visibility, and variadic metadata through textual and binary IR. See [Native ABI classification and libraries](docs/abi-and-libraries.md).
 
@@ -347,7 +347,7 @@ Forge is licensed under the [Apache License 2.0](LICENSE). Maintained source, he
 
 ## Frontend Integration API
 
-Forge 1.3 includes reusable source management, structured diagnostics, nested symbol scopes, semantic declarations, and safe control-flow builders under `<forge/frontend/frontend.hpp>`.
+Forge includes reusable source management, structured diagnostics, nested symbol scopes, semantic declarations, and safe control-flow builders under `<forge/frontend/frontend.hpp>`.
 
 Create a standalone frontend project with:
 

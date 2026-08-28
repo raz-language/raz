@@ -16,17 +16,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER_ROOT = ROOT / "compiler"
-_NAMESPACE_RE = re.compile(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
-_IMPORT_RE = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_NAMESPACE_RE = re.compile(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*;")
+_IMPORT_RE = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*;")
 
 
 def _module_graph(root: Path | None = None) -> tuple[dict[str, Path], dict[str, set[str]]]:
     compiler_root = (root / "compiler") if root is not None else COMPILER_ROOT
-    source_root = compiler_root / "src"
+    source_roots = [compiler_root / "src"]
     namespace_to_path: dict[str, Path] = {}
     raw_imports: dict[str, set[str]] = {}
 
-    for path in sorted(source_root.rglob("*.rz")):
+    paths: list[Path] = []
+    for source_root in source_roots:
+        if source_root.is_dir():
+            paths.extend(source_root.rglob("*.rz"))
+
+    for path in sorted(paths):
         text = path.read_text(encoding="utf-8")
         match = _NAMESPACE_RE.search(text)
         if match is None:

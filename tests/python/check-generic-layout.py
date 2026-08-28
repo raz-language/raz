@@ -28,12 +28,12 @@ def require_tree(rel: str, needles: list[str]) -> None:
 require_tree('src/bootstrap/compiler/semantic', ['size_of', 'align_of', 'D2290'])
 require_tree('src/bootstrap/compiler/lowering/hir_to_mir', ['size_of', 'align_of', 'type_alignment'])
 require('src/bootstrap/compiler/syntax/namespace_lowering.cpp', ['Compiler intrinsics such as size_of<T>() and align_of<T>()'])
-require('compiler/src/hir/semantic/reflection.rz', [
+require('compiler/src/raz_hir/src/hir/semantic/reflection.rz', [
     'hir_reflection_type_size',
     'hir_reflection_type_align',
     'struct_explicit_alignments',
 ])
-require('compiler/src/hir/generics/instantiate.rz', ['hir_find_generic_substitution', 'builder.generic_active'])
+require('compiler/src/raz_hir/src/hir/generics/instantiate.rz', ['hir_find_generic_substitution', 'builder.generic_active'])
 require_tree('src/runtime', ['raz_rt_alloc_aligned', 'raz_rt_dealloc_aligned', 'alignment > 4096'])
 require('src/forge/src/ir/verifier.cpp', ['operation.alignment > 4096U', 'alignment no greater than 4096'])
 require('library/core/mem/mem.rz', ['public struct Layout', 'public fn layout_of<T>()'])

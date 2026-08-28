@@ -2,107 +2,73 @@
 
 This directory contains the production Raz compiler, written in Raz.
 
-The compiler source is organized by responsibility under `compiler/src/` and is compiled as ordinary semantic Raz modules. Each compiler module owns an explicit `raz_compiler_*` namespace and an import edge; production builds do not use physical source concatenation. No compiler source-order file is retained; deterministic qualification materialization is derived from discovered modules, while `src/main.rz` remains the small semantic entrypoint.
+The layout follows the same broad architectural idea as rustc: one compiler tree is composed of focused compiler packages with explicit dependency boundaries. The goal is not to copy rustc's crate count mechanically; Raz splits only where the boundary improves ownership, incremental rebuilds, or backend isolation.
 
-## Source layout
+`compiler/src/main.rz` is intentionally tiny. It delegates to `raz_driver`, while the compiler implementation lives in sibling `raz_*` packages.
+
+## Package layout
 
 ```text
-src/
-  frontend/
-    lexer.rz
-    parser.rz
-  hir/
-    core/
-      model.rz
-      builder.rz
-      symbols.rz
-      types.rz
-    generics/
-      instantiate.rz
-      const_generics.rz
-      type_instantiation.rz
-    traits/
-      matching.rz
-      solver.rz
-    semantic/
-      ownership.rz
-      reflection.rz
-      expressions.rz
-      statements.rz
-      declarations.rz
-      comptime.rz
-  mir/
-    core/
-      model.rz
-      builder.rz
-    analysis/
-      cfg.rz
-      dataflow.rz
-      liveness.rz
-      dominance.rz
-    ownership/
-      places.rz
-      moves.rz
-      borrows.rz
-      drops.rz
-    transform/
-      simplify_cfg.rz
-      const_prop.rz
-      remap.rz
-      copy_prop.rz
-      scalar.rz
-      dce.rz
-      cfg_cleanup.rz
-      pipeline.rz
-    verify/
-      verifier.rz
-    lowering.rz
-    interpreter.rz
-  backend/
-    forge/
-      writer.rz
-      symbol_writer.rz
-      tls_codegen.rz
-      native_shape.rz
-      native_support.rz
-      native_types.rz
-      native_operations.rz
-      native_functions.rz
-      native_aggregate.rz
-      globals_codegen.rz
-      function_codegen.rz
-      codegen.rz
-    llvm/
-      writer.rz
-      target.rz
-      globals_codegen.rz
-      codegen.rz
-  driver/
-    backend.rz
-    cli.rz
-    package.rz
-    project.rz
-    registry.rz
-    registry_install.rz
-    tooling.rz
-  main.rz
+compiler/
+  src/
+    main.rz                 # raz-compiler executable entry
+    raz_lexer/              # tokenization and source primitives
+    raz_parser/             # syntax parser
+    raz_query/              # shared query database/context infrastructure
+    raz_hir/                # HIR + semantic operations + traits
+    raz_mir/                # HIR -> MIR + ownership facts + analysis/verification
+    raz_mir_opt/            # canonical MIR optimization transforms + pass policy
+    raz_borrowck/           # move/loan/reborrow/drop legality over canonical MIR
+    raz_codegen_forge/      # Forge native backend
+    raz_codegen_llvm/       # LLVM IR/native integration
+    raz_codegen_wasm/       # WebAssembly backend
+    raz_codegen_rxe/        # Raz executable bytecode backend
+    raz_codegen_web/        # static/browser web lowering
+    raz_driver/             # CLI, projects, packages, registry, LSP, tooling
 ```
 
-## Boundaries
+The split follows real ownership/rebuild boundaries rather than crate-count mimicry. `raz_query` owns the query database/context, while HIR owns semantic operations that still require `HirBuilder`. `raz_mir` owns executable MIR plus the ownership-event facts recorded during lowering, its reusable CFG/dataflow/liveness analysis APIs, and structural verification. `raz_mir_opt` consumes that API through a one-way dependency and owns canonical optimization transforms/pass policy. `raz_borrowck` independently consumes MIR and owns move, partial-move, loan-region, reborrow, and drop legality. This keeps MIR independent of borrow checking while preserving ownership metadata as part of the canonical IR contract.
 
-- `frontend/` owns source tokenization and syntax parsing.
-- `hir/core/` owns HIR storage, builder state, namespaces/symbols, and core type operations.
-- `hir/generics/` owns substitutions and concrete generic instantiation.
-- `hir/traits/` owns generic trait matching and trait solving.
-- `hir/semantic/` owns semantic construction, ownership, reflection, declarations, statements, expressions, and comptime.
-- `mir/` owns HIR-to-MIR lowering, CFG/dataflow analysis, ownership facts, structural verification, backend-neutral scalar/CFG optimization, MIR execution/qualification, and MIR lifetime management.
-- `backend/forge/` owns Forge textual/structured emission and native Forge lowering.
-- `backend/llvm/` owns the LLVM compatibility/production backend implementation retained by this tree.
-- `driver/` owns CLI parsing, backend selection, project loading, formatting/docs/test tooling, package manifests, registry resolution, and dependency locking.
-- `main.rz` only orchestrates phases and process exit status.
+## Dependency direction
 
-The compiler is split at stable responsibility boundaries so semantic analysis, lowering, backend code generation, and project tooling can evolve independently.
+```text
+raz_lexer
+    ↓
+raz_parser
+    ↓
+raz_query ──→ raz_hir
+                 ↓
+              raz_mir ──→ raz_borrowck
+                  │
+                  └────→ raz_mir_opt
+                 ↓             ↓
+                 └──────→ raz_driver
+                 ↓
+       raz_codegen_* packages
+                 ↓
+             raz_driver
+                 ↓
+            raz-compiler
+```
+
+Backends consume parser/HIR/MIR APIs directly where needed. Compiler packages must not introduce reverse semantic dependencies. In particular, HIR cannot depend on MIR, MIR cannot depend on `raz_borrowck` or `raz_mir_opt`, and backends do not perform ownership legality checks themselves. `raz_mir_opt` depends only on MIR and does not own language legality. The driver runs `raz_borrowck` before and after `raz_mir_opt` so transforms cannot silently invalidate ownership semantics. Query infrastructure remains data-oriented so `raz_query` does not depend back on HIR.
+
+## Bootstrap boundary
+
+The C++ Stage-0 compiler is frozen compatibility machinery. It predates some of the production compiler's cross-package interface behavior, so bootstrap presents HIR + MIR + borrow checking as a disposable `raz-middle` compatibility package only while Stage-0 constructs the first Raz seed compiler.
+
+That compatibility package is never canonical source. The first Raz-owned self-host generation compiles the real `raz_hir`, `raz_mir`, `raz_mir_opt`, and `raz_borrowck` packages independently.
+
+## Native build artifacts
+
+Package/module objects under:
+
+```text
+target/<profile>/packages/
+```
+
+are the canonical native object layout. `target/<profile>/obj/<package>.o` / `.obj` is only a whole-program linker scratch path and is removed after a successful executable link.
 
 ## Source ordering
 
-Raz packages use deterministic semantic module discovery and explicit imports. The generic project loader still recognizes `source-order.txt` for legacy packages, but the canonical compiler intentionally does not provide one. The compiler keeps no ordering metadata at all. Host-side qualification discovers `compiler/src/**/*.rz` directly and treats `src/main.rz` as the entrypoint; repository checks prevent compiler source-order files from returning.
+Compiler packages use semantic module discovery and explicit imports. No compiler `source-order.txt` is retained. Bootstrap discovers the canonical package manifests and `.rz` sources directly, and `src/main.rz` remains the executable entry point.

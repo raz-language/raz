@@ -1,0 +1,338 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_llvm::globals_codegen;
+
+public import raz_codegen_llvm::target;
+
+// LLVM module-storage construction/destruction helpers.
+fn llvm_global_is_aggregate(HirModule& hir, i64 global_index) -> bool {
+    return (
+        raz_compiler_rt_arena_get(hir.global_type_structs, global_index) >= 0 ||
+        raz_compiler_rt_arena_get(hir.global_array_extents, global_index) >= 0
+    );
+}
+
+fn llvm_has_aggregate_globals(HirModule& hir) -> bool {
+    i64 global_index = 0;
+
+    while (global_index < hir.global_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0 &&
+            llvm_global_is_aggregate(hir, global_index)
+        ) {
+            return true;
+        }
+        global_index += 1;
+    }
+    return false;
+}
+
+fn llvm_global_temp(ForgeWriter&mut out, bool cleanup, i64 id) {
+    if (cleanup) {
+        
+
+        llvm_literal(out, "%gfini");
+    } else {
+        
+
+        llvm_literal(out, "%ginit");
+    }
+    writer_decimal(out, id);
+}
+
+fn llvm_static_aggregate_argument_start(HirModule& hir, i64 node) -> i64 {
+    if (raz_compiler_rt_arena_get(hir.node_kinds, node) == 34) {
+        return raz_compiler_rt_arena_get(hir.node_b, node);
+    }
+    return raz_compiler_rt_arena_get(hir.node_a, node);
+}
+
+fn llvm_static_aggregate_argument_count(HirModule& hir, i64 node) -> i64 {
+    if (raz_compiler_rt_arena_get(hir.node_kinds, node) == 34) {
+        return raz_compiler_rt_arena_get(hir.node_c, node);
+    }
+    return raz_compiler_rt_arena_get(hir.node_b, node);
+}
+
+fn llvm_emit_static_aggregate_create(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    i64 node,
+    i64&mut next_temp,
+) -> i64 {
+    i64 count = llvm_static_aggregate_argument_count(hir, node);
+    i64 storage = *next_temp;
+
+    *next_temp += 1;
+    writer_space(out);
+    writer_space(out);
+    llvm_global_temp(out, false, storage);
+
+    
+
+    llvm_literal(out, " = call i64 @raz_rt_stage1_arena_create(i64 ");
+    writer_decimal(out, count);
+    writer_put(out, 41);
+    writer_newline(out);
+
+    i64 start = llvm_static_aggregate_argument_start(hir, node);
+    i64 argument = 0;
+
+    while (argument < count) {
+        i64 child = raz_compiler_rt_arena_get(hir.arguments, start + argument);
+        i64 child_kind = raz_compiler_rt_arena_get(hir.node_kinds, child);
+        i64 child_storage = -1;
+
+        if (child_kind == 53 || child_kind == 34) {
+            child_storage = llvm_emit_static_aggregate_create(out, hir, child, next_temp);
+        }
+        writer_space(out);
+        writer_space(out);
+
+        
+
+        llvm_literal(out, "call void @raz_rt_stage1_arena_set(i64 ");
+        llvm_global_temp(out, false, storage);
+
+        llvm_literal(out, ", i64 ");
+        writer_decimal(out, argument);
+        llvm_literal(out, ", i64 ");
+        if (child_storage >= 0) {
+            llvm_global_temp(out, false, child_storage);
+        } else {
+            writer_decimal(out, raz_compiler_rt_arena_get(hir.node_values, child));
+        }
+        writer_put(out, 41);
+        writer_newline(out);
+        argument += 1;
+    }
+    return storage;
+}
+
+fn llvm_emit_static_aggregate_destroy(
+    ForgeWriter&mut out,
+    Source& source,
+    HirModule& hir,
+    i64 node,
+    i64 storage,
+    i64&mut next_temp,
+) {
+    i64 structure = raz_compiler_rt_arena_get(hir.node_type_structs, node);
+
+    if (raz_compiler_rt_arena_get(hir.node_kinds, node) == 34 && structure >= 0) {
+        i64 drop_function = raz_compiler_rt_arena_get(hir.struct_drop_functions, structure);
+
+        if (drop_function >= 0) {
+            writer_space(out);
+            writer_space(out);
+
+            
+
+            llvm_literal(out, "call i64 ");
+            llvm_function_name(out, source, hir, drop_function);
+
+            
+
+            llvm_literal(out, "(i64 ");
+            llvm_global_temp(out, true, storage);
+            writer_put(out, 41);
+            writer_newline(out);
+        }
+    }
+
+    i64 count = llvm_static_aggregate_argument_count(hir, node);
+    i64 start = llvm_static_aggregate_argument_start(hir, node);
+    i64 argument = count;
+
+    while (argument > 0) {
+        argument -= 1;
+
+        i64 child = raz_compiler_rt_arena_get(hir.arguments, start + argument);
+        i64 child_kind = raz_compiler_rt_arena_get(hir.node_kinds, child);
+
+        if (child_kind == 53 || child_kind == 34) {
+            i64 child_storage = *next_temp;
+
+            *next_temp += 1;
+            writer_space(out);
+            writer_space(out);
+            llvm_global_temp(out, true, child_storage);
+
+            
+
+            llvm_literal(out, " = call i64 @raz_rt_stage1_arena_get(i64 ");
+            llvm_global_temp(out, true, storage);
+
+            
+
+            llvm_literal(out, ", i64 ");
+            writer_decimal(out, argument);
+            writer_put(out, 41);
+            writer_newline(out);
+            llvm_emit_static_aggregate_destroy(out, source, hir, child, child_storage, next_temp);
+        }
+    }
+    writer_space(out);
+    writer_space(out);
+
+    
+
+    llvm_literal(out, "call void @raz_rt_stage1_arena_destroy(i64 ");
+    llvm_global_temp(out, true, storage);
+    writer_put(out, 41);
+    writer_newline(out);
+}
+
+fn llvm_emit_global_lifecycle(ForgeWriter&mut out, Source& source, HirModule& hir) {
+    if (!llvm_has_aggregate_globals(hir)) {
+        return;
+    }
+
+    
+
+    llvm_literal(out, "define internal void @__raz_globals_init() {\nentry:\n");
+
+    i64 next_temp = 0;
+    i64 global_index = 0;
+
+    while (global_index < hir.global_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0 &&
+            llvm_global_is_aggregate(hir, global_index)
+        ) {
+            i64 initializer = raz_compiler_rt_arena_get(hir.global_initializer_nodes, global_index);
+            i64 storage = llvm_emit_static_aggregate_create(out, hir, initializer, &mut next_temp);
+
+            writer_space(out);
+            writer_space(out);
+
+            
+
+            llvm_literal(out, "store i64 ");
+            llvm_global_temp(out, false, storage);
+
+            
+
+            llvm_literal(out, ", ptr ");
+            llvm_module_global_name(out, source, hir, global_index);
+            writer_newline(out);
+        }
+        global_index += 1;
+    }
+
+    
+
+    llvm_literal(out, "  ret void\n}\n\n");
+
+    
+
+    llvm_literal(out, "define internal void @__raz_globals_fini() {\nentry:\n");
+    next_temp = 0;
+    global_index = hir.global_count;
+    while (global_index > 0) {
+        global_index -= 1;
+        if (
+            raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0 &&
+            llvm_global_is_aggregate(hir, global_index)
+        ) {
+            i64 storage = next_temp;
+
+            next_temp += 1;
+            writer_space(out);
+            writer_space(out);
+            llvm_global_temp(out, true, storage);
+
+            
+
+            llvm_literal(out, " = load i64, ptr ");
+            llvm_module_global_name(out, source, hir, global_index);
+            writer_newline(out);
+            llvm_emit_static_aggregate_destroy(
+                out,
+                source,
+                hir,
+                raz_compiler_rt_arena_get(hir.global_initializer_nodes, global_index),
+                storage,
+                &mut next_temp,
+            );
+            writer_space(out);
+            writer_space(out);
+
+            
+
+            llvm_literal(out, "store i64 0, ptr ");
+            llvm_module_global_name(out, source, hir, global_index);
+            writer_newline(out);
+        }
+    }
+
+    
+
+    llvm_literal(out, "  ret void\n}\n\n");
+}
+
+fn llvm_emit_module_globals_impl(ForgeWriter&mut out, Source& source, HirModule& hir) {
+    i64 global_index = 0;
+
+    while (global_index < hir.global_count) {
+        llvm_module_global_name(out, source, hir, global_index);
+        writer_space(out);
+        writer_put(out, 61);
+        writer_space(out);
+        if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) != 0) {
+            
+
+            llvm_literal(out, "external");
+            writer_space(out);
+        } else if (raz_compiler_rt_arena_get(hir.global_internal_flags, global_index) != 0) {
+            
+
+            llvm_literal(out, "internal");
+            writer_space(out);
+        }
+        if (raz_compiler_rt_arena_get(hir.global_tls_flags, global_index) != 0) {
+            
+
+            llvm_literal(out, "thread_local");
+            writer_space(out);
+        }
+
+        bool aggregate_global = llvm_global_is_aggregate(hir, global_index);
+
+        if (aggregate_global || raz_compiler_rt_arena_get(hir.global_mutable_flags, global_index) != 0) {
+            
+
+            llvm_literal(out, "global");
+        } else {
+            
+
+            llvm_literal(out, "constant");
+        }
+        writer_space(out);
+        if (aggregate_global) {
+            writer_i64(out);
+        } else {
+            llvm_type(out, raz_compiler_rt_arena_get(hir.global_types, global_index));
+        }
+        if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
+            writer_space(out);
+            if (aggregate_global) {
+                writer_decimal(out, 0);
+            } else {
+                i64 initializer = raz_compiler_rt_arena_get(hir.global_initializer_nodes, global_index);
+
+                writer_decimal(out, raz_compiler_rt_arena_get(hir.node_values, initializer));
+            }
+        }
+        writer_newline(out);
+        global_index += 1;
+    }
+    if (hir.global_count > 0) {
+        writer_newline(out);
+    }
+}
+
+fn llvm_emit_module_globals(ForgeWriter&mut out, Source& source, HirModule& hir) {
+    llvm_emit_module_globals_impl(out, source, hir);
+}

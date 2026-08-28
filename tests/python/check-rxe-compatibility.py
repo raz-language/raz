@@ -5,9 +5,9 @@
 from pathlib import Path
 import re, subprocess, sys
 root=Path(__file__).resolve().parents[2]
-isa=(root/'compiler/src/backend/rxe/isa.rz').read_text()
-decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text()
-reference=(root/'compiler/src/backend/rxe/reference.rz').read_text()
+isa=(root/'compiler/src/raz_codegen_rxe/src/rxe/isa.rz').read_text()
+decoder=(root/'compiler/src/raz_codegen_rxe/src/rxe/decoder.rz').read_text()
+reference=(root/'compiler/src/raz_codegen_rxe/src/rxe/reference.rz').read_text()
 assert re.search(r'fn\s+rxe_isa_version\(\)\s*->\s*i64\s*\{\s*return\s+1;\s*\}', isa)
 assert re.search(r'fn\s+rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+7;\s*\}', isa)
 ops=re.findall(r'fn\s+rxe_op_([a-z0-9_]+)\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}', isa)

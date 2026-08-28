@@ -1,0 +1,941 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::core::symbols;
+
+public import raz_hir::core::builder;
+
+fn hir_symbol_cache_context(
+    HirBuilder&mut builder,
+    i64 reference_offset,
+    i64&mut package,
+    i64&mut namespace_hash,
+    i64&mut module_id,
+) {
+    *package = builder.namespace_lookup_target_package_hash;
+    *namespace_hash = builder.namespace_lookup_target_hash;
+
+    if (*namespace_hash < 0) {
+        *namespace_hash = hir_namespace_at_offset(builder, reference_offset);
+        *package = hir_package_at_offset(builder, reference_offset);
+    } else if (*package < 0) {
+        *package = hir_package_at_offset(builder, reference_offset);
+    }
+    *module_id = hir_module_at_offset(builder, reference_offset);
+}
+
+fn hir_symbol_cache_slot(
+    HirBuilder&mut builder,
+    i64 kind,
+    i64 package,
+    i64 namespace_hash,
+    i64 module_id,
+    i64 offset,
+    i64 length,
+) -> i64 {
+    i64 seed = (kind * 131 + package * 17 + namespace_hash * 7 + module_id + 8191) % 281474976710597;
+
+    return raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 65536;
+}
+
+fn hir_symbol_cache_get(
+    HirBuilder&mut builder,
+    i64 kind,
+    i64 reference_offset,
+    i64 offset,
+    i64 length,
+    i64 epoch,
+    i64&mut out_result,
+) -> bool {
+    i64 package = -1;
+    i64 namespace_hash = -1;
+    i64 module_id = -1;
+
+    hir_symbol_cache_context(builder, reference_offset, &mut package, &mut namespace_hash, &mut module_id);
+
+    i64 slot = hir_symbol_cache_slot(builder, kind, package, namespace_hash, module_id, offset, length);
+
+    if (
+        raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_kinds, slot) == kind + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_packages, slot) == package &&
+        raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_namespaces, slot) == namespace_hash &&
+        raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_modules, slot) == module_id &&
+        raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_epochs, slot) == epoch &&
+        token_same(
+            &builder.scan.input,
+            raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_name_offsets, slot),
+            raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_name_lengths, slot),
+            offset,
+            length,
+        )
+    ) {
+        *out_result = raz_compiler_rt_arena_get_unchecked(builder.symbol_cache_results, slot);
+        builder.symbol_cache_hits += 1;
+        return true;
+    }
+    builder.symbol_cache_misses += 1;
+    return false;
+}
+
+fn hir_symbol_cache_put(
+    HirBuilder&mut builder,
+    i64 kind,
+    i64 reference_offset,
+    i64 offset,
+    i64 length,
+    i64 epoch,
+    i64 result,
+) {
+    i64 package = -1;
+    i64 namespace_hash = -1;
+    i64 module_id = -1;
+
+    hir_symbol_cache_context(builder, reference_offset, &mut package, &mut namespace_hash, &mut module_id);
+
+    i64 slot = hir_symbol_cache_slot(builder, kind, package, namespace_hash, module_id, offset, length);
+
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_kinds, slot, kind + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_packages, slot, package);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_namespaces, slot, namespace_hash);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_modules, slot, module_id);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_name_offsets, slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_name_lengths, slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_epochs, slot, epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.symbol_cache_results, slot, result);
+}
+
+fn hir_function_lookup_bucket(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    return raz_compiler_rt_arena_range_hash(
+        builder.scan.input.bytes,
+        offset,
+        length,
+        146959810393466,
+    ) % 32768;
+}
+
+fn hir_function_lookup_insert(HirBuilder&mut builder, i64 function_index) {
+    if (function_index < 0 || function_index >= 16384) {
+        return;
+    }
+
+    i64 offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, function_index);
+    i64 length = raz_compiler_rt_arena_get(builder.module.function_name_lengths, function_index);
+
+    if (offset < 0 || length <= 0) {
+        return;
+    }
+
+    i64 bucket = hir_function_lookup_bucket(builder, offset, length);
+    i64 previous = raz_compiler_rt_arena_get_unchecked(builder.function_lookup_bucket_heads, bucket);
+
+    raz_compiler_rt_arena_set_unchecked(builder.function_lookup_next, function_index, previous);
+    raz_compiler_rt_arena_set_unchecked(builder.function_lookup_bucket_heads, bucket, function_index + 1);
+}
+
+fn hir_function_lookup_head(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    if (offset < 0 || length <= 0) {
+        return -1;
+    }
+
+    i64 bucket = hir_function_lookup_bucket(builder, offset, length);
+    i64 stored = raz_compiler_rt_arena_get_unchecked(builder.function_lookup_bucket_heads, bucket);
+
+    if (stored == 0) {
+        return -1;
+    }
+    return stored - 1;
+}
+
+fn hir_function_lookup_next_index(HirBuilder&mut builder, i64 function_index) -> i64 {
+    if (function_index < 0 || function_index >= 16384) {
+        return -1;
+    }
+
+    i64 stored = raz_compiler_rt_arena_get_unchecked(builder.function_lookup_next, function_index);
+
+    if (stored == 0) {
+        return -1;
+    }
+    return stored - 1;
+}
+
+fn hir_add_package_dependency(
+    HirBuilder&mut builder,
+    i64 owner_package,
+    i64 alias,
+    i64 target_package,
+) -> bool {
+    i64 index = 0;
+
+    while (index < builder.package_dependency_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.package_dependency_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.package_dependency_aliases, index) == alias
+        ) {
+            if (raz_compiler_rt_arena_get(builder.package_dependency_targets, index) != target_package) {
+                hir_fail(builder, DiagnosticCode::AmbiguousName);
+                return false;
+            }
+            return true;
+        }
+        index += 1;
+    }
+    if (builder.package_dependency_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    index = builder.package_dependency_count;
+    builder.package_dependency_count += 1;
+    raz_compiler_rt_arena_set(builder.package_dependency_owner_packages, index, owner_package);
+    raz_compiler_rt_arena_set(builder.package_dependency_aliases, index, alias);
+    raz_compiler_rt_arena_set(builder.package_dependency_targets, index, target_package);
+    return true;
+}
+
+fn hir_find_package_dependency(HirBuilder&mut builder, i64 owner_package, i64 alias) -> i64 {
+    i64 index = 0;
+
+    while (index < builder.package_dependency_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.package_dependency_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.package_dependency_aliases, index) == alias
+        ) {
+            return raz_compiler_rt_arena_get(builder.package_dependency_targets, index);
+        }
+        index += 1;
+    }
+    return -1;
+}
+
+fn hir_parse_import_path(HirBuilder&mut builder, i64&mut out_package, i64&mut out_namespace) -> bool {
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 first_hash = 17;
+
+    first_hash = hir_namespace_hash_token(builder, first_hash, &builder.current);
+
+    i64 dependency_package = hir_find_package_dependency(
+        builder,
+        builder.current_package_hash,
+        first_hash,
+    );
+    i64 full_hash = first_hash;
+    i64 target_hash = first_hash;
+
+    if (dependency_package >= 0) {
+        // Dependency aliases replace the package-root component.  Preserve the
+        // remainder of the namespace while hashing it onto the target package
+        // identity: `re::program` -> `regex::program`.
+        target_hash = dependency_package;
+    }
+
+    hir_advance(builder);
+    while (builder.current.kind == TokenKind::ColonColon) {
+        full_hash = hir_namespace_hash_byte(full_hash, 58);
+        full_hash = hir_namespace_hash_byte(full_hash, 58);
+        target_hash = hir_namespace_hash_byte(target_hash, 58);
+        target_hash = hir_namespace_hash_byte(target_hash, 58);
+        hir_advance(builder);
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+        full_hash = hir_namespace_hash_token(builder, full_hash, &builder.current);
+        target_hash = hir_namespace_hash_token(builder, target_hash, &builder.current);
+        hir_advance(builder);
+    }
+
+    if (dependency_package >= 0) {
+        *out_package = dependency_package;
+        *out_namespace = target_hash;
+    } else {
+        *out_package = builder.current_package_hash;
+        *out_namespace = full_hash;
+    }
+    return true;
+}
+
+fn hir_record_declaration_visibility(HirBuilder&mut builder, i64 source_offset, i64 visibility) -> bool {
+    i64 low = 0;
+    i64 high = builder.declaration_visibility_count;
+
+    while (low < high) {
+        i64 middle = low + (high - low) / 2;
+
+        if (raz_compiler_rt_arena_get(builder.declaration_visibility_offsets, middle) < source_offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low < builder.declaration_visibility_count &&
+        raz_compiler_rt_arena_get(builder.declaration_visibility_offsets, low) == source_offset) {
+        if (raz_compiler_rt_arena_get(builder.declaration_visibility_values, low) != visibility) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        return true;
+    }
+    // Declaration discovery is source ordered. A missing replay entry before an
+    // existing offset would make the binary-search visibility table unsorted.
+    if (low != builder.declaration_visibility_count) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (builder.declaration_visibility_count >= 16384) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 index = builder.declaration_visibility_count;
+
+    builder.declaration_visibility_count += 1;
+    raz_compiler_rt_arena_set(builder.declaration_visibility_offsets, index, source_offset);
+    raz_compiler_rt_arena_set(builder.declaration_visibility_values, index, visibility);
+    return true;
+}
+
+fn hir_declaration_visibility(HirBuilder&mut builder, i64 declaration_offset) -> i64 {
+    // Visibility records are appended by the first top-level source pass, so
+    // declaration offsets are monotonically increasing. Symbol resolution can
+    // ask this tens of thousands of times; binary search avoids replaying the
+    // declaration prefix for every accessibility check.
+    i64 low = 0;
+    i64 high = builder.declaration_visibility_count;
+
+    while (low < high) {
+        i64 middle = low + (high - low) / 2;
+
+        if (raz_compiler_rt_arena_get(builder.declaration_visibility_offsets, middle) <= declaration_offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low <= 0) {
+        return 0;
+    }
+    return raz_compiler_rt_arena_get(builder.declaration_visibility_values, low - 1);
+}
+
+fn hir_declaration_accessible(HirBuilder&mut builder, i64 reference_offset, i64 declaration_offset) -> bool {
+    if (declaration_offset < 0) {
+        return true;
+    }
+
+    i64 visibility = hir_declaration_visibility(builder, declaration_offset);
+
+    if (visibility == 1) {
+        return true;
+    }
+    if (visibility == 2) {
+        return hir_module_at_offset(
+            builder,
+            reference_offset,
+        ) == hir_module_at_offset(builder, declaration_offset);
+    }
+
+    i64 requester_package = hir_package_at_offset(builder, reference_offset);
+    i64 declaration_package = hir_package_at_offset(builder, declaration_offset);
+
+    if (requester_package == 0 && declaration_package == 0) {
+        return true;
+    }
+    return requester_package != 0 && requester_package == declaration_package;
+}
+
+fn hir_namespace_import_bucket_slot(i64 owner_package, i64 owner) -> i64 {
+    i64 slot = (owner_package * 131 + owner * 31 + 97) % 8192;
+
+    if (slot < 0) {
+        slot += 8192;
+    }
+    return slot;
+}
+
+fn hir_namespace_import_head(HirBuilder&mut builder, i64 owner_package, i64 owner) -> i64 {
+    i64 slot = hir_namespace_import_bucket_slot(owner_package, owner);
+    i64 stored = raz_compiler_rt_arena_get(builder.namespace_import_bucket_heads, slot);
+
+    if (stored == 0) {
+        return -1;
+    }
+    return stored - 1;
+}
+
+fn hir_namespace_import_chain_next(HirBuilder&mut builder, i64 index) -> i64 {
+    i64 stored = raz_compiler_rt_arena_get(builder.namespace_import_next, index);
+
+    if (stored == 0) {
+        return -1;
+    }
+    return stored - 1;
+}
+
+fn hir_add_namespace_import(
+    HirBuilder&mut builder,
+    i64 owner_package,
+    i64 owner,
+    i64 target_package,
+    i64 target,
+    i64 alias,
+    bool qualified_only,
+    bool reexport,
+) -> bool {
+    i64 flags = 0;
+
+    if (qualified_only) {
+        flags |= 1;
+    }
+    if (reexport) {
+        flags |= 2;
+    }
+
+    i64 index = hir_namespace_import_head(builder, owner_package, owner);
+
+    while (index >= 0) {
+        if (
+            raz_compiler_rt_arena_get(builder.namespace_import_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.namespace_import_owners, index) == owner &&
+            raz_compiler_rt_arena_get(builder.namespace_import_target_packages, index) == target_package &&
+            raz_compiler_rt_arena_get(builder.namespace_import_targets, index) == target &&
+            raz_compiler_rt_arena_get(builder.namespace_import_aliases, index) == alias &&
+            raz_compiler_rt_arena_get(builder.namespace_import_flags, index) == flags
+        ) {
+            return true;
+        }
+        index = hir_namespace_import_chain_next(builder, index);
+    }
+    if (builder.namespace_import_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    index = builder.namespace_import_count;
+    builder.namespace_import_count += 1;
+    raz_compiler_rt_arena_set(builder.namespace_import_owner_packages, index, owner_package);
+    raz_compiler_rt_arena_set(builder.namespace_import_owners, index, owner);
+    raz_compiler_rt_arena_set(builder.namespace_import_target_packages, index, target_package);
+    raz_compiler_rt_arena_set(builder.namespace_import_targets, index, target);
+    raz_compiler_rt_arena_set(builder.namespace_import_aliases, index, alias);
+    raz_compiler_rt_arena_set(builder.namespace_import_flags, index, flags);
+
+    i64 bucket = hir_namespace_import_bucket_slot(owner_package, owner);
+    i64 previous = raz_compiler_rt_arena_get(builder.namespace_import_bucket_heads, bucket);
+
+    raz_compiler_rt_arena_set(builder.namespace_import_next, index, previous);
+    raz_compiler_rt_arena_set(builder.namespace_import_bucket_heads, bucket, index + 1);
+    return true;
+}
+
+fn hir_namespace_resolve_alias(
+    HirBuilder&mut builder,
+    i64 reference_offset,
+    i64 candidate,
+    i64&mut out_package,
+) -> i64 {
+    i64 owner_package = hir_package_at_offset(builder, reference_offset);
+    i64 owner = hir_namespace_at_offset(builder, reference_offset);
+    i64 match_namespace = candidate;
+    i64 match_package = owner_package;
+    bool matched = false;
+    i64 index = hir_namespace_import_head(builder, owner_package, owner);
+
+    while (index >= 0) {
+        if (
+            raz_compiler_rt_arena_get(builder.namespace_import_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.namespace_import_owners, index) == owner &&
+            raz_compiler_rt_arena_get(builder.namespace_import_aliases, index) == candidate
+        ) {
+            i64 target_package = raz_compiler_rt_arena_get(builder.namespace_import_target_packages, index);
+            i64 target_namespace = raz_compiler_rt_arena_get(builder.namespace_import_targets, index);
+
+            if (matched && (match_package != target_package || match_namespace != target_namespace)) {
+                hir_fail(builder, DiagnosticCode::AmbiguousName);
+                *out_package = -2;
+                return candidate;
+            }
+            matched = true;
+            match_package = target_package;
+            match_namespace = target_namespace;
+        }
+        index = hir_namespace_import_chain_next(builder, index);
+    }
+    *out_package = match_package;
+    return match_namespace;
+}
+
+fn hir_namespace_reexport_cache_slot(i64 owner_package, i64 owner, i64 target_package, i64 target) -> i64 {
+    i64 seed = (owner_package * 131 + owner * 31 + target_package * 17 + target * 7 + 97) % 4096;
+
+    if (seed < 0) {
+        seed += 4096;
+    }
+    return seed;
+}
+
+fn hir_namespace_reexports_target(
+    HirBuilder&mut builder,
+    i64 owner_package,
+    i64 owner,
+    i64 target_package,
+    i64 target,
+    i64 depth,
+) -> bool {
+    if (depth > 256) {
+        return false;
+    }
+
+    i64 cache_slot = hir_namespace_reexport_cache_slot(owner_package, owner, target_package, target);
+    i64 epoch = builder.namespace_import_count;
+
+    if (
+        raz_compiler_rt_arena_get(builder.namespace_reexport_cache_epochs, cache_slot) == epoch &&
+        raz_compiler_rt_arena_get(
+            builder.namespace_reexport_cache_owner_packages,
+            cache_slot,
+        ) == owner_package &&
+        raz_compiler_rt_arena_get(builder.namespace_reexport_cache_owners, cache_slot) == owner &&
+        raz_compiler_rt_arena_get(
+            builder.namespace_reexport_cache_target_packages,
+            cache_slot,
+        ) == target_package &&
+        raz_compiler_rt_arena_get(builder.namespace_reexport_cache_targets, cache_slot) == target
+    ) {
+        return raz_compiler_rt_arena_get(builder.namespace_reexport_cache_results, cache_slot) != 0;
+    }
+
+    bool result = false;
+    i64 index = hir_namespace_import_head(builder, owner_package, owner);
+
+    while (index >= 0 && !result) {
+        if (
+            raz_compiler_rt_arena_get(builder.namespace_import_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.namespace_import_owners, index) == owner
+        ) {
+            i64 flags = raz_compiler_rt_arena_get(builder.namespace_import_flags, index);
+
+            if ((flags & 2) != 0 && (flags & 1) == 0) {
+                i64 imported_package = raz_compiler_rt_arena_get(
+                    builder.namespace_import_target_packages,
+                    index,
+                );
+
+                i64 imported = raz_compiler_rt_arena_get(builder.namespace_import_targets, index);
+
+                if (
+                    (imported_package == target_package && imported == target) ||
+                    hir_namespace_reexports_target(
+                        builder,
+                        imported_package,
+                        imported,
+                        target_package,
+                        target,
+                        depth + 1,
+                    )
+                ) {
+                    result = true;
+                }
+            }
+        }
+        index = hir_namespace_import_chain_next(builder, index);
+    }
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_owner_packages, cache_slot, owner_package);
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_owners, cache_slot, owner);
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_target_packages, cache_slot, target_package);
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_targets, cache_slot, target);
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_epochs, cache_slot, epoch);
+
+    i64 encoded_result = 0;
+
+    if (result) {
+        encoded_result = 1;
+    }
+    raz_compiler_rt_arena_set(builder.namespace_reexport_cache_results, cache_slot, encoded_result);
+    return result;
+}
+
+fn hir_namespace_same(HirBuilder&mut builder, i64 reference_offset, i64 declaration_offset) -> bool {
+    if (declaration_offset < 0) {
+        return builder.namespace_lookup_target_hash < 0;
+    }
+
+    i64 target_package = hir_package_at_offset(builder, declaration_offset);
+    i64 target = hir_namespace_at_offset(builder, declaration_offset);
+    bool namespace_match = false;
+
+    if (builder.namespace_lookup_target_hash >= 0) {
+        i64 lookup_package = builder.namespace_lookup_target_package_hash;
+
+        if (lookup_package < 0) {
+            lookup_package = hir_package_at_offset(builder, reference_offset);
+        }
+        namespace_match =
+            (target_package == lookup_package && target == builder.namespace_lookup_target_hash) ||
+            hir_namespace_reexports_target(
+                builder,
+                lookup_package,
+                builder.namespace_lookup_target_hash,
+                target_package,
+                target,
+                0,
+            );
+    } else {
+        namespace_match =
+            hir_package_at_offset(builder, reference_offset) == target_package &&
+            hir_namespace_at_offset(builder, reference_offset) == target;
+    }
+    return namespace_match && hir_declaration_accessible(builder, reference_offset, declaration_offset);
+}
+
+fn hir_namespace_imported(HirBuilder&mut builder, i64 reference_offset, i64 declaration_offset) -> bool {
+    if (declaration_offset < 0 || builder.namespace_lookup_target_hash >= 0) {
+        return false;
+    }
+
+    i64 owner_package = hir_package_at_offset(builder, reference_offset);
+    i64 owner = hir_namespace_at_offset(builder, reference_offset);
+    i64 target_package = hir_package_at_offset(builder, declaration_offset);
+    i64 target = hir_namespace_at_offset(builder, declaration_offset);
+
+    if (owner_package == target_package && owner == target) {
+        return false;
+    }
+
+    i64 index = hir_namespace_import_head(builder, owner_package, owner);
+
+    while (index >= 0) {
+        if (
+            raz_compiler_rt_arena_get(builder.namespace_import_owner_packages, index) == owner_package &&
+            raz_compiler_rt_arena_get(builder.namespace_import_owners, index) == owner
+        ) {
+            i64 flags = raz_compiler_rt_arena_get(builder.namespace_import_flags, index);
+
+            if ((flags & 1) == 0) {
+                i64 imported_package = raz_compiler_rt_arena_get(
+                    builder.namespace_import_target_packages,
+                    index,
+                );
+
+                i64 imported = raz_compiler_rt_arena_get(builder.namespace_import_targets, index);
+
+                if (
+                    (
+                        (imported_package == target_package && imported == target) ||
+                        hir_namespace_reexports_target(
+                            builder,
+                            imported_package,
+                            imported,
+                            target_package,
+                            target,
+                            0,
+                        )
+                    ) &&
+                    hir_declaration_accessible(builder, reference_offset, declaration_offset)
+                ) {
+                    return true;
+                }
+            }
+        }
+        index = hir_namespace_import_chain_next(builder, index);
+    }
+    return false;
+}
+
+fn hir_namespace_visible(HirBuilder&mut builder, i64 reference_offset, i64 declaration_offset) -> bool {
+    return (
+        hir_namespace_same(builder, reference_offset, declaration_offset) ||
+        hir_namespace_imported(builder, reference_offset, declaration_offset)
+    );
+}
+
+fn hir_namespace_ambiguous(
+    HirBuilder&mut builder,
+    i64 first_declaration_offset,
+    i64 next_declaration_offset,
+) -> bool {
+    if (first_declaration_offset < 0 || next_declaration_offset < 0) {
+        return false;
+    }
+    return (
+        hir_package_at_offset(
+            builder,
+            first_declaration_offset,
+        ) != hir_package_at_offset(builder, next_declaration_offset) ||
+        hir_namespace_at_offset(
+            builder,
+            first_declaration_offset,
+        ) != hir_namespace_at_offset(builder, next_declaration_offset)
+    );
+}
+
+fn hir_top_level_name_hash(i64 package_hash, i64 namespace_hash, i64 name_hash) -> i64 {
+    i64 value = package_hash;
+
+    value = (value * 131 + namespace_hash + 4099) % 281474976710597;
+    value = (value * 131 + name_hash + 4099) % 281474976710597;
+    if (value < 0) {
+        value = 0 - value;
+    }
+    return value;
+}
+
+fn hir_namespace_has_top_level_name(HirBuilder&mut builder, i64 offset, i64 length) -> bool {
+    if (offset < 0 || length <= 0) {
+        return false;
+    }
+
+    i64 package_hash = hir_package_at_offset(builder, offset);
+    i64 namespace_hash = hir_namespace_at_offset(builder, offset);
+
+    i64 name_hash = raz_compiler_rt_arena_range_hash(
+        builder.scan.input.bytes,
+        offset,
+        length,
+        146959810393466,
+    );
+
+    i64 slot = hir_top_level_name_hash(package_hash, namespace_hash, name_hash) % 32768;
+    i64 probes = 0;
+
+    while (probes < 32768) {
+        if (raz_compiler_rt_arena_get(builder.top_level_name_used, slot) == 0) {
+            raz_compiler_rt_arena_set(builder.top_level_name_used, slot, 1);
+            raz_compiler_rt_arena_set(builder.top_level_name_packages, slot, package_hash);
+            raz_compiler_rt_arena_set(builder.top_level_name_namespaces, slot, namespace_hash);
+            raz_compiler_rt_arena_set(builder.top_level_name_hashes, slot, name_hash);
+            raz_compiler_rt_arena_set(builder.top_level_name_offsets, slot, offset);
+            raz_compiler_rt_arena_set(builder.top_level_name_lengths, slot, length);
+            return false;
+        }
+        if (
+            raz_compiler_rt_arena_get(builder.top_level_name_packages, slot) == package_hash &&
+            raz_compiler_rt_arena_get(builder.top_level_name_namespaces, slot) == namespace_hash &&
+            raz_compiler_rt_arena_get(builder.top_level_name_hashes, slot) == name_hash &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.top_level_name_offsets, slot),
+                raz_compiler_rt_arena_get(builder.top_level_name_lengths, slot),
+                offset,
+                length,
+            )
+        ) {
+            return true;
+        }
+        slot = (slot + 1) % 32768;
+        probes += 1;
+    }
+    return true;
+}
+
+fn hir_save_generic_substitutions(
+    HirBuilder&mut builder,
+    i64 name_offsets,
+    i64 name_lengths,
+    i64 type_structures,
+    i64 types,
+) -> i64 {
+    i64 count = builder.generic_substitution_count;
+    i64 index = 0;
+
+    while (index < count) {
+        raz_compiler_rt_arena_set(
+            name_offsets,
+            index,
+            raz_compiler_rt_arena_get(builder.generic_substitution_name_offsets, index),
+        );
+        raz_compiler_rt_arena_set(
+            name_lengths,
+            index,
+            raz_compiler_rt_arena_get(builder.generic_substitution_name_lengths, index),
+        );
+        raz_compiler_rt_arena_set(
+            type_structures,
+            index,
+            raz_compiler_rt_arena_get(builder.generic_substitution_type_structs, index),
+        );
+        raz_compiler_rt_arena_set(
+            types,
+            index,
+            raz_compiler_rt_arena_get(builder.generic_substitution_types, index),
+        );
+        index += 1;
+    }
+    return count;
+}
+
+fn hir_clear_generic_substitutions(HirBuilder&mut builder) {
+    builder.generic_substitution_count = 0;
+}
+
+fn hir_add_generic_substitution(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64 type_structure,
+    i64 type_kind,
+) -> bool {
+    if (builder.generic_substitution_count >= 32) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 slot = builder.generic_substitution_count;
+
+    builder.generic_substitution_count += 1;
+    raz_compiler_rt_arena_set(builder.generic_substitution_name_offsets, slot, name_offset);
+    raz_compiler_rt_arena_set(builder.generic_substitution_name_lengths, slot, name_length);
+    raz_compiler_rt_arena_set(builder.generic_substitution_type_structs, slot, type_structure);
+    raz_compiler_rt_arena_set(builder.generic_substitution_types, slot, type_kind);
+    if (slot == 0) {
+        builder.generic_type_name_offset = name_offset;
+        builder.generic_type_name_length = name_length;
+        builder.generic_type_structure = type_structure;
+        builder.generic_type_kind = type_kind;
+    }
+    return true;
+}
+
+// Generic parameter names can collide across nesting levels: `struct Wrapper<T>`
+// installs its own `T` before `impl<T: Copy> ... for Wrapper<Pair<T, i64> >`
+// installs the impl's `T`. Lookup is first-match-wins, so a plain append would
+// leave the struct's binding shadowing the impl's and the body would resolve `T`
+// to the whole argument instead of the destructured one. The innermost binding
+// must win, so replace a same-named entry in place.
+fn hir_set_generic_substitution(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64 type_structure,
+    i64 type_kind,
+) -> bool {
+    i64 slot = 0;
+
+    while (slot < builder.generic_substitution_count) {
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_offsets, slot),
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_lengths, slot),
+                name_offset,
+                name_length,
+            )
+        ) {
+            raz_compiler_rt_arena_set(builder.generic_substitution_type_structs, slot, type_structure);
+            raz_compiler_rt_arena_set(builder.generic_substitution_types, slot, type_kind);
+            if (slot == 0) {
+                builder.generic_type_structure = type_structure;
+                builder.generic_type_kind = type_kind;
+            }
+            return true;
+        }
+        slot += 1;
+    }
+    return hir_add_generic_substitution(builder, name_offset, name_length, type_structure, type_kind);
+}
+
+fn hir_restore_generic_substitutions(
+    HirBuilder&mut builder,
+    i64 count,
+    i64 name_offsets,
+    i64 name_lengths,
+    i64 type_structures,
+    i64 types,
+) {
+    hir_clear_generic_substitutions(builder);
+
+    i64 index = 0;
+
+    while (index < count) {
+        hir_add_generic_substitution(
+            builder,
+            raz_compiler_rt_arena_get(name_offsets, index),
+            raz_compiler_rt_arena_get(name_lengths, index),
+            raz_compiler_rt_arena_get(type_structures, index),
+            raz_compiler_rt_arena_get(types, index),
+        );
+        index += 1;
+    }
+}
+
+fn hir_find_generic_substitution(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64&mut out_structure,
+    i64&mut out_type,
+) -> bool {
+    i64 slot = 0;
+
+    while (slot < builder.generic_substitution_count) {
+        i64 structure = raz_compiler_rt_arena_get(builder.generic_substitution_type_structs, slot);
+
+        if (
+            structure >= -1 &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_offsets, slot),
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_lengths, slot),
+                name_offset,
+                name_length,
+            )
+        ) {
+            *out_structure = structure;
+            *out_type = raz_compiler_rt_arena_get(builder.generic_substitution_types, slot);
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+// Const generic substitutions share the generic argument pack. A structure tag
+// of -2 means the paired type slot stores the compile-time integer value.
+fn hir_find_generic_const_substitution(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64&mut out_value,
+) -> bool {
+    i64 slot = 0;
+
+    while (slot < builder.generic_substitution_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.generic_substitution_type_structs, slot) == -2 &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_offsets, slot),
+                raz_compiler_rt_arena_get(builder.generic_substitution_name_lengths, slot),
+                name_offset,
+                name_length,
+            )
+        ) {
+            *out_value = raz_compiler_rt_arena_get(builder.generic_substitution_types, slot);
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+// Generic const substitutions carry their value in the compact substitution
+// pack.  Recover the declared scalar type from the canonical generic-parameter
+// record so using `N` as an expression preserves `const usize N` rather than
+// silently treating every const parameter as i64.
+fn hir_generic_const_parameter_type(HirBuilder&mut builder, i64 name_offset, i64 name_length) -> i64 {
+    i64 parameter = 0;
+
+    while (parameter < builder.module.generic_parameter_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, parameter) == 2 &&
+            raz_compiler_rt_arena_get(builder.module.generic_parameter_name_offsets, parameter) == name_offset &&
+            raz_compiler_rt_arena_get(builder.module.generic_parameter_name_lengths, parameter) == name_length
+        ) {
+            return raz_compiler_rt_arena_get(builder.module.generic_parameter_const_types, parameter);
+        }
+        parameter += 1;
+    }
+    return 0;
+}

@@ -4,9 +4,9 @@
 
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-float_src = (root / "compiler/src/backend/wasm/float.rz").read_text()
-codegen = (root / "compiler/src/backend/wasm/codegen.rz").read_text()
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+float_src = (root / "compiler/src/raz_codegen_wasm/src/wasm/float.rz").read_text()
+codegen = (root / "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz").read_text()
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 need_float = [
     "fn wasm_float_decimal_bits",
     "fn wasm_float_emit_literal",
@@ -40,6 +40,6 @@ need_codegen = [
 for token in need_codegen:
     if token not in codegen:
         raise SystemExit(f"wasm-float: codegen missing {token}")
-if "src/backend/wasm/float.rz" not in order:
+if "src/raz_codegen_wasm/src/wasm/float.rz" not in order:
     raise SystemExit("wasm-float: semantic compiler source graph missing float backend")
 print("wasm-float: PASS (literals + arithmetic/comparisons + numeric casts + typed indirect/closure ABI)")

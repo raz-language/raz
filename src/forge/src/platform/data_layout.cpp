@@ -1,7 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/data_layout.hpp"
 
 #include <algorithm>
 #include <bit>

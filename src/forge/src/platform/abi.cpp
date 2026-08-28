@@ -1,7 +1,7 @@
 // Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
-#include "forge/target/abi.hpp"
+#include "forge/platform/abi.hpp"
 
 #include <algorithm>
 #include <limits>

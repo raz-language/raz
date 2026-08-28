@@ -102,9 +102,11 @@ Artifact reuse is intentionally exact. Native build artifacts are reused only
 when the complete source/backend key matches. Semantic checks additionally keep a
 versioned semantic key: an unchanged `raz check` can return after restoring the
 validated project-source snapshot and confirming that exact semantic key, without
-rebuilding HIR. The project snapshot stores the already ordered combined source and
-a manifest/module input list keyed by file size plus high-resolution modification
-time; any metadata change is a conservative cache miss.
+rebuilding HIR. The project snapshot stores the already ordered combined source and a
+manifest/module input list keyed by file size, high-resolution modification time, and
+content fingerprint. Metadata changes are immediate conservative misses; unchanged
+metadata is still byte-verified so timestamp-preserving rewrites cannot restore stale
+source.
 
 Project loading reads each module source once on a cache miss and reuses that retained
 buffer for namespace discovery, import discovery, and final topological assembly.
@@ -121,6 +123,5 @@ generation. Cache readers must treat unknown or malformed state as a miss.
 
 ## Bootstrap boundary
 
-The semantic query database is implemented in Raz. The compatibility-pinned native host compiler
-compiler remains a host compiler and does not acquire production query,
+The semantic query database is implemented in Raz. The compatibility-pinned native host compiler remains a host compiler and does not acquire production query,
 generic, trait, or invalidation policy.

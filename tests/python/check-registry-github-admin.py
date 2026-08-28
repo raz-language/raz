@@ -8,8 +8,8 @@ ROOT=Path(__file__).resolve().parents[2]
 PACKAGES=ROOT.parent/'packages'
 
 def main()->int:
-    transport=(ROOT/'compiler/src/driver/registry_transport.rz').read_text(encoding='utf-8')
-    registry=(ROOT/'compiler/src/driver/registry.rz').read_text(encoding='utf-8')
+    transport=(ROOT/'compiler/src/raz_driver/src/registry_transport.rz').read_text(encoding='utf-8')
+    registry=(ROOT/'compiler/src/raz_driver/src/registry.rz').read_text(encoding='utf-8')
     workflow=(PACKAGES/'.github/workflows/registry-admin.yml').read_text(encoding='utf-8')
     assert 'fn registry_http_post(' in transport
     assert 'registry_github_admin_dispatch' in transport

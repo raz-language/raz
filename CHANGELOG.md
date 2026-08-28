@@ -12,6 +12,14 @@ All notable user-visible changes to Raz are documented here.
 
 ## Unreleased
 
+- Normal bootstrap output no longer forces compiler phase-timing traces (`raz-phase ... ns`). Developers can still opt into those diagnostics explicitly with `RAZ_COMPILER_PHASE_TRACE=1`.
+- Expanded the first-party `web` target/library with opt-in browser interactivity. Pages now expose ID-aware HTML helpers plus click text updates, class toggles, input mirroring, and small counter state. Interactive pages emit a tiny route-local ES module (`app.js`), while fully static routes continue to emit no JavaScript or WebAssembly. Added arbitrary `element`/`begin` helpers so standard or custom HTML tags do not require dedicated library methods, and added permanent bootstrap qualification for the static/interactive split.
+- `raz new <name> --target web` now starts from host-friendly `write_route("/")` output instead of an explicit filesystem filename, keeping starter source aligned with static-route generation.
+
+- Added durable file synchronization to `std::fs::file` with `sync` and `try_sync`. The runtime flushes C stdio buffers and then calls `_commit` on Windows or `fsync` on POSIX, enabling applications such as write-ahead logs to acknowledge commits only after the OS file descriptor has been synchronized.
+- Raised the HIR lexical block capacity from 16,384 to 65,536 and expanded every corresponding HIR/MIR backing arena and cleanup index. This fixes self-host compilation of the large RXE reference interpreter, which previously failed with `E00004: too many items in this scope` during repro generation.
+- Completed Forge's target-specific source naming migration to `platform`: the embedded and standalone Forge trees now consistently use `include/forge/platform`, `src/platform`, and `tests/platform`, preventing source-package cleanup of generated `target/` directories from deleting legitimate ABI/data-layout headers or tests.
+
 - Build/check output now has an explicit Cargo-style package identity contract: every dependency actually compiled is announced as `Compiling <name> v<version>` / `Checking <name> v<version>` before the root package, while fully restored artifact-cache builds remain `Fresh` rather than claiming recompilation.
 
 - Fixed the Forge O2 self-host regression that could miscompile installed-project native path preparation. SCCP now treats unmodelled result-producing operations (including calls) as overdefined instead of lattice-bottom binary expressions, and comparison folds preserve their `i1` result type. Release bootstrap now runs the self-hosted compiler against fresh debug/release native projects and verifies canonical `target/<profile>/{obj,bin}` output plus execution.
@@ -57,6 +65,9 @@ All notable user-visible changes to Raz are documented here.
 
 ### Native linking
 
+- Normal modular Forge builds no longer materialize an empty `target/<profile>/obj/` directory. The whole-project object directory is created lazily only if package-unit emission/linking falls back to the legacy backend path.
+- Reduced Windows Forge executable bloat by adding ObLink reachability-based COMDAT/section garbage collection and compiling `raz_runtime` with `/Gy /Gw`. Dead runtime functions no longer keep their relocations live or pull unrelated CRT/network/OpenSSL archive members into an executable.
+- Fixed reusable Windows Stage-0 bootstrap caches that enabled OpenSSL but did not persist FindOpenSSL's `OPENSSL_SSL_LIBRARY` / `OPENSSL_CRYPTO_LIBRARY` implementation-detail cache entries. `raz_runtime` now exports Raz-owned canonical OpenSSL linker paths, and `bootstrap.py` performs a configure-only metadata refresh when an older otherwise-valid Stage-0 cache lacks them; the cached Stage-0 compiler/runtime/Forge artifacts are preserved.
 - Fixed Windows bootstrap OpenSSL detection so a cached header-only
   `OPENSSL_INCLUDE_DIR` can no longer masquerade as an enabled runtime TLS
   dependency. CMake now exports the runtime feature state explicitly and

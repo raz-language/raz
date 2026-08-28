@@ -1,0 +1,2642 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_lexer::lexer;
+
+// Token definitions and scanner utilities live here. Keep this layer small and
+// allocation-light; every compiler phase starts by walking these tokens.
+public enum TokenKind {
+    End,
+    Identifier,
+    Integer,
+    Float,
+    LeftParen,
+    RightParen,
+    LeftBrace,
+    RightBrace,
+    LeftBracket,
+    RightBracket,
+    Comma,
+    Semicolon,
+    Dot,
+    Colon,
+    Ampersand,
+    Pipe,
+    Bang,
+    Equal,
+    EqualEqual,
+    BangEqual,
+    Arrow,
+    Plus,
+    PlusEqual,
+    Minus,
+    MinusEqual,
+    Star,
+    StarEqual,
+    Slash,
+    SlashEqual,
+    Percent,
+    PercentEqual,
+    Less,
+    LessEqual,
+    LessLess,
+    LessLessEqual,
+    Greater,
+    GreaterEqual,
+    GreaterGreater,
+    GreaterGreaterEqual,
+    AmpAmp,
+    AmpersandEqual,
+    PipePipe,
+    PipeEqual,
+    Caret,
+    CaretEqual,
+    Tilde,
+    String,
+    Character,
+    ColonColon,
+    FatArrow,
+    DotDot,
+    DotDotEqual,
+    Question,
+    At,
+    Lifetime,
+    Unknown,
+}
+
+public enum DiagnosticCode {
+    None,
+    InvalidByte,
+    ExpectedToken,
+    ExpectedIdentifier,
+    TooManyItems,
+    UnknownName,
+    DuplicateName,
+    UnknownType,
+    WrongArgumentCount,
+    MissingReturn,
+    InvalidMove,
+    UseAfterMove,
+    BorrowConflict,
+    AmbiguousName,
+    UnreachablePattern,
+    NonExhaustivePattern,
+    DynTraitMethodUnavailable,
+}
+
+public struct Token {
+    TokenKind kind;
+    i64 offset;
+    i64 length;
+}
+
+public struct Diagnostic {
+    DiagnosticCode code;
+    i64 offset;
+}
+
+public struct Source {
+    i64 bytes;
+    i64 length;
+}
+
+public struct Lexer {
+    Source input;
+    i64 offset;
+    Diagnostic last_error;
+}
+
+public struct ModuleSyntax {
+    i64 function_count;
+    i64 parameter_count;
+    i64 local_count;
+    i64 expression_count;
+    i64 diagnostic_count;
+    DiagnosticCode diagnostic_code;
+    i64 diagnostic_offset;
+    i64 complex_source_mode;
+    i64 function_name_offsets;
+    i64 function_name_lengths;
+    i64 function_parameter_starts;
+    i64 function_parameter_counts;
+    i64 function_statement_counts;
+    i64 function_return_type_offsets;
+    i64 function_return_type_lengths;
+    i64 function_return_reference;
+    i64 function_return_mutable;
+    i64 function_has_return_type;
+    i64 function_is_extern;
+    i64 parameter_type_offsets;
+    i64 parameter_type_lengths;
+    i64 parameter_name_offsets;
+    i64 parameter_name_lengths;
+    i64 parameter_reference;
+    i64 parameter_mutable;
+    i64 local_name_offsets;
+    i64 local_name_lengths;
+    i64 local_function_indices;
+}
+
+public extern fn raz_rt_alloc_aligned(i64 size, i64 alignment) -> usize;
+public extern fn raz_rt_dealloc_aligned(usize pointer, i64 alignment);
+public extern fn raz_rt_fill(usize destination, i64 value, i64 size);
+public extern fn raz_rt_move(usize destination, usize source, i64 size);
+extern fn raz_rt_bytes_equal(usize left, usize right, i64 size) -> i64;
+public extern fn raz_rt_process_argc() -> i64;
+public extern fn raz_rt_process_arg(i64 index, usize output, i64 capacity) -> i64;
+public extern fn raz_rt_stdio_write(i64 stream, usize data, i64 size) -> i64;
+public extern fn raz_rt_env_get(usize name, i64 name_length, usize output, i64 capacity) -> i64;
+public extern fn raz_rt_path_exists(usize path, i64 length) -> i64;
+public extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;
+public extern fn raz_rt_host_platform() -> i64;
+public extern fn raz_rt_host_arch() -> i64;
+extern fn raz_rt_tool_resolve(usize data, i64 length, usize output, i64 capacity) -> i64;
+public extern fn raz_rt_process_run(usize command, i64 length) -> i64;
+public extern fn raz_rt_process_run_argv(
+    usize program,
+    i64 program_length,
+    usize blob,
+    i64 blob_length,
+    i64 argument_count,
+) -> i64;
+public extern fn raz_rt_process_run_argv_cwd(
+    usize program,
+    i64 program_length,
+    usize blob,
+    i64 blob_length,
+    i64 argument_count,
+    usize working_directory,
+    i64 working_directory_length,
+) -> i64;
+extern fn raz_rt_tcp_connect(usize host, i64 host_length, i64 port) -> i64;
+extern fn raz_rt_socket_set_timeout_millis(i64 socket, i64 receive_millis, i64 send_millis) -> i64;
+extern fn raz_rt_socket_send(i64 socket, usize data, i64 size) -> i64;
+extern fn raz_rt_socket_receive(i64 socket, usize output, i64 capacity) -> i64;
+extern fn raz_rt_socket_close(i64 socket);
+extern fn raz_rt_tls_available() -> i64;
+extern fn raz_rt_tls_client_create(usize host, i64 host_length) -> usize;
+extern fn raz_rt_tls_feed(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_tls_drain(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_tls_pending_encrypted(usize handle) -> i64;
+extern fn raz_rt_tls_handshake(usize handle) -> i64;
+extern fn raz_rt_tls_handshake_finished(usize handle) -> i64;
+extern fn raz_rt_tls_write_plain(usize handle, usize data, i64 size) -> i64;
+extern fn raz_rt_tls_read_plain(usize handle, usize output, i64 capacity) -> i64;
+extern fn raz_rt_tls_shutdown(usize handle) -> i64;
+extern fn raz_rt_tls_destroy(usize handle);
+public extern fn raz_rt_file_open(usize path, i64 length, i64 flags) -> usize;
+public extern fn raz_rt_fs_metadata(usize path, i64 length, usize output, i64 capacity) -> i64;
+public extern fn raz_rt_file_read(usize handle, usize output, i64 capacity) -> i64;
+public extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
+public extern fn raz_rt_file_close(usize handle);
+public extern fn raz_rt_load_u8(usize address) -> i64;
+public extern fn raz_rt_cstr_len(string value) -> i64;
+public extern fn raz_rt_cstr_ptr(string value) -> usize;
+
+public fn compiler_literal_length(string value) -> i64 {
+    return raz_rt_cstr_len(value);
+}
+
+public fn compiler_literal_byte(string value, i64 index) -> i64 {
+    i64 length = raz_rt_cstr_len(value);
+
+    if (index < 0 || index >= length) {
+        return -1;
+    }
+    return raz_rt_load_u8(raz_rt_cstr_ptr(value) + index);
+}
+
+public extern fn raz_rt_time_monotonic_nanos() -> i64;
+public extern fn raz_rt_store_u8(usize address, i64 value) -> i64;
+public extern fn raz_rt_load_scalar(usize address, i64 bytes, i64 signed_value) -> i64;
+public extern fn raz_rt_store_scalar(usize address, i64 bytes, i64 value) -> i64;
+
+public extern fn raz_rt_ed25519_keygen(
+    usize private_key,
+    i64 private_capacity,
+    usize public_key,
+    i64 public_capacity,
+) -> i64;
+public extern fn raz_rt_ed25519_public(
+    usize private_key,
+    i64 private_length,
+    usize public_key,
+    i64 public_capacity,
+) -> i64;
+public extern fn raz_rt_ed25519_sign(
+    usize private_key,
+    i64 private_length,
+    usize message,
+    i64 message_length,
+    usize signature,
+    i64 signature_capacity,
+) -> i64;
+public extern fn raz_rt_ed25519_verify(
+    usize public_key,
+    i64 public_length,
+    usize message,
+    i64 message_length,
+    usize signature,
+    i64 signature_length,
+) -> i64;
+
+// Production compiler arena. The first 24 bytes intentionally preserve the
+// bootstrap arena ABI header so the few remaining Stage-1 OS/string adapters
+// can consume arena-backed buffers while arena ownership itself lives in Raz.
+public fn raz_compiler_rt_arena_create_width(i64 count, i64 element_bytes) -> i64 {
+    if (
+        count <= 0 ||
+        (element_bytes != 1 && element_bytes != 2 && element_bytes != 4 && element_bytes != 8) ||
+        count > (9223372036854775807 - 24) / element_bytes
+    ) {
+        return 0;
+    }
+
+    i64 bytes = 24 + count * element_bytes;
+    usize allocation = raz_rt_alloc_aligned(bytes, 8);
+
+    if (allocation == 0) {
+        return 0;
+    }
+    raz_rt_fill(allocation, 0, bytes);
+    unsafe {
+        *((allocation + 0)as i64*mut) = 4923358263036431937;
+        *((allocation + 8)as i64*mut) = count;
+        *((allocation + 16)as i64*mut) = element_bytes;
+    }
+    return (allocation + 24)as i64;
+}
+
+public fn raz_compiler_rt_arena_create(i64 count) -> i64 {
+    return raz_compiler_rt_arena_create_width(count, 8);
+}
+
+public fn raz_compiler_rt_arena_destroy(i64 handle) {
+    if (handle == 0) {
+        return;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        *((allocation + 0)as i64*mut) = 0;
+        *((allocation + 8)as i64*mut) = 0;
+        *((allocation + 16)as i64*mut) = 0;
+    }
+    raz_rt_dealloc_aligned(allocation, 8);
+}
+
+fn raz_compiler_rt_arena_count(i64 handle) -> i64 {
+    if (handle == 0) {
+        return 0;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        if (*((allocation + 0)as i64*const) != 4923358263036431937) {
+            return 0;
+        }
+        return *((allocation + 8)as i64*const);
+    }
+}
+
+fn raz_compiler_rt_arena_element_bytes(i64 handle) -> i64 {
+    if (handle == 0) {
+        return 0;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        if (*((allocation + 0)as i64*const) != 4923358263036431937) {
+            return 0;
+        }
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width == 1 || width == 2 || width == 4 || width == 8) {
+            return width;
+        }
+    }
+    return 8;
+}
+
+public fn raz_compiler_rt_arena_address(i64 handle, i64 index) -> i64 {
+    i64 count = raz_compiler_rt_arena_count(handle);
+
+    if (index < 0 || index >= count) {
+        return 0;
+    }
+    return ((handle as usize) + index * raz_compiler_rt_arena_element_bytes(handle))as i64;
+}
+
+public fn raz_compiler_rt_arena_get(i64 handle, i64 index) -> i64 {
+    if (handle == 0 || index < 0) {
+        return 0;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        if (*((allocation + 0)as i64*const) != 4923358263036431937) {
+            return 0;
+        }
+
+        i64 count = *((allocation + 8)as i64*const);
+
+        if (index >= count) {
+            return 0;
+        }
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width != 1 && width != 2 && width != 4 && width != 8) {
+            width = 8;
+        }
+        return raz_rt_load_scalar((handle as usize) + index * width, width, 0);
+    }
+}
+
+public fn raz_compiler_rt_arena_set(i64 handle, i64 index, i64 value) {
+    if (handle == 0 || index < 0) {
+        return;
+    }
+
+    usize allocation = (handle as usize) - 24;
+
+    unsafe {
+        if (*((allocation + 0)as i64*const) != 4923358263036431937) {
+            return;
+        }
+
+        i64 count = *((allocation + 8)as i64*const);
+
+        if (index >= count) {
+            return;
+        }
+
+        i64 width = *((allocation + 16)as i64*const);
+
+        if (width != 1 && width != 2 && width != 4 && width != 8) {
+            width = 8;
+        }
+        raz_rt_store_scalar((handle as usize) + index * width, width, value);
+    }
+}
+
+// Fixed-size compiler-internal tables use 8-byte cells by construction. These
+// accessors deliberately remain width-specialized so hot compiler metadata
+// lanes do not pay repeated header checks.
+public fn raz_compiler_rt_arena_get_unchecked(i64 handle, i64 index) -> i64 {
+    unsafe {
+        return *(((handle as usize) + index * 8)as i64*const);
+    }
+}
+
+public fn raz_compiler_rt_arena_set_unchecked(i64 handle, i64 index, i64 value) {
+    unsafe {
+        *(((handle as usize) + index * 8)as i64*mut) = value;
+    }
+}
+
+fn raz_compiler_rt_arena_range_equal(i64 handle, i64 left, i64 right, i64 count) -> i64 {
+    i64 capacity = raz_compiler_rt_arena_count(handle);
+
+    if (
+        left < 0 ||
+        right < 0 ||
+        count < 0 ||
+        left > capacity ||
+        right > capacity ||
+        count > capacity - left ||
+        count > capacity - right
+    ) {
+        return 0;
+    }
+
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+
+    return raz_rt_bytes_equal(
+        (handle as usize) + left * width,
+        (handle as usize) + right * width,
+        count * width,
+    );
+}
+
+public fn raz_compiler_rt_arena_range_hash(i64 handle, i64 offset, i64 count, i64 seed) -> i64 {
+    i64 capacity = raz_compiler_rt_arena_count(handle);
+
+    if (offset < 0 || count < 0 || offset > capacity || count > capacity - offset) {
+        return seed;
+    }
+
+    i64 modulus = 281474976710597;
+    i64 hash = seed % modulus;
+
+    if (hash < 0) {
+        hash += modulus;
+    }
+
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+    usize address = (handle as usize) + offset * width;
+    i64 index = 0;
+
+    while (index < count) {
+        hash = (hash * 131 + raz_rt_load_scalar(address + index * width, width, 0) + 1) % modulus;
+        index += 1;
+    }
+    return hash;
+}
+
+public fn raz_compiler_rt_arena_copy(
+    i64 destination,
+    i64 destination_offset,
+    i64 source,
+    i64 source_offset,
+    i64 count,
+) -> i64 {
+    i64 destination_count = raz_compiler_rt_arena_count(destination);
+    i64 source_count = raz_compiler_rt_arena_count(source);
+
+    if (
+        destination_offset < 0 ||
+        source_offset < 0 ||
+        count < 0 ||
+        destination_offset > destination_count ||
+        source_offset > source_count ||
+        count > destination_count - destination_offset ||
+        count > source_count - source_offset
+    ) {
+        return -1;
+    }
+
+    i64 destination_width = raz_compiler_rt_arena_element_bytes(destination);
+    i64 source_width = raz_compiler_rt_arena_element_bytes(source);
+
+    if (count > 0 && destination_width == source_width) {
+        raz_rt_move(
+            (destination as usize) + destination_offset * destination_width,
+            (source as usize) + source_offset * source_width,
+            count * source_width,
+        );
+    } else if (count > 0) {
+        i64 copied = 0;
+
+        while (copied < count) {
+            raz_compiler_rt_arena_set(
+                destination,
+                destination_offset + copied,
+                raz_compiler_rt_arena_get(source, source_offset + copied),
+            );
+            copied += 1;
+        }
+    }
+    return count;
+}
+
+public fn compiler_ascii_pack(i64 handle, i64 offset, i64 length) -> usize {
+    i64 capacity = raz_compiler_rt_arena_count(handle);
+
+    if (offset < 0 || length < 0 || offset > capacity || length > capacity - offset) {
+        return 0;
+    }
+
+    usize bytes = raz_rt_alloc_aligned(length + 1, 8);
+
+    if (bytes == 0) {
+        return 0;
+    }
+
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+
+    if (length > 0 && width == 1) {
+        raz_rt_move(bytes, (handle as usize) + offset, length);
+    } else {
+        i64 index = 0;
+
+        while (index < length) {
+            unsafe {
+                *((bytes + index)as u8*mut) = (raz_compiler_rt_arena_get(handle, offset + index) & 255)as u8;
+            }
+            index += 1;
+        }
+    }
+    unsafe {
+        *((bytes + length)as u8*mut) = 0;
+    }
+    return bytes;
+}
+
+public fn compiler_ascii_unpack(i64 handle, i64 offset, usize bytes, i64 length) -> bool {
+    i64 capacity = raz_compiler_rt_arena_count(handle);
+
+    if (
+        offset < 0 ||
+        length < 0 ||
+        offset > capacity ||
+        length > capacity - offset ||
+        (length > 0 && bytes == 0)
+    ) {
+        return false;
+    }
+
+    i64 width = raz_compiler_rt_arena_element_bytes(handle);
+
+    if (length > 0 && width == 1) {
+        raz_rt_move((handle as usize) + offset, bytes, length);
+    } else {
+        i64 index = 0;
+
+        while (index < length) {
+            unsafe {
+                raz_compiler_rt_arena_set(handle, offset + index, (*((bytes + index)as u8*const))as i64);
+            }
+            index += 1;
+        }
+    }
+    return true;
+}
+
+public fn raz_compiler_rt_write_ascii(i64 path, i64 path_length, i64 data, i64 size) -> i64 {
+    if (path_length < 0 || size < 0) {
+        return -1;
+    }
+
+    usize path_bytes = compiler_ascii_pack(path, 0, path_length);
+    usize data_bytes = compiler_ascii_pack(data, 0, size);
+
+    if ((path_length > 0 && path_bytes == 0) || (size > 0 && data_bytes == 0)) {
+        if (path_bytes != 0) {
+            raz_rt_dealloc_aligned(path_bytes, 8);
+        }
+        if (data_bytes != 0) {
+            raz_rt_dealloc_aligned(data_bytes, 8);
+        }
+        return -1;
+    }
+
+    usize file = raz_rt_file_open(path_bytes, path_length, 2 | 8 | 16);
+
+    if (file == 0) {
+        if (path_bytes != 0) {
+            raz_rt_dealloc_aligned(path_bytes, 8);
+        }
+        if (data_bytes != 0) {
+            raz_rt_dealloc_aligned(data_bytes, 8);
+        }
+        return -1;
+    }
+
+    i64 written = 0;
+
+    while (written < size) {
+        i64 count = raz_rt_file_write(file, data_bytes + written, size - written);
+
+        if (count <= 0) {
+            raz_rt_file_close(file);
+            raz_rt_dealloc_aligned(path_bytes, 8);
+            if (data_bytes != 0) {
+                raz_rt_dealloc_aligned(data_bytes, 8);
+            }
+            return -1;
+        }
+        written += count;
+    }
+    raz_rt_file_close(file);
+    if (path_bytes != 0) {
+        raz_rt_dealloc_aligned(path_bytes, 8);
+    }
+    if (data_bytes != 0) {
+        raz_rt_dealloc_aligned(data_bytes, 8);
+    }
+    return written;
+}
+
+public fn raz_compiler_rt_read_ascii(i64 path, i64 path_length, i64 data, i64 capacity) -> i64 {
+    if (path_length < 0 || capacity < 0) {
+        return -1;
+    }
+
+    usize path_bytes = compiler_ascii_pack(path, 0, path_length);
+
+    if (path_length > 0 && path_bytes == 0) {
+        return -1;
+    }
+
+    usize file = raz_rt_file_open(path_bytes, path_length, 1);
+
+    if (path_bytes != 0) {
+        raz_rt_dealloc_aligned(path_bytes, 8);
+    }
+    if (file == 0) {
+        return -1;
+    }
+
+    usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (bytes == 0) {
+        raz_rt_file_close(file);
+        return -1;
+    }
+
+    i64 total = 0;
+    bool reading = true;
+
+    while (reading && total < capacity) {
+        i64 count = raz_rt_file_read(file, bytes + total, capacity - total);
+
+        if (count < 0) {
+            raz_rt_file_close(file);
+            raz_rt_dealloc_aligned(bytes, 8);
+            return -1;
+        }
+        if (count == 0) {
+            reading = false;
+        } else {
+            total += count;
+        }
+    }
+    raz_rt_file_close(file);
+    if (total > 0) {
+        compiler_ascii_unpack(data, 0, bytes, total);
+    }
+    raz_rt_dealloc_aligned(bytes, 8);
+    return total;
+}
+
+public fn raz_compiler_rt_process_argc() -> i64 {
+    return raz_rt_process_argc();
+}
+
+public fn raz_compiler_rt_process_arg(i64 index, i64 output, i64 capacity) -> i64 {
+    if (capacity < 0) {
+        return -1;
+    }
+
+    usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_process_arg(index, bytes, capacity + 1);
+
+    if (result >= 0 && result <= capacity) {
+        compiler_ascii_unpack(output, 0, bytes, result);
+    }
+    raz_rt_dealloc_aligned(bytes, 8);
+    return result;
+}
+
+public fn raz_compiler_rt_stdio_write_ascii(i64 stream, i64 data, i64 size) -> i64 {
+    usize bytes = compiler_ascii_pack(data, 0, size);
+
+    if (size > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_stdio_write(stream, bytes, size);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_env_get_ascii(i64 name, i64 name_length, i64 output, i64 capacity) -> i64 {
+    usize name_bytes = compiler_ascii_pack(name, 0, name_length);
+
+    if (name_length > 0 && name_bytes == 0) {
+        return -1;
+    }
+
+    usize output_bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (output_bytes == 0) {
+        if (name_bytes != 0) {
+            raz_rt_dealloc_aligned(name_bytes, 8);
+        }
+        return -1;
+    }
+
+    i64 result = raz_rt_env_get(name_bytes, name_length, output_bytes, capacity + 1);
+
+    if (result >= 0 && result <= capacity) {
+        compiler_ascii_unpack(output, 0, output_bytes, result);
+    }
+    raz_rt_dealloc_aligned(output_bytes, 8);
+    if (name_bytes != 0) {
+        raz_rt_dealloc_aligned(name_bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_fs_metadata_ascii(i64 path, i64 path_length, i64 output) -> i64 {
+    if (path_length < 0 || output == 0) {
+        return 0;
+    }
+
+    usize bytes = compiler_ascii_pack(path, 0, path_length);
+
+    if (path_length > 0 && bytes == 0) {
+        return 0;
+    }
+
+    usize metadata = raz_rt_alloc_aligned(56, 8);
+
+    if (metadata == 0) {
+        if (bytes != 0) {
+            raz_rt_dealloc_aligned(bytes, 8);
+        }
+        return 0;
+    }
+    raz_rt_fill(metadata, 0, 56);
+
+    i64 result = raz_rt_fs_metadata(bytes, path_length, metadata, 7);
+
+    if (result != 0) {
+        i64 field = 0;
+
+        while (field < 7) {
+            unsafe {
+                raz_compiler_rt_arena_set(output, field, *((metadata + field * 8)as i64*const));
+            }
+            field += 1;
+        }
+    }
+    raz_rt_dealloc_aligned(metadata, 8);
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_path_exists_ascii(i64 path, i64 path_length) -> i64 {
+    usize bytes = compiler_ascii_pack(path, 0, path_length);
+
+    if (path_length > 0 && bytes == 0) {
+        return 0;
+    }
+
+    i64 result = raz_rt_path_exists(bytes, path_length);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_monotonic_nanos() -> i64 {
+    return raz_rt_time_monotonic_nanos();
+}
+
+// Host platform code (1 = Windows). Lives here rather than in the driver so
+// backend link drivers can select platform system libraries.
+public fn raz_compiler_rt_host_platform() -> i64 {
+    return raz_rt_host_platform();
+}
+
+public fn raz_compiler_rt_tool_resolve_ascii(i64 name, i64 name_length, i64 output, i64 capacity) -> i64 {
+    if (name == 0 || name_length <= 0 || output == 0 || capacity <= 0) {
+        return -1;
+    }
+
+    usize name_bytes = compiler_ascii_pack(name, 0, name_length);
+    usize output_bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (name_bytes == 0 || output_bytes == 0) {
+        if (name_bytes != 0) {
+            raz_rt_dealloc_aligned(name_bytes, 8);
+        }
+        if (output_bytes != 0) {
+            raz_rt_dealloc_aligned(output_bytes, 8);
+        }
+        return -1;
+    }
+
+    i64 result = raz_rt_tool_resolve(name_bytes, name_length, output_bytes, capacity + 1);
+
+    if (result > 0 && result <= capacity) {
+        compiler_ascii_unpack(output, 0, output_bytes, result);
+    }
+    raz_rt_dealloc_aligned(output_bytes, 8);
+    raz_rt_dealloc_aligned(name_bytes, 8);
+    return result;
+}
+
+public fn raz_compiler_rt_process_run_ascii(i64 command, i64 length) -> i64 {
+    usize bytes = compiler_ascii_pack(command, 0, length);
+
+    if (length > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_process_run(bytes, length);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_tcp_connect_ascii(i64 host, i64 host_length, i64 port) -> i64 {
+    usize bytes = compiler_ascii_pack(host, 0, host_length);
+
+    if (host_length > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_tcp_connect(bytes, host_length, port);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_socket_set_timeout_millis(i64 socket, i64 receive_millis, i64 send_millis) -> i64 {
+    return raz_rt_socket_set_timeout_millis(socket, receive_millis, send_millis);
+}
+
+public fn raz_compiler_rt_socket_send_ascii(i64 socket, i64 data, i64 offset, i64 size) -> i64 {
+    usize bytes = compiler_ascii_pack(data, offset, size);
+
+    if (size > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 sent = 0;
+
+    while (sent < size) {
+        i64 count = raz_rt_socket_send(socket, bytes + sent, size - sent);
+
+        if (count < 0) {
+            if (bytes != 0) {
+                raz_rt_dealloc_aligned(bytes, 8);
+            }
+            return -1;
+        }
+        if (count == 0) {
+            break;
+        }
+        sent += count;
+    }
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return sent;
+}
+
+public fn raz_compiler_rt_socket_receive_ascii(i64 socket, i64 output, i64 offset, i64 capacity) -> i64 {
+    usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (bytes == 0) {
+        return -1;
+    }
+
+    i64 count = raz_rt_socket_receive(socket, bytes, capacity);
+
+    if (count > 0) {
+        compiler_ascii_unpack(output, offset, bytes, count);
+    }
+    raz_rt_dealloc_aligned(bytes, 8);
+    return count;
+}
+
+public fn raz_compiler_rt_socket_close(i64 socket) {
+    raz_rt_socket_close(socket);
+}
+
+public fn raz_compiler_rt_tls_available() -> i64 {
+    return raz_rt_tls_available();
+}
+
+public fn raz_compiler_rt_tls_client_create_ascii(i64 host, i64 host_length) -> usize {
+    usize bytes = compiler_ascii_pack(host, 0, host_length);
+
+    if (host_length > 0 && bytes == 0) {
+        return 0;
+    }
+
+    usize handle = raz_rt_tls_client_create(bytes, host_length);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return handle;
+}
+
+public fn raz_compiler_rt_tls_feed_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
+    usize bytes = compiler_ascii_pack(data, offset, size);
+
+    if (size > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_tls_feed(handle as usize, bytes, size);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_tls_drain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
+    usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (bytes == 0) {
+        return -1;
+    }
+
+    i64 count = raz_rt_tls_drain(handle as usize, bytes, capacity);
+
+    if (count > 0) {
+        compiler_ascii_unpack(output, offset, bytes, count);
+    }
+    raz_rt_dealloc_aligned(bytes, 8);
+    return count;
+}
+
+public fn raz_compiler_rt_tls_pending_encrypted(i64 handle) -> i64 {
+    return raz_rt_tls_pending_encrypted(handle as usize);
+}
+
+public fn raz_compiler_rt_tls_handshake(i64 handle) -> i64 {
+    return raz_rt_tls_handshake(handle as usize);
+}
+
+public fn raz_compiler_rt_tls_handshake_finished(i64 handle) -> i64 {
+    return raz_rt_tls_handshake_finished(handle as usize);
+}
+
+public fn raz_compiler_rt_tls_write_plain_ascii(i64 handle, i64 data, i64 offset, i64 size) -> i64 {
+    usize bytes = compiler_ascii_pack(data, offset, size);
+
+    if (size > 0 && bytes == 0) {
+        return -1;
+    }
+
+    i64 result = raz_rt_tls_write_plain(handle as usize, bytes, size);
+
+    if (bytes != 0) {
+        raz_rt_dealloc_aligned(bytes, 8);
+    }
+    return result;
+}
+
+public fn raz_compiler_rt_tls_read_plain_ascii(i64 handle, i64 output, i64 offset, i64 capacity) -> i64 {
+    usize bytes = raz_rt_alloc_aligned(capacity + 1, 8);
+
+    if (bytes == 0) {
+        return -1;
+    }
+
+    i64 count = raz_rt_tls_read_plain(handle as usize, bytes, capacity);
+
+    if (count > 0) {
+        compiler_ascii_unpack(output, offset, bytes, count);
+    }
+    raz_rt_dealloc_aligned(bytes, 8);
+    return count;
+}
+
+public fn raz_compiler_rt_tls_shutdown(i64 handle) -> i64 {
+    return raz_rt_tls_shutdown(handle as usize);
+}
+
+public fn raz_compiler_rt_tls_destroy(i64 handle) {
+    raz_rt_tls_destroy(handle as usize);
+}
+
+public struct Parser {
+    Lexer scan;
+    Token current;
+    Diagnostic last_error;
+    ModuleSyntax&mut module;
+    i64 current_function;
+}
+
+public fn init_token(Token&mut out, TokenKind token_kind, i64 offset, i64 length) {
+    out.kind = token_kind;
+    out.offset = offset;
+    out.length = length;
+}
+
+public fn clear_diagnostic(Diagnostic&mut out) {
+    out.code = DiagnosticCode::None;
+    out.offset = 0;
+}
+
+public fn set_diagnostic(Diagnostic&mut out, DiagnosticCode code, i64 offset) {
+    out.code = code;
+    out.offset = offset;
+}
+
+public fn diagnostic_code_value(DiagnosticCode code) -> i64 {
+    if (code == DiagnosticCode::InvalidByte) {
+        return 1;
+    }
+    if (code == DiagnosticCode::ExpectedToken) {
+        return 2;
+    }
+    if (code == DiagnosticCode::ExpectedIdentifier) {
+        return 3;
+    }
+    if (code == DiagnosticCode::TooManyItems) {
+        return 4;
+    }
+    if (code == DiagnosticCode::UnknownName) {
+        return 5;
+    }
+    if (code == DiagnosticCode::DuplicateName) {
+        return 6;
+    }
+    if (code == DiagnosticCode::UnknownType) {
+        return 7;
+    }
+    if (code == DiagnosticCode::WrongArgumentCount) {
+        return 8;
+    }
+    if (code == DiagnosticCode::MissingReturn) {
+        return 9;
+    }
+    if (code == DiagnosticCode::InvalidMove) {
+        return 10;
+    }
+    if (code == DiagnosticCode::UseAfterMove) {
+        return 11;
+    }
+    if (code == DiagnosticCode::BorrowConflict) {
+        return 12;
+    }
+    if (code == DiagnosticCode::AmbiguousName) {
+        return 13;
+    }
+    if (code == DiagnosticCode::UnreachablePattern) {
+        return 14;
+    }
+    if (code == DiagnosticCode::NonExhaustivePattern) {
+        return 15;
+    }
+    return 0;
+}
+
+public fn source_byte(Source& value, i64 index) -> i64 {
+    if (index < 0 || index >= value.length) {
+        return 0;
+    }
+    return raz_rt_load_u8((value.bytes as usize) + index);
+}
+
+fn is_space(i64 value) -> bool {
+    return value == 32 || value == 9 || value == 10 || value == 13;
+}
+
+fn is_alpha(i64 value) -> bool {
+    return (value >= 65 && value <= 90) || (value >= 97 && value <= 122) || value == 95;
+}
+
+fn is_digit(i64 value) -> bool {
+    return value >= 48 && value <= 57;
+}
+
+public fn digit_value(i64 value) -> i64 {
+    if (value >= 48 && value <= 57) {
+        return value - 48;
+    }
+    if (value >= 97 && value <= 102) {
+        return value - 87;
+    }
+    if (value >= 65 && value <= 70) {
+        return value - 55;
+    }
+    return -1;
+}
+
+fn skip_space(Lexer&mut scan) {
+    while (scan.offset < scan.input.length && is_space(source_byte(&scan.input, scan.offset))) {
+        scan.offset += 1;
+    }
+}
+
+public fn init_lexer(Lexer&mut out, Source input) {
+    out.input = input;
+    out.offset = 0;
+    clear_diagnostic(&mut out.last_error);
+}
+
+public fn next_token(Lexer&mut scan, Token&mut out) {
+    skip_space(scan);
+
+    i64 start = scan.offset;
+
+    if (start >= scan.input.length) {
+        init_token(out, TokenKind::End, start, 0);
+        return;
+    }
+
+    i64 current = source_byte(&scan.input, scan.offset);
+
+    if (
+        current == 47 &&
+        scan.offset + 1 < scan.input.length &&
+        source_byte(&scan.input, scan.offset + 1) == 47
+    ) {
+        scan.offset += 2;
+        while (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) != 10) {
+            scan.offset += 1;
+        }
+        next_token(scan, out);
+        return;
+    }
+    if (
+        current == 47 &&
+        scan.offset + 1 < scan.input.length &&
+        source_byte(&scan.input, scan.offset + 1) == 42
+    ) {
+        scan.offset += 2;
+
+        i64 depth = 1;
+
+        while (scan.offset < scan.input.length && depth > 0) {
+            i64 comment = source_byte(&scan.input, scan.offset);
+
+            if (
+                comment == 47 &&
+                scan.offset + 1 < scan.input.length &&
+                source_byte(&scan.input, scan.offset + 1) == 42
+            ) {
+                depth += 1;
+                scan.offset += 2;
+            } else if (
+                comment == 42 &&
+                scan.offset + 1 < scan.input.length &&
+                source_byte(&scan.input, scan.offset + 1) == 47
+            ) {
+                depth -= 1;
+                scan.offset += 2;
+            } else {
+                scan.offset += 1;
+            }
+        }
+        if (depth != 0) {
+            set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+            init_token(out, TokenKind::Unknown, start, scan.offset - start);
+            return;
+        }
+        next_token(scan, out);
+        return;
+    }
+    if (current == 34) {
+        scan.offset += 1;
+
+        bool escaped = false;
+
+        while (scan.offset < scan.input.length) {
+            i64 byte = source_byte(&scan.input, scan.offset);
+
+            if (!escaped && byte == 34) {
+                scan.offset += 1;
+                init_token(out, TokenKind::String, start, scan.offset - start);
+                return;
+            }
+            if (!escaped && byte == 92) {
+                escaped = true;
+            } else {
+                escaped = false;
+            }
+            scan.offset += 1;
+        }
+        set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+        init_token(out, TokenKind::Unknown, start, scan.offset - start);
+        return;
+    }
+    if (current == 39) {
+        // A leading apostrophe followed by an identifier is a named lifetime
+        // unless it is closed by another apostrophe as a character literal.
+        if (scan.offset + 1 < scan.input.length && is_alpha(source_byte(&scan.input, scan.offset + 1))) {
+            i64 probe = scan.offset + 2;
+
+            while (
+                probe < scan.input.length &&
+                (is_alpha(source_byte(&scan.input, probe)) || is_digit(source_byte(&scan.input, probe)))
+            ) {
+                probe += 1;
+            }
+            if (probe >= scan.input.length || source_byte(&scan.input, probe) != 39) {
+                scan.offset = probe;
+                init_token(out, TokenKind::Lifetime, start, scan.offset - start);
+                return;
+            }
+        }
+        scan.offset += 1;
+
+        bool escaped = false;
+
+        while (scan.offset < scan.input.length) {
+            i64 byte = source_byte(&scan.input, scan.offset);
+
+            if (!escaped && byte == 39) {
+                scan.offset += 1;
+                init_token(out, TokenKind::Character, start, scan.offset - start);
+                return;
+            }
+            if (!escaped && byte == 92) {
+                escaped = true;
+            } else {
+                escaped = false;
+            }
+            scan.offset += 1;
+        }
+        set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+        init_token(out, TokenKind::Unknown, start, scan.offset - start);
+        return;
+    }
+    if (is_alpha(current)) {
+        scan.offset += 1;
+        while (
+            scan.offset < scan.input.length &&
+            (
+                is_alpha(source_byte(&scan.input, scan.offset)) ||
+                is_digit(source_byte(&scan.input, scan.offset))
+            )
+        ) {
+            scan.offset += 1;
+        }
+        init_token(out, TokenKind::Identifier, start, scan.offset - start);
+        return;
+    }
+    if (is_digit(current)) {
+        i64 base = 10;
+
+        if (current == 48 && scan.offset + 1 < scan.input.length) {
+            i64 prefix = source_byte(&scan.input, scan.offset + 1);
+
+            if (prefix == 120 || prefix == 88) {
+                base = 16;
+                scan.offset += 2;
+            } else if (prefix == 98 || prefix == 66) {
+                base = 2;
+                scan.offset += 2;
+            } else if (prefix == 111 || prefix == 79) {
+                base = 8;
+                scan.offset += 2;
+            }
+        }
+        if (scan.offset == start) {
+            scan.offset += 1;
+        }
+
+        i64 digits = 1;
+
+        if (base != 10) {
+            digits = 0;
+        }
+
+        bool scanning_digits = true;
+
+        while (scan.offset < scan.input.length && scanning_digits) {
+            i64 byte = source_byte(&scan.input, scan.offset);
+
+            if (byte == 95) {
+                scan.offset += 1;
+            } else {
+                i64 digit = digit_value(byte);
+
+                if (digit < 0 || digit >= base) {
+                    scanning_digits = false;
+                } else {
+                    digits += 1;
+                    scan.offset += 1;
+                }
+            }
+        }
+        if (digits == 0) {
+            set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+            init_token(out, TokenKind::Unknown, start, scan.offset - start);
+            return;
+        }
+
+        bool floating = false;
+
+        if (
+            base == 10 &&
+            scan.offset < scan.input.length &&
+            source_byte(&scan.input, scan.offset) == 46 &&
+            scan.offset + 1 < scan.input.length &&
+            is_digit(source_byte(&scan.input, scan.offset + 1))
+        ) {
+            floating = true;
+            scan.offset += 1;
+            while (
+                scan.offset < scan.input.length &&
+                (
+                    is_digit(source_byte(&scan.input, scan.offset)) ||
+                    source_byte(&scan.input, scan.offset) == 95
+                )
+            ) {
+                scan.offset += 1;
+            }
+        }
+        if (
+            base == 10 &&
+            scan.offset < scan.input.length &&
+            (source_byte(&scan.input, scan.offset) == 101 || source_byte(&scan.input, scan.offset) == 69)
+        ) {
+            floating = true;
+            scan.offset += 1;
+            if (
+                scan.offset < scan.input.length &&
+                (source_byte(&scan.input, scan.offset) == 43 || source_byte(&scan.input, scan.offset) == 45)
+            ) {
+                scan.offset += 1;
+            }
+
+            i64 exponent_start = scan.offset;
+
+            while (
+                scan.offset < scan.input.length &&
+                (
+                    is_digit(source_byte(&scan.input, scan.offset)) ||
+                    source_byte(&scan.input, scan.offset) == 95
+                )
+            ) {
+                scan.offset += 1;
+            }
+            if (scan.offset == exponent_start) {
+                set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+                init_token(out, TokenKind::Unknown, start, scan.offset - start);
+                return;
+            }
+        }
+        if (floating) {
+            init_token(out, TokenKind::Float, start, scan.offset - start);
+        } else {
+            init_token(out, TokenKind::Integer, start, scan.offset - start);
+        }
+        return;
+    }
+    scan.offset += 1;
+    if (current == 40) {
+        init_token(out, TokenKind::LeftParen, start, 1);
+        return;
+    }
+    if (current == 41) {
+        init_token(out, TokenKind::RightParen, start, 1);
+        return;
+    }
+    if (current == 123) {
+        init_token(out, TokenKind::LeftBrace, start, 1);
+        return;
+    }
+    if (current == 125) {
+        init_token(out, TokenKind::RightBrace, start, 1);
+        return;
+    }
+    if (current == 44) {
+        init_token(out, TokenKind::Comma, start, 1);
+        return;
+    }
+    if (current == 59) {
+        init_token(out, TokenKind::Semicolon, start, 1);
+        return;
+    }
+    if (current == 91) {
+        init_token(out, TokenKind::LeftBracket, start, 1);
+        return;
+    }
+    if (current == 93) {
+        init_token(out, TokenKind::RightBracket, start, 1);
+        return;
+    }
+    if (current == 46) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 46) {
+            scan.offset += 1;
+            if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+                scan.offset += 1;
+                init_token(out, TokenKind::DotDotEqual, start, 3);
+                return;
+            }
+            init_token(out, TokenKind::DotDot, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Dot, start, 1);
+        return;
+    }
+    if (current == 58) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 58) {
+            scan.offset += 1;
+            init_token(out, TokenKind::ColonColon, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Colon, start, 1);
+        return;
+    }
+    if (current == 38) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 38) {
+            scan.offset += 1;
+            init_token(out, TokenKind::AmpAmp, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::AmpersandEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Ampersand, start, 1);
+        return;
+    }
+    if (current == 124) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 124) {
+            scan.offset += 1;
+            init_token(out, TokenKind::PipePipe, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::PipeEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Pipe, start, 1);
+        return;
+    }
+    if (current == 61) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::EqualEqual, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 62) {
+            scan.offset += 1;
+            init_token(out, TokenKind::FatArrow, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Equal, start, 1);
+        return;
+    }
+    if (current == 33) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::BangEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Bang, start, 1);
+        return;
+    }
+    if (current == 60) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 60) {
+            scan.offset += 1;
+            if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+                scan.offset += 1;
+                init_token(out, TokenKind::LessLessEqual, start, 3);
+                return;
+            }
+            init_token(out, TokenKind::LessLess, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::LessEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Less, start, 1);
+        return;
+    }
+    if (current == 62) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 62) {
+            scan.offset += 1;
+            if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+                scan.offset += 1;
+                init_token(out, TokenKind::GreaterGreaterEqual, start, 3);
+                return;
+            }
+            init_token(out, TokenKind::GreaterGreater, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::GreaterEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Greater, start, 1);
+        return;
+    }
+    if (current == 43) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::PlusEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Plus, start, 1);
+        return;
+    }
+    if (current == 42) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::StarEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Star, start, 1);
+        return;
+    }
+    if (current == 47) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::SlashEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Slash, start, 1);
+        return;
+    }
+    if (current == 37) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::PercentEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Percent, start, 1);
+        return;
+    }
+    if (current == 94) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::CaretEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Caret, start, 1);
+        return;
+    }
+    if (current == 126) {
+        init_token(out, TokenKind::Tilde, start, 1);
+        return;
+    }
+    if (current == 63) {
+        init_token(out, TokenKind::Question, start, 1);
+        return;
+    }
+    if (current == 64) {
+        init_token(out, TokenKind::At, start, 1);
+        return;
+    }
+    if (current == 45) {
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 62) {
+            scan.offset += 1;
+            init_token(out, TokenKind::Arrow, start, 2);
+            return;
+        }
+        if (scan.offset < scan.input.length && source_byte(&scan.input, scan.offset) == 61) {
+            scan.offset += 1;
+            init_token(out, TokenKind::MinusEqual, start, 2);
+            return;
+        }
+        init_token(out, TokenKind::Minus, start, 1);
+        return;
+    }
+    set_diagnostic(&mut scan.last_error, DiagnosticCode::InvalidByte, start);
+    init_token(out, TokenKind::Unknown, start, 1);
+}
+
+fn token_count(Source input) -> i64 {
+    Lexer scan;
+
+    init_lexer(&mut scan, input);
+
+    Token item;
+    i64 count = 0;
+
+    while (true) {
+        next_token(&mut scan, &mut item);
+        if (item.kind == TokenKind::End) {
+            return count;
+        }
+        if (item.kind == TokenKind::Unknown) {
+            return -1;
+        }
+        count += 1;
+    }
+    return -1;
+}
+
+public fn qualify_extended_lexer() -> bool {
+    i64 data = raz_compiler_rt_arena_create(27);
+
+    if (data == 0) {
+        return false;
+    }
+
+    string seed = "[ ] . : & | ! && || += -= \n";
+    i64 index = 0;
+
+    while (index < 27) {
+        raz_compiler_rt_arena_set(data, index, compiler_literal_byte(seed, index));
+        index += 1;
+    }
+
+    Source input;
+
+    input.bytes = data;
+    input.length = 27;
+
+    bool passed = token_count(input) == 11;
+
+    raz_compiler_rt_arena_destroy(data);
+    return passed;
+}
+
+public fn token_is_fn(Source& source, Token& token) -> bool {
+    return (
+        token.length == 2 &&
+        source_byte(source, token.offset) == 102 &&
+        source_byte(source, token.offset + 1) == 110
+    );
+}
+
+public fn token_is_public(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 112 &&
+        source_byte(source, token.offset + 1) == 117 &&
+        source_byte(source, token.offset + 2) == 98 &&
+        source_byte(source, token.offset + 3) == 108 &&
+        source_byte(source, token.offset + 4) == 105 &&
+        source_byte(source, token.offset + 5) == 99
+    );
+}
+
+public fn token_is_private(Source& source, Token& token) -> bool {
+    return (
+        token.length == 7 &&
+        source_byte(source, token.offset) == 112 &&
+        source_byte(source, token.offset + 1) == 114 &&
+        source_byte(source, token.offset + 2) == 105 &&
+        source_byte(source, token.offset + 3) == 118 &&
+        source_byte(source, token.offset + 4) == 97 &&
+        source_byte(source, token.offset + 5) == 116 &&
+        source_byte(source, token.offset + 6) == 101
+    );
+}
+
+public fn token_is_if(Source& source, Token& token) -> bool {
+    return (
+        token.length == 2 &&
+        source_byte(source, token.offset) == 105 &&
+        source_byte(source, token.offset + 1) == 102
+    );
+}
+
+public fn token_is_while(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 119 &&
+        source_byte(source, token.offset + 1) == 104 &&
+        source_byte(source, token.offset + 2) == 105 &&
+        source_byte(source, token.offset + 3) == 108 &&
+        source_byte(source, token.offset + 4) == 101
+    );
+}
+
+public fn token_is_break(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 98 &&
+        source_byte(source, token.offset + 1) == 114 &&
+        source_byte(source, token.offset + 2) == 101 &&
+        source_byte(source, token.offset + 3) == 97 &&
+        source_byte(source, token.offset + 4) == 107
+    );
+}
+
+public fn token_is_continue(Source& source, Token& token) -> bool {
+    return (
+        token.length == 8 &&
+        source_byte(source, token.offset) == 99 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 110 &&
+        source_byte(source, token.offset + 3) == 116 &&
+        source_byte(source, token.offset + 4) == 105 &&
+        source_byte(source, token.offset + 5) == 110 &&
+        source_byte(source, token.offset + 6) == 117 &&
+        source_byte(source, token.offset + 7) == 101
+    );
+}
+
+public fn token_is_for(Source& source, Token& token) -> bool {
+    return (
+        token.length == 3 &&
+        source_byte(source, token.offset) == 102 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 114
+    );
+}
+
+public fn token_is_in(Source& source, Token& token) -> bool {
+    return (
+        token.length == 2 &&
+        source_byte(source, token.offset) == 105 &&
+        source_byte(source, token.offset + 1) == 110
+    );
+}
+
+public fn token_is_match(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 109 &&
+        source_byte(source, token.offset + 1) == 97 &&
+        source_byte(source, token.offset + 2) == 116 &&
+        source_byte(source, token.offset + 3) == 99 &&
+        source_byte(source, token.offset + 4) == 104
+    );
+}
+
+public fn token_is_defer(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 100 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 102 &&
+        source_byte(source, token.offset + 3) == 101 &&
+        source_byte(source, token.offset + 4) == 114
+    );
+}
+
+public fn token_is_unsafe(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 117 &&
+        source_byte(source, token.offset + 1) == 110 &&
+        source_byte(source, token.offset + 2) == 115 &&
+        source_byte(source, token.offset + 3) == 97 &&
+        source_byte(source, token.offset + 4) == 102 &&
+        source_byte(source, token.offset + 5) == 101
+    );
+}
+
+public fn token_is_import(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 105 &&
+        source_byte(source, token.offset + 1) == 109 &&
+        source_byte(source, token.offset + 2) == 112 &&
+        source_byte(source, token.offset + 3) == 111 &&
+        source_byte(source, token.offset + 4) == 114 &&
+        source_byte(source, token.offset + 5) == 116
+    );
+}
+
+public fn token_is_namespace(Source& source, Token& token) -> bool {
+    return (
+        token.length == 9 &&
+        source_byte(source, token.offset) == 110 &&
+        source_byte(source, token.offset + 1) == 97 &&
+        source_byte(source, token.offset + 2) == 109 &&
+        source_byte(source, token.offset + 3) == 101 &&
+        source_byte(source, token.offset + 4) == 115 &&
+        source_byte(source, token.offset + 5) == 112 &&
+        source_byte(source, token.offset + 6) == 97 &&
+        source_byte(source, token.offset + 7) == 99 &&
+        source_byte(source, token.offset + 8) == 101
+    );
+}
+
+public fn token_is_raz_package(Source& source, Token& token) -> bool {
+    string expected = "__raz_package";
+
+    if (token.length != 13) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < 13) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn token_is_raz_module(Source& source, Token& token) -> bool {
+    string expected = "__raz_module";
+
+    if (token.length != 12) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < 12) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn token_is_raz_dependency(Source& source, Token& token) -> bool {
+    string expected = "__raz_dependency";
+
+    if (token.length != 16) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < 16) {
+        if (source_byte(source, token.offset + index) != compiler_literal_byte(expected, index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn token_is_const(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 99 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 110 &&
+        source_byte(source, token.offset + 3) == 115 &&
+        source_byte(source, token.offset + 4) == 116
+    );
+}
+
+public fn token_is_global(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 103 &&
+        source_byte(source, token.offset + 1) == 108 &&
+        source_byte(source, token.offset + 2) == 111 &&
+        source_byte(source, token.offset + 3) == 98 &&
+        source_byte(source, token.offset + 4) == 97 &&
+        source_byte(source, token.offset + 5) == 108
+    );
+}
+
+public fn token_is_static(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 115 &&
+        source_byte(source, token.offset + 1) == 116 &&
+        source_byte(source, token.offset + 2) == 97 &&
+        source_byte(source, token.offset + 3) == 116 &&
+        source_byte(source, token.offset + 4) == 105 &&
+        source_byte(source, token.offset + 5) == 99
+    );
+}
+
+public fn token_is_thread_local(Source& source, Token& token) -> bool {
+    return (
+        token.length == 12 &&
+        source_byte(source, token.offset) == 116 &&
+        source_byte(source, token.offset + 1) == 104 &&
+        source_byte(source, token.offset + 2) == 114 &&
+        source_byte(source, token.offset + 3) == 101 &&
+        source_byte(source, token.offset + 4) == 97 &&
+        source_byte(source, token.offset + 5) == 100 &&
+        source_byte(source, token.offset + 6) == 95 &&
+        source_byte(source, token.offset + 7) == 108 &&
+        source_byte(source, token.offset + 8) == 111 &&
+        source_byte(source, token.offset + 9) == 99 &&
+        source_byte(source, token.offset + 10) == 97 &&
+        source_byte(source, token.offset + 11) == 108
+    );
+}
+
+public fn token_is_comptime(Source& source, Token& token) -> bool {
+    return (
+        token.length == 8 &&
+        source_byte(source, token.offset) == 99 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 109 &&
+        source_byte(source, token.offset + 3) == 112 &&
+        source_byte(source, token.offset + 4) == 116 &&
+        source_byte(source, token.offset + 5) == 105 &&
+        source_byte(source, token.offset + 6) == 109 &&
+        source_byte(source, token.offset + 7) == 101
+    );
+}
+
+public fn token_is_async(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 115 &&
+        source_byte(source, token.offset + 2) == 121 &&
+        source_byte(source, token.offset + 3) == 110 &&
+        source_byte(source, token.offset + 4) == 99
+    );
+}
+
+public fn token_is_await(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 119 &&
+        source_byte(source, token.offset + 2) == 97 &&
+        source_byte(source, token.offset + 3) == 105 &&
+        source_byte(source, token.offset + 4) == 116
+    );
+}
+
+public fn token_is_spawn(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 115 &&
+        source_byte(source, token.offset + 1) == 112 &&
+        source_byte(source, token.offset + 2) == 97 &&
+        source_byte(source, token.offset + 3) == 119 &&
+        source_byte(source, token.offset + 4) == 110
+    );
+}
+
+public fn token_is_assert(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 115 &&
+        source_byte(source, token.offset + 2) == 115 &&
+        source_byte(source, token.offset + 3) == 101 &&
+        source_byte(source, token.offset + 4) == 114 &&
+        source_byte(source, token.offset + 5) == 116
+    );
+}
+
+public fn token_is_true(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 116 &&
+        source_byte(source, token.offset + 1) == 114 &&
+        source_byte(source, token.offset + 2) == 117 &&
+        source_byte(source, token.offset + 3) == 101
+    );
+}
+
+public fn token_is_false(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 102 &&
+        source_byte(source, token.offset + 1) == 97 &&
+        source_byte(source, token.offset + 2) == 108 &&
+        source_byte(source, token.offset + 3) == 115 &&
+        source_byte(source, token.offset + 4) == 101
+    );
+}
+
+public fn token_is_else(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 101 &&
+        source_byte(source, token.offset + 1) == 108 &&
+        source_byte(source, token.offset + 2) == 115 &&
+        source_byte(source, token.offset + 3) == 101
+    );
+}
+
+public fn token_is_return(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 114 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 116 &&
+        source_byte(source, token.offset + 3) == 117 &&
+        source_byte(source, token.offset + 4) == 114 &&
+        source_byte(source, token.offset + 5) == 110
+    );
+}
+
+public fn token_is_enum(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 101 &&
+        source_byte(source, token.offset + 1) == 110 &&
+        source_byte(source, token.offset + 2) == 117 &&
+        source_byte(source, token.offset + 3) == 109
+    );
+}
+
+public fn token_is_struct(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 115 &&
+        source_byte(source, token.offset + 1) == 116 &&
+        source_byte(source, token.offset + 2) == 114 &&
+        source_byte(source, token.offset + 3) == 117 &&
+        source_byte(source, token.offset + 4) == 99 &&
+        source_byte(source, token.offset + 5) == 116
+    );
+}
+
+public fn token_is_extern(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 101 &&
+        source_byte(source, token.offset + 1) == 120 &&
+        source_byte(source, token.offset + 2) == 116 &&
+        source_byte(source, token.offset + 3) == 101 &&
+        source_byte(source, token.offset + 4) == 114 &&
+        source_byte(source, token.offset + 5) == 110
+    );
+}
+
+public fn token_is_abi(Source& source, Token& token) -> bool {
+    return (
+        token.length == 3 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 98 &&
+        source_byte(source, token.offset + 2) == 105
+    );
+}
+
+public fn token_is_link_name(Source& source, Token& token) -> bool {
+    return (
+        token.length == 9 &&
+        source_byte(source, token.offset) == 108 &&
+        source_byte(source, token.offset + 1) == 105 &&
+        source_byte(source, token.offset + 2) == 110 &&
+        source_byte(source, token.offset + 3) == 107 &&
+        source_byte(source, token.offset + 4) == 95 &&
+        source_byte(source, token.offset + 5) == 110 &&
+        source_byte(source, token.offset + 6) == 97 &&
+        source_byte(source, token.offset + 7) == 109 &&
+        source_byte(source, token.offset + 8) == 101
+    );
+}
+
+public fn token_is_derive(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 100 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 114 &&
+        source_byte(source, token.offset + 3) == 105 &&
+        source_byte(source, token.offset + 4) == 118 &&
+        source_byte(source, token.offset + 5) == 101
+    );
+}
+
+public fn token_is_target_feature(Source& source, Token& token) -> bool {
+    return (
+        token.length == 14 &&
+        source_byte(source, token.offset) == 116 &&
+        source_byte(source, token.offset + 1) == 97 &&
+        source_byte(source, token.offset + 2) == 114 &&
+        source_byte(source, token.offset + 3) == 103 &&
+        source_byte(source, token.offset + 4) == 101 &&
+        source_byte(source, token.offset + 5) == 116 &&
+        source_byte(source, token.offset + 6) == 95 &&
+        source_byte(source, token.offset + 7) == 102 &&
+        source_byte(source, token.offset + 8) == 101 &&
+        source_byte(source, token.offset + 9) == 97 &&
+        source_byte(source, token.offset + 10) == 116 &&
+        source_byte(source, token.offset + 11) == 117 &&
+        source_byte(source, token.offset + 12) == 114 &&
+        source_byte(source, token.offset + 13) == 101
+    );
+}
+
+public fn token_is_abi_c(Source& source, Token& token) -> bool {
+    return token.length == 1 && source_byte(source, token.offset) == 67;
+}
+
+public fn token_is_abi_system(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 115 &&
+        source_byte(source, token.offset + 1) == 121 &&
+        source_byte(source, token.offset + 2) == 115 &&
+        source_byte(source, token.offset + 3) == 116 &&
+        source_byte(source, token.offset + 4) == 101 &&
+        source_byte(source, token.offset + 5) == 109
+    );
+}
+
+public fn token_is_abi_raz(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 68 &&
+        source_byte(source, token.offset + 1) == 97 &&
+        source_byte(source, token.offset + 2) == 115 &&
+        source_byte(source, token.offset + 3) == 104
+    );
+}
+
+public fn token_is_supported_target_feature(Source& source, Token& token) -> bool {
+    if (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 115 &&
+        source_byte(source, token.offset + 1) == 115 &&
+        source_byte(source, token.offset + 2) == 101 &&
+        source_byte(source, token.offset + 3) == 50
+    ) {
+        return true;
+    }
+    if (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 118 &&
+        source_byte(source, token.offset + 2) == 120 &&
+        source_byte(source, token.offset + 3) == 50
+    ) {
+        return true;
+    }
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 110 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 111 &&
+        source_byte(source, token.offset + 3) == 110
+    );
+}
+
+fn token_is_i64(Source& source, i64 offset, i64 length) -> bool {
+    return (
+        length == 3 &&
+        source_byte(source, offset) == 105 &&
+        source_byte(source, offset + 1) == 54 &&
+        source_byte(source, offset + 2) == 52
+    );
+}
+
+fn token_is_f32(Source& source, i64 offset, i64 length) -> bool {
+    return (
+        length == 3 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 51 &&
+        source_byte(source, offset + 2) == 50
+    );
+}
+
+fn token_is_f64(Source& source, i64 offset, i64 length) -> bool {
+    return (
+        length == 3 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 54 &&
+        source_byte(source, offset + 2) == 52
+    );
+}
+
+public fn token_is_numeric_type(Source& source, i64 offset, i64 length) -> bool {
+    if (length == 2) {
+        i64 first = source_byte(source, offset);
+        i64 second = source_byte(source, offset + 1);
+
+        return (first == 105 || first == 117) && second == 56;
+    }
+    if (length == 3) {
+        i64 first = source_byte(source, offset);
+        i64 second = source_byte(source, offset + 1);
+        i64 third = source_byte(source, offset + 2);
+
+        if ((first == 105 || first == 117) && second == 49 && third == 54) {
+            return true;
+        }
+        if ((first == 105 || first == 117 || first == 102) && second == 51 && third == 50) {
+            return true;
+        }
+        if ((first == 105 || first == 117 || first == 102) && second == 54 && third == 52) {
+            return true;
+        }
+        if (first == 105 && second == 110 && third == 116) {
+            return true;
+        }
+    }
+    if (length == 4) {
+        bool uint_name =
+            source_byte(source, offset) == 117 &&
+            source_byte(source, offset + 1) == 105 &&
+            source_byte(source, offset + 2) == 110 &&
+            source_byte(source, offset + 3) == 116;
+        bool byte_name =
+            source_byte(source, offset) == 98 &&
+            source_byte(source, offset + 1) == 121 &&
+            source_byte(source, offset + 2) == 116 &&
+            source_byte(source, offset + 3) == 101;
+        return uint_name || byte_name;
+    }
+    if (length == 5) {
+        bool usize_name =
+            source_byte(source, offset) == 117 &&
+            source_byte(source, offset + 1) == 115 &&
+            source_byte(source, offset + 2) == 105 &&
+            source_byte(source, offset + 3) == 122 &&
+            source_byte(source, offset + 4) == 101;
+        bool isize_name =
+            source_byte(source, offset) == 105 &&
+            source_byte(source, offset + 1) == 115 &&
+            source_byte(source, offset + 2) == 105 &&
+            source_byte(source, offset + 3) == 122 &&
+            source_byte(source, offset + 4) == 101;
+        return usize_name || isize_name;
+    }
+    return false;
+}
+
+fn token_is_string_type(Source& source, i64 offset, i64 length) -> bool {
+    return (
+        length == 6 &&
+        source_byte(source, offset) == 115 &&
+        source_byte(source, offset + 1) == 116 &&
+        source_byte(source, offset + 2) == 114 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 110 &&
+        source_byte(source, offset + 5) == 103
+    );
+}
+
+public fn token_is_scalar_type(Source& source, i64 offset, i64 length) -> bool {
+    if (token_is_numeric_type(source, offset, length) || token_is_string_type(source, offset, length)) {
+        return true;
+    }
+    if (
+        length == 4 &&
+        source_byte(source, offset) == 98 &&
+        source_byte(source, offset + 1) == 111 &&
+        source_byte(source, offset + 2) == 111 &&
+        source_byte(source, offset + 3) == 108
+    ) {
+        return true;
+    }
+    return (
+        length == 4 &&
+        source_byte(source, offset) == 99 &&
+        source_byte(source, offset + 1) == 104 &&
+        source_byte(source, offset + 2) == 97 &&
+        source_byte(source, offset + 3) == 114
+    );
+}
+
+public fn token_is_as(Source& source, Token& token) -> bool {
+    return (
+        token.length == 2 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 115
+    );
+}
+
+public fn primitive_type_kind(Source& source, i64 offset, i64 length) -> i64 {
+    if (token_is_string_type(source, offset, length)) {
+        return 13;
+    }
+    if (token_is_f64(source, offset, length)) {
+        return 1;
+    }
+    if (token_is_f32(source, offset, length)) {
+        return 11;
+    }
+    if (length == 2) {
+        i64 first = source_byte(source, offset);
+
+        if (first == 105) {
+            return 2;
+        }
+        if (first == 117) {
+            return 5;
+        }
+    }
+    if (length == 3) {
+        i64 first = source_byte(source, offset);
+        i64 second = source_byte(source, offset + 1);
+        i64 third = source_byte(source, offset + 2);
+
+        if (second == 49 && third == 54) {
+            if (first == 105) {
+                return 3;
+            }
+            if (first == 117) {
+                return 6;
+            }
+        }
+        if (second == 51 && third == 50) {
+            if (first == 105) {
+                return 4;
+            }
+            if (first == 117) {
+                return 7;
+            }
+        }
+        if (first == 117 && second == 54 && third == 52) {
+            return 8;
+        }
+        if (first == 117 && second == 105 && third == 110) {
+            return 8;
+        }
+        if (first == 105 && second == 115 && third == 105) {
+            return 0;
+        }
+    }
+    if (length == 5 && source_byte(source, offset) == 117) {
+        return 9;
+    }
+    if (length == 4) {
+        if (source_byte(source, offset) == 98 && source_byte(source, offset + 1) == 121) {
+            return 5;
+        }
+        if (source_byte(source, offset) == 117 && source_byte(source, offset + 1) == 105) {
+            return 8;
+        }
+        if (
+            source_byte(source, offset) == 99 &&
+            source_byte(source, offset + 1) == 104 &&
+            source_byte(source, offset + 2) == 97 &&
+            source_byte(source, offset + 3) == 114
+        ) {
+            return 10;
+        }
+    }
+    return 0;
+}
+
+public fn primitive_type_is_float(i64 type_kind) -> bool {
+    return type_kind == 1 || type_kind == 11;
+}
+
+public fn primitive_type_is_unsigned(i64 type_kind) -> bool {
+    return (type_kind >= 5 && type_kind <= 9) || type_kind == 10;
+}
+
+public fn primitive_type_is_integer(i64 type_kind) -> bool {
+    // Only the built-in scalar integer/boolean/character kinds participate in
+    // integer arithmetic. Higher HIR-only kinds are enums/aggregates/handles.
+    return type_kind == 0 || (type_kind >= 2 && type_kind <= 10);
+}
+
+public fn primitive_type_width(i64 type_kind) -> i64 {
+    if (type_kind == 2 || type_kind == 5) {
+        return 8;
+    }
+    if (type_kind == 3 || type_kind == 6) {
+        return 16;
+    }
+    if (type_kind == 4 || type_kind == 7 || type_kind == 10 || type_kind == 11) {
+        return 32;
+    }
+    return 64;
+}
+
+public fn primitive_cast_supported(i64 source_type, i64 target_type) -> bool {
+    if (source_type == target_type) {
+        return true;
+    }
+    if (
+        source_type == 12 ||
+        target_type == 12 ||
+        source_type == 13 ||
+        target_type == 13 ||
+        source_type == 14 ||
+        target_type == 14
+    ) {
+        return false;
+    }
+
+    bool source_float = primitive_type_is_float(source_type);
+    bool target_float = primitive_type_is_float(target_type);
+
+    if (!source_float && !target_float) {
+        return true;
+    }
+    if (source_float && target_float) {
+        return true;
+    }
+
+    i64 integer_type = source_type;
+
+    if (source_float) {
+        integer_type = target_type;
+    }
+    if (primitive_type_is_unsigned(integer_type) && primitive_type_width(integer_type) == 64) {
+        return false;
+    }
+    return true;
+}
+
+public fn token_is_length(Source& source, Token& token) -> bool {
+    return (
+        token.length == 6 &&
+        source_byte(source, token.offset) == 108 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 110 &&
+        source_byte(source, token.offset + 3) == 103 &&
+        source_byte(source, token.offset + 4) == 116 &&
+        source_byte(source, token.offset + 5) == 104
+    );
+}
+
+public fn token_is_mut(Source& source, Token& token) -> bool {
+    return (
+        token.length == 3 &&
+        source_byte(source, token.offset) == 109 &&
+        source_byte(source, token.offset + 1) == 117 &&
+        source_byte(source, token.offset + 2) == 116
+    );
+}
+
+public fn token_is_move(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 109 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 118 &&
+        source_byte(source, token.offset + 3) == 101
+    );
+}
+
+public fn token_is_ref(Source& source, Token& token) -> bool {
+    return (
+        token.length == 3 &&
+        source_byte(source, token.offset) == 114 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 102
+    );
+}
+
+public fn token_is_auto(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 97 &&
+        source_byte(source, token.offset + 1) == 117 &&
+        source_byte(source, token.offset + 2) == 116 &&
+        source_byte(source, token.offset + 3) == 111
+    );
+}
+
+public fn token_is_impl(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 105 &&
+        source_byte(source, token.offset + 1) == 109 &&
+        source_byte(source, token.offset + 2) == 112 &&
+        source_byte(source, token.offset + 3) == 108
+    );
+}
+
+public fn token_is_trait(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 116 &&
+        source_byte(source, token.offset + 1) == 114 &&
+        source_byte(source, token.offset + 2) == 97 &&
+        source_byte(source, token.offset + 3) == 105 &&
+        source_byte(source, token.offset + 4) == 116
+    );
+}
+
+public fn token_is_dyn(Source& source, Token& token) -> bool {
+    return (
+        token.length == 3 &&
+        source_byte(source, token.offset) == 100 &&
+        source_byte(source, token.offset + 1) == 121 &&
+        source_byte(source, token.offset + 2) == 110
+    );
+}
+
+public fn token_is_self_type(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 83 &&
+        source_byte(source, token.offset + 1) == 101 &&
+        source_byte(source, token.offset + 2) == 108 &&
+        source_byte(source, token.offset + 3) == 102
+    );
+}
+
+public fn token_is_type_keyword(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 116 &&
+        source_byte(source, token.offset + 1) == 121 &&
+        source_byte(source, token.offset + 2) == 112 &&
+        source_byte(source, token.offset + 3) == 101
+    );
+}
+
+public fn token_is_drop_trait(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 68 &&
+        source_byte(source, token.offset + 1) == 114 &&
+        source_byte(source, token.offset + 2) == 111 &&
+        source_byte(source, token.offset + 3) == 112
+    );
+}
+
+public fn token_is_clone_trait(Source& source, Token& token) -> bool {
+    return (
+        token.length == 5 &&
+        source_byte(source, token.offset) == 67 &&
+        source_byte(source, token.offset + 1) == 108 &&
+        source_byte(source, token.offset + 2) == 111 &&
+        source_byte(source, token.offset + 3) == 110 &&
+        source_byte(source, token.offset + 4) == 101
+    );
+}
+
+public fn token_is_copy_trait(Source& source, Token& token) -> bool {
+    return (
+        token.length == 4 &&
+        source_byte(source, token.offset) == 67 &&
+        source_byte(source, token.offset + 1) == 111 &&
+        source_byte(source, token.offset + 2) == 112 &&
+        source_byte(source, token.offset + 3) == 121
+    );
+}
+
+public fn token_is_clone_function(Source& source, i64 offset, i64 length) -> bool {
+    return (
+        length == 5 &&
+        source_byte(source, offset) == 99 &&
+        source_byte(source, offset + 1) == 108 &&
+        source_byte(source, offset + 2) == 111 &&
+        source_byte(source, offset + 3) == 110 &&
+        source_byte(source, offset + 4) == 101
+    );
+}
+
+fn token_matches_literal(Source& source, Token& token, string expected, i64 length) -> bool {
+    if (token.length != length) {
+        return false;
+    }
+
+    usize expected_bytes = raz_rt_cstr_ptr(expected);
+    i64 index = 0;
+
+    while (index < length) {
+        if (source_byte(source, token.offset + index) != raz_rt_load_u8(expected_bytes + index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+public fn token_extern_kind(Source& source, Token& token) -> i64 {
+    if (token.length == 27 && source_byte(source, token.offset + 21) == 99) {
+        return 1;
+    }
+    if (token.length == 28 && source_byte(source, token.offset + 21) == 100) {
+        return 2;
+    }
+    if (token.length == 24 && source_byte(source, token.offset + 21) == 103) {
+        return 3;
+    }
+    if (token.length == 24 && source_byte(source, token.offset + 21) == 115) {
+        return 4;
+    }
+    if (token.length == 26 && source_byte(source, token.offset + 15) == 119) {
+        return 5;
+    }
+    if (token.length == 25 && source_byte(source, token.offset + 15) == 114) {
+        return 6;
+    }
+    if (token.length == 23 && source_byte(source, token.offset + 8) == 119) {
+        return 5;
+    }
+    if (token.length == 22 && source_byte(source, token.offset + 8) == 114) {
+        return 6;
+    }
+    if (token_matches_literal(source, token, "raz_rt_random_fill", 18)) {
+        return 7;
+    }
+    if (token_matches_literal(source, token, "raz_rt_random_seed", 18)) {
+        return 8;
+    }
+    if (token_matches_literal(source, token, "raz_rt_secure_zero", 18)) {
+        return 9;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_keygen", 21)) {
+        return 10;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_public", 21)) {
+        return 11;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_sign", 19)) {
+        return 12;
+    }
+    if (token_matches_literal(source, token, "raz_rt_ed25519_verify", 21)) {
+        return 13;
+    }
+    return 0;
+}
+
+public fn token_same(Source& source, i64 left_offset, i64 left_length, i64 right_offset, i64 right_length) -> bool {
+    if (
+        left_length != right_length ||
+        left_offset < 0 ||
+        right_offset < 0 ||
+        left_length < 0 ||
+        left_offset > source.length ||
+        right_offset > source.length ||
+        left_length > source.length - left_offset ||
+        right_length > source.length - right_offset
+    ) {
+        return false;
+    }
+    return raz_rt_bytes_equal(
+        (source.bytes as usize) + left_offset,
+        (source.bytes as usize) + right_offset,
+        left_length,
+    ) != 0;
+}

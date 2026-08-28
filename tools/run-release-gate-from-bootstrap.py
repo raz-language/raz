@@ -35,9 +35,9 @@ def main() -> int:
     args = ap.parse_args()
 
     qualification = ROOT / 'target/bootstrap'
-    compiler = qualification / 'repro-1' / 'target' / args.bootstrap_profile / 'bin' / f'raz-compiler{EXE}'
+    compiler = qualification / 'release' / 'bin' / f'raz{EXE}'
     if not compiler.is_file():
-        raise SystemExit(f'release artifacts: self-hosted compiler not found: {compiler}')
+        raise SystemExit(f'release artifacts: retained production compiler not found: {compiler}')
 
     host = ROOT / 'build' / args.host_preset
     forge_run = one(host, (f'forge-codegen{EXE}',))

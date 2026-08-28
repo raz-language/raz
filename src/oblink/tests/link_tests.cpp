@@ -13,11 +13,18 @@
 #include "oblink/link.hpp"
 #include "oblink/coff.hpp"
 #include "pe_validate.hpp"
+#include "coff_builder.hpp"
 
 // Every successful link in this file must produce an image the Windows loader
 // would accept. Checking only for "MZ" let a build ship in which each output
 // carried two zero-length sections at the same RVA -- a file that is obviously
 // a PE and that no Windows machine will run.
+static oblink::LinkOptions link_options(std::filesystem::path output) {
+  oblink::LinkOptions options;
+  options.output = std::move(output);
+  return options;
+}
+
 static bool valid_image(const std::filesystem::path& path, const char* what) {
   const auto image = oblink::testing::validate_pe(path);
   if (image.ok()) return true;
@@ -28,6 +35,30 @@ static bool valid_image(const std::filesystem::path& path, const char* what) {
 static void u16(std::vector<std::byte>& b, std::uint16_t v){b.push_back(std::byte(v&255));b.push_back(std::byte(v>>8));}
 static void u32(std::vector<std::byte>& b, std::uint32_t v){for(int i=0;i<4;++i)b.push_back(std::byte((v>>(8*i))&255));}
 static void be32(std::vector<std::byte>& b, std::uint32_t v){for(int i=3;i>=0;--i)b.push_back(std::byte((v>>(8*i))&255));}
+static std::vector<std::byte> object_with_dead_comdat_undefined() {
+  using namespace oblink::testing;
+  ObjectBuilder builder;
+  const auto missing = builder.add_symbol({"missing", 0, 0, 0x20, 2, {}});
+  builder.add_comdat_section_symbol(".text$mn", 1, oblink::coff::comdat_select_any, 1);
+  builder.add_symbol({"main", 0, 1, 0x20, 2, {}});
+  builder.add_comdat_section_symbol(".text$mn", 2, oblink::coff::comdat_select_any, 5);
+  builder.add_symbol({"dead", 0, 2, 0x20, 2, {}});
+
+  BuiltSection main_section;
+  main_section.name = ".text$mn";
+  main_section.characteristics = 0x60001020U;
+  main_section.data = {0xC3};
+  builder.add_section(std::move(main_section));
+
+  BuiltSection dead_section;
+  dead_section.name = ".text$mn";
+  dead_section.characteristics = 0x60001020U;
+  dead_section.data = {0xE8, 0, 0, 0, 0};
+  dead_section.relocations.push_back({1, missing, oblink::coff::reloc_amd64_rel32});
+  builder.add_section(std::move(dead_section));
+  return builder.build();
+}
+
 static std::vector<std::byte> object_with_symbol(std::string symbol, bool define, std::string ref = {}, bool comdat = false) {
   std::vector<std::byte> b;
   const std::uint16_t reloc_count = ref.empty() ? 0 : 1;
@@ -36,7 +67,7 @@ static std::vector<std::byte> object_with_symbol(std::string symbol, bool define
   const std::uint32_t sym_off = reloc_off + reloc_count * 10U;
   const std::uint32_t sym_count = ref.empty() ? 1 : 2;
   u16(b,0x8664); u16(b,1); u32(b,0); u32(b,sym_off); u32(b,sym_count); u16(b,0); u16(b,0);
-  for(char c: std::string(".text")) b.push_back(std::byte(c)); while(b.size()<28)b.push_back(std::byte{0});
+  for(char c: std::string(".text")) { b.push_back(std::byte(c)); } while(b.size()<28)b.push_back(std::byte{0});
   u32(b,0); u32(b,0); u32(b,raw_size); u32(b,raw_off); u32(b,reloc_count?reloc_off:0); u32(b,0); u16(b,reloc_count); u16(b,0); u32(b,0x60000020U | (comdat ? 0x00001000U : 0U));
   if (ref.empty()) b.push_back(std::byte{0xC3});
   else { b.push_back(std::byte{0xE8}); u32(b,0); u32(b,1); u32(b,1); u16(b,0x0004); }
@@ -48,7 +79,7 @@ static std::vector<std::byte> object_with_long_symbol_ref(std::string symbol, st
   std::vector<std::byte> b;
   const std::uint32_t raw_off=60U, raw_size=5U, reloc_off=65U, sym_off=75U, sym_count=2U;
   u16(b,0x8664);u16(b,1);u32(b,0);u32(b,sym_off);u32(b,sym_count);u16(b,0);u16(b,0);
-  for(char c:std::string(".text"))b.push_back(std::byte(c));while(b.size()<28)b.push_back(std::byte{0});
+  for(char c:std::string(".text")) { b.push_back(std::byte(c)); } while(b.size()<28)b.push_back(std::byte{0});
   u32(b,0);u32(b,0);u32(b,raw_size);u32(b,raw_off);u32(b,reloc_off);u32(b,0);u16(b,1);u16(b,0);u32(b,0x60000020U);
   b.push_back(std::byte{0xE8});u32(b,0);u32(b,1);u32(b,1);u16(b,0x0004);
   std::vector<std::string> long_names;
@@ -71,7 +102,7 @@ static std::vector<std::byte> object_with_comdat_data(std::string symbol, std::v
   const std::uint32_t sym_off=raw_off+static_cast<std::uint32_t>(payload.size());
   // section symbol + its auxiliary section-definition record + public external
   u16(b,0x8664);u16(b,1);u32(b,0);u32(b,sym_off);u32(b,3);u16(b,0);u16(b,0);
-  for(char c:std::string(".rdata"))b.push_back(std::byte(c));while(b.size()<28)b.push_back(std::byte{0});
+  for(char c:std::string(".rdata")) { b.push_back(std::byte(c)); } while(b.size()<28)b.push_back(std::byte{0});
   u32(b,0);u32(b,0);u32(b,static_cast<std::uint32_t>(payload.size()));u32(b,raw_off);
   u32(b,0);u32(b,0);u16(b,0);u16(b,0);u32(b,0x40000040U|(mark_comdat?0x00001000U:0U));
   b.insert(b.end(),payload.begin(),payload.end());
@@ -111,10 +142,10 @@ static std::vector<std::byte> object_with_common(std::string symbol, std::uint32
   std::vector<std::byte> b;
   const std::uint32_t raw_off=60, sym_off=61;
   u16(b,0x8664);u16(b,1);u32(b,0);u32(b,sym_off);u32(b,1);u16(b,0);u16(b,0);
-  for(char c:std::string(".text"))b.push_back(std::byte(c));while(b.size()<28)b.push_back(std::byte{0});
+  for(char c:std::string(".text")) { b.push_back(std::byte(c)); } while(b.size()<28)b.push_back(std::byte{0});
   u32(b,0);u32(b,0);u32(b,1);u32(b,raw_off);u32(b,0);u32(b,0);u16(b,0);u16(b,0);u32(b,0x60000020U);
   b.push_back(std::byte{0xC3});
-  for(size_t i=0;i<8;++i)b.push_back(i<symbol.size()?std::byte(symbol[i]):std::byte{0});u32(b,size);u16(b,0);u16(b,0);b.push_back(std::byte{2});b.push_back(std::byte{0});u32(b,4);return b;
+  for(size_t i=0;i<8;++i) { b.push_back(i<symbol.size()?std::byte(symbol[i]):std::byte{0}); } u32(b,size);u16(b,0);u16(b,0);b.push_back(std::byte{2});b.push_back(std::byte{0});u32(b,4);return b;
 }
 // A .text section plus an uninitialized .bss section holding one symbol. The
 // .bss header reports its extent in SizeOfRawData with PointerToRawData zero,
@@ -249,7 +280,7 @@ static std::vector<std::byte> mingw_import_tail(std::string iname_symbol, std::s
   u16(b,0x8664);u16(b,1);u32(b,0);u32(b,sym_off);u32(b,1);u16(b,0);u16(b,0);
   for(char c:std::string(".idata$7"))b.push_back(std::byte(c));
   u32(b,0);u32(b,0);u32(b,name_size);u32(b,name_raw);u32(b,0);u32(b,0);u16(b,0);u16(b,0);u32(b,0xC0000040U);
-  for(char c:dll)b.push_back(std::byte(c)); b.push_back(std::byte{0});
+  for(char c:dll) { b.push_back(std::byte(c)); } b.push_back(std::byte{0});
   for(size_t i=0;i<8;++i)b.push_back(i<iname_symbol.size()?std::byte(iname_symbol[i]):std::byte{0});
   u32(b,0);u16(b,1);u16(b,0);b.push_back(std::byte{2});b.push_back(std::byte{0});u32(b,4);
   return b;
@@ -302,7 +333,7 @@ static std::vector<std::byte> object_with_directive(std::string symbol, std::str
   auto section=[&](std::string name,std::uint32_t size,std::uint32_t raw,std::uint32_t chars){for(size_t i=0;i<8;++i)b.push_back(i<name.size()?std::byte(name[i]):std::byte{0});u32(b,0);u32(b,0);u32(b,size);u32(b,raw);u32(b,0);u32(b,0);u16(b,0);u16(b,0);u32(b,chars);};
   section(".text",1,text_raw,0x60000020U);section(".drectve",static_cast<std::uint32_t>(directive.size()),directive_raw,0x00100A00U);
   b.push_back(std::byte{0xC3});for(char c:directive)b.push_back(std::byte(c));
-  for(size_t i=0;i<8;++i)b.push_back(i<symbol.size()?std::byte(symbol[i]):std::byte{0});u32(b,0);u16(b,1);u16(b,0x20);b.push_back(std::byte{2});b.push_back(std::byte{0});u32(b,4);return b;
+  for(size_t i=0;i<8;++i) { b.push_back(i<symbol.size()?std::byte(symbol[i]):std::byte{0}); } u32(b,0);u16(b,1);u16(b,0x20);b.push_back(std::byte{2});b.push_back(std::byte{0});u32(b,4);return b;
 }
 static std::vector<std::byte> object_with_alias(std::string symbol, std::string ref, std::string library, std::string alias_target) {
   const std::string directive=" /DEFAULTLIB:"+library+" /ALTERNATENAME:"+ref+"="+alias_target;
@@ -332,14 +363,14 @@ static std::vector<std::byte> object_with_imagebase_pointer() {
   u32(b,0);u16(b,0);u16(b,0);b.push_back(std::byte{2});b.push_back(std::byte{0});
   const std::string name="__ImageBase";
   u32(b,static_cast<std::uint32_t>(4U+name.size()+1U));
-  for(char c:name)b.push_back(std::byte(c));b.push_back(std::byte{0});
+  for(char c:name) { b.push_back(std::byte(c)); } b.push_back(std::byte{0});
   return b;
 }
 
 static std::vector<std::byte> import_object(std::string symbol, std::string dll) {
   std::vector<std::byte> payload;
-  for (char c : symbol) payload.push_back(std::byte(c)); payload.push_back(std::byte{0});
-  for (char c : dll) payload.push_back(std::byte(c)); payload.push_back(std::byte{0});
+  for (char c : symbol) { payload.push_back(std::byte(c)); } payload.push_back(std::byte{0});
+  for (char c : dll) { payload.push_back(std::byte(c)); } payload.push_back(std::byte{0});
   std::vector<std::byte> b;
   u16(b,0); u16(b,0xffff); u16(b,0); u16(b,0x8664); u32(b,0);
   u32(b,static_cast<std::uint32_t>(payload.size())); u16(b,0);
@@ -361,7 +392,7 @@ static void write_indexed_archive(const std::filesystem::path& path, std::string
   const std::size_t index_size=8U+symbol.size()+1U;
   const std::uint32_t member_offset=static_cast<std::uint32_t>(8U+60U+index_size+(index_size&1U));
   std::vector<std::byte> index;be32(index,1);be32(index,member_offset);
-  for(char c:symbol)index.push_back(std::byte(c));index.push_back(std::byte{0});
+  for(char c:symbol) { index.push_back(std::byte(c)); } index.push_back(std::byte{0});
   std::ofstream out(path,std::ios::binary);out<<"!<arch>\n";ar_raw_member(out,"/",index);ar_member(out,member_name,member);
   if(!unindexed.empty())ar_member(out,"unused.obj",unindexed);
 }
@@ -373,8 +404,25 @@ static int run(){
   const auto mainobj=dir/"main.obj", lib=dir/"runtime.lib", exe=dir/"main.exe";
   write_bytes(mainobj, object_with_symbol("main", true, "helper"));
   {std::ofstream out(lib,std::ios::binary); out<<"!<arch>\n"; ar_member(out,"helper.obj",object_with_symbol("helper",true)); ar_member(out,"unused.obj",object_with_symbol("unused",true,"missing"));}
-  auto result=oblink::link({mainobj,lib},{.output=exe}); if(!result.ok()){for(auto& d:result.diagnostics)std::cerr<<d.message<<'\n';return 1;}
+  auto result=oblink::link({mainobj,lib},link_options(exe)); if(!result.ok()){for(auto& d:result.diagnostics)std::cerr<<d.message<<'\n';return 1;}
   if(!valid_image(exe,"single-object link")) return 2;
+
+  // /OPT:REF-style reachability must discard an unreferenced COMDAT before
+  // archive-resolution considers its relocations. Otherwise a dead helper call
+  // pulls C++/CRT/archive members and bloats small Forge executables.
+  const auto gc_obj=dir/"gc-main.obj", gc_exe=dir/"gc-main.exe", gc_map=dir/"gc-main.map";
+  write_bytes(gc_obj, object_with_dead_comdat_undefined());
+  oblink::LinkOptions gc_opts; gc_opts.output=gc_exe; gc_opts.map_output=gc_map;
+  auto gc_result=oblink::link({gc_obj},gc_opts);
+  if(!gc_result.ok()){for(auto& d:gc_result.diagnostics)std::cerr<<d.message<<'\n';return 40;}
+  if(!valid_image(gc_exe,"dead COMDAT GC link")) return 41;
+  {
+    std::ifstream map(gc_map);
+    std::string text((std::istreambuf_iterator<char>(map)), std::istreambuf_iterator<char>());
+    if(text.find(" dead\n")!=std::string::npos || text.find(" missing\n")!=std::string::npos){
+      std::cerr<<"dead COMDAT GC link: unreachable symbols survived\n"; return 42;
+    }
+  }
 
   // Archive resolution must be lazy per symbol. If two members both define
   // helper, only the first provider should be extracted; eagerly loading both
@@ -384,7 +432,7 @@ static int run(){
   {std::ofstream out(lazy_lib,std::ios::binary); out<<"!<arch>\n";
    ar_member(out,"first.obj",object_with_symbol("helper",true));
    ar_member(out,"second.obj",object_with_symbol("helper",true,"must_not_be_loaded"));}
-  auto lazy_result=oblink::link({lazy_main,lazy_lib},{.output=lazy_exe});
+  auto lazy_result=oblink::link({lazy_main,lazy_lib},link_options(lazy_exe));
   if(!lazy_result.ok()){for(auto& d:lazy_result.diagnostics)std::cerr<<d.message<<'\n';return 12;}
   if(!valid_image(lazy_exe,"lazy archive link")) return 20;
 
@@ -395,7 +443,7 @@ static int run(){
   write_bytes(idx_main,object_with_symbol("main",true,"helper"));
   write_indexed_archive(idx_lib,"helper","helper.obj",object_with_symbol("helper",true),
                         {std::byte{0x13},std::byte{0x37},std::byte{0x42}});
-  auto indexed_result=oblink::link({idx_main,idx_lib},{.output=idx_exe});
+  auto indexed_result=oblink::link({idx_main,idx_lib},link_options(idx_exe));
   if(!indexed_result.ok()){for(auto& d:indexed_result.diagnostics)std::cerr<<d.message<<'\n';return 14;}
   if(!valid_image(idx_exe,"indexed archive link")) return 21;
 
@@ -405,7 +453,7 @@ static int run(){
   write_bytes(crt_main,object_with_symbol("main",true));
   write_indexed_archive(crt_lib,"mainCRTStartup","startup.obj",
                         object_with_long_symbol_ref("mainCRTStartup","main"));
-  auto crt_result=oblink::link({crt_main,crt_lib},{.output=crt_exe});
+  auto crt_result=oblink::link({crt_main,crt_lib},link_options(crt_exe));
   if(!crt_result.ok()){for(auto& d:crt_result.diagnostics)std::cerr<<d.message<<'\n';return 15;}
   if(!valid_image(crt_exe,"CRT startup link")) return 22;
   if(pe_entry_rva(crt_exe)==0x1000U) return 16;
@@ -414,13 +462,13 @@ static int run(){
   // and C++ objects. It must resolve without an input definition.
   const auto imagebase_obj=dir/"imagebase.obj", imagebase_exe=dir/"imagebase.exe";
   write_bytes(imagebase_obj,object_with_imagebase_pointer());
-  auto imagebase_result=oblink::link({imagebase_obj},{.output=imagebase_exe});
+  auto imagebase_result=oblink::link({imagebase_obj},link_options(imagebase_exe));
   if(!imagebase_result.ok()){for(auto& d:imagebase_result.diagnostics)std::cerr<<d.message<<'\n';return 17;}
   if(!valid_image(imagebase_exe,"__ImageBase link")) return 23;
   const auto c1=dir/"comdat1.obj", c2=dir/"comdat2.obj", cexe=dir/"comdat.exe";
   write_bytes(c1, object_with_symbol("main", true, {}, true));
   write_bytes(c2, object_with_symbol("main", true, {}, true));
-  auto comdat_result=oblink::link({c1,c2},{.output=cexe});
+  auto comdat_result=oblink::link({c1,c2},link_options(cexe));
   if(!comdat_result.ok()){for(auto& d:comdat_result.diagnostics)std::cerr<<d.message<<'\n';return 3;}
   if(!valid_image(cexe,"code COMDAT link")) return 24;
 
@@ -433,7 +481,7 @@ static int run(){
   write_bytes(dmain,object_with_long_symbol_ref("main",nothrow));
   write_bytes(d1,object_with_comdat_data(nothrow,{std::byte{1},std::byte{2}},oblink::coff::comdat_select_any,false));
   write_bytes(d2,object_with_comdat_data(nothrow,{std::byte{3},std::byte{4}},oblink::coff::comdat_select_any,false));
-  auto data_comdat_result=oblink::link({dmain,d1,d2},{.output=dexe});
+  auto data_comdat_result=oblink::link({dmain,d1,d2},link_options(dexe));
   if(!data_comdat_result.ok()){for(auto& d:data_comdat_result.diagnostics)std::cerr<<d.message<<'\n';return 9;}
   if(!valid_image(dexe,"data COMDAT link")) return 25;
 
@@ -441,7 +489,7 @@ static int run(){
   write_bytes(smmain,object_with_symbol("main",true));
   write_bytes(sm1,object_with_comdat_data("same",{std::byte{1}},oblink::coff::comdat_select_same_size));
   write_bytes(sm2,object_with_comdat_data("same",{std::byte{1},std::byte{2}},oblink::coff::comdat_select_same_size));
-  auto same_result=oblink::link({smmain,sm1,sm2},{.output=smexe});
+  auto same_result=oblink::link({smmain,sm1,sm2},link_options(smexe));
   if(same_result.ok()) return 10;
 
   // Microsoft short-import object: the referring object asks for __imp_f while
@@ -450,7 +498,7 @@ static int run(){
   const auto impmain=dir/"impmain.obj", implib=dir/"kernel.lib", impexe=dir/"import.exe";
   write_bytes(impmain, object_with_symbol("main", true, "__imp_f"));
   {std::ofstream out(implib,std::ios::binary); out<<"!<arch>\n"; ar_member(out,"f.imp",import_object("f","kernel32.dll"));}
-  auto import_result=oblink::link({impmain,implib},{.output=impexe});
+  auto import_result=oblink::link({impmain,implib},link_options(impexe));
   if(!import_result.ok()){for(auto& d:import_result.diagnostics)std::cerr<<d.message<<'\n';return 4;}
   if(!valid_image(impexe,"import link")) return 18;
   std::vector<char> import_bytes;
@@ -470,7 +518,7 @@ static int run(){
 
   const auto commonmain=dir/"common-main.obj", commonobj=dir/"common.obj", commonexe=dir/"common.exe";
   write_bytes(commonmain,object_with_symbol("main",true,"common"));write_bytes(commonobj,object_with_common("common",8));
-  auto common_result=oblink::link({commonmain,commonobj},{.output=commonexe});
+  auto common_result=oblink::link({commonmain,commonobj},link_options(commonexe));
   if(!common_result.ok()){for(auto& d:common_result.diagnostics)std::cerr<<d.message<<'\n';return 7;}
   if(!valid_image(commonexe,"common symbol link")) return 27;
 
@@ -487,7 +535,7 @@ static int run(){
   const auto mm1=dir/"mismatch1.obj", mm2=dir/"mismatch2.obj", mmexe=dir/"mismatch.exe";
   write_bytes(mm1,object_with_directive("main"," /FAILIFMISMATCH:RuntimeLibrary=ONE"));
   write_bytes(mm2,object_with_directive("other"," /FAILIFMISMATCH:RuntimeLibrary=TWO"));
-  auto mismatch_result=oblink::link({mm1,mm2},{.output=mmexe});
+  auto mismatch_result=oblink::link({mm1,mm2},link_options(mmexe));
   if(mismatch_result.ok()) return 13;
 
   // Uninitialized data must reach the image as image extent with no file bytes.
@@ -557,7 +605,7 @@ static int run(){
   const auto idmain=dir/"idata-main.obj", idlib=dir/"idata.lib", idexe=dir/"idata.exe";
   write_bytes(idmain,object_with_idata_contribution("main","__imp_f"));
   {std::ofstream out(idlib,std::ios::binary); out<<"!<arch>\n"; ar_member(out,"f.imp",import_object("f","kernel32.dll"));}
-  auto idata_result=oblink::link({idmain,idlib},{.output=idexe});
+  auto idata_result=oblink::link({idmain,idlib},link_options(idexe));
   if(!idata_result.ok()){for(auto& d:idata_result.diagnostics)std::cerr<<d.message<<'\n';return 39;}
   if(!valid_image(idexe,"contributed .idata link")) return 40;
   {

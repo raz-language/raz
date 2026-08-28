@@ -3,7 +3,7 @@
 
 #include "forge/ir/parser.hpp"
 #include "forge/ir/lexer.hpp"
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/data_layout.hpp"
 #include <charconv>
 #include <cstdint>
 #include <algorithm>
@@ -248,6 +248,14 @@ private:
         } catch (const std::invalid_argument&) { fail("invalid integer initializer"); }
           catch (const std::out_of_range&) { fail("integer initializer is out of range"); }
     }
+    void parse_operation_attributes(Operation& operation) {
+        while (take("attr")) {
+            const auto name = expect_kind(TokenKind::identifier, "operation attribute name").text;
+            const auto value_token = expect_kind(TokenKind::string, "operation attribute value");
+            const auto value_bytes = decode_string(value_token);
+            operation.attributes.push_back({name, std::string(value_bytes.begin(), value_bytes.end())});
+        }
+    }
     void write_scalar(std::vector<std::uint8_t>& bytes, std::size_t offset, Type type, std::uint64_t value) {
         const auto layout = target::DataLayout::host();
         const auto size = layout.size_of(type);
@@ -450,12 +458,13 @@ private:
         Operation op;
         if (peek().kind==TokenKind::value && peek(1).text=="=") { op.result=peek().text; pos_+=2; }
         op.opcode=expect_kind(TokenKind::identifier,"opcode").text;
-        if (op.opcode=="return") { if (peek().kind==TokenKind::value) op.operands.push_back(tokens_[pos_++].text); return op; }
-        if (op.opcode=="unreachable") return op;
-        if (op.opcode=="jump") { op.successors.push_back(expect_kind(TokenKind::identifier,"destination block").text); op.successor_arguments.push_back(at("(")?parse_args():std::vector<std::string>{}); return op; }
+        if (op.opcode=="return") { if (peek().kind==TokenKind::value) op.operands.push_back(tokens_[pos_++].text); parse_operation_attributes(op); return op; }
+        if (op.opcode=="unreachable") { parse_operation_attributes(op); return op; }
+        if (op.opcode=="jump") { op.successors.push_back(expect_kind(TokenKind::identifier,"destination block").text); op.successor_arguments.push_back(at("(")?parse_args():std::vector<std::string>{}); parse_operation_attributes(op); return op; }
         if (op.opcode=="branch") {
             op.operands.push_back(expect_kind(TokenKind::value,"condition").text); expect(",");
             for (int i=0;i<2;++i) { op.successors.push_back(expect_kind(TokenKind::identifier,"destination block").text); op.successor_arguments.push_back(at("(")?parse_args():std::vector<std::string>{}); if (i==0) expect(","); }
+            parse_operation_attributes(op);
             return op;
         }
         op.type=parse_type();
@@ -471,12 +480,14 @@ private:
                 if (!take(",")) break;
             }
             expect(")");
+            parse_operation_attributes(op);
             return op;
         }
         std::size_t arity = 0;
         if (op.opcode == "func.address" || op.opcode == "callback.address") {
             op.operands.push_back(expect_kind(TokenKind::symbol, "function address target").text);
             if (take("as")) op.operands.push_back(expect_kind(TokenKind::symbol, "function address signature").text);
+            parse_operation_attributes(op);
             return op;
         }
         if (op.opcode == "const" || op.opcode == "load" || op.opcode == "neg" || op.opcode == "not" || op.opcode == "copy" || op.opcode == "stack.alloc" ||
@@ -494,7 +505,7 @@ private:
                  op.opcode == "shl" || op.opcode == "shr.signed" || op.opcode == "shr.unsigned" ||
                  (op.opcode == "ptr.offset" || op.opcode == "field.address") || op.opcode.starts_with("cmp.")) arity = 2;
         else if (op.opcode == "select" || op.opcode == "struct.field.address" || op.opcode == "struct.field.name.address" || op.opcode == "array.element.address" || op.opcode == "callback.element.address" || op.opcode == "memory.copy" || op.opcode == "memory.set") arity = 3;
-        else if (op.opcode == "store" || op.opcode == "aggregate.zero.struct" || op.opcode == "aggregate.zero.array" || op.opcode == "aggregate.move.struct" || op.opcode == "aggregate.move.array" || op.opcode == "aggregate.borrow.struct" || op.opcode == "aggregate.borrow.array" || op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array" || op.opcode == "aggregate.borrow.end.struct" || op.opcode == "aggregate.borrow.end.array" || op.opcode == "aggregate.end.struct" || op.opcode == "aggregate.end.array") arity = 2;
+        else if (op.opcode == "store" || op.opcode == "aggregate.zero.struct" || op.opcode == "aggregate.zero.array" || op.opcode == "aggregate.move.struct" || op.opcode == "aggregate.move.array" || op.opcode == "aggregate.borrow.struct" || op.opcode == "aggregate.borrow.array" || op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array" || op.opcode == "aggregate.attach.struct" || op.opcode == "aggregate.attach.array" || op.opcode == "aggregate.borrow.end.struct" || op.opcode == "aggregate.borrow.end.array" || op.opcode == "aggregate.end.struct" || op.opcode == "aggregate.end.array") arity = 2;
         else if (op.opcode == "aggregate.copy.struct" || op.opcode == "aggregate.copy.array") arity = 3;
         else fail("unknown opcode '" + op.opcode + "'");
         for (std::size_t i = 0; i < arity; ++i) {
@@ -513,6 +524,7 @@ private:
                 else op.alignment = static_cast<std::uint32_t>(value);
             } catch (...) { fail("invalid alignment"); }
         }
+        parse_operation_attributes(op);
         return op;
     }
     std::vector<Token> tokens_; Diagnostics diagnostics_; std::size_t pos_{};

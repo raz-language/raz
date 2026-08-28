@@ -1,0 +1,2489 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::registry_transport;
+
+public import raz_driver::signing;
+
+// Registry transport and deterministic package-archive handling. Network policy,
+// HTTP framing, TLS pumping, mirror fallback, and archive extraction live in Raz;
+// the runtime exports only socket/TLS/filesystem ABI primitives.
+fn registry_env_ascii_literal(string key, i64 output, i64 capacity) -> i64 {
+    i64 key_length = compiler_literal_length(key);
+    i64 name = raz_compiler_rt_arena_create(key_length);
+    if (name == 0) { return -1; }
+    i64 i = 0;
+    while (i < key_length) { raz_compiler_rt_arena_set(name, i, compiler_literal_byte(key, i)); i += 1; }
+    i64 n = raz_compiler_rt_env_get_ascii(name, key_length, output, capacity);
+    raz_compiler_rt_arena_destroy(name);
+    return n;
+}
+
+fn registry_env_ascii(i64[]key, i64 key_length, i64 output, i64 capacity) -> i64 {
+    i64 name = raz_compiler_rt_arena_create(key_length);
+
+    if (name == 0) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<key_length) {
+        raz_compiler_rt_arena_set(name, i, key[i]);
+        i += 1;
+    }
+
+    i64 n = raz_compiler_rt_env_get_ascii(name, key_length, output, capacity);
+
+    raz_compiler_rt_arena_destroy(name);
+    return n;
+}
+
+fn registry_starts_literal(i64 data, i64 length, string prefix) -> bool {
+    i64 prefix_length = compiler_literal_length(prefix);
+    if (length < prefix_length) { return false; }
+    i64 i = 0;
+    while (i < prefix_length) {
+        if (raz_compiler_rt_arena_get(data, i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_starts(i64 data, i64 length, i64[]prefix, i64 prefix_length) -> bool {
+    if (length<prefix_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<prefix_length) {
+        if (raz_compiler_rt_arena_get(data, i) != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_url_parse(
+    i64 url,
+    i64 length,
+    i64 host,
+    i64 host_capacity,
+    i64&mut host_length,
+    i64 path,
+    i64 path_capacity,
+    i64&mut path_length,
+    i64&mut port,
+    bool&mut secure,
+) -> bool {
+    string http = "http://";
+    string https = "https://";
+    i64 cursor = 0;
+
+    if (registry_starts_literal(url, length, https)) {
+        *secure = true;
+        *port = 443;
+        cursor = 8;
+    } else if (registry_starts_literal(url, length, http)) {
+        *secure = false;
+        *port = 80;
+        cursor = 7;
+    } else {
+        return false;
+    }
+
+    i64 hs = cursor;
+
+    while (
+        cursor<length &&
+        raz_compiler_rt_arena_get(url, cursor) != 47 &&
+        raz_compiler_rt_arena_get(url, cursor) != 58
+    ) {
+        cursor += 1;
+    }
+    if (cursor <= hs || cursor - hs> host_capacity) {
+        return false;
+    }
+    *host_length = cursor - hs;
+
+    i64 i = 0;
+
+    while (i<*host_length) {
+        raz_compiler_rt_arena_set(host, i, raz_compiler_rt_arena_get(url, hs + i));
+        i += 1;
+    }
+    if (cursor<length && raz_compiler_rt_arena_get(url, cursor) == 58) {
+        cursor += 1;
+
+        i64 value = 0;
+        i64 digits = 0;
+
+        while (
+            cursor<length &&
+            raz_compiler_rt_arena_get(url, cursor) >= 48 &&
+            raz_compiler_rt_arena_get(url, cursor) <= 57
+        ) {
+            value = value*10 + raz_compiler_rt_arena_get(url, cursor) - 48;
+            digits += 1;
+            cursor += 1;
+        }
+        if (digits == 0 || value <= 0 || value> 65535) {
+            return false;
+        }
+        *port = value;
+    }
+    if (cursor >= length) {
+        if (path_capacity<1) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(path, 0, 47);
+        *path_length = 1;
+        return true;
+    }
+    if (raz_compiler_rt_arena_get(url, cursor) != 47) {
+        return false;
+    }
+    *path_length = length - cursor;
+    if (*path_length> path_capacity) {
+        return false;
+    }
+    i = 0;
+    while (i<*path_length) {
+        raz_compiler_rt_arena_set(path, i, raz_compiler_rt_arena_get(url, cursor + i));
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_tls_flush(i64 tls, i64 socket, i64 scratch, i64 capacity) -> bool {
+    while (raz_compiler_rt_tls_pending_encrypted(tls)> 0) {
+        i64 count = raz_compiler_rt_tls_drain_ascii(tls, scratch, 0, capacity);
+
+        if (count<0) {
+            return false;
+        }
+        if (count == 0) {
+            return true;
+        }
+        if (raz_compiler_rt_socket_send_ascii(socket, scratch, 0, count) != count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn registry_tls_receive(i64 tls, i64 socket, i64 scratch, i64 capacity) -> i64 {
+    i64 count = raz_compiler_rt_socket_receive_ascii(socket, scratch, 0, capacity);
+
+    if (count <= 0) {
+        return count;
+    }
+
+    i64 used = 0;
+
+    while (used<count) {
+        i64 fed = raz_compiler_rt_tls_feed_ascii(tls, scratch, used, count - used);
+
+        if (fed <= 0) {
+            return -1;
+        }
+        used += fed;
+    }
+    return count;
+}
+
+fn registry_tls_connect(i64 host, i64 host_length, i64 socket, i64 scratch, i64 capacity) -> i64 {
+    if (raz_compiler_rt_tls_available() != 1) {
+        return 0;
+    }
+
+    i64 tls = raz_compiler_rt_tls_client_create_ascii(host, host_length);
+
+    if (tls == 0) {
+        return 0;
+    }
+    while (raz_compiler_rt_tls_handshake_finished(tls) != 1) {
+        i64 state = raz_compiler_rt_tls_handshake(tls);
+
+        if (!registry_tls_flush(tls, socket, scratch, capacity)) {
+            raz_compiler_rt_tls_destroy(tls);
+            return 0;
+        }
+        if (state == 1) {
+            return tls;
+        }
+        if (state<0 || registry_tls_receive(tls, socket, scratch, capacity) <= 0) {
+            raz_compiler_rt_tls_destroy(tls);
+            return 0;
+        }
+    }
+    return tls;
+}
+
+fn registry_transport_request(
+    i64 host,
+    i64 host_length,
+    i64 path,
+    i64 path_length,
+    i64 request,
+    i64 capacity,
+) -> i64 {
+    i64 cursor = 0;
+    
+
+    package_append_string_literal(request, capacity, &mut cursor, "GET ");
+    package_append(request, capacity, &mut cursor, path, 0, path_length);
+
+    
+
+    package_append_string_literal(request, capacity, &mut cursor, " HTTP/1.0\r\nHost: ");
+    package_append(request, capacity, &mut cursor, host, 0, host_length);
+
+    
+
+    package_append_string_literal(request, capacity, &mut cursor, "\r\nUser-Agent: Raz/1.0\r\nAccept: */*");
+
+    bool github_api = host_length == 14;
+    string gh_host = "api.github.com";
+    i64 gh_i = 0;
+
+    while (github_api && gh_i < 14) {
+        if (raz_compiler_rt_arena_get(host, gh_i) != compiler_literal_byte(gh_host, gh_i)) {
+            github_api = false;
+        }
+        gh_i += 1;
+    }
+    if (github_api) {
+        i64 token = raz_compiler_rt_arena_create(8192);
+
+        if (token != 0) {
+            i64 tl = registry_publish_token(token, 8192, true);
+
+            if (tl> 0) {
+                
+
+                package_append_string_literal(request, capacity, &mut cursor, "\r\nAuthorization: Bearer ");
+                package_append(request, capacity, &mut cursor, token, 0, tl);
+            }
+            raz_compiler_rt_arena_destroy(token);
+        }
+
+        
+
+        package_append_string_literal(request, capacity, &mut cursor, "\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: ");
+
+        
+
+        package_append_string_literal(request, capacity, &mut cursor, "2026-03-10");
+    }
+
+    
+
+    package_append_string_literal(request, capacity, &mut cursor, "\r\nConnection: close\r\n\r\n");
+    return cursor;
+}
+
+fn registry_http_status(i64 response, i64 length) -> i64 {
+    if (length<12) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<length && raz_compiler_rt_arena_get(response, i) != 32) {
+        i += 1;
+    }
+    if (i + 4> length) {
+        return -1;
+    }
+    i += 1;
+
+    i64 status = 0;
+    i64 n = 0;
+
+    while (i<length && n<3) {
+        i64 ch = raz_compiler_rt_arena_get(response, i);
+
+        if (ch<48 || ch> 57) {
+            return -1;
+        }
+        status = status*10 + ch - 48;
+        i += 1;
+        n += 1;
+    }
+    if (n == 3) {
+        return status;
+    }
+    return -1;
+}
+
+fn registry_http_body_start(i64 response, i64 length) -> i64 {
+    i64 i = 0;
+
+    while (i + 3 < length) {
+        if (
+            raz_compiler_rt_arena_get(response, i) == 13 &&
+            raz_compiler_rt_arena_get(response, i + 1) == 10 &&
+            raz_compiler_rt_arena_get(response, i + 2) == 13 &&
+            raz_compiler_rt_arena_get(response, i + 3) == 10
+        ) {
+            return i + 4;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn registry_http_location(i64 response, i64 length, i64 output, i64 capacity) -> i64 {
+    i64 i = 0;
+
+    // Skip the status line.
+    while (i < length && raz_compiler_rt_arena_get(response, i) != 10) {
+        i += 1;
+    }
+    if (i < length) {
+        i += 1;
+    }
+
+    string key = "location";
+
+    while (i < length) {
+        i64 start = i;
+
+        while (i < length && raz_compiler_rt_arena_get(response, i) != 10) {
+            i += 1;
+        }
+
+        i64 end = i;
+
+        if (i < length) {
+            i += 1;
+        }
+        if (end> start && raz_compiler_rt_arena_get(response, end - 1) == 13) {
+            end -= 1;
+        }
+        if (end == start) {
+            return 0;
+        }
+
+        i64 colon = start;
+
+        while (colon < end && raz_compiler_rt_arena_get(response, colon) != 58) {
+            colon += 1;
+        }
+        if (colon - start == 8) {
+            bool same = true;
+            i64 k = 0;
+
+            while (same && k < 8) {
+                i64 ch = raz_compiler_rt_arena_get(response, start + k);
+
+                if (ch >= 65 && ch <= 90) {
+                    ch += 32;
+                }
+                if (ch != compiler_literal_byte(key, k)) {
+                    same = false;
+                }
+                k += 1;
+            }
+            if (same) {
+                i64 value = colon + 1;
+
+                while (
+                    value < end &&
+                    (
+                        raz_compiler_rt_arena_get(response, value) == 32 ||
+                        raz_compiler_rt_arena_get(response, value) == 9
+                    )
+                ) {
+                    value += 1;
+                }
+
+                i64 value_length = end - value;
+
+                if (value_length <= 0 || value_length> capacity) {
+                    return -1;
+                }
+
+                i64 n = 0;
+
+                while (n < value_length) {
+                    raz_compiler_rt_arena_set(output, n, raz_compiler_rt_arena_get(response, value + n));
+                    n += 1;
+                }
+                return value_length;
+            }
+        }
+    }
+    return 0;
+}
+
+// Fetches a complete HTTP/1.0 response body. Redirects are followed with a
+// small fixed limit because GitHub Release assets resolve through its CDN.
+fn registry_http_get_depth(
+    i64 url,
+    i64 url_length,
+    i64 output,
+    i64 output_capacity,
+    i64 redirect_depth,
+) -> i64 {
+    i64 host = raz_compiler_rt_arena_create(2048);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 request = raz_compiler_rt_arena_create(16384);
+    i64 scratch = raz_compiler_rt_arena_create(65536);
+    i64 response = raz_compiler_rt_arena_create_width(output_capacity + 65536, 1);
+
+    if (host == 0 || path == 0 || request == 0 || scratch == 0 || response == 0) {
+        return -70;
+    }
+
+    i64 hl = 0;
+    i64 pl = 0;
+    i64 port = 0;
+    bool secure = false;
+
+    if (
+        !registry_url_parse(url, url_length, host, 2048, &mut hl, path, 8192, &mut pl, &mut port, &mut secure)
+    ) {
+        return -71;
+    }
+
+    i64 socket = raz_compiler_rt_tcp_connect_ascii(host, hl, port);
+
+    if (socket<0) {
+        return -72;
+    }
+    raz_compiler_rt_socket_set_timeout_millis(socket, 10000, 10000);
+
+    i64 tls = 0;
+
+    if (secure) {
+        tls = registry_tls_connect(host, hl, socket, scratch, 65536);
+        if (tls == 0) {
+            raz_compiler_rt_socket_close(socket);
+            return -73;
+        }
+    }
+
+    i64 request_length = registry_transport_request(host, hl, path, pl, request, 16384);
+
+    if (request_length <= 0) {
+        return -70;
+    }
+    if (secure) {
+        i64 sent = 0;
+
+        while (sent<request_length) {
+            i64 n = raz_compiler_rt_tls_write_plain_ascii(tls, request, sent, request_length - sent);
+
+            if (n<0) {
+                return -74;
+            }
+            if (!registry_tls_flush(tls, socket, scratch, 65536)) {
+                return -74;
+            }
+            if (n> 0) {
+                sent += n;
+            } else if (registry_tls_receive(tls, socket, scratch, 65536) <= 0) {
+                return -74;
+            }
+        }
+    } else if (raz_compiler_rt_socket_send_ascii(socket, request, 0, request_length) != request_length) {
+        raz_compiler_rt_socket_close(socket);
+        return -74;
+    }
+
+    i64 total = 0;
+    bool done = false;
+
+    while (!done && total<output_capacity + 65536) {
+        i64 available = output_capacity + 65536 - total;
+
+        if (available> 65536) {
+            available = 65536;
+        }
+
+        i64 n = 0;
+
+        if (secure) {
+            n = raz_compiler_rt_tls_read_plain_ascii(tls, response, total, available);
+            if (n> 0) {
+                total += n;
+                continue;
+            }
+            if (n == -2) {
+                break;
+            }
+            if (n<0) {
+                break;
+            }
+
+            i64 encrypted = registry_tls_receive(tls, socket, scratch, 65536);
+
+            if (encrypted <= 0) {
+                done = true;
+            }
+        } else {
+            n = raz_compiler_rt_socket_receive_ascii(socket, response, total, available);
+            if (n> 0) {
+                total += n;
+            } else {
+                done = true;
+            }
+        }
+    }
+    if (secure) {
+        raz_compiler_rt_tls_shutdown(tls);
+        registry_tls_flush(tls, socket, scratch, 65536);
+        raz_compiler_rt_tls_destroy(tls);
+    }
+    raz_compiler_rt_socket_close(socket);
+
+    i64 status = registry_http_status(response, total);
+    i64 body = registry_http_body_start(response, total);
+
+    if (status >= 300 && status < 400 && body >= 0) {
+        if (redirect_depth >= 5) {
+            return -77;
+        }
+
+        i64 location = raz_compiler_rt_arena_create(16384);
+
+        if (location == 0) {
+            return -70;
+        }
+
+        i64 location_length = registry_http_location(response, total, location, 16384);
+
+        if (location_length <= 0) {
+            raz_compiler_rt_arena_destroy(location);
+            return -77;
+        }
+        raz_compiler_rt_arena_destroy(host);
+        raz_compiler_rt_arena_destroy(path);
+        raz_compiler_rt_arena_destroy(request);
+        raz_compiler_rt_arena_destroy(scratch);
+        raz_compiler_rt_arena_destroy(response);
+        i64 redirected = registry_http_get_depth(
+            location,
+            location_length,
+            output,
+            output_capacity,
+            redirect_depth + 1,
+        );
+        raz_compiler_rt_arena_destroy(location);
+        return redirected;
+    }
+    if (status<200 || status >= 300 || body<0) {
+        return -75;
+    }
+
+    i64 body_length = total - body;
+
+    if (body_length> output_capacity) {
+        return -76;
+    }
+
+    i64 i = 0;
+
+    while (i<body_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(response, body + i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(host);
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(request);
+    raz_compiler_rt_arena_destroy(scratch);
+    raz_compiler_rt_arena_destroy(response);
+    return body_length;
+}
+
+fn registry_http_get(i64 url, i64 url_length, i64 output, i64 output_capacity) -> i64 {
+    return registry_http_get_depth(url, url_length, output, output_capacity, 0);
+}
+
+fn registry_join_url(
+    i64 base,
+    i64 base_length,
+    i64 suffix,
+    i64 suffix_start,
+    i64 suffix_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    i64 cursor = 0;
+
+    package_append(output, capacity, &mut cursor, base, 0, base_length);
+    if (cursor> 0 && raz_compiler_rt_arena_get(output, cursor - 1) == 47) {
+        if (suffix_length> 0 && raz_compiler_rt_arena_get(suffix, suffix_start) == 47) {
+            suffix_start += 1;
+            suffix_length -= 1;
+        }
+    } else if (suffix_length == 0 || raz_compiler_rt_arena_get(suffix, suffix_start) != 47) {
+        
+
+        package_append_string_literal(output, capacity, &mut cursor, "/");
+    }
+    package_append(output, capacity, &mut cursor, suffix, suffix_start, suffix_length);
+    return cursor;
+}
+
+fn registry_default_base(i64 output, i64 capacity) -> i64 {
+    string value = "https://raw.githubusercontent.com/raz-language/packages/main";
+
+    if (capacity < 60) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < 60) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(value, i));
+        i += 1;
+    }
+    return 60;
+}
+
+fn registry_fetch_base_index(i64 base, i64 base_length, i64 output, i64 capacity) -> i64 {
+    i64 url = raz_compiler_rt_arena_create(8192);
+
+    if (url == 0) {
+        return -70;
+    }
+
+    string suffix = "index.txt";
+    i64 sl = 9;
+    i64 tmp = raz_compiler_rt_arena_create(9);
+    i64 i = 0;
+
+    while (i<9) {
+        raz_compiler_rt_arena_set(tmp, i, compiler_literal_byte(suffix, i));
+        i += 1;
+    }
+
+    i64 ul = registry_join_url(base, base_length, tmp, 0, sl, url, 8192);
+    i64 n = registry_http_get(url, ul, output, capacity);
+
+    raz_compiler_rt_arena_destroy(tmp);
+    raz_compiler_rt_arena_destroy(url);
+    return n;
+}
+
+fn registry_index_cache_path(i64 output, i64 capacity) -> i64 {
+    i64 credentials = raz_compiler_rt_arena_create(8192);
+    i64 parent = raz_compiler_rt_arena_create(8192);
+
+    if (credentials == 0 || parent == 0) {
+        return -1;
+    }
+
+    i64 parent_length = 0;
+    i64 credential_length = registry_credentials_path(credentials, 8192, parent, 8192, &mut parent_length);
+
+    if (credential_length <= 0 || parent_length <= 0) {
+        raz_compiler_rt_arena_destroy(credentials);
+        raz_compiler_rt_arena_destroy(parent);
+        return -1;
+    }
+    if (raz_compiler_rt_create_dir_ascii(parent, parent_length) != 0) {
+        raz_compiler_rt_arena_destroy(credentials);
+        raz_compiler_rt_arena_destroy(parent);
+        return -1;
+    }
+
+    i64 cursor = 0;
+
+    package_append(output, capacity, &mut cursor, parent, 0, parent_length);
+
+    
+
+    package_append_string_literal(output, capacity, &mut cursor, "/registry");
+    if (raz_compiler_rt_create_dir_ascii(output, cursor) != 0) {
+        raz_compiler_rt_arena_destroy(credentials);
+        raz_compiler_rt_arena_destroy(parent);
+        return -1;
+    }
+
+    
+
+    package_append_string_literal(output, capacity, &mut cursor, "/index.txt");
+    raz_compiler_rt_arena_destroy(credentials);
+    raz_compiler_rt_arena_destroy(parent);
+    return cursor;
+}
+
+fn registry_cache_index(i64 data, i64 length) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(8192);
+
+    if (path == 0) {
+        return -1;
+    }
+
+    i64 pl = registry_index_cache_path(path, 8192);
+    i64 n = raz_compiler_rt_write_ascii(path, pl, data, length);
+
+    raz_compiler_rt_arena_destroy(path);
+    return n;
+}
+
+fn registry_read_cached_index(i64 output, i64 capacity) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(8192);
+
+    if (path == 0) {
+        return -1;
+    }
+
+    i64 pl = registry_index_cache_path(path, 8192);
+    i64 n = raz_compiler_rt_read_ascii(path, pl, output, capacity);
+
+    raz_compiler_rt_arena_destroy(path);
+    return n;
+}
+
+// Returns index length and writes the base URL that supplied it. Local index mode writes base length 0.
+fn registry_load_index(i64 output, i64 capacity, i64 base, i64 base_capacity, i64&mut base_length) -> i64 {
+    i64 local = raz_compiler_rt_arena_create(8192);
+
+    if (local == 0) {
+        return -70;
+    }
+
+    i64 local_len = registry_index_path(local, 8192);
+
+    if (local_len> 0) {
+        i64 n = raz_compiler_rt_read_ascii(local, local_len, output, capacity);
+
+        raz_compiler_rt_arena_destroy(local);
+        if (n <= 0) {
+            *base_length = 0;
+            return n;
+        }
+        // A local index is often used as a deterministic resolver snapshot while
+        // package archives still live in the remote registry. Preserve an
+        // explicit RAZ_REGISTRY_URL as the relative-package base; otherwise use
+        // the official GitHub registry base. This keeps local-index tests and
+        // offline resolver snapshots from accidentally treating package paths as
+        // process-working-directory paths.
+
+        string pkey = "RAZ_REGISTRY_URL";
+        i64 configured = registry_env_ascii_literal(pkey, base, base_capacity);
+
+        if (configured> 0) {
+            *base_length = configured;
+        } else {
+            i64 fallback = registry_default_base(base, base_capacity);
+
+            if (fallback> 0) {
+                *base_length = fallback;
+            } else {
+                *base_length = 0;
+            }
+        }
+        return n;
+    }
+    raz_compiler_rt_arena_destroy(local);
+    if (registry_offline()) {
+        i64 cached = registry_read_cached_index(output, capacity);
+
+        *base_length = 0;
+        if (cached> 0) {
+            return cached;
+        }
+        return -60;
+    }
+
+    i64 primary = raz_compiler_rt_arena_create(8192);
+    i64 mirrors = raz_compiler_rt_arena_create(32768);
+
+    if (primary == 0 || mirrors == 0) {
+        return -70;
+    }
+
+    string pkey = "RAZ_REGISTRY_URL";
+    i64 plen = registry_env_ascii_literal(pkey, primary, 8192);
+
+    // The official registry is GitHub-backed. RAZ_REGISTRY_URL still overrides
+    // this for private registries, mirrors, and deterministic test fixtures.
+    if (plen <= 0) {
+        plen = registry_default_base(primary, 8192);
+    }
+    if (plen> 0) {
+        i64 n = registry_fetch_base_index(primary, plen, output, capacity);
+
+        if (n> 0) {
+            if (plen> base_capacity) {
+                return -70;
+            }
+
+            i64 i = 0;
+
+            while (i < plen) {
+                raz_compiler_rt_arena_set(base, i, raz_compiler_rt_arena_get(primary, i));
+                i += 1;
+            }
+            *base_length = plen;
+            registry_cache_index(output, n);
+            return n;
+        }
+    }
+
+    string mkey = "RAZ_REGISTRY_MIRRORS";
+    i64 ml = registry_env_ascii_literal(mkey, mirrors, 32768);
+    i64 pos = 0;
+
+    while (ml> 0 && pos<ml) {
+        while (
+            pos<ml &&
+            (
+                raz_compiler_rt_arena_get(mirrors, pos) == 59 ||
+                ascii_is_space(raz_compiler_rt_arena_get(mirrors, pos))
+            )
+        ) {
+            pos += 1;
+        }
+
+        i64 start = pos;
+
+        while (pos<ml && raz_compiler_rt_arena_get(mirrors, pos) != 59) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        while (end> start && ascii_is_space(raz_compiler_rt_arena_get(mirrors, end - 1))) {
+            end -= 1;
+        }
+        if (end> start) {
+            i64 n = 0;
+            i64 candidate = raz_compiler_rt_arena_create(8192);
+            i64 i = 0;
+
+            while (i<end - start) {
+                raz_compiler_rt_arena_set(candidate, i, raz_compiler_rt_arena_get(mirrors, start + i));
+                i += 1;
+            }
+            n = registry_fetch_base_index(candidate, end - start, output, capacity);
+            if (n> 0) {
+                if (end - start> base_capacity) {
+                    return -70;
+                }
+                i = 0;
+                while (i<end - start) {
+                    raz_compiler_rt_arena_set(base, i, raz_compiler_rt_arena_get(candidate, i));
+                    i += 1;
+                }
+                *base_length = end - start;
+                registry_cache_index(output, n);
+                raz_compiler_rt_arena_destroy(candidate);
+                return n;
+            }
+            raz_compiler_rt_arena_destroy(candidate);
+        }
+        if (pos<ml) {
+            pos += 1;
+        }
+    }
+    // Network/mirror failure falls back to the last verified index snapshot.
+    // This is deliberately a failure fallback rather than a cache-first policy:
+    // normal online resolution still observes newly published/yanked versions,
+    // while transient GitHub outages do not make an already-used registry unusable.
+
+    i64 cached = registry_read_cached_index(output, capacity);
+
+    if (cached> 0) {
+        i64 fallback_base = registry_default_base(base, base_capacity);
+
+        if (fallback_base> 0) {
+            *base_length = fallback_base;
+        } else {
+            *base_length = 0;
+        }
+        raz_compiler_rt_arena_destroy(primary);
+        raz_compiler_rt_arena_destroy(mirrors);
+        return cached;
+    }
+    raz_compiler_rt_arena_destroy(primary);
+    raz_compiler_rt_arena_destroy(mirrors);
+    return -60;
+}
+
+fn registry_safe_archive_path(i64 path, i64 length) -> bool {
+    if (length <= 0) {
+        return false;
+    }
+
+    i64 first = raz_compiler_rt_arena_get(path, 0);
+
+    if (first == 47 || first == 92) {
+        return false;
+    }
+
+    i64 i = 0;
+    i64 component = 0;
+
+    while (i <= length) {
+        if (i == length || raz_compiler_rt_arena_get(path, i) == 47) {
+            if (
+                i - component == 2 &&
+                raz_compiler_rt_arena_get(path, component) == 46 &&
+                raz_compiler_rt_arena_get(path, component + 1) == 46
+            ) {
+                return false;
+            }
+            if (i == component) {
+                return false;
+            }
+            component = i + 1;
+        } else {
+            if (raz_compiler_rt_arena_get(path, i) == 92 || raz_compiler_rt_arena_get(path, i) == 58) {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_decode_hex(i64 source, i64 start, i64 length, i64 output, i64 capacity) -> i64 {
+    if ((length&1) != 0 || length / 2> capacity) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<length) {
+        i64 a = registry_hex_value(raz_compiler_rt_arena_get(source, start + i));
+        i64 b = registry_hex_value(raz_compiler_rt_arena_get(source, start + i + 1));
+
+        if (a<0 || b<0) {
+            return -1;
+        }
+        raz_compiler_rt_arena_set(output, i / 2, a*16 + b);
+        i += 2;
+    }
+    return length / 2;
+}
+
+fn registry_extract_archive(i64 archive, i64 length, i64 destination, i64 destination_length) -> i64 {
+    string header = "RAZPKG1\n";
+
+    if (length<8) {
+        return 66;
+    }
+
+    i64 i = 0;
+
+    while (i<8) {
+        if (raz_compiler_rt_arena_get(archive, i) != compiler_literal_byte(header, i)) {
+            return 66;
+        }
+        i += 1;
+    }
+    raz_compiler_rt_remove_path_ascii(destination, destination_length);
+    if (raz_compiler_rt_create_dir_ascii(destination, destination_length) != 0) {
+        return 65;
+    }
+
+    i64 pos = 8;
+
+    while (pos<length) {
+        i64 start = pos;
+
+        while (pos<length && raz_compiler_rt_arena_get(archive, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos<length) {
+            pos += 1;
+        }
+        if (start == end) {
+            continue;
+        }
+        if (
+            end - start<4 ||
+            raz_compiler_rt_arena_get(archive, start) != 70 ||
+            raz_compiler_rt_arena_get(archive, start + 1) != 32
+        ) {
+            return 66;
+        }
+
+        i64 sep = start + 2;
+
+        while (sep<end && raz_compiler_rt_arena_get(archive, sep) != 32) {
+            sep += 1;
+        }
+        if (sep >= end) {
+            return 66;
+        }
+
+        i64 path = raz_compiler_rt_arena_create(4096);
+        i64 data = raz_compiler_rt_arena_create((end - sep) / 2 + 1);
+        i64 full = raz_compiler_rt_arena_create(8192);
+
+        if (path == 0 || data == 0 || full == 0) {
+            return 40;
+        }
+
+        i64 pl = registry_decode_hex(archive, start + 2, sep - (start + 2), path, 4096);
+        i64 dl = registry_decode_hex(archive, sep + 1, end - (sep + 1), data, (end - sep) / 2 + 1);
+
+        if (pl <= 0 || dl<0 || !registry_safe_archive_path(path, pl)) {
+            return 66;
+        }
+
+        i64 cursor = 0;
+
+        package_append(full, 8192, &mut cursor, destination, 0, destination_length);
+
+        
+
+        package_append_string_literal(full, 8192, &mut cursor, "/");
+        package_append(full, 8192, &mut cursor, path, 0, pl);
+
+        i64 parent = cursor - 1;
+
+        while (parent >= 0 && raz_compiler_rt_arena_get(full, parent) != 47) {
+            parent -= 1;
+        }
+        if (parent> 0 && raz_compiler_rt_create_dir_ascii(full, parent) != 0) {
+            return 65;
+        }
+        if (raz_compiler_rt_write_ascii(full, cursor, data, dl) != dl) {
+            return 65;
+        }
+        raz_compiler_rt_arena_destroy(path);
+        raz_compiler_rt_arena_destroy(data);
+        raz_compiler_rt_arena_destroy(full);
+    }
+    return 0;
+}
+
+fn registry_store_materialize_archive(
+    i64 url,
+    i64 url_length,
+    i64 checksum,
+    i64 checksum_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    i64 store_length = registry_store_path(checksum, checksum_length, output, capacity);
+
+    if (store_length <= 0) {
+        return 40;
+    }
+    if (raz_compiler_rt_path_exists_ascii(output, store_length) != 0) {
+        if (registry_store_verify(output, store_length, checksum, checksum_length)) {
+            return store_length;
+        }
+        if (registry_offline()) {
+            return -63;
+        }
+    }
+    if (registry_offline()) {
+        return -64;
+    }
+
+    i64 archive = raz_compiler_rt_arena_create_width(33554432, 1);
+
+    if (archive == 0) {
+        return -70;
+    }
+
+    i64 n = registry_http_get(url, url_length, archive, 33554432);
+
+    if (n <= 0) {
+        raz_compiler_rt_arena_destroy(archive);
+        return -67;
+    }
+
+    i64 unpack = registry_extract_archive(archive, n, output, store_length);
+
+    raz_compiler_rt_arena_destroy(archive);
+    if (unpack != 0) {
+        return -unpack;
+    }
+    if (!registry_store_verify(output, store_length, checksum, checksum_length)) {
+        raz_compiler_rt_remove_path_ascii(output, store_length);
+        return -62;
+    }
+    return store_length;
+}
+
+// Publishing/packing support. Directory enumeration is a permanent filesystem ABI
+// boundary; archive encoding and HTTP publishing policy remain in Raz.
+fn registry_hex_digit(i64 value) -> i64 {
+    if (value<10) {
+        return 48 + value;
+    }
+    return 87 + value;
+}
+
+fn registry_append_hex_bytes(
+    i64 output,
+    i64 capacity,
+    i64&mut cursor,
+    i64 data,
+    i64 start,
+    i64 length,
+) -> bool {
+    if (*cursor + length*2> capacity) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<length) {
+        i64 b = raz_compiler_rt_arena_get(data, start + i)&255;
+
+        raz_compiler_rt_arena_set(output, *cursor, registry_hex_digit((b >> 4)&15));
+        *cursor += 1;
+        raz_compiler_rt_arena_set(output, *cursor, registry_hex_digit(b&15));
+        *cursor += 1;
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_append_decimal(i64 output, i64 capacity, i64&mut cursor, i64 value) -> bool {
+    i64 digits = raz_compiler_rt_arena_create(32);
+
+    if (digits == 0) {
+        return false;
+    }
+
+    i64 count = 0;
+
+    if (value == 0) {
+        raz_compiler_rt_arena_set(digits, count, 48);
+        count += 1;
+    } else {
+        while (value> 0 && count<32) {
+            raz_compiler_rt_arena_set(digits, count, 48 + (value % 10));
+            count += 1;
+            value /= 10;
+        }
+    }
+    if (*cursor + count> capacity) {
+        raz_compiler_rt_arena_destroy(digits);
+        return false;
+    }
+    while (count> 0) {
+        count -= 1;
+        raz_compiler_rt_arena_set(output, *cursor, raz_compiler_rt_arena_get(digits, count));
+        *cursor += 1;
+    }
+    raz_compiler_rt_arena_destroy(digits);
+    return true;
+}
+
+fn registry_pack_tree(i64 root, i64 root_length, i64 archive, i64 archive_capacity) -> i64 {
+    i64 listing = raz_compiler_rt_arena_create_width(4194304, 1);
+
+    if (listing == 0) {
+        return -40;
+    }
+
+    i64 ll = raz_compiler_rt_tree_list_ascii(root, root_length, listing, 4194304);
+
+    if (ll<0) {
+        raz_compiler_rt_arena_destroy(listing);
+        return -65;
+    }
+
+    i64 cursor = 0;
+    
+
+    if (!package_append_string_literal(archive, archive_capacity, &mut cursor, "RAZPKG1\n")) {
+        return -40;
+    }
+
+    i64 pos = 0;
+
+    while (pos<ll) {
+        i64 start = pos;
+
+        while (pos<ll && raz_compiler_rt_arena_get(listing, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 pl = pos - start;
+
+        if (pos<ll) {
+            pos += 1;
+        }
+        if (pl <= 0) {
+            continue;
+        }
+
+        i64 rel = raz_compiler_rt_arena_create(pl);
+
+        if (rel == 0) {
+            return -40;
+        }
+
+        i64 r = 0;
+
+        while (r<pl) {
+            raz_compiler_rt_arena_set(rel, r, raz_compiler_rt_arena_get(listing, start + r));
+            r += 1;
+        }
+
+        bool ignored = registry_package_path_ignored(rel, pl);
+
+        raz_compiler_rt_arena_destroy(rel);
+        if (ignored) {
+            continue;
+        }
+
+        i64 full = raz_compiler_rt_arena_create(8192);
+        i64 data = raz_compiler_rt_arena_create_width(33554432, 1);
+
+        if (full == 0 || data == 0) {
+            return -40;
+        }
+
+        i64 fc = 0;
+
+        package_append(full, 8192, &mut fc, root, 0, root_length);
+        if (
+            fc> 0 &&
+            raz_compiler_rt_arena_get(full, fc - 1) != 47 &&
+            raz_compiler_rt_arena_get(full, fc - 1) != 92
+        ) {
+            
+
+            package_append_string_literal(full, 8192, &mut fc, "/");
+        }
+        package_append(full, 8192, &mut fc, listing, start, pl);
+
+        i64 dl = raz_compiler_rt_read_ascii(full, fc, data, 33554432);
+
+        if (dl<0) {
+            return -65;
+        }
+
+        
+
+        if (
+            !package_append_string_literal(archive, archive_capacity, &mut cursor, "F ") ||
+            !registry_append_hex_bytes(archive, archive_capacity, &mut cursor, listing, start, pl)
+        ) {
+            return -40;
+        }
+
+        
+
+        package_append_string_literal(archive, archive_capacity, &mut cursor, " ");
+        if (!registry_append_hex_bytes(archive, archive_capacity, &mut cursor, data, 0, dl)) {
+            return -40;
+        }
+
+        
+
+        package_append_string_literal(archive, archive_capacity, &mut cursor, "\n");
+        raz_compiler_rt_arena_destroy(full);
+        raz_compiler_rt_arena_destroy(data);
+    }
+    raz_compiler_rt_arena_destroy(listing);
+    return cursor;
+}
+
+fn registry_credentials_path(
+    i64 output,
+    i64 capacity,
+    i64 parent,
+    i64 parent_capacity,
+    i64&mut parent_length
+) -> i64 {
+    i64 home = raz_compiler_rt_arena_create(8192);
+
+    if (home == 0) {
+        return -1;
+    }
+
+    string raz_home_key = "RAZ_HOME";
+    i64 hl = registry_env_ascii_literal(raz_home_key, home, 8192);
+    bool explicit_raz_home = hl> 0;
+
+    if (hl <= 0) {
+        string home_key = "HOME";
+
+        hl = registry_env_ascii_literal(home_key, home, 8192);
+    }
+    if (hl <= 0) {
+        string profile_key = "USERPROFILE";
+
+        hl = registry_env_ascii_literal(profile_key, home, 8192);
+    }
+
+    i64 cursor = 0;
+
+    if (hl> 0) {
+        i64 i = 0;
+
+        while (i < hl) {
+            if (cursor >= parent_capacity) {
+                raz_compiler_rt_arena_destroy(home);
+                return -1;
+            }
+            raz_compiler_rt_arena_set(parent, cursor, raz_compiler_rt_arena_get(home, i));
+            cursor += 1;
+            i += 1;
+        }
+        if (!explicit_raz_home) {
+            string suffix = "/.raz";
+
+            i = 0;
+            while (i < 5) {
+                if (cursor >= parent_capacity) {
+                    raz_compiler_rt_arena_destroy(home);
+                    return -1;
+                }
+                raz_compiler_rt_arena_set(parent, cursor, compiler_literal_byte(suffix, i));
+                cursor += 1;
+                i += 1;
+            }
+        }
+    } else {
+        string fallback = "./.raz";
+        i64 i = 0;
+
+        while (i < 6) {
+            if (cursor >= parent_capacity) {
+                raz_compiler_rt_arena_destroy(home);
+                return -1;
+            }
+            raz_compiler_rt_arena_set(parent, cursor, compiler_literal_byte(fallback, i));
+            cursor += 1;
+            i += 1;
+        }
+    }
+    *parent_length = cursor;
+    if (cursor + 12> capacity) {
+        raz_compiler_rt_arena_destroy(home);
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < cursor) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(parent, i));
+        i += 1;
+    }
+
+    string tail = "/credentials";
+
+    i = 0;
+    while (i < 12) {
+        raz_compiler_rt_arena_set(output, cursor + i, compiler_literal_byte(tail, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(home);
+    return cursor + 12;
+}
+
+fn registry_read_saved_token(i64 output, i64 capacity) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 parent = raz_compiler_rt_arena_create(8192);
+
+    if (path == 0 || parent == 0) {
+        return -1;
+    }
+
+    i64 parent_length = 0;
+    i64 pl = registry_credentials_path(path, 8192, parent, 8192, &mut parent_length);
+
+    if (pl <= 0) {
+        return -1;
+    }
+
+    i64 n = raz_compiler_rt_read_ascii(path, pl, output, capacity);
+
+    if (n> 0) {
+        while (n> 0) {
+            i64 ch = raz_compiler_rt_arena_get(output, n - 1);
+
+            if (ch != 10 && ch != 13 && ch != 32 && ch != 9) {
+                break;
+            }
+            n -= 1;
+        }
+    }
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(parent);
+    return n;
+}
+
+fn registry_login_command(i64 argc) -> i64 {
+    if (argc != 2 && argc != 3) {
+        return 55;
+    }
+
+    i64 token = raz_compiler_rt_arena_create(8192);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 parent = raz_compiler_rt_arena_create(8192);
+    i64 body = raz_compiler_rt_arena_create(8193);
+
+    if (token == 0 || path == 0 || parent == 0 || body == 0) {
+        return 40;
+    }
+
+    i64 tl = 0;
+
+    if (argc == 3) {
+        tl = raz_compiler_rt_process_arg(2, token, 8192);
+    } else {
+        tl = registry_publish_token(token, 8192, true);
+    }
+    if (tl <= 0 || tl >= 8192) {
+        return 55;
+    }
+
+    i64 parent_length = 0;
+    i64 pl = registry_credentials_path(path, 8192, parent, 8192, &mut parent_length);
+
+    if (pl <= 0 || raz_compiler_rt_create_dir_ascii(parent, parent_length) != 0) {
+        return 56;
+    }
+
+    i64 i = 0;
+
+    while (i < tl) {
+        raz_compiler_rt_arena_set(body, i, raz_compiler_rt_arena_get(token, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_set(body, tl, 10);
+    if (raz_compiler_rt_write_ascii(path, pl, body, tl + 1) != tl + 1) {
+        return 56;
+    }
+
+    string message = "Saved Raz registry credentials.\n";
+
+    cli_write_literal(message);
+    raz_compiler_rt_arena_destroy(token);
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(parent);
+    raz_compiler_rt_arena_destroy(body);
+    return 0;
+}
+
+fn registry_logout_command(i64 argc) -> i64 {
+    if (argc != 2) {
+        return 55;
+    }
+
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 parent = raz_compiler_rt_arena_create(8192);
+
+    if (path == 0 || parent == 0) {
+        return 40;
+    }
+
+    i64 parent_length = 0;
+    i64 pl = registry_credentials_path(path, 8192, parent, 8192, &mut parent_length);
+
+    if (pl> 0 && raz_compiler_rt_path_exists_ascii(path, pl) != 0) {
+        if (raz_compiler_rt_remove_path_ascii(path, pl) != 0) {
+            return 56;
+        }
+    }
+
+    
+
+    cli_write_literal("Removed Raz registry credentials.");
+
+    
+
+    cli_write_literal("\n");
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(parent);
+    return 0;
+}
+
+fn registry_publish_token(i64 output, i64 capacity, bool allow_github) -> i64 {
+    string registry_key = "RAZ_REGISTRY_TOKEN";
+    i64 length = registry_env_ascii_literal(registry_key, output, capacity);
+
+    if (length> 0 || !allow_github) {
+        return length;
+    }
+    // GitHub Actions, gh, and normal developer environments conventionally
+    // expose this name.  Falling back to it keeps the official registry fully
+    // GitHub-backed without making users duplicate the same token into a Raz-
+    // specific environment variable.
+
+    string github_key = "GITHUB_TOKEN";
+
+    length = registry_env_ascii_literal(github_key, output, capacity);
+    if (length> 0) {
+        return length;
+    }
+    return registry_read_saved_token(output, capacity);
+}
+
+fn registry_base64_encoded_length(i64 length) -> i64 {
+    if (length<0 || length> 805306368) {
+        return -1;
+    }
+    return ((length + 2) / 3)*4;
+}
+
+fn registry_base64_digit(i64 value) -> i64 {
+    if (value<26) {
+        return 65 + value;
+    }
+    if (value<52) {
+        return 97 + value - 26;
+    }
+    if (value<62) {
+        return 48 + value - 52;
+    }
+    if (value == 62) {
+        return 43;
+    }
+    return 47;
+}
+
+fn registry_base64_encode(i64 input, i64 length, i64 output, i64 capacity) -> i64 {
+    i64 required = registry_base64_encoded_length(length);
+
+    if (required<0 || required> capacity) {
+        return -1;
+    }
+
+    i64 src = 0;
+    i64 dst = 0;
+
+    while (src + 3 <= length) {
+        i64 a = raz_compiler_rt_arena_get(input, src)&255;
+        i64 b = raz_compiler_rt_arena_get(input, src + 1)&255;
+        i64 c = raz_compiler_rt_arena_get(input, src + 2)&255;
+
+        raz_compiler_rt_arena_set(output, dst, registry_base64_digit((a >> 2)&63));
+        raz_compiler_rt_arena_set(output, dst + 1, registry_base64_digit(((a&3) << 4) | ((b >> 4)&15)));
+        raz_compiler_rt_arena_set(output, dst + 2, registry_base64_digit(((b&15) << 2) | ((c >> 6)&3)));
+        raz_compiler_rt_arena_set(output, dst + 3, registry_base64_digit(c&63));
+        src += 3;
+        dst += 4;
+    }
+
+    i64 remaining = length - src;
+
+    if (remaining == 1) {
+        i64 a = raz_compiler_rt_arena_get(input, src)&255;
+
+        raz_compiler_rt_arena_set(output, dst, registry_base64_digit((a >> 2)&63));
+        raz_compiler_rt_arena_set(output, dst + 1, registry_base64_digit((a&3) << 4));
+        raz_compiler_rt_arena_set(output, dst + 2, 61);
+        raz_compiler_rt_arena_set(output, dst + 3, 61);
+        dst += 4;
+    } else if (remaining == 2) {
+        i64 a = raz_compiler_rt_arena_get(input, src)&255;
+        i64 b = raz_compiler_rt_arena_get(input, src + 1)&255;
+
+        raz_compiler_rt_arena_set(output, dst, registry_base64_digit((a >> 2)&63));
+        raz_compiler_rt_arena_set(output, dst + 1, registry_base64_digit(((a&3) << 4) | ((b >> 4)&15)));
+        raz_compiler_rt_arena_set(output, dst + 2, registry_base64_digit((b&15) << 2));
+        raz_compiler_rt_arena_set(output, dst + 3, 61);
+        dst += 4;
+    }
+    return dst;
+}
+
+fn registry_github_publish_archive(
+    i64 name,
+    i64 name_length,
+    i64 version,
+    i64 version_length,
+    i64 archive,
+    i64 archive_length,
+) -> i64 {
+    i64 token = raz_compiler_rt_arena_create(8192);
+
+    if (token == 0) {
+        return -70;
+    }
+
+    i64 token_length = registry_publish_token(token, 8192, true);
+
+    raz_compiler_rt_arena_destroy(token);
+    if (token_length <= 0) {
+        return 0;
+    }
+
+    i64 encoded_length = registry_base64_encoded_length(archive_length);
+
+    if (encoded_length <= 0) {
+        return -70;
+    }
+
+    i64 encoded = raz_compiler_rt_arena_create(encoded_length);
+    i64 body_capacity = encoded_length + name_length + version_length + 512;
+    i64 body = raz_compiler_rt_arena_create(body_capacity);
+    i64 url = raz_compiler_rt_arena_create(16384);
+    i64 content_type = raz_compiler_rt_arena_create(32);
+
+    if (encoded == 0 || body == 0 || url == 0 || content_type == 0) {
+        return -70;
+    }
+    if (registry_base64_encode(archive, archive_length, encoded, encoded_length) != encoded_length) {
+        return -70;
+    }
+
+    i64 uc = 0;
+    
+
+    package_append_string_literal(url, 16384, &mut uc, "https://api.github.com/repos/raz-language/packages/contents/packages/");
+    package_append(url, 16384, &mut uc, name, 0, name_length);
+
+    
+
+    package_append_string_literal(url, 16384, &mut uc, "/");
+    package_append(url, 16384, &mut uc, version, 0, version_length);
+
+    
+
+    package_append_string_literal(url, 16384, &mut uc, ".dpk");
+
+    i64 bc = 0;
+    
+
+    package_append_string_literal(body, body_capacity, &mut bc, "{\"message\":\"Publish ");
+    package_append(body, body_capacity, &mut bc, name, 0, name_length);
+
+    
+
+    package_append_string_literal(body, body_capacity, &mut bc, "@");
+    package_append(body, body_capacity, &mut bc, version, 0, version_length);
+
+    
+
+    package_append_string_literal(body, body_capacity, &mut bc, "\",\"content\":\"");
+    package_append(body, body_capacity, &mut bc, encoded, 0, encoded_length);
+
+    
+
+    package_append_string_literal(body, body_capacity, &mut bc, "\",\"branch\":\"main\"}");
+
+    string ct = "application/json";
+    i64 i = 0;
+
+    while (i<16) {
+        raz_compiler_rt_arena_set(content_type, i, compiler_literal_byte(ct, i));
+        i += 1;
+    }
+
+    i64 status = registry_http_put(url, uc, body, bc, content_type, 16);
+
+    raz_compiler_rt_arena_destroy(encoded);
+    raz_compiler_rt_arena_destroy(body);
+    raz_compiler_rt_arena_destroy(url);
+    raz_compiler_rt_arena_destroy(content_type);
+    if (status<0) {
+        return status;
+    }
+    return 1;
+}
+
+fn registry_github_admin_dispatch(
+    i64 action,
+    i64 action_length,
+    i64 package_name,
+    i64 package_length,
+    i64 value,
+    i64 value_length,
+) -> i64 {
+    i64 token = raz_compiler_rt_arena_create(8192);
+
+    if (token == 0) {
+        return -70;
+    }
+
+    i64 token_length = registry_publish_token(token, 8192, true);
+
+    raz_compiler_rt_arena_destroy(token);
+    if (token_length <= 0) {
+        return 0;
+    }
+
+    i64 url = raz_compiler_rt_arena_create(16384);
+    i64 body = raz_compiler_rt_arena_create(32768);
+    i64 content_type = raz_compiler_rt_arena_create(32);
+
+    if (url == 0 || body == 0 || content_type == 0) {
+        return -70;
+    }
+
+    i64 uc = 0;
+    
+
+    package_append_string_literal(url, 16384, &mut uc, "https://api.github.com/repos/raz-language/packages/actions/workflows/registry-admin.yml/dispatches");
+
+    i64 bc = 0;
+    
+
+    package_append_string_literal(body, 32768, &mut bc, "{\"ref\":\"main\",\"inputs\":{\"action\":\"");
+    package_append(body, 32768, &mut bc, action, 0, action_length);
+
+    
+
+    package_append_string_literal(body, 32768, &mut bc, "\",\"package\":\"");
+    package_append(body, 32768, &mut bc, package_name, 0, package_length);
+
+    
+
+    package_append_string_literal(body, 32768, &mut bc, "\",\"value\":\"");
+    package_append(body, 32768, &mut bc, value, 0, value_length);
+
+    
+
+    package_append_string_literal(body, 32768, &mut bc, "\"}}");
+
+    string ct = "application/json";
+    i64 i = 0;
+
+    while (i < 16) {
+        raz_compiler_rt_arena_set(content_type, i, compiler_literal_byte(ct, i));
+        i += 1;
+    }
+
+    i64 status = registry_http_post(url, uc, body, bc, content_type, 16);
+
+    raz_compiler_rt_arena_destroy(url);
+    raz_compiler_rt_arena_destroy(body);
+    raz_compiler_rt_arena_destroy(content_type);
+    if (status < 0) {
+        return status;
+    }
+    return 1;
+}
+
+fn registry_http_write(
+    i64 method,
+    i64 url,
+    i64 url_length,
+    i64 body,
+    i64 body_length,
+    i64 content_type,
+    i64 content_type_length,
+) -> i64 {
+    i64 host = raz_compiler_rt_arena_create(2048);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 request = raz_compiler_rt_arena_create(body_length + 32768);
+    i64 scratch = raz_compiler_rt_arena_create(65536);
+    i64 response = raz_compiler_rt_arena_create(131072);
+
+    if (host == 0 || path == 0 || request == 0 || scratch == 0 || response == 0) {
+        return -70;
+    }
+
+    i64 hl = 0;
+    i64 pl = 0;
+    i64 port = 0;
+    bool secure = false;
+
+    if (
+        !registry_url_parse(url, url_length, host, 2048, &mut hl, path, 8192, &mut pl, &mut port, &mut secure)
+    ) {
+        return -71;
+    }
+
+    i64 socket = raz_compiler_rt_tcp_connect_ascii(host, hl, port);
+
+    if (socket<0) {
+        return -72;
+    }
+    raz_compiler_rt_socket_set_timeout_millis(socket, 15000, 15000);
+
+    i64 tls = 0;
+
+    if (secure) {
+        tls = registry_tls_connect(host, hl, socket, scratch, 65536);
+        if (tls == 0) {
+            raz_compiler_rt_socket_close(socket);
+            return -73;
+        }
+    }
+
+    i64 cursor = 0;
+
+    if (method == 1) {
+        
+
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "POST ");
+    } else {
+        
+
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "PUT ");
+    }
+    package_append(request, body_length + 32768, &mut cursor, path, 0, pl);
+
+    
+
+    package_append_string_literal(request, body_length + 32768, &mut cursor, " HTTP/1.0\r\nHost: ");
+    package_append(request, body_length + 32768, &mut cursor, host, 0, hl);
+
+    
+
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nContent-Type: ");
+    package_append(request, body_length + 32768, &mut cursor, content_type, 0, content_type_length);
+
+    
+
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nContent-Length: ");
+    registry_append_decimal(request, body_length + 32768, &mut cursor, body_length);
+
+    i64 token = raz_compiler_rt_arena_create(8192);
+    bool github_api = hl == 14;
+    string gh_host = "api.github.com";
+    i64 gh_i = 0;
+
+    while (github_api && gh_i<14) {
+        if (raz_compiler_rt_arena_get(host, gh_i) != compiler_literal_byte(gh_host, gh_i)) {
+            github_api = false;
+        }
+        gh_i += 1;
+    }
+
+    i64 tl = registry_publish_token(token, 8192, github_api);
+
+    if (tl> 0) {
+        
+
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nAuthorization: Bearer ");
+        package_append(request, body_length + 32768, &mut cursor, token, 0, tl);
+    }
+    raz_compiler_rt_arena_destroy(token);
+    // Optional detached-signature hook for private registries. Raz does not
+    // prescribe a signing algorithm here; CI/release tooling may provide a
+    // precomputed signature and the registry decides how to verify it.
+
+    i64 signature = raz_compiler_rt_arena_create(8192);
+    string skey = "RAZ_REGISTRY_SIGNATURE";
+    i64 sl = registry_env_ascii_literal(skey, signature, 8192);
+
+    if (sl> 0) {
+        
+
+        package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nX-Raz-Signature: ");
+        package_append(request, body_length + 32768, &mut cursor, signature, 0, sl);
+    }
+    raz_compiler_rt_arena_destroy(signature);
+    // GitHub requires a User-Agent for REST API requests. These headers are
+    // harmless for generic/private registries and let the same transport serve
+    // both the static official registry and GitHub Contents publishing.
+
+    
+
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nUser-Agent: Raz/1.0\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2026-03-10");
+
+    
+
+    package_append_string_literal(request, body_length + 32768, &mut cursor, "\r\nConnection: close\r\n\r\n");
+    package_append(request, body_length + 32768, &mut cursor, body, 0, body_length);
+
+    i64 sent = 0;
+
+    if (secure) {
+        while (sent<cursor) {
+            i64 n = raz_compiler_rt_tls_write_plain_ascii(tls, request, sent, cursor - sent);
+
+            if (n<0) {
+                return -74;
+            }
+            if (!registry_tls_flush(tls, socket, scratch, 65536)) {
+                return -74;
+            }
+            if (n> 0) {
+                sent += n;
+            } else if (registry_tls_receive(tls, socket, scratch, 65536) <= 0) {
+                return -74;
+            }
+        }
+    } else {
+        while (sent<cursor) {
+            i64 n = raz_compiler_rt_socket_send_ascii(socket, request, sent, cursor - sent);
+
+            if (n <= 0) {
+                return -74;
+            }
+            sent += n;
+        }
+    }
+
+    i64 total = 0;
+    bool done = false;
+
+    while (!done && total<131072) {
+        i64 n = 0;
+
+        if (secure) {
+            n = raz_compiler_rt_tls_read_plain_ascii(tls, response, total, 131072 - total);
+            if (n> 0) {
+                total += n;
+                continue;
+            }
+            if (n == -2) {
+                break;
+            }
+            if (n<0) {
+                break;
+            }
+            if (registry_tls_receive(tls, socket, scratch, 65536) <= 0) {
+                done = true;
+            }
+        } else {
+            n = raz_compiler_rt_socket_receive_ascii(socket, response, total, 131072 - total);
+            if (n> 0) {
+                total += n;
+            } else {
+                done = true;
+            }
+        }
+    }
+    if (secure) {
+        raz_compiler_rt_tls_shutdown(tls);
+        registry_tls_flush(tls, socket, scratch, 65536);
+        raz_compiler_rt_tls_destroy(tls);
+    }
+    raz_compiler_rt_socket_close(socket);
+
+    i64 status = registry_http_status(response, total);
+
+    raz_compiler_rt_arena_destroy(host);
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(request);
+    raz_compiler_rt_arena_destroy(scratch);
+    raz_compiler_rt_arena_destroy(response);
+    if (status<200 || status >= 300) {
+        return -75;
+    }
+    return status;
+}
+
+fn registry_http_put(
+    i64 url,
+    i64 url_length,
+    i64 body,
+    i64 body_length,
+    i64 content_type,
+    i64 content_type_length,
+) -> i64 {
+    return registry_http_write(0, url, url_length, body, body_length, content_type, content_type_length);
+}
+
+fn registry_http_post(
+    i64 url,
+    i64 url_length,
+    i64 body,
+    i64 body_length,
+    i64 content_type,
+    i64 content_type_length,
+) -> i64 {
+    return registry_http_write(1, url, url_length, body, body_length, content_type, content_type_length);
+}
+
+fn registry_ends_dpk(i64 path, i64 length) -> bool {
+    if (length<4) {
+        return false;
+    }
+
+    string ext = ".dpk";
+    i64 i = 0;
+
+    while (i<4) {
+        if (raz_compiler_rt_arena_get(path, length - 4 + i) != compiler_literal_byte(ext, i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_store_materialize_local_archive(
+    i64 source,
+    i64 source_length,
+    i64 checksum,
+    i64 checksum_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    i64 store_length = registry_store_path(checksum, checksum_length, output, capacity);
+
+    if (store_length <= 0) {
+        return 40;
+    }
+    if (raz_compiler_rt_path_exists_ascii(output, store_length) != 0) {
+        if (registry_store_verify(output, store_length, checksum, checksum_length)) {
+            return store_length;
+        }
+        if (registry_offline()) {
+            return -63;
+        }
+    }
+    if (registry_offline()) {
+        return -64;
+    }
+
+    i64 archive = raz_compiler_rt_arena_create_width(67108864, 1);
+
+    if (archive == 0) {
+        return -70;
+    }
+
+    i64 n = raz_compiler_rt_read_ascii(source, source_length, archive, 67108864);
+
+    if (n <= 0) {
+        raz_compiler_rt_arena_destroy(archive);
+        return -67;
+    }
+
+    i64 unpack = registry_extract_archive(archive, n, output, store_length);
+
+    raz_compiler_rt_arena_destroy(archive);
+    if (unpack != 0) {
+        return -unpack;
+    }
+    if (!registry_store_verify(output, store_length, checksum, checksum_length)) {
+        raz_compiler_rt_remove_path_ascii(output, store_length);
+        return -62;
+    }
+    return store_length;
+}
+
+fn registry_path_prefix_literal(i64 path, i64 length, string prefix) -> bool {
+    i64 pl = compiler_literal_length(prefix);
+    if (length < pl) { return false; }
+    i64 i = 0;
+    while (i < pl) {
+        if (raz_compiler_rt_arena_get(path, i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_path_prefix(i64 path, i64 length, i64[]prefix, i64 pl) -> bool {
+    if (length<pl) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<pl) {
+        if (raz_compiler_rt_arena_get(path, i) != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn registry_package_path_ignored(i64 path, i64 length) -> bool {
+    string git = ".git/";
+
+    if (registry_path_prefix_literal(path, length, git)) {
+        return true;
+    }
+
+    string razd = ".raz/";
+
+    if (registry_path_prefix_literal(path, length, razd)) {
+        return true;
+    }
+
+    string publish = ".raz-publish/";
+
+    if (registry_path_prefix_literal(path, length, publish)) {
+        return true;
+    }
+
+    string build = "build/";
+
+    if (registry_path_prefix_literal(path, length, build)) {
+        return true;
+    }
+
+    string target = "target/";
+
+    if (registry_path_prefix_literal(path, length, target)) {
+        return true;
+    }
+
+    string diag = "stage1-diagnostic.txt";
+
+    if (length == 21) {
+        i64 i = 0;
+        bool same = true;
+
+        while (i<21) {
+            if (raz_compiler_rt_arena_get(path, i) != compiler_literal_byte(diag, i)) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (same) {
+            return true;
+        }
+    }
+
+    string metadata_cache = ".raz.cache";
+    string metadata_registry = ".raz.registry";
+    string metadata_index = ".raz.registry-index";
+    string metadata_git = ".raz.git";
+
+    if (
+        (length == 10 && registry_path_prefix_literal(path, length, metadata_cache)) ||
+        (length == 13 && registry_path_prefix_literal(path, length, metadata_registry)) ||
+        (length == 19 && registry_path_prefix_literal(path, length, metadata_index)) ||
+        (length == 8 && registry_path_prefix_literal(path, length, metadata_git))
+    ) {
+        return true;
+    }
+    if (registry_ends_dpk(path, length)) {
+        return true;
+    }
+    return false;
+}
+
+fn registry_tree_hash(i64 root, i64 root_length) -> i64 {
+    i64 listing = raz_compiler_rt_arena_create_width(4194304, 1);
+
+    if (listing == 0) {
+        return 0;
+    }
+
+    i64 ll = raz_compiler_rt_tree_list_ascii(root, root_length, listing, 4194304);
+
+    if (ll<0) {
+        return 0;
+    }
+
+    i64 hash = 1469598103934665603;
+    i64 prime = 1099511628211;
+    i64 pos = 0;
+
+    while (pos<ll) {
+        i64 st = pos;
+
+        while (pos<ll && raz_compiler_rt_arena_get(listing, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 pl = pos - st;
+
+        if (pos<ll) {
+            pos += 1;
+        }
+        if (pl <= 0) {
+            continue;
+        }
+
+        i64 rel = raz_compiler_rt_arena_create(pl);
+
+        if (rel == 0) {
+            return 0;
+        }
+
+        i64 ri = 0;
+
+        while (ri<pl) {
+            raz_compiler_rt_arena_set(rel, ri, raz_compiler_rt_arena_get(listing, st + ri));
+            ri += 1;
+        }
+
+        bool ignored = registry_package_path_ignored(rel, pl);
+
+        raz_compiler_rt_arena_destroy(rel);
+        if (ignored) {
+            continue;
+        }
+
+        i64 i = 0;
+
+        while (i<pl) {
+            hash = (hash ^ (raz_compiler_rt_arena_get(listing, st + i)&255))*prime;
+            i += 1;
+        }
+        hash = (hash ^ 0)*prime;
+
+        i64 full = raz_compiler_rt_arena_create(8192);
+        i64 data = raz_compiler_rt_arena_create_width(33554432, 1);
+
+        if (full == 0 || data == 0) {
+            return 0;
+        }
+
+        i64 c = 0;
+
+        package_append(full, 8192, &mut c, root, 0, root_length);
+        if (
+            c> 0 &&
+            raz_compiler_rt_arena_get(full, c - 1) != 47 &&
+            raz_compiler_rt_arena_get(full, c - 1) != 92
+        ) {
+            
+
+            package_append_string_literal(full, 8192, &mut c, "/");
+        }
+        package_append(full, 8192, &mut c, listing, st, pl);
+
+        i64 dl = raz_compiler_rt_read_ascii(full, c, data, 33554432);
+
+        if (dl<0) {
+            return 0;
+        }
+        i = 0;
+        while (i<dl) {
+            hash = (hash ^ (raz_compiler_rt_arena_get(data, i)&255))*prime;
+            i += 1;
+        }
+        hash = (hash ^ 255)*prime;
+        raz_compiler_rt_arena_destroy(full);
+        raz_compiler_rt_arena_destroy(data);
+    }
+    raz_compiler_rt_arena_destroy(listing);
+    return hash;
+}
+
+// Shared registry environment/store primitives live with transport so the
+// registry policy layer can depend on transport without a semantic import cycle.
+fn registry_hex_value(i64 value) -> i64 {
+    if (value >= 48 && value <= 57) {
+        return value - 48;
+    }
+    if (value >= 97 && value <= 102) {
+        return value - 87;
+    }
+    if (value >= 65 && value <= 70) {
+        return value - 55;
+    }
+    return -1;
+}
+
+fn registry_index_path(i64 output, i64 capacity) -> i64 {
+    i64 name = raz_compiler_rt_arena_create(19);
+
+    if (name == 0) {
+        return -1;
+    }
+
+    string n = "RAZ_REGISTRY_INDEX";
+    i64 i = 0;
+
+    while (i<18) {
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(n, i));
+        i += 1;
+    }
+
+    i64 length = raz_compiler_rt_env_get_ascii(name, 18, output, capacity);
+
+    raz_compiler_rt_arena_destroy(name);
+    return length;
+}
+
+fn registry_env_flag_literal(string key) -> bool {
+    i64 key_length = compiler_literal_length(key);
+    i64 name = raz_compiler_rt_arena_create(key_length);
+    i64 value = raz_compiler_rt_arena_create(16);
+    if (name == 0 || value == 0) { return false; }
+    i64 i = 0;
+    while (i < key_length) { raz_compiler_rt_arena_set(name, i, compiler_literal_byte(key, i)); i += 1; }
+    i64 length = raz_compiler_rt_env_get_ascii(name, key_length, value, 16);
+    raz_compiler_rt_arena_destroy(name);
+    if (length <= 0) { raz_compiler_rt_arena_destroy(value); return false; }
+    bool enabled = !(length == 1 && raz_compiler_rt_arena_get(value, 0) == 48);
+    raz_compiler_rt_arena_destroy(value);
+    return enabled;
+}
+
+fn registry_env_flag(i64[]key, i64 key_length) -> bool {
+    i64 name = raz_compiler_rt_arena_create(key_length);
+    i64 value = raz_compiler_rt_arena_create(16);
+
+    if (name == 0 || value == 0) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<key_length) {
+        raz_compiler_rt_arena_set(name, i, key[i]);
+        i += 1;
+    }
+
+    i64 length = raz_compiler_rt_env_get_ascii(name, key_length, value, 16);
+    bool enabled = false;
+
+    if (length> 0) {
+        i64 first = raz_compiler_rt_arena_get(value, 0);
+
+        enabled = first == 49 || first == 116 || first == 84 || first == 121 || first == 89;
+    }
+    raz_compiler_rt_arena_destroy(name);
+    raz_compiler_rt_arena_destroy(value);
+    return enabled;
+}
+
+fn registry_offline() -> bool {
+    string key = "RAZ_OFFLINE";
+
+    return registry_env_flag_literal(key);
+}
+
+fn registry_store_root(i64 output, i64 capacity) -> i64 {
+    string store_key = "RAZ_PACKAGE_STORE";
+    i64 length = registry_env_ascii_literal(store_key, output, capacity);
+
+    if (length> 0) {
+        return length;
+    }
+
+    i64 home = raz_compiler_rt_arena_create(8192);
+
+    if (home == 0) {
+        return -1;
+    }
+
+    string raz_home_key = "RAZ_HOME";
+    i64 hl = registry_env_ascii_literal(raz_home_key, home, 8192);
+
+    if (hl> 0) {
+        if (hl + 6> capacity) {
+            raz_compiler_rt_arena_destroy(home);
+            return -1;
+        }
+
+        i64 i = 0;
+
+        while (i<hl) {
+            raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(home, i));
+            i += 1;
+        }
+
+        string tail = "/store";
+
+        i = 0;
+        while (i<6) {
+            raz_compiler_rt_arena_set(output, hl + i, compiler_literal_byte(tail, i));
+            i += 1;
+        }
+        raz_compiler_rt_arena_destroy(home);
+        return hl + 6;
+    }
+
+    string home_key = "HOME";
+
+    hl = registry_env_ascii_literal(home_key, home, 8192);
+    if (hl <= 0) {
+        string profile_key = "USERPROFILE";
+
+        hl = registry_env_ascii_literal(profile_key, home, 8192);
+    }
+    if (hl> 0) {
+        if (hl + 12> capacity) {
+            raz_compiler_rt_arena_destroy(home);
+            return -1;
+        }
+
+        i64 i = 0;
+
+        while (i<hl) {
+            raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(home, i));
+            i += 1;
+        }
+
+        string tail = "/.raz/store";
+
+        i = 0;
+        while (i<11) {
+            raz_compiler_rt_arena_set(output, hl + i, compiler_literal_byte(tail, i));
+            i += 1;
+        }
+        raz_compiler_rt_arena_destroy(home);
+        return hl + 11;
+    }
+    raz_compiler_rt_arena_destroy(home);
+
+    string fallback = "./target/store";
+
+    if (capacity<14) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<14) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(fallback, i));
+        i += 1;
+    }
+    return 14;
+}
+
+fn registry_store_path(i64 checksum, i64 checksum_length, i64 output, i64 capacity) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+
+    if (root == 0) {
+        return -1;
+    }
+
+    i64 rl = registry_store_root(root, 8192);
+
+    if (rl <= 0 || rl + 1 + checksum_length> capacity) {
+        raz_compiler_rt_arena_destroy(root);
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<rl) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(root, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_set(output, rl, 47);
+    i = 0;
+    while (i<checksum_length) {
+        raz_compiler_rt_arena_set(output, rl + 1 + i, raz_compiler_rt_arena_get(checksum, i));
+        i += 1;
+    }
+
+    i64 total = rl + 1 + checksum_length;
+
+    if (total<capacity) {
+        raz_compiler_rt_arena_set(output, total, 0);
+    }
+    raz_compiler_rt_arena_destroy(root);
+    return total;
+}
+
+fn registry_store_verify(i64 path, i64 path_length, i64 checksum, i64 checksum_length) -> bool {
+    i64 hash = registry_tree_hash(path, path_length);
+
+    if (hash == 0) {
+        return false;
+    }
+    return registry_hex64_matches(checksum, 0, checksum_length, hash);
+}
+
+fn registry_hex64_matches(i64 data, i64 start, i64 length, i64 value) -> bool {
+    if (length != 16) {
+        return false;
+    }
+
+    i64 shift = 60;
+    i64 i = 0;
+
+    while (i<16) {
+        i64 nib = registry_hex_value(raz_compiler_rt_arena_get(data, start + i));
+
+        if (nib<0 || nib != ((value >> shift)&15)) {
+            return false;
+        }
+        shift -= 4;
+        i += 1;
+    }
+    return true;
+}

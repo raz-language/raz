@@ -5,10 +5,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-backend = (ROOT / "compiler/src/driver/backend.rz").read_text(encoding="utf-8")
-target = (ROOT / "compiler/src/backend/llvm/target.rz").read_text(encoding="utf-8")
-main = (ROOT / "compiler/src/main.rz").read_text(encoding="utf-8")
-cli = (ROOT / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
+backend = (ROOT / "compiler/src/raz_driver/src/backend.rz").read_text(encoding="utf-8")
+target = (ROOT / "compiler/src/raz_codegen_llvm/src/llvm/target.rz").read_text(encoding="utf-8")
+main = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
+cli = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
 build_driver = (ROOT / "src/bootstrap/tools/raz/detail/build_driver.hpp").read_text(encoding="utf-8")
 bootstrap = (ROOT / "tools/bootstrap.py").read_text(encoding="utf-8")
 readme = (ROOT / "README.md").read_text(encoding="utf-8")

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "forge/ir/verifier.hpp"
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/data_layout.hpp"
 #include <algorithm>
 #include <charconv>
 #include <unordered_map>
@@ -110,7 +110,7 @@ Diagnostics verify_module(const Module& module) {
         const auto expected_bytes = global.is_named_aggregate() ? aggregate_size.value_or(0)
             : (!global.function_signature_name.empty() ? static_cast<std::size_t>(global.element_count) * sizeof(std::uintptr_t)
                : static_cast<std::size_t>(global.element_count));
-        if (!global.bytes.empty() && !global.is_named_aggregate() && global.element_count == 1)
+        if (!global.bytes.empty() && !global.is_named_aggregate() && global.element_count == 1 && global.type != Type(TypeKind::i8))
             diagnostics.push_back({DiagnosticSeverity::error, "scalar global @" + global.name + " cannot use a byte-string initializer", {}});
         if (!global.bytes.empty() && global.bytes.size() != expected_bytes)
             diagnostics.push_back({DiagnosticSeverity::error, "byte initializer size mismatch for global @" + global.name, {}});
@@ -516,7 +516,8 @@ Diagnostics verify_module(const Module& module) {
                     aggregate_name = op.operands[0].starts_with("@") ? op.operands[0].substr(1) : op.operands[0];
                 } else if ((op.opcode == "aggregate.move.struct" || op.opcode == "aggregate.move.array" ||
                             op.opcode == "aggregate.borrow.struct" || op.opcode == "aggregate.borrow.array" ||
-                            op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array") && op.operands.size() == 2) {
+                            op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array" ||
+                            op.opcode == "aggregate.attach.struct" || op.opcode == "aggregate.attach.array") && op.operands.size() == 2) {
                     aggregate_kind = (op.opcode.ends_with("struct")) ? AggregateRefKind::structure : AggregateRefKind::array;
                     aggregate_name = op.operands[1].starts_with("@") ? op.operands[1].substr(1) : op.operands[1];
                 } else if (op.opcode == "call" && !op.operands.empty() && op.operands[0].starts_with("@")) {
@@ -928,6 +929,15 @@ Diagnostics verify_module(const Module& module) {
                     const bool valid = operation.type == Type(TypeKind::ptr) && !operation.result.empty() && known && identity;
                     if (!valid) diagnostics.push_back({DiagnosticSeverity::error,
                         operation.opcode + " requires a matching named aggregate source and ptr result in block " + current.name, {}});
+                }
+                if (operation.opcode == "aggregate.attach.struct" || operation.opcode == "aggregate.attach.array") {
+                    const bool structure = operation.opcode.ends_with("struct");
+                    const bool known = operation.operands.size() == 2 && operation.operands[1].starts_with("@") &&
+                        (structure ? struct_table.contains(operation.operands[1].substr(1)) : array_table.contains(operation.operands[1].substr(1)));
+                    const bool valid = operation.type == Type(TypeKind::ptr) && !operation.result.empty() && known &&
+                        operand_type(0) == Type(TypeKind::ptr);
+                    if (!valid) diagnostics.push_back({DiagnosticSeverity::error,
+                        operation.opcode + " requires a ptr source, known aggregate, and ptr result in block " + current.name, {}});
                 }
                 if (operation.opcode == "aggregate.borrow.struct" || operation.opcode == "aggregate.borrow.array" ||
                     operation.opcode == "aggregate.borrow.mut.struct" || operation.opcode == "aggregate.borrow.mut.array") {

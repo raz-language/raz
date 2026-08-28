@@ -6,12 +6,12 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-lowering = (root / 'compiler/src/mir/lowering.rz').read_text(encoding='utf-8')
-lowering_paths = (root / 'compiler/src/mir/ownership/lowering_paths.rz').read_text(encoding='utf-8')
-loans = (root / 'compiler/src/mir/ownership/loan_regions.rz').read_text(encoding='utf-8')
-paths = (root / 'compiler/src/mir/ownership/paths.rz').read_text(encoding='utf-8')
-drops = (root / 'compiler/src/mir/ownership/drops.rz').read_text(encoding='utf-8')
-dce = (root / 'compiler/src/mir/transform/dce.rz').read_text(encoding='utf-8')
+lowering = (root / 'compiler/src/raz_mir/src/mir/lowering.rz').read_text(encoding='utf-8')
+lowering_paths = (root / 'compiler/src/raz_mir/src/mir/ownership/lowering_paths.rz').read_text(encoding='utf-8')
+loans = (root / 'compiler/src/raz_borrowck/src/borrowck/loan_regions.rz').read_text(encoding='utf-8')
+paths = (root / 'compiler/src/raz_borrowck/src/borrowck/paths.rz').read_text(encoding='utf-8')
+drops = (root / 'compiler/src/raz_borrowck/src/borrowck/drops.rz').read_text(encoding='utf-8')
+dce = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/dce.rz').read_text(encoding='utf-8')
 
 checks = {
     'borrow lowering records semantic loan events': all(x in lowering_paths for x in [
@@ -37,8 +37,8 @@ checks = {
     # used to name was replaced by a precomputed pin map built once from
     # ownership_event_instructions, so assert the pinning itself.
     'loan program points remain DCE-pinned':
-        'mir.ownership_event_instructions' in dce and
-        'while (event < mir.ownership_event_count)' in dce,
+        'mir.ownership.ownership_event_instructions' in dce and
+        'while (event < mir.ownership.ownership_event_count)' in dce,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

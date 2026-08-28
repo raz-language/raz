@@ -5,9 +5,9 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-copy_prop = (ROOT / 'compiler/src/mir/transform/copy_prop.rz').read_text(encoding='utf-8')
-remap = (ROOT / 'compiler/src/mir/transform/remap.rz').read_text(encoding='utf-8')
-writer = (ROOT / 'compiler/src/backend/forge/writer.rz').read_text(encoding='utf-8')
+copy_prop = (ROOT / 'compiler/src/raz_mir_opt/src/mir_opt/transform/copy_prop.rz').read_text(encoding='utf-8')
+remap = (ROOT / 'compiler/src/raz_mir_opt/src/mir_opt/transform/remap.rz').read_text(encoding='utf-8')
+writer = (ROOT / 'compiler/src/raz_codegen_forge/src/forge/writer.rz').read_text(encoding='utf-8')
 
 checks = {
     'copy propagation collects a replacement table': 'i64 replacements = raz_compiler_rt_arena_create(mir.instruction_count + 1);' in copy_prop,

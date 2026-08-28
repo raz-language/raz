@@ -1,0 +1,244 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::cfg_cleanup;
+
+public import raz_mir_opt::transform::dce;
+
+// CFG destruction is deliberately edge-value aware. Block labels (opcode 24)
+// can materialize incoming edge values, so threading is restricted to empty
+// labels and jumps that carry no merge value.
+fn fold_mir_constant_branches(MirModule&mut mir) -> bool {
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 23) {
+            i64 condition = 0;
+
+            if (mir_constant_value(mir, raz_compiler_rt_arena_get(mir.op_a, ip), &mut condition)) {
+                i64 target = raz_compiler_rt_arena_get(mir.op_b, ip);
+
+                if (condition != 0) {
+                    target = raz_compiler_rt_arena_get(mir.op_c, ip);
+                }
+
+                i64 edge_value = raz_compiler_rt_arena_get(mir.op_d, ip);
+
+                raz_compiler_rt_arena_set(mir.opcodes, ip, 22);
+                raz_compiler_rt_arena_set(mir.op_a, ip, 0);
+                raz_compiler_rt_arena_set(mir.op_b, ip, target);
+                raz_compiler_rt_arena_set(mir.op_c, ip, edge_value);
+                raz_compiler_rt_arena_set(mir.op_d, ip, 0);
+            }
+        }
+        ip += 1;
+    }
+    return true;
+}
+
+fn mir_cfg_trampoline_target(MirModule& mir, MirCfg& cfg, i64 target) -> i64 {
+    if (target < 0 || target >= mir.instruction_count) {
+        return target;
+    }
+
+    i64 block = mir_cfg_block_for_instruction(cfg, target);
+
+    if (block < 0 || block >= cfg.block_count) {
+        return target;
+    }
+
+    i64 start = raz_compiler_rt_arena_get(cfg.block_starts, block);
+    i64 end = raz_compiler_rt_arena_get(cfg.block_ends, block);
+
+    if (start != target || end - start != 2) {
+        return target;
+    }
+    if (
+        raz_compiler_rt_arena_get(mir.opcodes, start) != 24 ||
+        raz_compiler_rt_arena_get(mir.op_a, start) != 0
+    ) {
+        return target;
+    }
+    if (
+        raz_compiler_rt_arena_get(mir.opcodes, start + 1) != 22 ||
+        raz_compiler_rt_arena_get(mir.op_c, start + 1) >= 0
+    ) {
+        return target;
+    }
+    return raz_compiler_rt_arena_get(mir.op_b, start + 1);
+}
+
+fn mir_cfg_resolve_trampoline_target(MirModule& mir, MirCfg& cfg, i64 target) -> i64 {
+    i64 current = target;
+    i64 steps = 0;
+
+    while (steps <= cfg.block_count) {
+        i64 next = mir_cfg_trampoline_target(mir, cfg, current);
+
+        if (next == current) {
+            return current;
+        }
+        current = next;
+        steps += 1;
+    }
+    // More trampoline edges than blocks implies a cycle. Preserve the original
+    // target instead of oscillating between equivalent rewrites.
+    return target;
+}
+
+fn thread_mir_empty_jumps(MirModule&mut mir) -> bool {
+    MirCfg cfg;
+
+    if (!build_mir_cfg(mir, &mut cfg)) {
+        return false;
+    }
+
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 22) {
+            i64 target = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 threaded = mir_cfg_resolve_trampoline_target(mir, &cfg, target);
+
+            if (threaded != target && threaded != ip) {
+                raz_compiler_rt_arena_set(mir.op_b, ip, threaded);
+            }
+        } else if (opcode == 23) {
+            i64 false_target = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 true_target = raz_compiler_rt_arena_get(mir.op_c, ip);
+            i64 threaded_false = mir_cfg_resolve_trampoline_target(mir, &cfg, false_target);
+            i64 threaded_true = mir_cfg_resolve_trampoline_target(mir, &cfg, true_target);
+
+            if (threaded_false != false_target && threaded_false != ip) {
+                raz_compiler_rt_arena_set(mir.op_b, ip, threaded_false);
+            }
+            if (threaded_true != true_target && threaded_true != ip) {
+                raz_compiler_rt_arena_set(mir.op_c, ip, threaded_true);
+            }
+        }
+        ip += 1;
+    }
+    destroy_mir_cfg(&mut cfg);
+    return true;
+}
+
+fn eliminate_mir_unreachable_blocks(MirModule&mut mir) -> bool {
+    MirCfg cfg;
+
+    if (!build_mir_cfg(mir, &mut cfg)) {
+        return false;
+    }
+
+    MirDataflowSet reachable;
+
+    if (!init_mir_dataflow_set(&mut reachable, cfg.block_count)) {
+        destroy_mir_cfg(&mut cfg);
+        return false;
+    }
+
+    i64 function_index = 0;
+
+    while (function_index < mir.function_count) {
+        i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+
+        if (count > 0) {
+            i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+            i64 entry = mir_cfg_block_for_instruction(&cfg, start);
+
+            if (entry < 0 || !mir_cfg_mark_reachable(&cfg, entry, &mut reachable)) {
+                destroy_mir_dataflow_set(&mut reachable);
+                destroy_mir_cfg(&mut cfg);
+                return false;
+            }
+        }
+        function_index += 1;
+    }
+
+    i64 keep = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (keep == 0) {
+        destroy_mir_dataflow_set(&mut reachable);
+        destroy_mir_cfg(&mut cfg);
+        return false;
+    }
+
+    bool changed = false;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        i64 block = mir_cfg_block_for_instruction(&cfg, ip);
+        bool live = block >= 0 && mir_dataflow_contains(&reachable, block);
+
+        if (live) {
+            raz_compiler_rt_arena_set(keep, ip, 1);
+        } else {
+            raz_compiler_rt_arena_set(keep, ip, 0);
+        }
+        if (!live) {
+            changed = true;
+        }
+        ip += 1;
+    }
+    destroy_mir_dataflow_set(&mut reachable);
+    destroy_mir_cfg(&mut cfg);
+    if (changed && !compact_mir_instructions(mir, keep)) {
+        raz_compiler_rt_arena_destroy(keep);
+        return false;
+    }
+    raz_compiler_rt_arena_destroy(keep);
+    return true;
+}
+
+fn eliminate_mir_fallthrough_jumps(MirModule&mut mir) -> bool {
+    i64 keep = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (keep == 0) {
+        return false;
+    }
+
+    bool changed = false;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        bool retain = true;
+
+        if (
+            raz_compiler_rt_arena_get(mir.opcodes, ip) == 22 &&
+            raz_compiler_rt_arena_get(mir.op_c, ip) < 0 &&
+            raz_compiler_rt_arena_get(mir.op_b, ip) == ip + 1
+        ) {
+            retain = false;
+            changed = true;
+        }
+        if (retain) {
+            raz_compiler_rt_arena_set(keep, ip, 1);
+        } else {
+            raz_compiler_rt_arena_set(keep, ip, 0);
+        }
+        ip += 1;
+    }
+    if (changed && !compact_mir_instructions(mir, keep)) {
+        raz_compiler_rt_arena_destroy(keep);
+        return false;
+    }
+    raz_compiler_rt_arena_destroy(keep);
+    return true;
+}
+
+fn cleanup_mir_cfg(MirModule&mut mir) -> bool {
+    if (!fold_mir_constant_branches(mir)) {
+        return false;
+    }
+    if (!thread_mir_empty_jumps(mir)) {
+        return false;
+    }
+    if (!eliminate_mir_unreachable_blocks(mir)) {
+        return false;
+    }
+    if (!eliminate_mir_fallthrough_jumps(mir)) {
+        return false;
+    }
+    return true;
+}

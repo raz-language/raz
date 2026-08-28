@@ -6,15 +6,17 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-model = (root / 'compiler/src/mir/core/model.rz').read_text(encoding='utf-8')
-builder = (root / 'compiler/src/mir/core/builder.rz').read_text(encoding='utf-8')
-lowering = (root / 'compiler/src/mir/lowering.rz').read_text(encoding='utf-8')
-lowering_paths = (root / 'compiler/src/mir/ownership/lowering_paths.rz').read_text(encoding='utf-8')
-paths = (root / 'compiler/src/mir/ownership/paths.rz').read_text(encoding='utf-8')
-partial = (root / 'compiler/src/mir/ownership/partial_moves.rz').read_text(encoding='utf-8')
-dce = (root / 'compiler/src/mir/transform/dce.rz').read_text(encoding='utf-8')
-move = (root / 'compiler/src/mir/ownership/move_state.rz').read_text(encoding='utf-8')
-drops = (root / 'compiler/src/mir/ownership/drops.rz').read_text(encoding='utf-8')
+model = (root / 'compiler/src/raz_mir/src/mir/core/model.rz').read_text(encoding='utf-8')
+ownership_context = (root / 'compiler/src/raz_mir/src/mir/ownership/context.rz').read_text(encoding='utf-8')
+model += '\n' + ownership_context
+builder = (root / 'compiler/src/raz_mir/src/mir/core/builder.rz').read_text(encoding='utf-8')
+lowering = (root / 'compiler/src/raz_mir/src/mir/lowering.rz').read_text(encoding='utf-8')
+lowering_paths = (root / 'compiler/src/raz_mir/src/mir/ownership/lowering_paths.rz').read_text(encoding='utf-8')
+paths = (root / 'compiler/src/raz_borrowck/src/borrowck/paths.rz').read_text(encoding='utf-8')
+partial = (root / 'compiler/src/raz_borrowck/src/borrowck/partial_moves.rz').read_text(encoding='utf-8')
+dce = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/dce.rz').read_text(encoding='utf-8')
+move = (root / 'compiler/src/raz_borrowck/src/borrowck/move_state.rz').read_text(encoding='utf-8')
+drops = (root / 'compiler/src/raz_borrowck/src/borrowck/drops.rz').read_text(encoding='utf-8')
 
 checks = {
     'MIR owns projection path metadata': all(x in model for x in [
@@ -39,11 +41,11 @@ checks = {
         'mir_partial_local_clear_path' in partial and
         'mir_record_hir_path_event(hir, out, store_instruction, 2, target)' in lowering,
     'legacy whole-local checker ignores projected events':
-        'mir.ownership_event_path_counts' in move,
+        'mir.ownership.ownership_event_path_counts' in move,
     'ownership firewall executes partial-move verifier':
         'verify_mir_partial_move_dataflow_with_cfg(mir, &cfg)' in drops,
     'DCE pins ownership semantic program points': all(x in dce for x in [
-        'mir.ownership_event_instructions', '| 2', '& 2']),
+        'mir.ownership.ownership_event_instructions', '| 2', '& 2']),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

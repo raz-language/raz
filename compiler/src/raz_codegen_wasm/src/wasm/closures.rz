@@ -1,0 +1,215 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::closures;
+
+public import raz_codegen_wasm::runtime_memory;
+public import raz_codegen_wasm::globals;
+public import raz_codegen_wasm::float;
+
+fn wasm_closure_count(MirModule& mir) -> i64 {
+    i64 count = 0;
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 50) {
+            count += 1;
+        }
+        ip += 1;
+    }
+    return count;
+}
+
+fn wasm_closure_ordinal(MirModule& mir, i64 instruction) -> i64 {
+    i64 ordinal = 0;
+    i64 ip = 0;
+
+    while (ip < instruction) {
+        if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 50) {
+            ordinal += 1;
+        }
+        ip += 1;
+    }
+    return ordinal;
+}
+
+fn wasm_closure_adapter_type(HirModule& hir, i64 signature) -> i64 {
+    return hir.function_count + hir.function_type_count + signature;
+}
+
+fn wasm_closure_adapter_function(HirModule& hir, MirModule& mir, i64 instruction) -> i64 {
+    return hir.function_count + wasm_closure_ordinal(mir, instruction);
+}
+
+fn wasm_closure_emit_create(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+) -> bool {
+    i64 closure_function = raz_compiler_rt_arena_get(mir.op_a, instruction);
+    i64 argument_start = raz_compiler_rt_arena_get(mir.op_c, instruction);
+    i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+
+    if (!wasm_memory_emit_allocate(out, mir, function_index, instruction, capture_count + 1)) {
+        return false;
+    }
+
+    i64 result_local = wasm_memory_register_local(mir, function_index, instruction);
+
+    wasm_local_get(out, result_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 66);
+    wasm_i64(out, wasm_closure_adapter_function(hir, mir, instruction));
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+
+    i64 capture = 0;
+
+    while (capture < capture_count) {
+        wasm_local_get(out, result_local);
+        wasm_u8(out, 66);
+        wasm_i64(out, (capture + 1) * 8);
+        wasm_u8(out, 124);
+        wasm_u8(out, 167);
+        wasm_local_get(
+            out,
+            wasm_memory_register_local(
+                mir,
+                function_index,
+                raz_compiler_rt_arena_get(mir.call_arguments, argument_start + capture),
+            ),
+        );
+        wasm_u8(out, 55);
+        wasm_u32(out, 3);
+        wasm_u32(out, 0);
+        capture += 1;
+    }
+    return true;
+}
+
+fn wasm_closure_emit_call(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+) -> bool {
+    i64 argument_start = raz_compiler_rt_arena_get(mir.op_b, instruction);
+    i64 argument_count = raz_compiler_rt_arena_get(mir.op_c, instruction);
+    i64 signature = raz_compiler_rt_arena_get(mir.op_d, instruction);
+    i64 argument = 0;
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+
+    while (argument < argument_count) {
+        wasm_local_get(
+            out,
+            wasm_memory_register_local(
+                mir,
+                function_index,
+                raz_compiler_rt_arena_get(mir.call_arguments, argument_start + argument),
+            ),
+        );
+        i64 argument_type = raz_compiler_rt_arena_get(
+            hir.function_type_parameter_types,
+            parameter_start + argument,
+        );
+        if (primitive_type_is_float(argument_type)) {
+            wasm_float_emit_bits_to_value(out, argument_type);
+        }
+        argument += 1;
+    }
+    i64 closure_local = wasm_memory_register_local(
+        mir,
+        function_index,
+        raz_compiler_rt_arena_get(mir.op_a, instruction),
+    );
+    wasm_local_get(out, closure_local);
+    wasm_local_get(out, closure_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 41);
+    wasm_u32(out, 3);
+    wasm_u32(out, 0);
+    wasm_u8(out, 167);
+    wasm_u8(out, 17);
+    wasm_u32(out, wasm_closure_adapter_type(hir, signature));
+    wasm_u32(out, 0);
+
+    i64 return_type = raz_compiler_rt_arena_get(hir.function_type_return_types, signature);
+
+    if (return_type != 15) {
+        if (primitive_type_is_float(return_type)) {
+            wasm_float_emit_value_to_bits(out, return_type);
+        }
+        wasm_local_set(out, wasm_memory_register_local(mir, function_index, instruction));
+    }
+    return true;
+}
+
+fn wasm_closure_emit_adapter_body(
+    ForgeWriter&mut section,
+    HirModule& hir,
+    MirModule& mir,
+    i64 instruction,
+) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+
+    i64 closure_function = raz_compiler_rt_arena_get(mir.op_a, instruction);
+
+    i64 explicit_count = raz_compiler_rt_arena_get(
+        hir.function_closure_explicit_parameter_counts,
+        closure_function,
+    );
+
+    i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+    i64 argument = 0;
+
+    while (argument < explicit_count) {
+        wasm_local_get(&mut body, argument);
+        argument += 1;
+    }
+
+    i64 environment_parameter = explicit_count;
+    i64 capture = 0;
+
+    while (capture < capture_count) {
+        wasm_local_get(&mut body, environment_parameter);
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, (capture + 1) * 8);
+        wasm_u8(&mut body, 124);
+        wasm_u8(&mut body, 167);
+        wasm_u8(&mut body, 41);
+        wasm_u32(&mut body, 3);
+        wasm_u32(&mut body, 0);
+        i64 closure_parameter_start = raz_compiler_rt_arena_get(
+            hir.function_parameter_starts,
+            closure_function,
+        );
+        i64 capture_type = raz_compiler_rt_arena_get(
+            hir.parameter_types,
+            closure_parameter_start + explicit_count + capture,
+        );
+        if (primitive_type_is_float(capture_type)) {
+            wasm_float_emit_bits_to_value(&mut body, capture_type);
+        }
+        capture += 1;
+    }
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, closure_function + wasm_host_import_count());
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}

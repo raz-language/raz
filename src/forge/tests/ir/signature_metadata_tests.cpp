@@ -54,5 +54,32 @@ int main() {
     require(decoded.module.functions()[1].calling_convention == forge::ir::CallingConvention::fast,
             "binary IR lost calling convention");
 
+    const std::string callback_storage_source = R"FIR(module @callback_storage {
+  signature @unary(%value: i64) -> i64
+  func @identity(%value: i64) -> i64 {
+  entry:
+    return %value
+  }
+  func @apply(%operation: callback @unary, %value: i64) -> i64 {
+  entry:
+    %slot = stack.alloc ptr 8 align 8 attr callback.signature "unary"
+    store ptr %operation %slot align 8
+    %loaded = load ptr %slot align 8
+    %result = call.indirect i64 %loaded as @unary(%value)
+    return %result
+  }
+})FIR";
+    auto callback_storage = forge::ir::parse_module(callback_storage_source);
+    require(callback_storage.ok(), "callback storage attribute IR failed to parse");
+    require(forge::ir::verify_module(*callback_storage.module).empty(),
+            "callback storage attribute IR failed verification");
+    const auto callback_printed = forge::ir::print_module(*callback_storage.module);
+    require(callback_printed.find("attr callback.signature \"unary\"") != std::string::npos,
+            "canonical printer omitted callback storage attribute");
+    const auto callback_reparsed = forge::ir::parse_module(callback_printed);
+    require(callback_reparsed.ok(), "printed callback storage attribute IR failed to reparse");
+    require(forge::ir::verify_module(*callback_reparsed.module).empty(),
+            "printed callback storage attribute IR failed verification");
+
     std::cout << "signature metadata tests passed\n";
 }

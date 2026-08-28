@@ -14,6 +14,7 @@ extern fn raz_rt_file_write(usize handle, usize data, i64 size) -> i64;
 extern fn raz_rt_file_seek(usize handle, i64 offset, i64 origin) -> i64;
 extern fn raz_rt_file_tell(usize handle) -> i64;
 extern fn raz_rt_file_flush(usize handle) -> i64;
+extern fn raz_rt_file_sync(usize handle) -> i64;
 extern fn raz_rt_file_eof(usize handle) -> i64;
 extern fn raz_rt_file_close(usize handle);
 public const i64 read_flag = 1;
@@ -118,6 +119,12 @@ public fn position(File& file) -> i64 {
 
 public fn flush(File&mut file) -> bool {
     return file.handle != 0 && raz_rt_file_flush(file.handle) == 1;
+}
+
+/// Flushes buffered bytes and asks the operating system to synchronize the
+/// underlying file to stable storage (`_commit` on Windows, `fsync` on POSIX).
+public fn sync(File&mut file) -> bool {
+    return file.handle != 0 && raz_rt_file_sync(file.handle) == 1;
 }
 
 public fn eof(File& file) -> bool {
@@ -250,6 +257,18 @@ public fn try_flush(File&mut file) -> Result<bool, IoError> {
         return Result<bool, IoError>::Error(error_with_code(IoOperation::Flush, -1));
     }
     if (raz_rt_file_flush(file.handle) != 1) {
+        return Result<bool, IoError>::Error(last_error(IoOperation::Flush));
+    }
+    return Result<bool, IoError>::Ok(true);
+}
+
+/// Structured durable synchronization. This includes a userspace flush and a
+/// platform file-descriptor sync before reporting success.
+public fn try_sync(File&mut file) -> Result<bool, IoError> {
+    if (file.handle == 0) {
+        return Result<bool, IoError>::Error(error_with_code(IoOperation::Flush, -1));
+    }
+    if (raz_rt_file_sync(file.handle) != 1) {
         return Result<bool, IoError>::Error(last_error(IoOperation::Flush));
     }
     return Result<bool, IoError>::Ok(true);

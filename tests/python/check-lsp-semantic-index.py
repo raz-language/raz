@@ -148,7 +148,7 @@ def main() -> int:
 
     diagnostics = [message for message in messages if message.get("method") == "textDocument/publishDiagnostics" and message.get("params", {}).get("uri") == bad_uri]
     assert diagnostics and diagnostics[0]["params"]["diagnostics"], diagnostics
-    assert diagnostics[0]["params"]["diagnostics"][0]["code"] == "E0002", diagnostics[0]
+    assert diagnostics[0]["params"]["diagnostics"][0]["code"] == "D1001", diagnostics[0]
     actions = by_id(messages, 14)["result"]
     assert any(action.get("kind") == "quickfix" and any(edit.get("newText") == ";" for edits in action.get("edit", {}).get("changes", {}).values() for edit in edits) for action in actions), actions
     assert diagnostics[-1]["params"]["diagnostics"] == [], diagnostics[-1]

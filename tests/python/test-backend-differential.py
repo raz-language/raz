@@ -14,10 +14,45 @@ import subprocess
 import tempfile
 import os
 import shutil
+import sys
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+
+
+def runtime_link_dependencies(runtime: Path) -> list[str]:
+    """Mirror the installed toolchain's self-describing runtime link layout."""
+    configured = os.environ.get('RAZ_RUNTIME_LINK_DEPS', '')
+    if configured:
+        values = configured.replace(os.pathsep, ';').split(';')
+        return [value for value in values if value and Path(value).is_file()]
+    directory = runtime.parent
+    if os.name == 'nt':
+        names = ['raz_runtime_ssl.lib', 'raz_runtime_crypto.lib', 'raz_runtime_ssl.a', 'raz_runtime_crypto.a']
+    else:
+        names = ['libraz_runtime_ssl.so', 'libraz_runtime_crypto.so', 'libraz_runtime_ssl.a', 'libraz_runtime_crypto.a']
+    return [str(directory / item) for item in names if (directory / item).is_file()]
+
+def resolve_forge_cli(forge_run: Path) -> Path:
+    """Resolve Forge's object-emission CLI from the execution-tool path.
+
+    Release-gate callers historically pass --forge-run because the differential
+    harness also used the old combined Forge tool. Forge 2.0 splits compilation
+    into `forge` and execution into `forge-run`. Preserve the public harness
+    argument while selecting the sibling compiler when the split tools are used.
+    """
+    name = forge_run.name.lower()
+    if name in {'forge-run', 'forge-run.exe'}:
+        sibling = forge_run.with_name('forge.exe' if name.endswith('.exe') else 'forge')
+        if sibling.is_file():
+            return sibling
+        raise SystemExit(
+            f'backend-differential: {forge_run} is the execution CLI, but sibling Forge compiler {sibling} is missing'
+        )
+    return forge_run
 
 
 def main() -> int:
@@ -26,36 +61,61 @@ def main() -> int:
     ap.add_argument('--razc', required=True, type=Path)
     ap.add_argument('--forge-run', required=True, type=Path)
     ap.add_argument('--runtime', type=Path)
+    ap.add_argument('--forge-structured', action='store_true',
+                    help='prefer Raz production structured Forge object emission, falling back to textual FIR when unsupported')
     ap.add_argument('--target')
     ap.add_argument('--cpu')
     ap.add_argument('--features')
     args = ap.parse_args()
+
+    args.source = args.source.resolve()
+    args.razc = args.razc.resolve()
+    args.forge_run = args.forge_run.resolve()
+    if args.runtime is not None:
+        args.runtime = args.runtime.resolve()
 
     with tempfile.TemporaryDirectory(prefix='raz-backend-diff-') as tmp:
         tmp = Path(tmp)
         fir = tmp / 'program.fir'
         exe = tmp / ('program.exe' if subprocess.os.name == 'nt' else 'program')
 
-        forge_compile = run([str(args.razc), '--backend=forge', str(args.source), str(fir)])
-        if forge_compile.returncode != 0:
-            print(forge_compile.stdout, end='')
-            print(forge_compile.stderr, end='')
-            raise SystemExit(f'Forge compilation failed: {forge_compile.returncode}')
         if args.runtime is None:
             raise SystemExit('backend-differential: --runtime is required for executable Forge comparison')
         forge_object = tmp / ('program.obj' if os.name == 'nt' else 'program.o')
-        if os.name == 'nt':
-            forge_codegen = run([str(args.forge_run), str(fir), f'--emit-coff={forge_object}', '--abi=windows'])
-        else:
-            forge_codegen = run([str(args.forge_run), str(fir), f'--emit-elf={forge_object}', '--abi=sysv'])
-        if forge_codegen.returncode != 0:
-            print(forge_codegen.stdout, end='')
-            print(forge_codegen.stderr, end='')
-            raise SystemExit(f'Forge object emission failed: {forge_codegen.returncode}')
+        structured_ready = False
+        if args.forge_structured:
+            forge_compile = run([
+                str(args.razc), '--backend=forge', '--forge-native', '--forge-structured-only',
+                '--opt=3', str(args.source), str(fir),
+            ])
+            structured_ready = forge_compile.returncode == 0 and forge_object.is_file()
+            if not structured_ready and forge_object.exists():
+                forge_object.unlink()
+        if not structured_ready:
+            forge_compile = run([str(args.razc), '--backend=forge', str(args.source), str(fir)])
+            if forge_compile.returncode != 0:
+                print(forge_compile.stdout, end='')
+                print(forge_compile.stderr, end='')
+                raise SystemExit(f'Forge compilation failed: {forge_compile.returncode}')
+            if os.name == 'nt':
+                object_format = 'coff'
+            elif sys.platform == 'darwin':
+                object_format = 'macho'
+            else:
+                object_format = 'elf'
+            forge_cli = resolve_forge_cli(args.forge_run)
+            forge_codegen = run([
+                str(forge_cli), 'compile', str(fir),
+                f'--format={object_format}', '-o', str(forge_object),
+            ])
+            if forge_codegen.returncode != 0:
+                print(forge_codegen.stdout, end='')
+                print(forge_codegen.stderr, end='')
+                raise SystemExit(f'Forge object emission failed: {forge_codegen.returncode}')
         linker = os.environ.get('CXX') or shutil.which('clang++') or shutil.which('c++') or shutil.which('g++')
         if not linker:
             raise SystemExit('backend-differential: no C++ linker driver found')
-        forge_link_cmd = [str(linker), str(forge_object), str(args.runtime)]
+        forge_link_cmd = [str(linker), str(forge_object), str(args.runtime), *runtime_link_dependencies(args.runtime)]
         if os.name != 'nt':
             forge_link_cmd += ['-lpthread', '-ldl']
         else:

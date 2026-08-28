@@ -3,8 +3,8 @@
 
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-hir = (root/'compiler/src/hir/semantic/statements.rz').read_text()
-mir = "\n".join(path.read_text() for path in sorted((root/'compiler/src/mir').rglob('*.rz')))
+hir = (root/'compiler/src/raz_hir/src/hir/semantic/statements.rz').read_text()
+mir = "\n".join(path.read_text() for path in sorted((root/'compiler/src/raz_mir/src/mir').rglob('*.rz')))
 example = (root/'tests/examples/backends/aggregate_global_replacement.rz').read_text()
 diff = root/'tests/examples/backends/differential/17_aggregate_global_replacement.rz'
 checks = {

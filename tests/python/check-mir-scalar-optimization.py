@@ -6,8 +6,8 @@ import sys
 
 root = Path(__file__).resolve().parents[2]
 required = [
-    "compiler/src/mir/transform/scalar.rz",
-    "compiler/src/mir/transform/cfg_cleanup.rz",
+    "compiler/src/raz_mir_opt/src/mir_opt/transform/scalar.rz",
+    "compiler/src/raz_mir_opt/src/mir_opt/transform/cfg_cleanup.rz",
 ]
 problems = []
 for rel in required:
@@ -16,9 +16,9 @@ for rel in required:
 
 scalar = (root / required[0]).read_text(encoding="utf-8")
 cfg = (root / required[1]).read_text(encoding="utf-8")
-const = (root / "compiler/src/mir/transform/const_prop.rz").read_text(encoding="utf-8")
-pipeline = (root / "compiler/src/mir/transform/pipeline.rz").read_text(encoding="utf-8")
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+const = (root / "compiler/src/raz_mir_opt/src/mir_opt/transform/const_prop.rz").read_text(encoding="utf-8")
+pipeline = (root / "compiler/src/raz_mir_opt/src/mir_opt/transform/pipeline.rz").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 for needle in [
     "simplify_mir_scalars",
@@ -42,7 +42,7 @@ for opcode in ("opcode >= 11 && opcode <= 16", "opcode == 19", "opcode == 20"):
 for call in ("simplify_mir_scalars(mir)", "cleanup_mir_cfg(mir)"):
     if call not in pipeline:
         problems.append(f"pipeline missing {call}")
-for module in ("src/mir/transform/scalar.rz", "src/mir/transform/cfg_cleanup.rz"):
+for module in ("src/raz_mir_opt/src/mir_opt/transform/scalar.rz", "src/raz_mir_opt/src/mir_opt/transform/cfg_cleanup.rz"):
     if module not in order:
         problems.append(f"semantic compiler source graph missing {module}")
 

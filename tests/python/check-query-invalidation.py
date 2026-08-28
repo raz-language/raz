@@ -6,13 +6,13 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-model = (root / 'compiler/src/hir/core/model.rz').read_text(encoding='utf-8')
-builder = (root / 'compiler/src/hir/core/builder.rz').read_text(encoding='utf-8')
-engine = (root / 'compiler/src/hir/query/engine.rz').read_text(encoding='utf-8')
-invalidation = (root / 'compiler/src/hir/query/invalidation.rz').read_text(encoding='utf-8')
-fingerprints = (root / 'compiler/src/hir/query/fingerprints.rz').read_text(encoding='utf-8')
-comptime = (root / 'compiler/src/hir/semantic/comptime.rz').read_text(encoding='utf-8')
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text(encoding='utf-8')
+builder = (root / 'compiler/src/raz_hir/src/hir/core/builder.rz').read_text(encoding='utf-8')
+engine = (root / 'compiler/src/raz_hir/src/hir/query/engine.rz').read_text(encoding='utf-8')
+invalidation = (root / 'compiler/src/raz_hir/src/hir/query/invalidation.rz').read_text(encoding='utf-8')
+fingerprints = (root / 'compiler/src/raz_hir/src/hir/query/fingerprints.rz').read_text(encoding='utf-8')
+comptime = (root / 'compiler/src/raz_hir/src/hir/semantic/comptime.rz').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 checks = {
     'semantic input families have independent fingerprints': all(x in model + invalidation for x in [
@@ -55,7 +55,7 @@ checks = {
     'HIR records module fingerprints after semantic construction':
         'hir_query_record_module_fingerprints(&mut builder, &input)' in comptime,
     'incremental query modules are part of the semantic compiler graph': all(x in order for x in [
-        'src/hir/query/invalidation.rz', 'src/hir/query/fingerprints.rz']),
+        'src/raz_hir/src/hir/query/invalidation.rz', 'src/raz_hir/src/hir/query/fingerprints.rz']),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

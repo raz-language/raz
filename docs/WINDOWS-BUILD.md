@@ -20,7 +20,7 @@ Useful options include:
 -Jobs <n>
 -HostPreset release
 -BootstrapProfile release
---verify-reproducibility   # optional release/CI fixed-point check
+--verify-reproducibility   # optional release fixed-point check
 ```
 
 ## Native components only
@@ -52,9 +52,13 @@ build/
 └─ release/
 
 target/bootstrap/
-├─ candidate/
-├─ repro-1/        # normal final self-hosted compiler
-└─ repro-2/        # only with --verify-reproducibility
+├─ release/
+│  ├─ bin/
+│  │  ├─ raz.exe
+│  │  └─ oblink.exe
+│  ├─ lib/            # runtime + Forge support archives
+│  └─ packages/       # canonical compiler package/module objects
+└─ BUILD-SUMMARY.txt
 ```
 
-On Windows the normal final compiler is `target/bootstrap/repro-1/target/<profile>/bin/raz-compiler.exe`. When `--verify-reproducibility` is requested, `repro-2` is the independent comparison generation rather than the everyday bootstrap artifact. Release packaging installs the production `raz`/`razc` executables rather than the native host compiler. See [Installation](INSTALLATION.md) for the redistributable layout.
+Bootstrap uses temporary seed, candidate, self-host, web, and regression workspaces while qualification is running. They are intentionally preserved if bootstrap fails, but after a successful build they are removed and only the canonical modular production target above is retained. The final Windows compiler/CLI is `target/bootstrap/release/bin/raz.exe`. The internal compiler package remains named `raz-compiler`, but successful bootstrap retains the public `raz.exe` product name. Release packaging may also provide `razc.exe` as a compatibility alias and `razup.exe` as the toolchain-manager entry point. See [Installation](INSTALLATION.md) for the redistributable layout.

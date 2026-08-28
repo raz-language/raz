@@ -22,6 +22,7 @@ Completed baseline:
   redirected to the prevailing definition
 - `--map` link maps and `--verbose` archive-selection tracing
 - GNU/MinGW import libraries via per-symbol stub recovery
+- reachability-based dead-section/COMDAT elimination (`/OPT:REF`-style)
 
 Next:
 
@@ -34,7 +35,6 @@ Next:
 
 ## Linker architecture
 
-- dead-section elimination
 - identical code folding
 - deterministic parallel object parsing
 - incremental symbol/section graph cache

@@ -1,0 +1,770 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_llvm::closures;
+
+public import raz_codegen_llvm::globals_codegen;
+
+// Escaping Raz callables use the canonical erased runtime ABI. LLVM keeps
+// closure captures in 8-byte environment slots because this backend already
+// transports aggregate values as arena-handle machine words. Generated
+// adapters decode those slots to the closure body's native LLVM parameter
+// types, while the runtime owns invocation-kind and reference-count semantics.
+
+fn llvm_mir_has_callable_operations(MirModule& mir) -> bool {
+    i64 instruction = 0;
+    while (instruction < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
+        if (opcode >= 50 && opcode <= 53) {
+            return true;
+        }
+        instruction += 1;
+    }
+    return false;
+}
+
+fn llvm_emit_callable_runtime_declarations(ForgeWriter&mut out) {
+    llvm_literal(out, "declare ptr @raz_rt_alloc(i64)\n");
+    llvm_literal(out, "declare void @raz_rt_dealloc(ptr)\n");
+    llvm_literal(
+        out,
+        "declare ptr @raz_rt_callable_create_erased(ptr, ptr, ptr, ptr, i32, i64, i64, i64)\n",
+    );
+    llvm_literal(
+        out,
+        "declare i32 @raz_rt_callable_invoke_erased(ptr, i64, ptr, i64, ptr, i64)\n",
+    );
+    llvm_literal(out, "declare ptr @raz_rt_callable_clone_erased(ptr)\n");
+    llvm_literal(out, "declare void @raz_rt_callable_destroy_erased(ptr)\n");
+    writer_newline(out);
+}
+
+fn llvm_callable_adapter_name(ForgeWriter&mut out, i64 closure_function, i64 instruction) {
+    llvm_literal(out, "@__raz_callable_adapter_");
+    writer_decimal(out, closure_function);
+    writer_put(out, 95);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_callable_drop_name(ForgeWriter&mut out, i64 closure_function, i64 instruction) {
+    llvm_literal(out, "@__raz_callable_drop_");
+    writer_decimal(out, closure_function);
+    writer_put(out, 95);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_callable_named_value(ForgeWriter&mut out, string prefix, i64 index) {
+    writer_put(out, 37);
+    llvm_literal(out, prefix);
+    writer_decimal(out, index);
+}
+
+fn llvm_callable_storage_alignment(i64 type_kind) -> i64 {
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        return 8;
+    }
+    i64 width = primitive_type_width(type_kind);
+    if (width <= 0) {
+        return 8;
+    }
+    i64 bytes = (width + 7) / 8;
+    if (bytes < 1) { return 1; }
+    if (bytes > 8) { return 8; }
+    return bytes;
+}
+
+fn llvm_callable_parameter_native_pointer(HirModule& hir, i64 function_index, i64 parameter) -> bool {
+    i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 index = start + parameter;
+
+    if (raz_compiler_rt_arena_get(hir.parameter_function_types, index) >= 0) {
+        return true;
+    }
+    if (
+        raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
+    ) {
+        return false;
+    }
+    i64 type_kind = raz_compiler_rt_arena_get(hir.parameter_types, index);
+    return type_kind == 12 || type_kind == 13 || type_kind == 14;
+}
+
+fn llvm_callable_parameter_alignment(HirModule& hir, i64 function_index, i64 parameter) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 index = start + parameter;
+
+    if (
+        llvm_callable_parameter_native_pointer(hir, function_index, parameter) ||
+        raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
+    ) {
+        return 8;
+    }
+    return llvm_callable_storage_alignment(raz_compiler_rt_arena_get(hir.parameter_types, index));
+}
+
+fn llvm_callable_signature_parameter_native_pointer(HirModule& hir, i64 signature, i64 parameter) -> bool {
+    i64 start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+    i64 index = start + parameter;
+
+    if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, index) >= 0) {
+        return true;
+    }
+    if (
+        raz_compiler_rt_arena_get(hir.function_type_parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, index) >= 0
+    ) {
+        return false;
+    }
+    i64 type_kind = raz_compiler_rt_arena_get(hir.function_type_parameter_types, index);
+    return type_kind == 12 || type_kind == 13 || type_kind == 14;
+}
+
+fn llvm_callable_signature_parameter_alignment(HirModule& hir, i64 signature, i64 parameter) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+    i64 index = start + parameter;
+
+    if (
+        llvm_callable_signature_parameter_native_pointer(hir, signature, parameter) ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, index) >= 0
+    ) {
+        return 8;
+    }
+    return llvm_callable_storage_alignment(raz_compiler_rt_arena_get(hir.function_type_parameter_types, index));
+}
+
+fn llvm_callable_function_returns_native_pointer(HirModule& hir, i64 function_index) -> bool {
+    if (raz_compiler_rt_arena_get(hir.function_returns_value, function_index) == 0) {
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(hir.function_return_function_types, function_index) >= 0) {
+        return true;
+    }
+    if (
+        raz_compiler_rt_arena_get(hir.function_return_references, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index) >= 0
+    ) {
+        return false;
+    }
+    i64 type_kind = raz_compiler_rt_arena_get(hir.function_return_types, function_index);
+    return type_kind == 12 || type_kind == 13 || type_kind == 14;
+}
+
+fn llvm_callable_signature_returns_native_pointer(HirModule& hir, i64 signature) -> bool {
+    if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, signature) >= 0) {
+        return true;
+    }
+    if (
+        raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
+    ) {
+        return false;
+    }
+    i64 type_kind = raz_compiler_rt_arena_get(hir.function_type_return_types, signature);
+    return type_kind == 12 || type_kind == 13 || type_kind == 14;
+}
+
+fn llvm_callable_signature_returns_value(HirModule& hir, i64 signature) -> bool {
+    if (
+        raz_compiler_rt_arena_get(hir.function_type_return_function_types, signature) >= 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
+    ) {
+        return true;
+    }
+    i64 type_kind = raz_compiler_rt_arena_get(hir.function_type_return_types, signature);
+    return primitive_type_is_integer(type_kind) || primitive_type_is_float(type_kind) || type_kind == 12 || type_kind == 13 || type_kind == 14;
+}
+
+fn llvm_callable_signature_return_alignment(HirModule& hir, i64 signature) -> i64 {
+    if (
+        llvm_callable_signature_returns_native_pointer(hir, signature) ||
+        raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
+    ) {
+        return 8;
+    }
+    return llvm_callable_storage_alignment(raz_compiler_rt_arena_get(hir.function_type_return_types, signature));
+}
+
+fn llvm_callable_value_native_pointer(HirModule& hir, MirModule& mir, i64 function_index, i64 value) -> bool {
+    if (value < 0 || value >= mir.instruction_count) {
+        return false;
+    }
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, value);
+    if (opcode == 2) {
+        return llvm_callable_parameter_native_pointer(hir, function_index, raz_compiler_rt_arena_get(mir.op_a, value));
+    }
+    if (opcode == 8) {
+        return llvm_callable_function_returns_native_pointer(hir, raz_compiler_rt_arena_get(mir.op_a, value));
+    }
+    if (opcode == 44 || opcode == 51) {
+        return llvm_callable_signature_returns_native_pointer(hir, raz_compiler_rt_arena_get(mir.op_d, value));
+    }
+    if (opcode == 50 || opcode == 52) {
+        return true;
+    }
+
+    i64 type_kind = raz_compiler_rt_arena_get(mir.op_types, value);
+    if (type_kind != 12 && type_kind != 13 && type_kind != 14) {
+        return false;
+    }
+    return (
+        opcode == 1 || opcode == 26 || opcode == 28 || opcode == 40 ||
+        opcode == 42 || opcode == 43 || opcode == 47
+    );
+}
+
+fn llvm_callable_signatures_equivalent(HirModule& hir, i64 left, i64 right, i64 depth) -> bool {
+    if (left == right) { return true; }
+    if (left < 0 || right < 0 || left >= hir.function_type_count || right >= hir.function_type_count || depth > 16) {
+        return false;
+    }
+
+    i64 left_return_type = raz_compiler_rt_arena_get(hir.function_type_return_types, left);
+    i64 right_return_type = raz_compiler_rt_arena_get(hir.function_type_return_types, right);
+    if (
+        raz_compiler_rt_arena_get(hir.function_type_return_references, left) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, left) != 0
+    ) { left_return_type = 12; }
+    else if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, left) >= 0) { left_return_type = 14; }
+    if (
+        raz_compiler_rt_arena_get(hir.function_type_return_references, right) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, right) != 0
+    ) { right_return_type = 12; }
+    else if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, right) >= 0) { right_return_type = 14; }
+
+    if (
+        left_return_type != right_return_type ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, left) != raz_compiler_rt_arena_get(hir.function_type_return_slices, right)
+    ) { return false; }
+
+    i64 left_return_function = raz_compiler_rt_arena_get(hir.function_type_return_function_types, left);
+    i64 right_return_function = raz_compiler_rt_arena_get(hir.function_type_return_function_types, right);
+    if ((left_return_function < 0) != (right_return_function < 0)) { return false; }
+    if (
+        left_return_function >= 0 &&
+        !llvm_callable_signatures_equivalent(hir, left_return_function, right_return_function, depth + 1)
+    ) { return false; }
+
+    i64 left_count = raz_compiler_rt_arena_get(hir.function_type_parameter_counts, left);
+    i64 right_count = raz_compiler_rt_arena_get(hir.function_type_parameter_counts, right);
+    if (left_count != right_count) { return false; }
+
+    i64 left_start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, left);
+    i64 right_start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, right);
+    i64 parameter = 0;
+    while (parameter < left_count) {
+        i64 a = left_start + parameter;
+        i64 b = right_start + parameter;
+        i64 left_type = raz_compiler_rt_arena_get(hir.function_type_parameter_types, a);
+        i64 right_type = raz_compiler_rt_arena_get(hir.function_type_parameter_types, b);
+        if (
+            raz_compiler_rt_arena_get(hir.function_type_parameter_references, a) != 0 ||
+            raz_compiler_rt_arena_get(hir.function_type_parameter_slices, a) != 0
+        ) { left_type = 12; }
+        else if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, a) >= 0) { left_type = 14; }
+        if (
+            raz_compiler_rt_arena_get(hir.function_type_parameter_references, b) != 0 ||
+            raz_compiler_rt_arena_get(hir.function_type_parameter_slices, b) != 0
+        ) { right_type = 12; }
+        else if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, b) >= 0) { right_type = 14; }
+        if (
+            left_type != right_type ||
+            raz_compiler_rt_arena_get(hir.function_type_parameter_slices, a) != raz_compiler_rt_arena_get(hir.function_type_parameter_slices, b)
+        ) { return false; }
+        i64 left_nested = raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, a);
+        i64 right_nested = raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, b);
+        if ((left_nested < 0) != (right_nested < 0)) { return false; }
+        if (
+            left_nested >= 0 &&
+            !llvm_callable_signatures_equivalent(hir, left_nested, right_nested, depth + 1)
+        ) { return false; }
+        parameter += 1;
+    }
+    return true;
+}
+
+fn llvm_callable_canonical_signature(HirModule& hir, i64 signature) -> i64 {
+    if (signature < 0 || signature >= hir.function_type_count) { return signature; }
+    i64 candidate = 0;
+    while (candidate < signature) {
+        if (llvm_callable_signatures_equivalent(hir, candidate, signature, 0)) { return candidate; }
+        candidate += 1;
+    }
+    return signature;
+}
+
+fn llvm_callable_emit_slot_address(
+    ForgeWriter&mut out,
+    i64 category,
+    i64 instruction,
+    string base,
+    i64 byte_offset,
+) {
+    writer_space(out); writer_space(out);
+    llvm_temp(out, category, instruction);
+    llvm_literal(out, " = getelementptr i8, ptr ");
+    llvm_literal(out, base);
+    llvm_literal(out, ", i64 ");
+    writer_decimal(out, byte_offset);
+    writer_newline(out);
+}
+
+fn llvm_callable_emit_capture_value(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 closure_function,
+    i64 parameter,
+    i64 value,
+    i64 instruction,
+    i64 category,
+) -> bool {
+    bool expected_pointer = llvm_callable_parameter_native_pointer(hir, closure_function, parameter);
+    bool actual_pointer = llvm_callable_value_native_pointer(hir, mir, function_index, value);
+    if (expected_pointer && !actual_pointer) {
+        writer_space(out); writer_space(out);
+        llvm_temp(out, category, instruction);
+        llvm_literal(out, " = inttoptr i64 ");
+        llvm_value(out, value);
+        llvm_literal(out, " to ptr");
+        writer_newline(out);
+        return true;
+    }
+    if (!expected_pointer && actual_pointer) {
+        i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, closure_function);
+        i64 index = start + parameter;
+        bool raw_word =
+            raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_types, index) == 0;
+        if (!raw_word) { return false; }
+        writer_space(out); writer_space(out);
+        llvm_temp(out, category, instruction);
+        llvm_literal(out, " = ptrtoint ptr ");
+        llvm_value(out, value);
+        llvm_literal(out, " to i64");
+        writer_newline(out);
+        return true;
+    }
+    return true;
+}
+
+fn llvm_callable_emit_adapter(
+    ForgeWriter&mut out,
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+    i64 closure_function,
+    i64 instruction,
+) -> bool {
+    i64 explicit_count = raz_compiler_rt_arena_get(hir.function_closure_explicit_parameter_counts, closure_function);
+    i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+
+    llvm_literal(out, "define internal i32 ");
+    llvm_callable_adapter_name(out, closure_function, instruction);
+    llvm_literal(out, "(ptr %environment, ptr %arguments, i64 %argument_size, ptr %result, i64 %result_size) {\nentry:\n");
+
+    i64 argument = 0;
+    while (argument < explicit_count) {
+        llvm_literal(out, "  ");
+        llvm_callable_named_value(out, "argp", argument);
+        llvm_literal(out, " = getelementptr i8, ptr %arguments, i64 ");
+        writer_decimal(out, argument * 8);
+        writer_newline(out);
+        llvm_literal(out, "  ");
+        llvm_callable_named_value(out, "arg", argument);
+        llvm_literal(out, " = load ");
+        llvm_parameter_type(out, hir, closure_function, argument);
+        llvm_literal(out, ", ptr ");
+        llvm_callable_named_value(out, "argp", argument);
+        llvm_literal(out, ", align ");
+        writer_decimal(out, llvm_callable_parameter_alignment(hir, closure_function, argument));
+        writer_newline(out);
+        argument += 1;
+    }
+
+    i64 capture = 0;
+    while (capture < capture_count) {
+        i64 parameter = explicit_count + capture;
+        llvm_literal(out, "  ");
+        llvm_callable_named_value(out, "capp", capture);
+        llvm_literal(out, " = getelementptr i8, ptr %environment, i64 ");
+        writer_decimal(out, capture * 8);
+        writer_newline(out);
+        llvm_literal(out, "  ");
+        llvm_callable_named_value(out, "cap", capture);
+        llvm_literal(out, " = load ");
+        llvm_parameter_type(out, hir, closure_function, parameter);
+        llvm_literal(out, ", ptr ");
+        llvm_callable_named_value(out, "capp", capture);
+        llvm_literal(out, ", align ");
+        writer_decimal(out, llvm_callable_parameter_alignment(hir, closure_function, parameter));
+        writer_newline(out);
+        capture += 1;
+    }
+
+    bool returns_value = raz_compiler_rt_arena_get(hir.function_returns_value, closure_function) != 0;
+    llvm_literal(out, "  ");
+    if (returns_value) { llvm_literal(out, "%callresult = "); }
+    llvm_literal(out, "call ");
+    llvm_function_return_type(out, hir, closure_function);
+    writer_space(out);
+    llvm_function_name(out, source, hir, closure_function);
+    writer_put(out, 40);
+
+    i64 parameter = 0;
+    i64 total = explicit_count + capture_count;
+    while (parameter < total) {
+        if (parameter > 0) { writer_put(out, 44); writer_space(out); }
+        llvm_parameter_type(out, hir, closure_function, parameter);
+        writer_space(out);
+        if (parameter < explicit_count) {
+            llvm_callable_named_value(out, "arg", parameter);
+        } else {
+            llvm_callable_named_value(out, "cap", parameter - explicit_count);
+        }
+        parameter += 1;
+    }
+    writer_put(out, 41);
+    writer_newline(out);
+
+    if (returns_value) {
+        llvm_literal(out, "  store ");
+        llvm_function_return_type(out, hir, closure_function);
+        llvm_literal(out, " %callresult, ptr %result, align ");
+        i64 alignment = 8;
+        if (
+            raz_compiler_rt_arena_get(hir.function_return_function_types, closure_function) < 0 &&
+            raz_compiler_rt_arena_get(hir.function_return_references, closure_function) == 0 &&
+            raz_compiler_rt_arena_get(hir.function_return_slices, closure_function) == 0 &&
+            raz_compiler_rt_arena_get(hir.function_return_type_structs, closure_function) < 0
+        ) {
+            alignment = llvm_callable_storage_alignment(raz_compiler_rt_arena_get(hir.function_return_types, closure_function));
+        }
+        writer_decimal(out, alignment);
+        writer_newline(out);
+    }
+    llvm_literal(out, "  ret i32 0\n}\n\n");
+    return !out.failed;
+}
+
+fn llvm_callable_emit_drop(
+    ForgeWriter&mut out,
+    Source& source,
+    HirModule& hir,
+    i64 closure_function,
+    i64 instruction,
+) -> bool {
+    i64 explicit_count = raz_compiler_rt_arena_get(hir.function_closure_explicit_parameter_counts, closure_function);
+    i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, closure_function);
+
+    llvm_literal(out, "define internal void ");
+    llvm_callable_drop_name(out, closure_function, instruction);
+    llvm_literal(out, "(ptr %environment) {\nentry:\n");
+
+    i64 capture = capture_count;
+    while (capture > 0) {
+        capture -= 1;
+        i64 parameter_index = parameter_start + explicit_count + capture;
+        i64 structure = raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter_index);
+        i64 drop_function = -1;
+        if (structure >= 0 && raz_compiler_rt_arena_get(hir.parameter_references, parameter_index) == 0) {
+            drop_function = raz_compiler_rt_arena_get(hir.struct_drop_functions, structure);
+        }
+        if (drop_function >= 0) {
+            llvm_literal(out, "  ");
+            llvm_callable_named_value(out, "dropp", capture);
+            llvm_literal(out, " = getelementptr i8, ptr %environment, i64 ");
+            writer_decimal(out, capture * 8);
+            writer_newline(out);
+            llvm_literal(out, "  ");
+            llvm_callable_named_value(out, "dropv", capture);
+            llvm_literal(out, " = load i64, ptr ");
+            llvm_callable_named_value(out, "dropp", capture);
+            llvm_literal(out, ", align 8\n  ");
+            bool returns_value = raz_compiler_rt_arena_get(hir.function_returns_value, drop_function) != 0;
+            if (returns_value) {
+                llvm_callable_named_value(out, "dropresult", capture);
+                llvm_literal(out, " = ");
+            }
+            llvm_literal(out, "call ");
+            llvm_function_return_type(out, hir, drop_function);
+            writer_space(out);
+            llvm_function_name(out, source, hir, drop_function);
+            writer_put(out, 40);
+            llvm_parameter_type(out, hir, drop_function, 0);
+            writer_space(out);
+            llvm_callable_named_value(out, "dropv", capture);
+            writer_put(out, 41);
+            writer_newline(out);
+        }
+    }
+    llvm_literal(out, "  call void @raz_rt_dealloc(ptr %environment)\n  ret void\n}\n\n");
+    return !out.failed;
+}
+
+fn llvm_emit_callable_support_functions(
+    ForgeWriter&mut out,
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+    i64 reachable_functions,
+) -> bool {
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        if (raz_compiler_rt_arena_get(reachable_functions, function_index) != 0) {
+            i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+            i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+            while (ip < end) {
+                if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 50) {
+                    i64 closure_function = raz_compiler_rt_arena_get(mir.op_a, ip);
+                    if (
+                        !llvm_callable_emit_adapter(out, source, hir, mir, closure_function, ip) ||
+                        !llvm_callable_emit_drop(out, source, hir, closure_function, ip)
+                    ) { return false; }
+                }
+                ip += 1;
+            }
+        }
+        function_index += 1;
+    }
+    return !out.failed;
+}
+
+fn llvm_emit_callable_create(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+) -> bool {
+    i64 closure_function = raz_compiler_rt_arena_get(mir.op_a, instruction);
+    i64 closure_kind = raz_compiler_rt_arena_get(mir.op_b, instruction);
+    i64 argument_start = raz_compiler_rt_arena_get(mir.op_c, instruction);
+    i64 signature = raz_compiler_rt_arena_get(mir.op_d, instruction);
+    i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+    i64 explicit_count = raz_compiler_rt_arena_get(hir.function_closure_explicit_parameter_counts, closure_function);
+    i64 environment_size = capture_count * 8;
+    if (environment_size <= 0) { environment_size = 8; }
+
+    writer_space(out); writer_space(out);
+    llvm_temp(out, 600, instruction);
+    llvm_literal(out, " = call ptr @raz_rt_alloc(i64 ");
+    writer_decimal(out, environment_size);
+    writer_put(out, 41);
+    writer_newline(out);
+
+    i64 capture = 0;
+    while (capture < capture_count) {
+        i64 parameter = explicit_count + capture;
+        i64 value = raz_compiler_rt_arena_get(mir.call_arguments, argument_start + capture);
+        i64 address_category = 710 + capture;
+        i64 cast_category = 750 + capture;
+        writer_space(out); writer_space(out);
+        llvm_temp(out, address_category, instruction);
+        llvm_literal(out, " = getelementptr i8, ptr ");
+        llvm_temp(out, 600, instruction);
+        llvm_literal(out, ", i64 ");
+        writer_decimal(out, capture * 8);
+        writer_newline(out);
+        if (!llvm_callable_emit_capture_value(out, hir, mir, function_index, closure_function, parameter, value, instruction, cast_category)) {
+            return false;
+        }
+        writer_space(out); writer_space(out);
+        llvm_literal(out, "store ");
+        llvm_parameter_type(out, hir, closure_function, parameter);
+        writer_space(out);
+        bool expected_pointer = llvm_callable_parameter_native_pointer(hir, closure_function, parameter);
+        bool actual_pointer = llvm_callable_value_native_pointer(hir, mir, function_index, value);
+        if (expected_pointer != actual_pointer) { llvm_temp(out, cast_category, instruction); }
+        else { llvm_value(out, value); }
+        llvm_literal(out, ", ptr ");
+        llvm_temp(out, address_category, instruction);
+        llvm_literal(out, ", align ");
+        writer_decimal(out, llvm_callable_parameter_alignment(hir, closure_function, parameter));
+        writer_newline(out);
+        capture += 1;
+    }
+
+    i64 runtime_kind = 0;
+    if (closure_kind == 3) { runtime_kind = 1; }
+    else if (closure_kind == 4) { runtime_kind = 2; }
+
+    llvm_emit_assignment(out, instruction);
+    llvm_literal(out, "call ptr @raz_rt_callable_create_erased(ptr ");
+    llvm_temp(out, 600, instruction);
+    llvm_literal(out, ", ptr ");
+    llvm_callable_adapter_name(out, closure_function, instruction);
+    llvm_literal(out, ", ptr null, ptr ");
+    llvm_callable_drop_name(out, closure_function, instruction);
+    llvm_literal(out, ", i32 ");
+    writer_decimal(out, runtime_kind);
+    llvm_literal(out, ", i64 ");
+    writer_decimal(out, llvm_callable_canonical_signature(hir, signature));
+    llvm_literal(out, ", i64 ");
+    writer_decimal(out, explicit_count * 8);
+    llvm_literal(out, ", i64 ");
+    if (llvm_callable_signature_returns_value(hir, signature)) { writer_decimal(out, 8); }
+    else { writer_decimal(out, 0); }
+    writer_put(out, 41);
+    writer_newline(out);
+    return !out.failed;
+}
+
+fn llvm_emit_callable_invoke(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+) -> bool {
+    i64 callee = raz_compiler_rt_arena_get(mir.op_a, instruction);
+    i64 argument_start = raz_compiler_rt_arena_get(mir.op_b, instruction);
+    i64 argument_count = raz_compiler_rt_arena_get(mir.op_c, instruction);
+    i64 signature = raz_compiler_rt_arena_get(mir.op_d, instruction);
+    bool callee_pointer = llvm_callable_value_native_pointer(hir, mir, function_index, callee);
+    if (!callee_pointer) {
+        writer_space(out); writer_space(out);
+        llvm_temp(out, 800, instruction);
+        llvm_literal(out, " = inttoptr i64 ");
+        llvm_value(out, callee);
+        llvm_literal(out, " to ptr");
+        writer_newline(out);
+    }
+
+    if (argument_count > 0) {
+        writer_space(out); writer_space(out);
+        llvm_temp(out, 801, instruction);
+        llvm_literal(out, " = alloca i64, i64 ");
+        writer_decimal(out, argument_count);
+        llvm_literal(out, ", align 8");
+        writer_newline(out);
+    }
+    i64 argument = 0;
+    while (argument < argument_count) {
+        i64 value = raz_compiler_rt_arena_get(mir.call_arguments, argument_start + argument);
+        i64 address_category = 810 + argument;
+        i64 cast_category = 850 + argument;
+        writer_space(out); writer_space(out);
+        llvm_temp(out, address_category, instruction);
+        llvm_literal(out, " = getelementptr i8, ptr ");
+        llvm_temp(out, 801, instruction);
+        llvm_literal(out, ", i64 ");
+        writer_decimal(out, argument * 8);
+        writer_newline(out);
+        bool expected_pointer = llvm_callable_signature_parameter_native_pointer(hir, signature, argument);
+        bool actual_pointer = llvm_callable_value_native_pointer(hir, mir, function_index, value);
+        if (expected_pointer && !actual_pointer) {
+            writer_space(out); writer_space(out);
+            llvm_temp(out, cast_category, instruction);
+            llvm_literal(out, " = inttoptr i64 ");
+            llvm_value(out, value);
+            llvm_literal(out, " to ptr");
+            writer_newline(out);
+        } else if (!expected_pointer && actual_pointer) {
+            writer_space(out); writer_space(out);
+            llvm_temp(out, cast_category, instruction);
+            llvm_literal(out, " = ptrtoint ptr ");
+            llvm_value(out, value);
+            llvm_literal(out, " to i64");
+            writer_newline(out);
+        }
+        writer_space(out); writer_space(out);
+        llvm_literal(out, "store ");
+        llvm_function_type_parameter_type(out, hir, signature, argument);
+        writer_space(out);
+        if (expected_pointer != actual_pointer) { llvm_temp(out, cast_category, instruction); }
+        else { llvm_value(out, value); }
+        llvm_literal(out, ", ptr ");
+        llvm_temp(out, address_category, instruction);
+        llvm_literal(out, ", align ");
+        writer_decimal(out, llvm_callable_signature_parameter_alignment(hir, signature, argument));
+        writer_newline(out);
+        argument += 1;
+    }
+
+    bool returns_value = llvm_callable_signature_returns_value(hir, signature);
+    if (returns_value) {
+        writer_space(out); writer_space(out);
+        llvm_temp(out, 890, instruction);
+        llvm_literal(out, " = alloca i64, align 8");
+        writer_newline(out);
+    }
+    writer_space(out); writer_space(out);
+    llvm_temp(out, 891, instruction);
+    llvm_literal(out, " = call i32 @raz_rt_callable_invoke_erased(ptr ");
+    if (callee_pointer) { llvm_value(out, callee); } else { llvm_temp(out, 800, instruction); }
+    llvm_literal(out, ", i64 ");
+    writer_decimal(out, llvm_callable_canonical_signature(hir, signature));
+    llvm_literal(out, ", ptr ");
+    if (argument_count > 0) { llvm_temp(out, 801, instruction); } else { llvm_literal(out, "null"); }
+    llvm_literal(out, ", i64 ");
+    writer_decimal(out, argument_count * 8);
+    llvm_literal(out, ", ptr ");
+    if (returns_value) { llvm_temp(out, 890, instruction); } else { llvm_literal(out, "null"); }
+    llvm_literal(out, ", i64 ");
+    if (returns_value) { writer_decimal(out, 8); } else { writer_decimal(out, 0); }
+    writer_put(out, 41);
+    writer_newline(out);
+
+    if (returns_value) {
+        llvm_emit_assignment(out, instruction);
+        llvm_literal(out, "load ");
+        llvm_function_type_return_type(out, hir, signature);
+        llvm_literal(out, ", ptr ");
+        llvm_temp(out, 890, instruction);
+        llvm_literal(out, ", align ");
+        writer_decimal(out, llvm_callable_signature_return_alignment(hir, signature));
+        writer_newline(out);
+    }
+    return !out.failed;
+}
+
+fn llvm_emit_callable_clone_or_destroy(
+    ForgeWriter&mut out,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 instruction,
+    bool clone,
+) -> bool {
+    i64 handle = raz_compiler_rt_arena_get(mir.op_a, instruction);
+    bool pointer = llvm_callable_value_native_pointer(hir, mir, function_index, handle);
+    if (!pointer) {
+        writer_space(out); writer_space(out);
+        llvm_temp(out, 900, instruction);
+        llvm_literal(out, " = inttoptr i64 ");
+        llvm_value(out, handle);
+        llvm_literal(out, " to ptr");
+        writer_newline(out);
+    }
+    if (clone) {
+        llvm_emit_assignment(out, instruction);
+        llvm_literal(out, "call ptr @raz_rt_callable_clone_erased(ptr ");
+    } else {
+        writer_space(out); writer_space(out);
+        llvm_literal(out, "call void @raz_rt_callable_destroy_erased(ptr ");
+    }
+    if (pointer) { llvm_value(out, handle); } else { llvm_temp(out, 900, instruction); }
+    writer_put(out, 41);
+    writer_newline(out);
+    return !out.failed;
+}

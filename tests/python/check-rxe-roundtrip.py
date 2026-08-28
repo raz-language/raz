@@ -5,10 +5,10 @@
 from pathlib import Path
 import re
 root=Path(__file__).resolve().parents[2]
-isa=(root/'compiler/src/backend/rxe/isa.rz').read_text()
-writer=(root/'compiler/src/backend/rxe/writer.rz').read_text()
-decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text()
-codegen=(root/'compiler/src/backend/rxe/codegen.rz').read_text()
+isa=(root/'compiler/src/raz_codegen_rxe/src/rxe/isa.rz').read_text()
+writer=(root/'compiler/src/raz_codegen_rxe/src/rxe/writer.rz').read_text()
+decoder=(root/'compiler/src/raz_codegen_rxe/src/rxe/decoder.rz').read_text()
+codegen=(root/'compiler/src/raz_codegen_rxe/src/rxe/codegen.rz').read_text()
 spec=(root/'docs/RXE-v1-FORMAT.md').read_text()
 assert re.search(r'fn\s+rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+7;\s*\}', isa)
 assert 'i64 header_bytes = 104;' in writer

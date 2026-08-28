@@ -5,13 +5,13 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-future = (root / 'compiler/src/backend/wasm/runtime_future.rz').read_text(encoding='utf-8')
-codegen = (root / 'compiler/src/backend/wasm/codegen.rz').read_text(encoding='utf-8')
-wasi = (root / 'compiler/src/backend/wasm/wasi.rz').read_text(encoding='utf-8')
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+future = (root / 'compiler/src/raz_codegen_wasm/src/wasm/runtime_future.rz').read_text(encoding='utf-8')
+codegen = (root / 'compiler/src/raz_codegen_wasm/src/wasm/codegen.rz').read_text(encoding='utf-8')
+wasi = (root / 'compiler/src/raz_codegen_wasm/src/wasm/wasi.rz').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
-assert 'src/backend/wasm/runtime_future.rz' in order
-assert 'public import raz_compiler_backend_wasm_runtime_future;' in codegen
+assert 'src/raz_codegen_wasm/src/wasm/runtime_future.rz' in order
+assert 'public import raz_compiler_backend::wasm::runtime_future;' in codegen
 assert 'wasm_future_runtime_function_supported(source, hir, function_index)' in codegen
 assert 'wasm_future_runtime_emit_body(&mut section, source, hir, function_index)' in codegen
 for name in [

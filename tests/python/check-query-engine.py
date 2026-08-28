@@ -6,27 +6,29 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-model = (root / 'compiler/src/hir/core/model.rz').read_text(encoding='utf-8')
-builder = (root / 'compiler/src/hir/core/builder.rz').read_text(encoding='utf-8')
-engine = (root / 'compiler/src/hir/query/engine.rz').read_text(encoding='utf-8')
-invalidation = (root / 'compiler/src/hir/query/invalidation.rz').read_text(encoding='utf-8')
-resolution = (root / 'compiler/src/hir/query/resolution.rz').read_text(encoding='utf-8')
-traits = (root / 'compiler/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
-reflection = (root / 'compiler/src/hir/semantic/reflection.rz').read_text(encoding='utf-8')
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
-lexer = (root / 'compiler/src/frontend/lexer.rz').read_text(encoding='utf-8')
+model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text(encoding='utf-8')
+query_context = (root / 'compiler/src/raz_query/src/query/context.rz').read_text(encoding='utf-8')
+model += '\n' + query_context
+builder = (root / 'compiler/src/raz_hir/src/hir/core/builder.rz').read_text(encoding='utf-8')
+engine = (root / 'compiler/src/raz_hir/src/hir/query/engine.rz').read_text(encoding='utf-8')
+invalidation = (root / 'compiler/src/raz_hir/src/hir/query/invalidation.rz').read_text(encoding='utf-8')
+resolution = (root / 'compiler/src/raz_hir/src/hir/query/resolution.rz').read_text(encoding='utf-8')
+traits = (root / 'compiler/src/raz_hir/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
+reflection = (root / 'compiler/src/raz_hir/src/hir/semantic/reflection.rz').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
+lexer = (root / 'compiler/src/raz_lexer/src/lexer.rz').read_text(encoding='utf-8')
 
 checks = {
-    'unified query storage lives in HirBuilder': all(x in model for x in [
+    'unified query storage lives in HirQueryContext owned by HirBuilder': all(x in model for x in [
         'query_cache_hashes', 'query_cache_kinds', 'query_active_hashes', 'query_active_kinds', 'query_dependency_parent_hashes', 'query_dependency_parent_kinds',
         'query_dependency_child_hashes', 'query_dependency_child_kinds', 'query_dependency_buckets', 'query_dependency_next', 'query_cache_hits', 'query_cycle_count']),
     'query storage is initialized and destroyed centrally': all(x in builder for x in [
-        'query_cache_hashes = raz_compiler_rt_arena_create', 'query_cache_kinds = raz_compiler_rt_arena_create',
-        'query_dependency_parent_hashes = raz_compiler_rt_arena_create', 'query_dependency_parent_kinds = raz_compiler_rt_arena_create',
-        'query_dependency_buckets = raz_compiler_rt_arena_create',
-        'raz_compiler_rt_arena_destroy(out.query_cache_hashes)', 'raz_compiler_rt_arena_destroy(out.query_cache_kinds)',
-        'raz_compiler_rt_arena_destroy(out.query_dependency_parent_hashes)', 'raz_compiler_rt_arena_destroy(out.query_dependency_parent_kinds)',
-        'raz_compiler_rt_arena_destroy(out.query_dependency_buckets)']),
+        'queries.query_cache_hashes = raz_compiler_rt_arena_create', 'queries.query_cache_kinds = raz_compiler_rt_arena_create',
+        'queries.query_dependency_parent_hashes = raz_compiler_rt_arena_create', 'queries.query_dependency_parent_kinds = raz_compiler_rt_arena_create',
+        'queries.query_dependency_buckets = raz_compiler_rt_arena_create',
+        'raz_compiler_rt_arena_destroy(out.queries.query_cache_hashes)', 'raz_compiler_rt_arena_destroy(out.queries.query_cache_kinds)',
+        'raz_compiler_rt_arena_destroy(out.queries.query_dependency_parent_hashes)', 'raz_compiler_rt_arena_destroy(out.queries.query_dependency_parent_kinds)',
+        'raz_compiler_rt_arena_destroy(out.queries.query_dependency_buckets)']),
     'query engine has stable keys and epoch validation': all(x in engine + invalidation for x in [
         'hir_query_hash', 'hir_query_lookup', 'query_cache_hashes', 'query_cache_epoch0', 'query_cache_epoch1']),
     'query hot paths reject by precomputed hash before exact keys': all(x in engine + invalidation for x in [
@@ -34,8 +36,8 @@ checks = {
         'query_invalidation_hashes', 'query_cache_hashes']),
     'query hot state uses bounded unchecked arena access': all(x in lexer + engine + invalidation for x in [
         'fn raz_compiler_rt_arena_get_unchecked', 'fn raz_compiler_rt_arena_set_unchecked',
-        'raz_compiler_rt_arena_get_unchecked(builder.query_cache_',
-        'raz_compiler_rt_arena_set_unchecked(builder.query_cache_']),
+        'raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_',
+        'raz_compiler_rt_arena_set_unchecked(builder.queries.query_cache_']),
     'query engine tracks reverse-indexed dependencies': all(x in engine for x in [
         'hir_query_record_dependency', 'query_dependency_parent_kinds', 'query_dependency_child_kinds',
         'query_dependency_buckets', 'query_dependency_next']),
@@ -47,7 +49,7 @@ checks = {
     'layout queries migrated': 'hir_query_kind_layout()' in reflection and 'layout_cache_structures' not in reflection,
     'field offset queries migrated': 'hir_query_kind_field_offset()' in reflection and 'field_offset_cache_' not in reflection,
     'query modules are semantic compiler modules': all(x in order for x in [
-        'src/hir/query/invalidation.rz', 'src/hir/query/engine.rz', 'src/hir/query/resolution.rz']),
+        'src/raz_hir/src/hir/query/invalidation.rz', 'src/raz_hir/src/hir/query/engine.rz', 'src/raz_hir/src/hir/query/resolution.rz']),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

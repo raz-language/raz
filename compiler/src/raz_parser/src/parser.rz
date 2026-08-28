@@ -1,0 +1,1909 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_parser::parser;
+
+public import lexer::lexer;
+
+// The parser records source structure without trying to do semantic work early.
+// That separation keeps syntax recovery useful even when later analysis fails.
+fn init_module(ModuleSyntax&mut out) -> bool {
+    out.function_count = 0;
+    out.parameter_count = 0;
+    out.local_count = 0;
+    out.expression_count = 0;
+    out.diagnostic_count = 0;
+    out.diagnostic_code = DiagnosticCode::None;
+    out.diagnostic_offset = 0;
+    out.complex_source_mode = 0;
+    out.function_name_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_name_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_parameter_starts = raz_compiler_rt_arena_create(16384);
+    out.function_parameter_counts = raz_compiler_rt_arena_create(16384);
+    out.function_statement_counts = raz_compiler_rt_arena_create(16384);
+    out.function_return_type_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_return_type_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_return_reference = raz_compiler_rt_arena_create(16384);
+    out.function_return_mutable = raz_compiler_rt_arena_create(16384);
+    out.function_has_return_type = raz_compiler_rt_arena_create(16384);
+    out.function_is_extern = raz_compiler_rt_arena_create(16384);
+    out.parameter_type_offsets = raz_compiler_rt_arena_create(2048);
+    out.parameter_type_lengths = raz_compiler_rt_arena_create(2048);
+    out.parameter_name_offsets = raz_compiler_rt_arena_create(2048);
+    out.parameter_name_lengths = raz_compiler_rt_arena_create(2048);
+    out.parameter_reference = raz_compiler_rt_arena_create(2048);
+    out.parameter_mutable = raz_compiler_rt_arena_create(2048);
+    out.local_name_offsets = raz_compiler_rt_arena_create(32768);
+    out.local_name_lengths = raz_compiler_rt_arena_create(32768);
+    out.local_function_indices = raz_compiler_rt_arena_create(32768);
+    return (
+        out.function_name_offsets != 0 &&
+        out.function_name_lengths != 0 &&
+        out.function_parameter_starts != 0 &&
+        out.function_parameter_counts != 0 &&
+        out.function_statement_counts != 0 &&
+        out.function_return_type_offsets != 0 &&
+        out.function_return_type_lengths != 0 &&
+        out.function_return_reference != 0 &&
+        out.function_return_mutable != 0 &&
+        out.function_has_return_type != 0 &&
+        out.function_is_extern != 0 &&
+        out.parameter_type_offsets != 0 &&
+        out.parameter_type_lengths != 0 &&
+        out.parameter_name_offsets != 0 &&
+        out.parameter_name_lengths != 0 &&
+        out.parameter_reference != 0 &&
+        out.parameter_mutable != 0 &&
+        out.local_name_offsets != 0 &&
+        out.local_name_lengths != 0 &&
+        out.local_function_indices != 0
+    );
+}
+
+fn destroy_module(ModuleSyntax&mut out) {
+    raz_compiler_rt_arena_destroy(out.function_name_offsets);
+    raz_compiler_rt_arena_destroy(out.function_name_lengths);
+    raz_compiler_rt_arena_destroy(out.function_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.function_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.function_statement_counts);
+    raz_compiler_rt_arena_destroy(out.function_return_type_offsets);
+    raz_compiler_rt_arena_destroy(out.function_return_type_lengths);
+    raz_compiler_rt_arena_destroy(out.function_return_reference);
+    raz_compiler_rt_arena_destroy(out.function_return_mutable);
+    raz_compiler_rt_arena_destroy(out.function_has_return_type);
+    raz_compiler_rt_arena_destroy(out.function_is_extern);
+    raz_compiler_rt_arena_destroy(out.parameter_type_offsets);
+    raz_compiler_rt_arena_destroy(out.parameter_type_lengths);
+    raz_compiler_rt_arena_destroy(out.parameter_name_offsets);
+    raz_compiler_rt_arena_destroy(out.parameter_name_lengths);
+    raz_compiler_rt_arena_destroy(out.parameter_reference);
+    raz_compiler_rt_arena_destroy(out.parameter_mutable);
+    raz_compiler_rt_arena_destroy(out.local_name_offsets);
+    raz_compiler_rt_arena_destroy(out.local_name_lengths);
+    raz_compiler_rt_arena_destroy(out.local_function_indices);
+}
+
+fn parser_advance(Parser&mut parser) {
+    next_token(&mut parser.scan, &mut parser.current);
+}
+
+fn init_parser(Parser&mut out, Source input, ModuleSyntax&mut module) {
+    init_lexer(&mut out.scan, input);
+    clear_diagnostic(&mut out.last_error);
+    out.module = module;
+    out.current_function = -1;
+    parser_advance(out);
+}
+
+fn parser_fail(Parser&mut parser, DiagnosticCode code) {
+    if (parser.last_error.code == DiagnosticCode::None) {
+        set_diagnostic(&mut parser.last_error, code, parser.current.offset);
+    }
+}
+
+fn parser_expect(Parser&mut parser, TokenKind token_kind) -> bool {
+    if (parser.current.kind != token_kind) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    parser_advance(parser);
+    return true;
+}
+
+fn find_function(Parser&mut parser, i64 offset, i64 length) -> i64 {
+    i64 index = 0;
+
+    while (index < parser.module.function_count) {
+        i64 stored_offset = raz_compiler_rt_arena_get(parser.module.function_name_offsets, index);
+        i64 stored_length = raz_compiler_rt_arena_get(parser.module.function_name_lengths, index);
+        bool matched = token_same(&parser.scan.input, stored_offset, stored_length, offset, length);
+
+        if (matched) {
+            return index;
+        }
+        index += 1;
+    }
+    return -1;
+}
+
+fn name_exists(Parser&mut parser, i64 offset, i64 length) -> bool {
+    i64 function_index = parser.current_function;
+    i64 parameter = raz_compiler_rt_arena_get(parser.module.function_parameter_starts, function_index);
+
+    i64 parameter_end =
+        parameter +
+        raz_compiler_rt_arena_get(parser.module.function_parameter_counts, function_index);
+    while (parameter < parameter_end) {
+        if (
+            token_same(
+                &parser.scan.input,
+                raz_compiler_rt_arena_get(parser.module.parameter_name_offsets, parameter),
+                raz_compiler_rt_arena_get(parser.module.parameter_name_lengths, parameter),
+                offset,
+                length,
+            )
+        ) {
+            return true;
+        }
+        parameter += 1;
+    }
+
+    i64 local = 0;
+
+    while (local < parser.module.local_count) {
+        if (
+            raz_compiler_rt_arena_get(parser.module.local_function_indices, local) == function_index &&
+            token_same(
+                &parser.scan.input,
+                raz_compiler_rt_arena_get(parser.module.local_name_offsets, local),
+                raz_compiler_rt_arena_get(parser.module.local_name_lengths, local),
+                offset,
+                length,
+            )
+        ) {
+            return true;
+        }
+        local += 1;
+    }
+    return false;
+}
+
+fn parse_primary(Parser&mut parser) -> bool {
+    if (
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_await(&parser.scan.input, &parser.current) ||
+            token_is_spawn(&parser.scan.input, &parser.current)
+        )
+    ) {
+        parser_advance(parser);
+        if (!parse_primary(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+        return true;
+    }
+    bool parser_closure =
+        parser.current.kind == TokenKind::Identifier &&
+        token_is_fn(&parser.scan.input, &parser.current);
+    if (
+        !parser_closure &&
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_ref(&parser.scan.input, &parser.current) ||
+            token_is_mut(&parser.scan.input, &parser.current) ||
+            token_is_move(&parser.scan.input, &parser.current)
+        )
+    ) {
+        i64 saved_scan_offset = parser.scan.offset;
+        TokenKind saved_kind = parser.current.kind;
+        i64 saved_offset = parser.current.offset;
+        i64 saved_length = parser.current.length;
+
+        parser_advance(parser);
+        parser_closure =
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_fn(&parser.scan.input, &parser.current);
+        if (!parser_closure) {
+            parser.scan.offset = saved_scan_offset;
+            init_token(&mut parser.current, saved_kind, saved_offset, saved_length);
+        }
+    }
+    if (parser_closure) {
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::LeftParen)) {
+            return false;
+        }
+
+        i64 paren_depth = 1;
+
+        while (paren_depth > 0 && parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftParen) {
+                paren_depth += 1;
+            } else if (parser.current.kind == TokenKind::RightParen) {
+                paren_depth -= 1;
+                if (paren_depth == 0) {
+                    parser_advance(parser);
+                    break;
+                }
+            }
+            parser_advance(parser);
+        }
+        if (paren_depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (parser.current.kind == TokenKind::Arrow) {
+            parser_advance(parser);
+
+            i64 type_depth = 0;
+
+            while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+                if (
+                    parser.current.kind == TokenKind::LeftParen ||
+                    parser.current.kind == TokenKind::LeftBracket ||
+                    parser.current.kind == TokenKind::Less
+                ) {
+                    type_depth += 1;
+                } else if (
+                    parser.current.kind == TokenKind::RightParen ||
+                    parser.current.kind == TokenKind::RightBracket ||
+                    parser.current.kind == TokenKind::Greater
+                ) {
+                    if (type_depth > 0) {
+                        type_depth -= 1;
+                    }
+                }
+                parser_advance(parser);
+            }
+        }
+        if (parser.current.kind != TokenKind::LeftBrace) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 brace_depth = 0;
+
+        while (parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftBrace) {
+                brace_depth += 1;
+            } else if (parser.current.kind == TokenKind::RightBrace) {
+                brace_depth -= 1;
+            }
+            parser_advance(parser);
+            if (brace_depth == 0) {
+                break;
+            }
+        }
+        if (brace_depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (parser.current.kind != TokenKind::LeftParen) {
+            parser.module.expression_count += 1;
+            return true;
+        }
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::RightParen) {
+            bool parsing_arguments = true;
+
+            while (parsing_arguments) {
+                if (!parse_expression(parser)) {
+                    return false;
+                }
+                if (parser.current.kind == TokenKind::Comma) {
+                    parser_advance(parser);
+                    if (parser.current.kind == TokenKind::RightParen) {
+                        parsing_arguments = false;
+                    }
+                } else {
+                    parsing_arguments = false;
+                }
+            }
+        }
+        if (!parser_expect(parser, TokenKind::RightParen)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+        return true;
+    }
+    if (parser.current.kind == TokenKind::Identifier && token_is_move(&parser.scan.input, &parser.current)) {
+        parser_advance(parser);
+        return parse_primary(parser);
+    }
+    if (parser.current.kind == TokenKind::LeftParen) {
+        parser_advance(parser);
+        if (!parse_expression(parser)) {
+            return false;
+        }
+        return parser_expect(parser, TokenKind::RightParen);
+    }
+    if (
+        parser.current.kind == TokenKind::Minus ||
+        parser.current.kind == TokenKind::Bang ||
+        parser.current.kind == TokenKind::Tilde ||
+        parser.current.kind == TokenKind::Star
+    ) {
+        parser_advance(parser);
+        return parse_primary(parser);
+    }
+    if (parser.current.kind == TokenKind::Ampersand) {
+        parser_advance(parser);
+        if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_mut(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+        }
+        return parse_primary(parser);
+    }
+    if (
+        parser.current.kind == TokenKind::Integer ||
+        parser.current.kind == TokenKind::Float ||
+        parser.current.kind == TokenKind::Character
+    ) {
+        parser.module.expression_count += 1;
+        parser_advance(parser);
+        return true;
+    }
+    if (
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_true(&parser.scan.input, &parser.current) ||
+            token_is_false(&parser.scan.input, &parser.current)
+        )
+    ) {
+        parser.module.expression_count += 1;
+        parser_advance(parser);
+        return true;
+    }
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 offset = parser.current.offset;
+    i64 length = parser.current.length;
+
+    parser_advance(parser);
+    if (parser.current.kind == TokenKind::LeftParen) {
+        i64 target = find_function(parser, offset, length);
+        bool local_callable = target < 0 && name_exists(parser, offset, length);
+
+        if (target < 0 && !local_callable) {
+            parser_fail(parser, DiagnosticCode::UnknownName);
+            return false;
+        }
+        parser_advance(parser);
+
+        i64 argument_count = 0;
+
+        if (parser.current.kind != TokenKind::RightParen) {
+            bool parsing_arguments = true;
+
+            while (parsing_arguments) {
+                if (!parse_expression(parser)) {
+                    return false;
+                }
+                argument_count += 1;
+                if (parser.current.kind == TokenKind::Comma) {
+                    parser_advance(parser);
+                    if (parser.current.kind == TokenKind::RightParen) {
+                        parsing_arguments = false;
+                    }
+                } else {
+                    parsing_arguments = false;
+                }
+            }
+        }
+        if (!parser_expect(parser, TokenKind::RightParen)) {
+            return false;
+        }
+        if (
+            !local_callable &&
+            argument_count != raz_compiler_rt_arena_get(parser.module.function_parameter_counts, target)
+        ) {
+            parser_fail(parser, DiagnosticCode::WrongArgumentCount);
+            return false;
+        }
+        parser.module.expression_count += 1;
+        return true;
+    }
+    if (!name_exists(parser, offset, length)) {
+        parser_fail(parser, DiagnosticCode::UnknownName);
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Dot || parser.current.kind == TokenKind::LeftBracket) {
+        if (parser.current.kind == TokenKind::Dot) {
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier && parser.current.kind != TokenKind::Integer) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            parser_advance(parser);
+        } else {
+            parser_advance(parser);
+            if (!parse_expression(parser) || !parser_expect(parser, TokenKind::RightBracket)) {
+                return false;
+            }
+        }
+        parser.module.expression_count += 1;
+    }
+    parser.module.expression_count += 1;
+    return true;
+}
+
+fn parse_cast(Parser&mut parser) -> bool {
+    if (!parse_primary(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Identifier && token_is_as(&parser.scan.input, &parser.current)) {
+        parser_advance(parser);
+        if (
+            parser.current.kind != TokenKind::Identifier ||
+            !token_is_numeric_type(&parser.scan.input, parser.current.offset, parser.current.length)
+        ) {
+            parser_fail(parser, DiagnosticCode::UnknownType);
+            return false;
+        }
+        parser_advance(parser);
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_product(Parser&mut parser) -> bool {
+    if (!parse_cast(parser)) {
+        return false;
+    }
+    while (
+        parser.current.kind == TokenKind::Star ||
+        parser.current.kind == TokenKind::Slash ||
+        parser.current.kind == TokenKind::Percent
+    ) {
+        parser_advance(parser);
+        if (!parse_cast(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_sum(Parser&mut parser) -> bool {
+    if (!parse_product(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Plus || parser.current.kind == TokenKind::Minus) {
+        parser_advance(parser);
+        if (!parse_product(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_shift(Parser&mut parser) -> bool {
+    if (!parse_sum(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::LessLess || parser.current.kind == TokenKind::GreaterGreater) {
+        parser_advance(parser);
+        if (!parse_sum(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_relational(Parser&mut parser) -> bool {
+    if (!parse_shift(parser)) {
+        return false;
+    }
+    while (
+        parser.current.kind == TokenKind::Less ||
+        parser.current.kind == TokenKind::LessEqual ||
+        parser.current.kind == TokenKind::Greater ||
+        parser.current.kind == TokenKind::GreaterEqual
+    ) {
+        parser_advance(parser);
+        if (!parse_shift(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_equality(Parser&mut parser) -> bool {
+    if (!parse_relational(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::EqualEqual || parser.current.kind == TokenKind::BangEqual) {
+        parser_advance(parser);
+        if (!parse_relational(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_bit_and(Parser&mut parser) -> bool {
+    if (!parse_equality(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Ampersand) {
+        parser_advance(parser);
+        if (!parse_equality(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_bit_xor(Parser&mut parser) -> bool {
+    if (!parse_bit_and(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Caret) {
+        parser_advance(parser);
+        if (!parse_bit_and(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_bit_or(Parser&mut parser) -> bool {
+    if (!parse_bit_xor(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::Pipe) {
+        parser_advance(parser);
+        if (!parse_bit_xor(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_logical_and(Parser&mut parser) -> bool {
+    if (!parse_bit_or(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::AmpAmp) {
+        parser_advance(parser);
+        if (!parse_bit_or(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_expression(Parser&mut parser) -> bool {
+    if (!parse_logical_and(parser)) {
+        return false;
+    }
+    while (parser.current.kind == TokenKind::PipePipe) {
+        parser_advance(parser);
+        if (!parse_logical_and(parser)) {
+            return false;
+        }
+        parser.module.expression_count += 1;
+    }
+    return true;
+}
+
+fn parse_type_reference(
+    Parser&mut parser,
+    i64&mut type_offset,
+    i64&mut type_length,
+    i64&mut reference,
+    i64&mut mutable,
+) -> bool {
+    *reference = 0;
+    *mutable = 0;
+    if (parser.current.kind == TokenKind::Identifier && token_is_dyn(&parser.scan.input, &parser.current)) {
+        i64 start = parser.current.offset;
+
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+        parser_advance(parser);
+        *type_offset = start;
+        *type_length = parser.current.offset - start;
+        parser.module.complex_source_mode = 1;
+    } else if (
+        parser.current.kind == TokenKind::Identifier &&
+        token_is_fn(&parser.scan.input, &parser.current)
+    ) {
+        i64 start = parser.current.offset;
+
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::LeftParen)) {
+            return false;
+        }
+        if (parser.current.kind != TokenKind::RightParen) {
+            bool parsing_parameters = true;
+
+            while (parsing_parameters) {
+                i64 child_offset = 0;
+                i64 child_length = 0;
+                i64 child_reference = 0;
+                i64 child_mutable = 0;
+
+                if (
+                    !parse_type_reference(
+                        parser,
+                        &mut child_offset,
+                        &mut child_length,
+                        &mut child_reference,
+                        &mut child_mutable,
+                    )
+                ) {
+                    return false;
+                }
+                if (parser.current.kind == TokenKind::Comma) {
+                    parser_advance(parser);
+                    if (parser.current.kind == TokenKind::RightParen) {
+                        parsing_parameters = false;
+                    }
+                } else {
+                    parsing_parameters = false;
+                }
+            }
+        }
+        if (!parser_expect(parser, TokenKind::RightParen)) {
+            return false;
+        }
+        if (parser.current.kind == TokenKind::Arrow) {
+            parser_advance(parser);
+
+            i64 return_offset = 0;
+            i64 return_length = 0;
+            i64 return_reference = 0;
+            i64 return_mutable = 0;
+
+            if (
+                !parse_type_reference(
+                    parser,
+                    &mut return_offset,
+                    &mut return_length,
+                    &mut return_reference,
+                    &mut return_mutable,
+                )
+            ) {
+                return false;
+            }
+        }
+        *type_offset = start;
+        *type_length = parser.current.offset - start;
+        parser.module.complex_source_mode = 1;
+    } else if (parser.current.kind == TokenKind::LeftParen) {
+        i64 start = parser.current.offset;
+        i64 depth = 0;
+        bool saw_comma = false;
+
+        while (parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftParen) {
+                depth += 1;
+            } else if (parser.current.kind == TokenKind::RightParen) {
+                depth -= 1;
+                if (depth == 0) {
+                    i64 finish = parser.current.offset + parser.current.length;
+
+                    parser_advance(parser);
+                    *type_offset = start;
+                    *type_length = finish - start;
+                    parser.module.complex_source_mode = 1;
+                    if (!saw_comma) {
+                        parser_fail(parser, DiagnosticCode::ExpectedToken);
+                        return false;
+                    }
+                    break;
+                }
+            } else if (parser.current.kind == TokenKind::Comma && depth == 1) {
+                saw_comma = true;
+            }
+            parser_advance(parser);
+        }
+        if (depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    } else {
+        if (parser.current.kind != TokenKind::Identifier) {
+            parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+        // Preserve the complete qualified type path in the compact frontend.
+        // HIR already resolves namespace/package-qualified types, but the
+        // syntax parser historically stopped after the first identifier.  That
+        // made declarations such as `pkg::module::Type value;` fail before HIR
+        // could perform the qualified lookup.  Consume every `:: identifier`
+        // segment here and keep one contiguous source span for downstream
+        // diagnostics/metadata.
+
+        i64 start = parser.current.offset;
+        i64 finish = parser.current.offset + parser.current.length;
+        bool qualified = false;
+
+        parser_advance(parser);
+        while (parser.current.kind == TokenKind::ColonColon) {
+            qualified = true;
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            finish = parser.current.offset + parser.current.length;
+            parser_advance(parser);
+        }
+        *type_offset = start;
+        *type_length = finish - start;
+        if (qualified) {
+            parser.module.complex_source_mode = 1;
+        }
+    }
+    if (parser.current.kind == TokenKind::LeftBracket) {
+        parser_advance(parser);
+        if (parser.current.kind == TokenKind::RightBracket) {
+            parser_advance(parser);
+            if (
+                parser.current.kind == TokenKind::Identifier &&
+                token_is_mut(&parser.scan.input, &parser.current)
+            ) {
+                *mutable = 1;
+                parser_advance(parser);
+            }
+        } else {
+            // Fixed-array extents are semantically checked by HIR. The compact
+            // parser only has to preserve the declaration boundary.
+
+            i64 bracket_depth = 1;
+
+            while (bracket_depth > 0 && parser.current.kind != TokenKind::End) {
+                if (parser.current.kind == TokenKind::LeftBracket) {
+                    bracket_depth += 1;
+                } else if (parser.current.kind == TokenKind::RightBracket) {
+                    bracket_depth -= 1;
+                }
+                parser_advance(parser);
+            }
+            if (bracket_depth != 0) {
+                parser_fail(parser, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        }
+        parser.module.complex_source_mode = 1;
+    }
+    if (parser.current.kind == TokenKind::Ampersand) {
+        *reference = 1;
+        parser_advance(parser);
+        if (parser.current.kind == TokenKind::Lifetime) {
+            parser.module.complex_source_mode = 1;
+            parser_advance(parser);
+        }
+        if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_mut(&parser.scan.input, &parser.current)
+        ) {
+            *mutable = 1;
+            parser_advance(parser);
+        }
+    } else if (parser.current.kind == TokenKind::Star) {
+        parser_advance(parser);
+        if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_const(&parser.scan.input, &parser.current)
+        ) {
+            *reference = 2;
+            parser_advance(parser);
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_mut(&parser.scan.input, &parser.current)
+        ) {
+            *reference = 3;
+            *mutable = 1;
+            parser_advance(parser);
+        } else {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parse_parameter(Parser&mut parser) -> bool {
+    if (parser.module.parameter_count >= 2048) {
+        parser_fail(parser, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 type_offset = 0;
+    i64 type_length = 0;
+    i64 reference = 0;
+    i64 mutable = 0;
+
+    if (!parse_type_reference(parser, &mut type_offset, &mut type_length, &mut reference, &mut mutable)) {
+        return false;
+    }
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+    if (name_exists(parser, parser.current.offset, parser.current.length)) {
+        parser_fail(parser, DiagnosticCode::DuplicateName);
+        return false;
+    }
+
+    i64 index = parser.module.parameter_count;
+
+    raz_compiler_rt_arena_set(parser.module.parameter_type_offsets, index, type_offset);
+    raz_compiler_rt_arena_set(parser.module.parameter_type_lengths, index, type_length);
+    raz_compiler_rt_arena_set(parser.module.parameter_name_offsets, index, parser.current.offset);
+    raz_compiler_rt_arena_set(parser.module.parameter_name_lengths, index, parser.current.length);
+    raz_compiler_rt_arena_set(parser.module.parameter_reference, index, reference);
+    raz_compiler_rt_arena_set(parser.module.parameter_mutable, index, mutable);
+    parser.module.parameter_count += 1;
+    raz_compiler_rt_arena_set(
+        parser.module.function_parameter_counts,
+        parser.current_function,
+        raz_compiler_rt_arena_get(parser.module.function_parameter_counts, parser.current_function) + 1,
+    );
+    parser_advance(parser);
+    return true;
+}
+
+fn find_local(Parser&mut parser, i64 offset, i64 length) -> i64 {
+    i64 local = 0;
+
+    while (local < parser.module.local_count) {
+        if (
+            raz_compiler_rt_arena_get(parser.module.local_function_indices, local) == parser.current_function &&
+            token_same(
+                &parser.scan.input,
+                raz_compiler_rt_arena_get(parser.module.local_name_offsets, local),
+                raz_compiler_rt_arena_get(parser.module.local_name_lengths, local),
+                offset,
+                length,
+            )
+        ) {
+            return local;
+        }
+        local += 1;
+    }
+    return -1;
+}
+
+fn parse_assignment(Parser&mut parser) -> bool {
+    if (parser.current.kind == TokenKind::Star) {
+        parser_advance(parser);
+    }
+
+    i64 offset = parser.current.offset;
+    i64 length = parser.current.length;
+
+    if (find_local(parser, offset, length) < 0) {
+        parser_fail(parser, DiagnosticCode::UnknownName);
+        return false;
+    }
+    parser_advance(parser);
+    if (parser.current.kind == TokenKind::LeftParen) {
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::RightParen) {
+            while (true) {
+                if (!parse_expression(parser)) {
+                    return false;
+                }
+                if (parser.current.kind != TokenKind::Comma) {
+                    break;
+                }
+                parser_advance(parser);
+                if (parser.current.kind == TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        if (!parser_expect(parser, TokenKind::RightParen)) {
+            return false;
+        }
+        return parser_expect(parser, TokenKind::Semicolon);
+    }
+    while (parser.current.kind == TokenKind::Dot || parser.current.kind == TokenKind::LeftBracket) {
+        if (parser.current.kind == TokenKind::Dot) {
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier && parser.current.kind != TokenKind::Integer) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            parser_advance(parser);
+        } else {
+            parser_advance(parser);
+            if (!parse_expression(parser) || !parser_expect(parser, TokenKind::RightBracket)) {
+                return false;
+            }
+        }
+    }
+
+    TokenKind operation = parser.current.kind;
+
+    if (
+        operation != TokenKind::Equal &&
+        operation != TokenKind::PlusEqual &&
+        operation != TokenKind::MinusEqual &&
+        operation != TokenKind::StarEqual &&
+        operation != TokenKind::SlashEqual &&
+        operation != TokenKind::PercentEqual &&
+        operation != TokenKind::AmpersandEqual &&
+        operation != TokenKind::PipeEqual &&
+        operation != TokenKind::CaretEqual &&
+        operation != TokenKind::LessLessEqual &&
+        operation != TokenKind::GreaterGreaterEqual
+    ) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    parser_advance(parser);
+    if (!parse_expression(parser)) {
+        return false;
+    }
+    return parser_expect(parser, TokenKind::Semicolon);
+}
+
+fn parse_local(Parser&mut parser) -> bool {
+    if (parser.module.local_count >= 32768) {
+        parser_fail(parser, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 type_offset = parser.current.offset;
+    i64 type_length = parser.current.length;
+    bool inferred = token_is_auto(&parser.scan.input, &parser.current);
+
+    if (inferred) {
+        parser_advance(parser);
+    } else {
+        i64 reference = 0;
+        i64 mutable = 0;
+
+        if (
+            !parse_type_reference(
+                parser,
+                &mut type_offset,
+                &mut type_length,
+                &mut reference,
+                &mut mutable,
+            )
+        ) {
+            return false;
+        }
+        // User-defined and package-qualified types require the semantic HIR
+        // path.  Scalar locals remain eligible for the compact fast path.
+        if (!token_is_scalar_type(&parser.scan.input, type_offset, type_length)) {
+            parser.module.complex_source_mode = 1;
+        }
+    }
+    if (parser.current.kind == TokenKind::LeftBracket) {
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::RightBracket)) {
+            return false;
+        }
+        parser.module.complex_source_mode = 1;
+        if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_mut(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+        }
+    }
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 name_offset = parser.current.offset;
+    i64 name_length = parser.current.length;
+
+    if (name_exists(parser, name_offset, name_length)) {
+        parser_fail(parser, DiagnosticCode::DuplicateName);
+        return false;
+    }
+    parser_advance(parser);
+
+    bool array_local = false;
+
+    if (parser.current.kind == TokenKind::LeftBracket) {
+        array_local = true;
+
+        i64 bracket_depth = 1;
+
+        parser_advance(parser);
+        while (bracket_depth > 0 && parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftBracket) {
+                bracket_depth += 1;
+            } else if (parser.current.kind == TokenKind::RightBracket) {
+                bracket_depth -= 1;
+            }
+            parser_advance(parser);
+        }
+        if (bracket_depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    }
+    if (!parser_expect(parser, TokenKind::Equal)) {
+        return false;
+    }
+    if (array_local && parser.current.kind == TokenKind::LeftBracket) {
+        i64 bracket_depth = 1;
+
+        parser_advance(parser);
+        while (bracket_depth > 0 && parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftBracket) {
+                bracket_depth += 1;
+            } else if (parser.current.kind == TokenKind::RightBracket) {
+                bracket_depth -= 1;
+            }
+            parser_advance(parser);
+        }
+        if (bracket_depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    } else if (!parse_expression(parser)) {
+        return false;
+    }
+    if (!parser_expect(parser, TokenKind::Semicolon)) {
+        return false;
+    }
+
+    i64 index = parser.module.local_count;
+
+    raz_compiler_rt_arena_set(parser.module.local_name_offsets, index, name_offset);
+    raz_compiler_rt_arena_set(parser.module.local_name_lengths, index, name_length);
+    raz_compiler_rt_arena_set(parser.module.local_function_indices, index, parser.current_function);
+    parser.module.local_count += 1;
+    return true;
+}
+
+fn parser_skip_balanced_block(Parser&mut parser) -> bool {
+    if (!parser_expect(parser, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 brace_depth = 1;
+
+    while (brace_depth > 0 && parser.current.kind != TokenKind::End) {
+        if (parser.current.kind == TokenKind::LeftBrace) {
+            brace_depth += 1;
+        } else if (parser.current.kind == TokenKind::RightBrace) {
+            brace_depth -= 1;
+        }
+        parser_advance(parser);
+    }
+    if (brace_depth != 0) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    return true;
+}
+
+fn parser_skip_balanced_function_body(Parser&mut parser, i64 function_index) -> bool {
+    if (!parser_expect(parser, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 brace_depth = 1;
+    i64 statement_count = 0;
+
+    while (brace_depth > 0 && parser.current.kind != TokenKind::End) {
+        if (parser.current.kind == TokenKind::LeftBrace) {
+            brace_depth += 1;
+        } else if (parser.current.kind == TokenKind::RightBrace) {
+            brace_depth -= 1;
+        } else if (parser.current.kind == TokenKind::Semicolon && brace_depth == 1) {
+            statement_count += 1;
+        }
+        parser_advance(parser);
+    }
+    if (brace_depth != 0) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    raz_compiler_rt_arena_set(parser.module.function_statement_counts, function_index, statement_count);
+    return true;
+}
+
+fn parse_function(Parser&mut parser, i64 complex_source_mode) -> bool {
+    if (
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_public(&parser.scan.input, &parser.current) ||
+            token_is_private(&parser.scan.input, &parser.current)
+        )
+    ) {
+        parser_advance(parser);
+    }
+
+    bool parsing_prefixes = true;
+
+    while (parsing_prefixes && parser.current.kind == TokenKind::Identifier) {
+        if (
+            token_is_async(&parser.scan.input, &parser.current) ||
+            token_is_unsafe(&parser.scan.input, &parser.current)
+        ) {
+            parser.module.complex_source_mode = 1;
+            parser_advance(parser);
+        } else {
+            parsing_prefixes = false;
+        }
+    }
+    if (parser.module.function_count >= 16384) {
+        parser_fail(parser, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    if (parser.current.kind != TokenKind::Identifier || !token_is_fn(&parser.scan.input, &parser.current)) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    parser_advance(parser);
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 function_index = parser.module.function_count;
+
+    raz_compiler_rt_arena_set(parser.module.function_name_offsets, function_index, parser.current.offset);
+    raz_compiler_rt_arena_set(parser.module.function_name_lengths, function_index, parser.current.length);
+    raz_compiler_rt_arena_set(
+        parser.module.function_parameter_starts,
+        function_index,
+        parser.module.parameter_count,
+    );
+    raz_compiler_rt_arena_set(parser.module.function_parameter_counts, function_index, 0);
+    raz_compiler_rt_arena_set(parser.module.function_statement_counts, function_index, 0);
+    parser.module.function_count += 1;
+    parser.current_function = function_index;
+    parser_advance(parser);
+    if (parser.current.kind == TokenKind::Less) {
+        // The compact parser is only a precheck for generic functions. Keep it
+        // grammar-neutral here: HIR owns type/lifetime/const parameter semantics.
+        parser.module.complex_source_mode = 1;
+
+        i64 generic_depth = 0;
+        bool scanning_generics = true;
+
+        while (scanning_generics && parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::Less) {
+                generic_depth += 1;
+            } else if (parser.current.kind == TokenKind::Greater) {
+                generic_depth -= 1;
+            }
+            parser_advance(parser);
+            if (generic_depth == 0) {
+                scanning_generics = false;
+            }
+        }
+        if (generic_depth != 0) {
+            parser_fail(parser, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    }
+    if (!parser_expect(parser, TokenKind::LeftParen)) {
+        return false;
+    }
+    while (parser.current.kind != TokenKind::RightParen) {
+        if (!parse_parameter(parser)) {
+            return false;
+        }
+        if (parser.current.kind != TokenKind::Comma) {
+            break;
+        }
+        parser_advance(parser);
+    }
+    if (!parser_expect(parser, TokenKind::RightParen)) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(parser.module.function_is_extern, function_index, 0);
+    raz_compiler_rt_arena_set(parser.module.function_has_return_type, function_index, 0);
+    if (parser.current.kind == TokenKind::Arrow) {
+        parser_advance(parser);
+
+        i64 return_offset = 0;
+        i64 return_length = 0;
+        i64 return_reference = 0;
+        i64 return_mutable = 0;
+
+        if (
+            !parse_type_reference(
+                parser,
+                &mut return_offset,
+                &mut return_length,
+                &mut return_reference,
+                &mut return_mutable,
+            )
+        ) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(parser.module.function_return_type_offsets, function_index, return_offset);
+        raz_compiler_rt_arena_set(parser.module.function_return_type_lengths, function_index, return_length);
+        raz_compiler_rt_arena_set(parser.module.function_return_reference, function_index, return_reference);
+        raz_compiler_rt_arena_set(parser.module.function_return_mutable, function_index, return_mutable);
+        raz_compiler_rt_arena_set(parser.module.function_has_return_type, function_index, 1);
+    }
+    if (complex_source_mode != 0 || parser.module.complex_source_mode != 0) {
+        return parser_skip_balanced_function_body(parser, function_index);
+    }
+    if (!parser_expect(parser, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    bool saw_return = false;
+
+    while (parser.current.kind != TokenKind::RightBrace && parser.current.kind != TokenKind::End) {
+        if (parser.current.kind == TokenKind::LeftBrace) {
+            if (!parser_skip_balanced_block(parser)) {
+                return false;
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_defer(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (parser.current.kind == TokenKind::LeftBrace) {
+                if (!parser_skip_balanced_block(parser)) {
+                    return false;
+                }
+            } else {
+                while (parser.current.kind != TokenKind::Semicolon && parser.current.kind != TokenKind::End) {
+                    parser_advance(parser);
+                }
+                if (!parser_expect(parser, TokenKind::Semicolon)) {
+                    return false;
+                }
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_match(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+                parser_advance(parser);
+            }
+            if (!parser_skip_balanced_block(parser)) {
+                return false;
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_unsafe(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (!parser_skip_balanced_block(parser)) {
+                return false;
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_for(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+                parser_advance(parser);
+            }
+            if (!parser_skip_balanced_block(parser)) {
+                return false;
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_while(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (!parse_expression(parser) || !parser_skip_balanced_block(parser)) {
+                return false;
+            }
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_if(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (!parse_expression(parser)) {
+                return false;
+            }
+            if (!parser_expect(parser, TokenKind::LeftBrace)) {
+                return false;
+            }
+            if (
+                parser.current.kind != TokenKind::Identifier ||
+                !token_is_return(&parser.scan.input, &parser.current)
+            ) {
+                parser_fail(parser, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            parser_advance(parser);
+            if (!parse_expression(parser)) {
+                return false;
+            }
+            if (
+                !parser_expect(parser, TokenKind::Semicolon) ||
+                !parser_expect(parser, TokenKind::RightBrace)
+            ) {
+                return false;
+            }
+            if (
+                parser.current.kind == TokenKind::Identifier &&
+                token_is_else(&parser.scan.input, &parser.current)
+            ) {
+                parser_advance(parser);
+                if (!parser_expect(parser, TokenKind::LeftBrace)) {
+                    return false;
+                }
+                if (
+                    parser.current.kind != TokenKind::Identifier ||
+                    !token_is_return(&parser.scan.input, &parser.current)
+                ) {
+                    parser_fail(parser, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                parser_advance(parser);
+                if (!parse_expression(parser)) {
+                    return false;
+                }
+                if (
+                    !parser_expect(parser, TokenKind::Semicolon) ||
+                    !parser_expect(parser, TokenKind::RightBrace)
+                ) {
+                    return false;
+                }
+            }
+            saw_return = true;
+        } else if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_return(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (!parse_expression(parser)) {
+                return false;
+            }
+            if (!parser_expect(parser, TokenKind::Semicolon)) {
+                return false;
+            }
+            saw_return = true;
+        } else {
+            if (
+                parser.current.kind == TokenKind::Identifier &&
+                token_is_const(&parser.scan.input, &parser.current)
+            ) {
+                if (parser.module.local_count >= 32768) {
+                    parser_fail(parser, DiagnosticCode::TooManyItems);
+                    return false;
+                }
+                parser_advance(parser);
+                if (
+                    parser.current.kind != TokenKind::Identifier ||
+                    !token_is_scalar_type(&parser.scan.input, parser.current.offset, parser.current.length)
+                ) {
+                    parser_fail(parser, DiagnosticCode::UnknownType);
+                    return false;
+                }
+                parser_advance(parser);
+                if (parser.current.kind != TokenKind::Identifier) {
+                    parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                    return false;
+                }
+
+                i64 const_name_offset = parser.current.offset;
+                i64 const_name_length = parser.current.length;
+
+                if (name_exists(parser, const_name_offset, const_name_length)) {
+                    parser_fail(parser, DiagnosticCode::DuplicateName);
+                    return false;
+                }
+                parser_advance(parser);
+                if (
+                    !parser_expect(parser, TokenKind::Equal) ||
+                    !parse_expression(parser) ||
+                    !parser_expect(parser, TokenKind::Semicolon)
+                ) {
+                    return false;
+                }
+
+                i64 const_local_index = parser.module.local_count;
+
+                raz_compiler_rt_arena_set(
+                    parser.module.local_name_offsets,
+                    const_local_index,
+                    const_name_offset,
+                );
+                raz_compiler_rt_arena_set(
+                    parser.module.local_name_lengths,
+                    const_local_index,
+                    const_name_length,
+                );
+                raz_compiler_rt_arena_set(
+                    parser.module.local_function_indices,
+                    const_local_index,
+                    parser.current_function,
+                );
+                parser.module.local_count += 1;
+            } else if (
+                parser.current.kind == TokenKind::Identifier &&
+                (
+                    token_is_scalar_type(&parser.scan.input, parser.current.offset, parser.current.length) ||
+                    token_is_auto(&parser.scan.input, &parser.current)
+                )
+            ) {
+                if (!parse_local(parser)) {
+                    return false;
+                }
+            } else {
+                if (!parse_assignment(parser)) {
+                    return false;
+                }
+            }
+        }
+        raz_compiler_rt_arena_set(
+            parser.module.function_statement_counts,
+            function_index,
+            raz_compiler_rt_arena_get(parser.module.function_statement_counts, function_index) + 1,
+        );
+    }
+    if (!parser_expect(parser, TokenKind::RightBrace)) {
+        return false;
+    }
+    if (
+        raz_compiler_rt_arena_get(parser.module.function_has_return_type, function_index) != 0 &&
+        !saw_return
+    ) {
+        parser_fail(parser, DiagnosticCode::MissingReturn);
+        return false;
+    }
+    return true;
+}
+
+fn parse_complex_function(Parser&mut parser) -> bool {
+    if (
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_public(&parser.scan.input, &parser.current) ||
+            token_is_private(&parser.scan.input, &parser.current)
+        )
+    ) {
+        parser_advance(parser);
+    }
+
+    bool parsing_prefixes = true;
+
+    while (parsing_prefixes && parser.current.kind == TokenKind::Identifier) {
+        if (
+            token_is_async(&parser.scan.input, &parser.current) ||
+            token_is_unsafe(&parser.scan.input, &parser.current)
+        ) {
+            parser.module.complex_source_mode = 1;
+            parser_advance(parser);
+        } else {
+            parsing_prefixes = false;
+        }
+    }
+    if (parser.current.kind != TokenKind::Identifier || !token_is_fn(&parser.scan.input, &parser.current)) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    parser_advance(parser);
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+    if (parser.module.function_count >= 16384) {
+        parser_fail(parser, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 function_index = parser.module.function_count;
+
+    raz_compiler_rt_arena_set(parser.module.function_name_offsets, function_index, parser.current.offset);
+    raz_compiler_rt_arena_set(parser.module.function_name_lengths, function_index, parser.current.length);
+    parser.module.function_count += 1;
+    parser_advance(parser);
+    while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+        parser_advance(parser);
+    }
+    if (parser.current.kind != TokenKind::LeftBrace) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 depth = 1;
+
+    parser_advance(parser);
+    while (depth > 0 && parser.current.kind != TokenKind::End) {
+        if (parser.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+        } else if (parser.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+        }
+        parser_advance(parser);
+    }
+    if (depth != 0) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    return true;
+}
+
+fn parse_extern_function(Parser&mut parser) -> bool {
+    if (parser.module.function_count >= 16384) {
+        parser_fail(parser, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    parser_advance(parser);
+    if (parser.current.kind != TokenKind::Identifier || !token_is_fn(&parser.scan.input, &parser.current)) {
+        parser_fail(parser, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    parser_advance(parser);
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 function_index = parser.module.function_count;
+
+    raz_compiler_rt_arena_set(parser.module.function_name_offsets, function_index, parser.current.offset);
+    raz_compiler_rt_arena_set(parser.module.function_name_lengths, function_index, parser.current.length);
+    raz_compiler_rt_arena_set(
+        parser.module.function_parameter_starts,
+        function_index,
+        parser.module.parameter_count,
+    );
+    raz_compiler_rt_arena_set(parser.module.function_parameter_counts, function_index, 0);
+    raz_compiler_rt_arena_set(parser.module.function_statement_counts, function_index, 0);
+    raz_compiler_rt_arena_set(parser.module.function_is_extern, function_index, 1);
+    raz_compiler_rt_arena_set(parser.module.function_has_return_type, function_index, 0);
+    parser.module.function_count += 1;
+    parser.current_function = function_index;
+    parser_advance(parser);
+    if (!parser_expect(parser, TokenKind::LeftParen)) {
+        return false;
+    }
+    while (parser.current.kind != TokenKind::RightParen) {
+        if (!parse_parameter(parser)) {
+            return false;
+        }
+        if (parser.current.kind != TokenKind::Comma) {
+            break;
+        }
+        parser_advance(parser);
+    }
+    if (!parser_expect(parser, TokenKind::RightParen)) {
+        return false;
+    }
+    if (parser.current.kind == TokenKind::Arrow) {
+        parser_advance(parser);
+
+        i64 return_offset = 0;
+        i64 return_length = 0;
+        i64 return_reference = 0;
+        i64 return_mutable = 0;
+
+        if (
+            !parse_type_reference(
+                parser,
+                &mut return_offset,
+                &mut return_length,
+                &mut return_reference,
+                &mut return_mutable,
+            )
+        ) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(parser.module.function_return_type_offsets, function_index, return_offset);
+        raz_compiler_rt_arena_set(parser.module.function_return_type_lengths, function_index, return_length);
+        raz_compiler_rt_arena_set(parser.module.function_return_reference, function_index, return_reference);
+        raz_compiler_rt_arena_set(parser.module.function_return_mutable, function_index, return_mutable);
+        raz_compiler_rt_arena_set(parser.module.function_has_return_type, function_index, 1);
+    }
+    return parser_expect(parser, TokenKind::Semicolon);
+}
+
+fn parser_skip_top_level_declaration(Parser&mut parser) -> i64 {
+    while (parser.current.kind == TokenKind::At) {
+        parser.module.complex_source_mode = 1;
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            return -1;
+        }
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::LeftParen)) {
+            return -1;
+        }
+        if (parser.current.kind != TokenKind::Identifier) {
+            return -1;
+        }
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::RightParen)) {
+            return -1;
+        }
+    }
+
+    i64 saved_scan_offset = parser.scan.offset;
+    TokenKind saved_current_kind = parser.current.kind;
+    i64 saved_current_offset = parser.current.offset;
+    i64 saved_current_length = parser.current.length;
+
+    if (
+        parser.current.kind == TokenKind::Identifier &&
+        (
+            token_is_public(&parser.scan.input, &parser.current) ||
+            token_is_private(&parser.scan.input, &parser.current)
+        )
+    ) {
+        parser_advance(parser);
+    }
+    if (parser.current.kind != TokenKind::Identifier) {
+        parser.scan.offset = saved_scan_offset;
+        init_token(&mut parser.current, saved_current_kind, saved_current_offset, saved_current_length);
+        return 0;
+    }
+    if (
+        token_is_async(&parser.scan.input, &parser.current) ||
+        token_is_unsafe(&parser.scan.input, &parser.current)
+    ) {
+        parser.module.complex_source_mode = 1;
+        parser.scan.offset = saved_scan_offset;
+        init_token(&mut parser.current, saved_current_kind, saved_current_offset, saved_current_length);
+        if (!parse_complex_function(parser)) {
+            return -1;
+        }
+        return 2;
+    }
+    if (token_is_fn(&parser.scan.input, &parser.current)) {
+        parser_advance(parser);
+        if (parser.current.kind == TokenKind::Identifier) {
+            parser_advance(parser);
+
+            bool generic_function = parser.current.kind == TokenKind::Less;
+
+            parser.scan.offset = saved_scan_offset;
+            init_token(&mut parser.current, saved_current_kind, saved_current_offset, saved_current_length);
+            if (generic_function) {
+                parser.module.complex_source_mode = 1;
+                if (!parse_complex_function(parser)) {
+                    return -1;
+                }
+                return 2;
+            }
+        } else {
+            parser.scan.offset = saved_scan_offset;
+            init_token(&mut parser.current, saved_current_kind, saved_current_offset, saved_current_length);
+        }
+    }
+    if (token_is_comptime(&parser.scan.input, &parser.current)) {
+        parser.module.complex_source_mode = 1;
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::LeftBrace || !parser_skip_balanced_block(parser)) {
+            return -1;
+        }
+        return 2;
+    }
+    if (token_is_const(&parser.scan.input, &parser.current)) {
+        parser.module.complex_source_mode = 1;
+        parser_advance(parser);
+        if (
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_fn(&parser.scan.input, &parser.current)
+        ) {
+            if (!parse_complex_function(parser)) {
+                return -1;
+            }
+            return 2;
+        }
+        while (parser.current.kind != TokenKind::Semicolon && parser.current.kind != TokenKind::End) {
+            parser_advance(parser);
+        }
+        if (!parser_expect(parser, TokenKind::Semicolon)) {
+            return -1;
+        }
+        return 2;
+    }
+    if (token_is_raz_module(&parser.scan.input, &parser.current)) {
+        parser_advance(parser);
+        if (!parser_expect(parser, TokenKind::Semicolon)) {
+            return -1;
+        }
+        return 1;
+    }
+    if (token_is_raz_dependency(&parser.scan.input, &parser.current)) {
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+            return -1;
+        }
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+            return -1;
+        }
+        parser_advance(parser);
+        while (parser.current.kind == TokenKind::ColonColon) {
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return -1;
+            }
+            parser_advance(parser);
+        }
+        if (!parser_expect(parser, TokenKind::Semicolon)) {
+            return -1;
+        }
+        return 1;
+    }
+    if (
+        token_is_namespace(&parser.scan.input, &parser.current) ||
+        token_is_import(&parser.scan.input, &parser.current) ||
+        token_is_raz_package(&parser.scan.input, &parser.current)
+    ) {
+        bool namespace_declaration = token_is_namespace(&parser.scan.input, &parser.current);
+        bool package_declaration = token_is_raz_package(&parser.scan.input, &parser.current);
+
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+            return -1;
+        }
+        parser_advance(parser);
+        while (parser.current.kind == TokenKind::ColonColon) {
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return -1;
+            }
+            parser_advance(parser);
+        }
+        if (namespace_declaration && parser.current.kind == TokenKind::LeftBrace) {
+            parser_advance(parser);
+            return 1;
+        }
+        if (
+            !namespace_declaration &&
+            !package_declaration &&
+            parser.current.kind == TokenKind::Identifier &&
+            token_is_as(&parser.scan.input, &parser.current)
+        ) {
+            parser_advance(parser);
+            if (parser.current.kind != TokenKind::Identifier) {
+                parser_fail(parser, DiagnosticCode::ExpectedIdentifier);
+                return -1;
+            }
+            parser_advance(parser);
+        }
+        if (!parser_expect(parser, TokenKind::Semicolon)) {
+            return -1;
+        }
+        return 1;
+    }
+    if (parser.current.kind == TokenKind::RightBrace) {
+        parser_advance(parser);
+        return 1;
+    }
+    if (token_is_trait(&parser.scan.input, &parser.current)) {
+        parser.module.complex_source_mode = 1;
+        while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+            parser_advance(parser);
+        }
+        if (parser.current.kind != TokenKind::LeftBrace || !parser_skip_balanced_block(parser)) {
+            return -1;
+        }
+        return 2;
+    }
+    if (
+        token_is_enum(&parser.scan.input, &parser.current) ||
+        token_is_struct(&parser.scan.input, &parser.current)
+    ) {
+        parser.module.complex_source_mode = 1;
+        parser_advance(parser);
+        if (parser.current.kind != TokenKind::Identifier) {
+            return -1;
+        }
+        parser_advance(parser);
+        while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+            parser_advance(parser);
+        }
+        if (!parser_expect(parser, TokenKind::LeftBrace)) {
+            return -1;
+        }
+
+        i64 depth = 1;
+
+        while (depth > 0 && parser.current.kind != TokenKind::End) {
+            if (parser.current.kind == TokenKind::LeftBrace) {
+                depth += 1;
+            } else if (parser.current.kind == TokenKind::RightBrace) {
+                depth -= 1;
+            }
+            parser_advance(parser);
+        }
+        if (depth != 0) {
+            return -1;
+        }
+        return 2;
+    }
+    if (token_is_impl(&parser.scan.input, &parser.current)) {
+        while (parser.current.kind != TokenKind::LeftBrace && parser.current.kind != TokenKind::End) {
+            parser_advance(parser);
+        }
+        if (parser.current.kind != TokenKind::LeftBrace || !parser_skip_balanced_block(parser)) {
+            return -1;
+        }
+        return 2;
+    }
+    if (token_is_extern(&parser.scan.input, &parser.current)) {
+        while (parser.current.kind != TokenKind::Semicolon && parser.current.kind != TokenKind::End) {
+            parser_advance(parser);
+        }
+        if (!parser_expect(parser, TokenKind::Semicolon)) {
+            return -1;
+        }
+        return 1;
+    }
+    parser.scan.offset = saved_scan_offset;
+    init_token(&mut parser.current, saved_current_kind, saved_current_offset, saved_current_length);
+    return 0;
+}
+
+fn parse_module(Source input, ModuleSyntax&mut out) -> bool {
+    if (!init_module(out)) {
+        return false;
+    }
+
+    Parser parser;
+
+    init_parser(&mut parser, input, out);
+
+    i64 complex_source_mode = 0;
+
+    while (parser.current.kind != TokenKind::End) {
+        i64 skipped = parser_skip_top_level_declaration(&mut parser);
+
+        if (skipped < 0) {
+            out.diagnostic_count = 1;
+            out.diagnostic_code = parser.last_error.code;
+            out.diagnostic_offset = parser.current.offset;
+            return false;
+        }
+        if (skipped == 2) {
+            complex_source_mode = 1;
+        }
+        if (skipped == 0) {
+            bool parsed = false;
+
+            if (complex_source_mode != 0) {
+                parsed = parse_complex_function(&mut parser);
+            } else {
+                parsed = parse_function(&mut parser, 0);
+            }
+            if (!parsed) {
+                out.diagnostic_count = 1;
+                out.diagnostic_code = parser.last_error.code;
+                out.diagnostic_offset = parser.last_error.offset;
+                return false;
+            }
+            if (parser.module.complex_source_mode != 0) {
+                complex_source_mode = 1;
+            }
+        }
+    }
+    return out.function_count > 0;
+}
+
+// compiler candidate-owned compact HIR and register MIR. These tables deliberately avoid
+// dependencies on the host compiler compiler's internal representation.

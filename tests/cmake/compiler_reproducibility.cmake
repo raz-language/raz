@@ -6,11 +6,10 @@ if(NOT DEFINED RAZ_EXE OR NOT DEFINED RAZ_RUNTIME_LIB OR NOT DEFINED RAZ_FORGE_B
   message(FATAL_ERROR "RAZ_EXE, RAZ_RUNTIME_LIB, RAZ_FORGE_BRIDGE_LIB, FORGE_LIB, CXX_COMPILER, SOURCE_ROOT, and WORK_ROOT are required")
 endif()
 
-if(NOT DEFINED RAZ_RUNTIME_LINK_MANIFEST OR NOT EXISTS "${RAZ_RUNTIME_LINK_MANIFEST}")
-  message(FATAL_ERROR "Raz runtime link manifest is required: ${RAZ_RUNTIME_LINK_MANIFEST}")
+set(raz_runtime_link_deps "")
+if(DEFINED RAZ_RUNTIME_LINK_DEPS AND NOT "${RAZ_RUNTIME_LINK_DEPS}" STREQUAL "")
+  set(raz_runtime_link_deps ${RAZ_RUNTIME_LINK_DEPS})
 endif()
-file(STRINGS "${RAZ_RUNTIME_LINK_MANIFEST}" raz_runtime_link_deps)
-list(FILTER raz_runtime_link_deps EXCLUDE REGEX "^[ \t]*$")
 
 include("${SOURCE_ROOT}/tests/cmake/compiler_source_set.cmake")
 

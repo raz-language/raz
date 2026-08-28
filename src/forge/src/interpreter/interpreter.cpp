@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "forge/interpreter/interpreter.hpp"
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/data_layout.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -493,7 +493,8 @@ private:
         }
         if (op.opcode == "aggregate.move.struct" || op.opcode == "aggregate.move.array" ||
             op.opcode == "aggregate.borrow.struct" || op.opcode == "aggregate.borrow.array" ||
-            op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array") {
+            op.opcode == "aggregate.borrow.mut.struct" || op.opcode == "aggregate.borrow.mut.array" ||
+            op.opcode == "aggregate.attach.struct" || op.opcode == "aggregate.attach.array") {
             auto source = lookup(values, op.operands.at(0));
             if (!source || source->kind() != Value::Kind::pointer) {
                 fail(diagnostics_, "invalid typed aggregate move"); return std::nullopt;

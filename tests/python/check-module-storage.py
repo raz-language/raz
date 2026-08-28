@@ -6,20 +6,20 @@ import re
 
 root = Path(__file__).resolve().parents[2]
 files = {
-    'model': root / 'compiler/src/hir/core/model.rz',
-    'lexer': root / 'compiler/src/frontend/lexer.rz',
-    'decl': root / 'compiler/src/hir/semantic/declarations.rz',
-    'expr': root / 'compiler/src/hir/semantic/expressions.rz',
-    'stmt': root / 'compiler/src/hir/semantic/statements.rz',
-    'mir': root / 'compiler/src/mir/lowering.rz',
-    'forge_globals': root / 'compiler/src/backend/forge/globals_codegen.rz',
-    'forge_fn': root / 'compiler/src/backend/forge/function_codegen.rz',
-    'forge': root / 'compiler/src/backend/forge/codegen.rz',
-    'llvm': root / 'compiler/src/backend/llvm/codegen.rz',
-    'llvm_globals': root / 'compiler/src/backend/llvm/globals_codegen.rz',
+    'model': root / 'compiler/src/raz_hir/src/hir/core/model.rz',
+    'lexer': root / 'compiler/src/raz_lexer/src/lexer.rz',
+    'decl': root / 'compiler/src/raz_hir/src/hir/semantic/declarations.rz',
+    'expr': root / 'compiler/src/raz_hir/src/hir/semantic/expressions.rz',
+    'stmt': root / 'compiler/src/raz_hir/src/hir/semantic/statements.rz',
+    'mir': root / 'compiler/src/raz_mir/src/mir/lowering.rz',
+    'forge_globals': root / 'compiler/src/raz_codegen_forge/src/forge/globals_codegen.rz',
+    'forge_fn': root / 'compiler/src/raz_codegen_forge/src/forge/function_codegen.rz',
+    'forge': root / 'compiler/src/raz_codegen_forge/src/forge/codegen.rz',
+    'llvm': root / 'compiler/src/raz_codegen_llvm/src/llvm/codegen.rz',
+    'llvm_globals': root / 'compiler/src/raz_codegen_llvm/src/llvm/globals_codegen.rz',
 }
 text = {k: p.read_text(encoding='utf-8') for k,p in files.items()}
-text['mir'] = '\n'.join(path.read_text(encoding='utf-8') for path in sorted((root / 'compiler/src/mir').rglob('*.rz')))
+text['mir'] = '\n'.join(path.read_text(encoding='utf-8') for path in sorted((root / 'compiler/src/raz_mir/src/mir').rglob('*.rz')))
 required = {
     'model': ['global_count', 'global_mutable_flags', 'global_extern_flags', 'global_tls_flags', 'global_internal_flags', 'global_initializer_nodes'],
     'lexer': ['fn token_is_global', 'fn token_is_static', 'fn token_is_thread_local'],
@@ -38,8 +38,8 @@ for key, markers in required.items():
         if marker not in text[key]:
             raise SystemExit(f'module-storage: FAIL missing {marker!r} in {files[key].relative_to(root)}')
 
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
-for name in ['src/backend/forge/globals_codegen.rz', 'src/backend/forge/function_codegen.rz', 'src/backend/llvm/globals_codegen.rz']:
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
+for name in ['src/raz_codegen_forge/src/forge/globals_codegen.rz', 'src/raz_codegen_forge/src/forge/function_codegen.rz', 'src/raz_codegen_llvm/src/llvm/globals_codegen.rz']:
     if name not in order:
         raise SystemExit(f'module-storage: FAIL missing semantic source module {name}')
 

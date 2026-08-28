@@ -54,7 +54,7 @@ if regressed:
     print("ERROR: migrated Stage-1 policy returned to native runtime:")
     for name in regressed: print("  " + name)
     sys.exit(1)
-externs = set(re.findall(r'^extern\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', source_text, re.M))
+externs = set(re.findall(r'^(?:public\s+)?extern\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', source_text, re.M))
 unknown = sorted(externs - allow)
 unused = sorted(allow - externs)
 if unknown:

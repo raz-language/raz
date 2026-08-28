@@ -5,8 +5,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SYMBOLS = (ROOT / "compiler/src/hir/core/symbols.rz").read_text(encoding="utf-8")
-BUILDER = (ROOT / "compiler/src/hir/core/builder.rz").read_text(encoding="utf-8")
+SYMBOLS = (ROOT / "compiler/src/raz_hir/src/hir/core/symbols.rz").read_text(encoding="utf-8")
+BUILDER = (ROOT / "compiler/src/raz_hir/src/hir/core/builder.rz").read_text(encoding="utf-8")
 
 checks = {
     "declaration visibility uses binary search": all(

@@ -1,0 +1,848 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_llvm::writer;
+
+public import forge::codegen;
+
+// Shared LLVM textual-IR writer and ABI helpers.
+// Kept ahead of globals/function emission so the compiler dependency graph is acyclic.
+// LLVM textual IR backend, implemented entirely in Raz.
+// This backend consumes the same MIR as Forge. Ordinary MIR and the scalar
+// async frame/state-machine path are lowered here in Raz. Backend capability
+// gaps fail explicitly rather than falling back to Forge or changing semantics.
+fn llvm_literal(ForgeWriter&mut out, string data) {
+    i64 i = 0; i64 length = compiler_literal_length(data);
+    while (i < length) { writer_put(out, compiler_literal_byte(data, i)); i += 1; }
+}
+
+fn llvm_chars(ForgeWriter&mut out, i64[]data, i64 length) {
+    i64 i = 0;
+
+    while (i < length) {
+        writer_put(out, data[i]);
+        i += 1;
+    }
+}
+
+fn llvm_function_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 function_index) {
+    i64 offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
+    i64 length = raz_compiler_rt_arena_get(hir.function_name_lengths, function_index);
+
+    if (
+        length == 4 &&
+        source_byte(source, offset) == 109 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 105 &&
+        source_byte(source, offset + 3) == 110
+    ) {
+        // LLVM needs a C ABI entry wrapper named `main`; keep Raz's language
+        // main distinct so the wrapper can normalize its return width.
+
+        
+
+        llvm_literal(out, "@__raz_main");
+        return;
+    }
+    writer_function_name(out, source, hir, function_index);
+}
+
+fn llvm_type(ForgeWriter&mut out, i64 type_kind) {
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        
+
+        llvm_literal(out, "ptr");
+        return;
+    }
+    if (type_kind == 1) {
+        
+
+        llvm_literal(out, "double");
+        return;
+    }
+    if (type_kind == 11) {
+        
+
+        llvm_literal(out, "float");
+        return;
+    }
+
+    i64 width = primitive_type_width(type_kind);
+
+    writer_put(out, 105);
+    if (width == 8) {
+        writer_put(out, 56);
+    } else if (width == 16) {
+        writer_put(out, 49);
+        writer_put(out, 54);
+    } else if (width == 32) {
+        writer_put(out, 51);
+        writer_put(out, 50);
+    } else {
+        writer_put(out, 54);
+        writer_put(out, 52);
+    }
+}
+
+fn llvm_value(ForgeWriter&mut out, i64 instruction) {
+    writer_put(out, 37);
+    writer_put(out, 114);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_parameter(ForgeWriter&mut out, i64 parameter) {
+    writer_put(out, 37);
+    writer_put(out, 112);
+    writer_decimal(out, parameter);
+}
+
+fn llvm_emit_assignment(ForgeWriter&mut out, i64 instruction) {
+    writer_space(out);
+    writer_space(out);
+    llvm_value(out, instruction);
+    writer_space(out);
+    writer_put(out, 61);
+    writer_space(out);
+}
+
+fn llvm_function_return_type(ForgeWriter&mut out, HirModule& hir, i64 function_index) {
+    if (raz_compiler_rt_arena_get(hir.function_returns_value, function_index) == 0) {
+        
+
+        llvm_literal(out, "void");
+    } else if (raz_compiler_rt_arena_get(hir.function_return_function_types, function_index) >= 0) {
+        
+
+        llvm_literal(out, "ptr");
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_return_references, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_return_types, function_index));
+    }
+}
+
+fn llvm_parameter_type(ForgeWriter&mut out, HirModule& hir, i64 function_index, i64 parameter) {
+    i64 start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 index = start + parameter;
+
+    if (raz_compiler_rt_arena_get(hir.parameter_function_types, index) >= 0) {
+        
+
+        llvm_literal(out, "ptr");
+    } else if (
+        raz_compiler_rt_arena_get(hir.parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_array_extents, index) >= 0 ||
+        raz_compiler_rt_arena_get(hir.parameter_type_structs, index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.parameter_types, index));
+    }
+}
+
+fn llvm_emit_binary_opcode(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    bool floating = primitive_type_is_float(type_kind);
+
+    if (opcode == 4) {
+        if (floating) {
+            
+
+            llvm_literal(out, "fadd");
+        } else {
+            
+
+            llvm_literal(out, "add");
+        }
+    } else if (opcode == 5) {
+        if (floating) {
+            
+
+            llvm_literal(out, "fsub");
+        } else {
+            
+
+            llvm_literal(out, "sub");
+        }
+    } else if (opcode == 6) {
+        if (floating) {
+            
+
+            llvm_literal(out, "fmul");
+        } else {
+            
+
+            llvm_literal(out, "mul");
+        }
+    } else if (opcode == 7) {
+        if (floating) {
+            
+
+            llvm_literal(out, "fdiv");
+        } else if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "udiv");
+        } else {
+            
+
+            llvm_literal(out, "sdiv");
+        }
+    } else if (opcode == 34) {
+        if (floating) {
+            
+
+            llvm_literal(out, "frem");
+        } else if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "urem");
+        } else {
+            
+
+            llvm_literal(out, "srem");
+        }
+    } else if (floating) {
+        return false;
+    } else if (opcode == 35) {
+        
+
+        llvm_literal(out, "and");
+    } else if (opcode == 36) {
+        
+
+        llvm_literal(out, "or");
+    } else if (opcode == 37) {
+        
+
+        llvm_literal(out, "xor");
+    } else if (opcode == 38) {
+        
+
+        llvm_literal(out, "shl");
+    } else if (opcode == 39) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "lshr");
+        } else {
+            
+
+            llvm_literal(out, "ashr");
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn llvm_emit_compare_predicate(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    if (primitive_type_is_float(type_kind)) {
+        if (opcode == 11) {
+            
+
+            llvm_literal(out, "oeq");
+        } else if (opcode == 12) {
+            
+
+            llvm_literal(out, "one");
+        } else if (opcode == 13) {
+            
+
+            llvm_literal(out, "olt");
+        } else if (opcode == 14) {
+            
+
+            llvm_literal(out, "ole");
+        } else if (opcode == 15) {
+            
+
+            llvm_literal(out, "ogt");
+        } else if (opcode == 16) {
+            
+
+            llvm_literal(out, "oge");
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (opcode == 11) {
+        
+
+        llvm_literal(out, "eq");
+    } else if (opcode == 12) {
+        
+
+        llvm_literal(out, "ne");
+    } else if (opcode == 13) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "ult");
+        } else {
+            
+
+            llvm_literal(out, "slt");
+        }
+    } else if (opcode == 14) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "ule");
+        } else {
+            
+
+            llvm_literal(out, "sle");
+        }
+    } else if (opcode == 15) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "ugt");
+        } else {
+            
+
+            llvm_literal(out, "sgt");
+        }
+    } else if (opcode == 16) {
+        if (primitive_type_is_unsigned(type_kind)) {
+            
+
+            llvm_literal(out, "uge");
+        } else {
+            
+
+            llvm_literal(out, "sge");
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn llvm_temp(ForgeWriter&mut out, i64 category, i64 instruction) {
+    writer_put(out, 37);
+    writer_put(out, 116);
+    writer_decimal(out, category);
+    writer_put(out, 95);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_local(ForgeWriter&mut out, i64 slot) {
+    writer_put(out, 37);
+    writer_put(out, 108);
+    writer_decimal(out, slot);
+}
+
+fn llvm_block(ForgeWriter&mut out, i64 instruction) {
+    writer_put(out, 98);
+    writer_put(out, 98);
+    writer_decimal(out, instruction);
+}
+
+fn llvm_value_result_type(MirModule& mir, i64 instruction) -> i64 {
+    if (instruction < 0 || instruction >= mir.instruction_count) {
+        return 0;
+    }
+
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, instruction);
+
+    if (opcode >= 11 && opcode <= 16) {
+        return 0;
+    }
+    return raz_compiler_rt_arena_get(mir.op_types, instruction);
+}
+
+fn llvm_emit_raw_to_value(
+    ForgeWriter&mut out,
+    i64 instruction,
+    i64 raw_category,
+    i64 raw_instruction,
+    i64 type_kind,
+) {
+    if (type_kind == 11) {
+        writer_space(out);
+        writer_space(out);
+        llvm_temp(out, 22, instruction);
+        writer_space(out);
+        writer_put(out, 61);
+        writer_space(out);
+
+        
+
+        llvm_literal(out, "trunc");
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        
+
+        llvm_literal(out, " to i32");
+        writer_newline(out);
+        llvm_emit_assignment(out, instruction);
+
+        
+
+        llvm_literal(out, "bitcast");
+        writer_space(out);
+        writer_i32(out);
+        writer_space(out);
+        llvm_temp(out, 22, instruction);
+
+        
+
+        llvm_literal(out, " to float");
+        writer_newline(out);
+        return;
+    }
+    llvm_emit_assignment(out, instruction);
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        
+
+        llvm_literal(out, "inttoptr");
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        
+
+        llvm_literal(out, " to ptr");
+    } else if (type_kind == 1) {
+        
+
+        llvm_literal(out, "bitcast");
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        
+
+        llvm_literal(out, " to double");
+    } else if (primitive_type_width(type_kind) < 64) {
+        
+
+        llvm_literal(out, "trunc");
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+
+        
+
+        llvm_literal(out, " to ");
+        llvm_type(out, type_kind);
+    } else {
+        
+
+        llvm_literal(out, "add");
+        writer_space(out);
+        writer_i64(out);
+        writer_space(out);
+        llvm_temp(out, raw_category, raw_instruction);
+        writer_put(out, 44);
+        writer_space(out);
+        writer_decimal(out, 0);
+    }
+    writer_newline(out);
+}
+
+fn llvm_emit_value_to_raw(ForgeWriter&mut out, i64 instruction, i64 value, i64 type_kind) -> i64 {
+    if (type_kind == 0 || primitive_type_width(type_kind) == 64) {
+        if (!primitive_type_is_float(type_kind) && type_kind != 12 && type_kind != 13 && type_kind != 14) {
+            return value;
+        }
+    }
+    writer_space(out);
+    writer_space(out);
+    llvm_temp(out, 20, instruction);
+    writer_space(out);
+    writer_put(out, 61);
+    writer_space(out);
+    if (type_kind == 12 || type_kind == 13 || type_kind == 14) {
+        
+
+        llvm_literal(out, "ptrtoint");
+        writer_space(out);
+
+        
+
+        llvm_literal(out, "ptr");
+        writer_space(out);
+        llvm_value(out, value);
+
+        
+
+        llvm_literal(out, " to i64");
+    } else if (type_kind == 1) {
+        
+
+        llvm_literal(out, "bitcast");
+        writer_space(out);
+
+        
+
+        llvm_literal(out, "double");
+        writer_space(out);
+        llvm_value(out, value);
+
+        
+
+        llvm_literal(out, " to i64");
+    } else if (type_kind == 11) {
+        
+
+        llvm_literal(out, "bitcast");
+        writer_space(out);
+
+        
+
+        llvm_literal(out, "float");
+        writer_space(out);
+        llvm_value(out, value);
+
+        
+
+        llvm_literal(out, " to i32");
+        writer_newline(out);
+        writer_space(out);
+        writer_space(out);
+        llvm_temp(out, 21, instruction);
+        writer_space(out);
+        writer_put(out, 61);
+        writer_space(out);
+        llvm_literal(out, "zext");
+        writer_space(out);
+        writer_i32(out);
+        writer_space(out);
+        llvm_temp(out, 20, instruction);
+
+        
+
+        llvm_literal(out, " to i64");
+        writer_newline(out);
+        return -21;
+    } else {
+        
+
+        llvm_literal(out, "zext");
+        writer_space(out);
+        llvm_type(out, type_kind);
+        writer_space(out);
+        llvm_value(out, value);
+
+        
+
+        llvm_literal(out, " to i64");
+    }
+    writer_newline(out);
+    return -20;
+}
+
+fn llvm_emit_numeric_cast(
+    ForgeWriter&mut out,
+    i64 instruction,
+    i64 source,
+    i64 source_type,
+    i64 target_type,
+) -> bool {
+    llvm_emit_assignment(out, instruction);
+    if (source_type == 12 || target_type == 12) {
+        if (source_type == 12 && target_type == 12) {
+            
+
+            llvm_literal(out, "getelementptr");
+
+            
+
+            llvm_literal(out, " i8, ptr ");
+            llvm_value(out, source);
+
+            
+
+            llvm_literal(out, ", i64 0");
+        } else if (source_type == 12) {
+            
+
+            llvm_literal(out, "ptrtoint");
+
+            
+
+            llvm_literal(out, " ptr");
+            writer_space(out);
+            llvm_value(out, source);
+
+            
+
+            llvm_literal(out, " to ");
+            llvm_type(out, target_type);
+        } else {
+            
+
+            llvm_literal(out, "inttoptr");
+            writer_space(out);
+            llvm_type(out, source_type);
+            writer_space(out);
+            llvm_value(out, source);
+
+            
+
+            llvm_literal(out, " to ");
+
+            
+
+            llvm_literal(out, "ptr");
+        }
+        writer_newline(out);
+        return true;
+    }
+    if (source_type == target_type) {
+        if (primitive_type_is_float(target_type)) {
+            
+
+            llvm_literal(out, "fadd");
+            writer_space(out);
+            llvm_type(out, target_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_put(out, 48);
+            writer_put(out, 46);
+            writer_put(out, 48);
+        } else {
+            
+
+            llvm_literal(out, "add");
+            writer_space(out);
+            llvm_type(out, target_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_decimal(out, 0);
+        }
+        writer_newline(out);
+        return true;
+    }
+
+    bool source_float = primitive_type_is_float(source_type);
+    bool target_float = primitive_type_is_float(target_type);
+
+    if (source_float && target_float) {
+        if (primitive_type_width(source_type) < primitive_type_width(target_type)) {
+            
+
+            llvm_literal(out, "fpext");
+        } else {
+            
+
+            llvm_literal(out, "fptrunc");
+        }
+    } else if (source_float) {
+        if (primitive_type_is_unsigned(target_type)) {
+            
+
+            llvm_literal(out, "fptoui");
+        } else {
+            
+
+            llvm_literal(out, "fptosi");
+        }
+    } else if (target_float) {
+        if (primitive_type_is_unsigned(source_type)) {
+            
+
+            llvm_literal(out, "uitofp");
+        } else {
+            
+
+            llvm_literal(out, "sitofp");
+        }
+    } else {
+        i64 source_width = primitive_type_width(source_type);
+        i64 target_width = primitive_type_width(target_type);
+
+        if (source_width == target_width) {
+            
+
+            llvm_literal(out, "add");
+            writer_space(out);
+            llvm_type(out, source_type);
+            writer_space(out);
+            llvm_value(out, source);
+            writer_put(out, 44);
+            writer_space(out);
+            writer_decimal(out, 0);
+            writer_newline(out);
+            return true;
+        }
+        if (source_width > target_width) {
+            
+
+            llvm_literal(out, "trunc");
+        } else if (primitive_type_is_unsigned(source_type)) {
+            
+
+            llvm_literal(out, "zext");
+        } else {
+            
+
+            llvm_literal(out, "sext");
+        }
+    }
+    writer_space(out);
+    llvm_type(out, source_type);
+    writer_space(out);
+    llvm_value(out, source);
+
+    
+
+    llvm_literal(out, " to ");
+    llvm_type(out, target_type);
+    writer_newline(out);
+    return true;
+}
+
+fn llvm_function_type_return_type(ForgeWriter&mut out, HirModule& hir, i64 signature) {
+    if (raz_compiler_rt_arena_get(hir.function_type_return_function_types, signature) >= 0) {
+        
+
+        llvm_literal(out, "ptr");
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_type_return_references, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_slices, signature) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_return_type_structs, signature) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_return_types, signature));
+    }
+}
+
+fn llvm_function_type_parameter_type(ForgeWriter&mut out, HirModule& hir, i64 signature, i64 parameter) {
+    i64 start = raz_compiler_rt_arena_get(hir.function_type_parameter_starts, signature);
+    i64 index = start + parameter;
+
+    if (raz_compiler_rt_arena_get(hir.function_type_parameter_function_types, index) >= 0) {
+        
+
+        llvm_literal(out, "ptr");
+    } else if (
+        raz_compiler_rt_arena_get(hir.function_type_parameter_references, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_slices, index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_type_parameter_type_structs, index) >= 0
+    ) {
+        writer_i64(out);
+    } else {
+        llvm_type(out, raz_compiler_rt_arena_get(hir.function_type_parameter_types, index));
+    }
+}
+
+fn llvm_emit_runtime_declarations(ForgeWriter&mut out) {
+    writer_newline(out);
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_stage1_arena_create(i64)\n");
+
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_stage1_arena_get(i64, i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_stage1_arena_set(i64, i64, i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_stage1_arena_destroy(i64)\n");
+    writer_newline(out);
+
+    
+
+    llvm_literal(out, "declare ptr @raz_rt_async_frame_create(i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_frame_set_poller(ptr, ptr)\n");
+
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_async_frame_future_i64(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare i32 @raz_rt_async_state_load(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_state_store(ptr, i32)\n");
+
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_async_slot_load(ptr, i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_slot_store(ptr, i64, i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_result_store(ptr, i64)\n");
+
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_async_cancel_requested(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_frame_cancel(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare i32 @raz_rt_async_await_poll(ptr, ptr, i32)\n");
+
+    
+
+    llvm_literal(out, "declare i64 @raz_rt_async_await_result(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_frame_destroy(ptr)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_slot_store_owned(ptr, i64, i64, i64)\n");
+
+    
+
+    llvm_literal(out, "declare void @raz_rt_async_slot_disarm(ptr, i64)\n");
+    writer_newline(out);
+}
+
+fn llvm_module_global_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 global_index) {
+    writer_put(out, 64);
+    if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
+        
+
+        llvm_literal(out, "__raz_global_");
+    }
+    writer_text(
+        out,
+        source,
+        raz_compiler_rt_arena_get(hir.global_name_offsets, global_index),
+        raz_compiler_rt_arena_get(hir.global_name_lengths, global_index),
+    );
+    if (writer_module_global_needs_identity_suffix(source, hir, global_index)) {
+        writer_put(out, 95);
+        writer_put(out, 103);
+        writer_decimal(out, global_index);
+    }
+}

@@ -16,12 +16,12 @@ def fail(message: str) -> None:
 
 
 def main() -> int:
-    transport = (ROOT / "compiler/src/driver/registry_transport.rz").read_text(encoding="utf-8")
-    registry = (ROOT / "compiler/src/driver/registry.rz").read_text(encoding="utf-8")
-    package = (ROOT / "compiler/src/driver/package.rz").read_text(encoding="utf-8")
-    cli = (ROOT / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
-    commands = (ROOT / "compiler/src/driver/commands.rz").read_text(encoding="utf-8")
-    main_source = (ROOT / "compiler/src/main.rz").read_text(encoding="utf-8")
+    transport = (ROOT / "compiler/src/raz_driver/src/registry_transport.rz").read_text(encoding="utf-8")
+    registry = (ROOT / "compiler/src/raz_driver/src/registry.rz").read_text(encoding="utf-8")
+    package = (ROOT / "compiler/src/raz_driver/src/package.rz").read_text(encoding="utf-8")
+    cli = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+    commands = (ROOT / "compiler/src/raz_driver/src/commands.rz").read_text(encoding="utf-8")
+    main_source = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
 
     if f'string value = "{EXPECTED}";' not in transport:
         fail("could not locate registry_default_base literal")
@@ -56,7 +56,7 @@ def main() -> int:
         fail("raz add does not accept the one-argument official package form")
     if "fn registry_bare_constraint(" not in registry or "bool same_name = al == nl" not in registry:
         fail("same-name official dependencies do not use compact manifest constraints")
-    if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/driver/project.rz").read_text(encoding="utf-8"):
+    if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8"):
         fail("project loader does not resolve compact registry constraints through raz.lock")
     if "prepared_submission = true" not in registry or 'cli_write_literal("Prepared ")' not in registry:
         fail("credential-free raz publish does not preserve PR-ready staging")

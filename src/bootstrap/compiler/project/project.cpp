@@ -236,7 +236,20 @@ bool discover_recursive(const std::filesystem::path& manifest_path, ProjectGraph
     return false;
   }
 
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(source_root)) {
+  // A source tree may contain path-dependency packages (for example the
+  // production compiler's src/* layout). A directory that owns a
+  // raz.toml starts a nested package boundary: its .rz files must be discovered
+  // when that package is traversed through [dependencies], never as modules of
+  // the containing package.
+  auto source_it = std::filesystem::recursive_directory_iterator(source_root);
+  const auto source_end = std::filesystem::recursive_directory_iterator{};
+  for (; source_it != source_end; ++source_it) {
+    const auto& entry = *source_it;
+    if (entry.is_directory() &&
+        std::filesystem::is_regular_file(entry.path() / "raz.toml")) {
+      source_it.disable_recursion_pending();
+      continue;
+    }
     if (!entry.is_regular_file() || entry.path().extension() != ".rz") {
       continue;
     }

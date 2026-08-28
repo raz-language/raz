@@ -4,7 +4,7 @@ ObLink is a standalone native linker designed to consume object files emitted by
 
 ObLink is intentionally a separate repository. Forge owns code generation and object emission; ObLink owns symbol resolution, relocation, executable image construction, libraries, imports, and future incremental linking.
 
-## Current baseline
+## What works today
 
 - AMD64 Microsoft COFF + BigObj parser
 - archive-index-driven lazy COFF archive (`.lib`) extraction; unused members remain unparsed
@@ -40,8 +40,7 @@ ObLink is intentionally a separate repository. Forge owns code generation and ob
 - direct Forge-compatible CLI shape: `oblink file.obj runtime.lib -o app.exe`
 - no third-party dependencies
 
-ObLink links and runs the Raz test-example corpus and the 6 MB self-hosted
-`raz-compiler.exe` against the MSVC CRT with no external linker involved.
+ObLink links and runs the Raz test-example corpus and the self-hosted `raz.exe` against the MSVC CRT without calling an external linker.
 
 The remaining Windows compatibility work is primarily complete CRT/load-config/CFG semantics, DLL/export generation, debug/PDB output, and less-common COFF directive/metadata cases. Output sections are not yet merged the way link.exe folds `.xdata`/`.CRT`/`.rtc` into `.rdata`, so images reserve more address space than they need.
 
@@ -67,3 +66,5 @@ oblink program.obj -L path/to/libs -l ws2_32 -o program.exe
 ```
 
 For MSVC/clang-cl generated library members, ObLink also consumes `/DEFAULTLIB:` directives and Microsoft short-import objects so `__imp_*` references become real PE IAT entries instead of unresolved symbols.
+
+The root Raz release build also runs a direct compatibility gate: Forge emits AMD64 COFF, ObLink links the object twice, and both PE images must validate and remain byte-for-byte deterministic.

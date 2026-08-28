@@ -6,6 +6,7 @@ All notable changes to ObLink are documented here.
 
 ### Correctness
 
+- Added reachability-based section/COMDAT elimination. Unreferenced function/data COMDATs are discarded before archive closure and final layout, so relocations from dead code no longer pull otherwise-unused archive members or imports into the link. Associative COMDATs follow their live parent, and references to discarded duplicate COMDATs are redirected to the prevailing definition.
 - Uninitialized sections are placed by extent instead of by file bytes. An
   object reports a `.bss` section's size in `SizeOfRawData` with a null
   `PointerToRawData`, and reading that many bytes from offset zero copied the
@@ -58,6 +59,12 @@ All notable changes to ObLink are documented here.
 
 ### Testing
 
+- Added a direct PE32+ image-builder regression and made the default strict test
+  configuration cover COFF parsing, linking, PE construction, response files,
+  and CLI version behavior under `-Werror`.
+- Added an integrated Forge compatibility gate that emits AMD64 COFF with the
+  standalone Forge CLI, links it twice with ObLink, validates the PE outputs,
+  and requires byte-for-byte deterministic SHA-256 identity.
 - Added `tests/pe_validate.hpp`, which checks a linked image against the rules
   the Windows loader enforces. Tests previously asserted only that a file began
   with `MZ`, which cannot distinguish a valid image from one the loader rejects.

@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-transport = (ROOT / 'compiler/src/driver/registry_transport.rz').read_text(encoding='utf-8')
+transport = (ROOT / 'compiler/src/raz_driver/src/registry_transport.rz').read_text(encoding='utf-8')
 runtime = (ROOT / 'src/runtime/runtime_internal.hpp').read_text(encoding='utf-8')
 cmake = (ROOT / 'src/runtime/CMakeLists.txt').read_text(encoding='utf-8')
 bootstrap = (ROOT / 'tools/bootstrap.py').read_text(encoding='utf-8')
@@ -28,6 +28,10 @@ checks = {
     'runtime links crypt32': 'ws2_32 bcrypt crypt32' in cmake,
     'recursive bootstrap links crypt32': 'crypt32.lib' in bootstrap and '-lcrypt32' in bootstrap,
     'bootstrap build driver links crypt32': 'crypt32.lib' in build_driver and '-lcrypt32' in build_driver,
+    'HTTP response buffers use byte-width arena storage':
+        'raz_compiler_rt_arena_create_width(output_capacity + 65536, 1)' in transport,
+    'registry archive downloads use byte-width arena storage':
+        'raz_compiler_rt_arena_create_width(33554432, 1)' in transport,
 }
 failed=[name for name, ok in checks.items() if not ok]
 if failed:

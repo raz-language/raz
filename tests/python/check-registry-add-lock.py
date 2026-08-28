@@ -4,10 +4,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-package = (ROOT / 'compiler/src/driver/package.rz').read_text(encoding='utf-8')
-registry = (ROOT / 'compiler/src/driver/registry.rz').read_text(encoding='utf-8')
-project = (ROOT / 'compiler/src/driver/project.rz').read_text(encoding='utf-8')
-incremental = (ROOT / 'compiler/src/driver/incremental.rz').read_text(encoding='utf-8')
+package = (ROOT / 'compiler/src/raz_driver/src/package.rz').read_text(encoding='utf-8')
+registry = (ROOT / 'compiler/src/raz_driver/src/registry.rz').read_text(encoding='utf-8')
+project = (ROOT / 'compiler/src/raz_driver/src/project.rz').read_text(encoding='utf-8')
+incremental = (ROOT / 'compiler/src/raz_driver/src/incremental.rz').read_text(encoding='utf-8')
 
 checks = {
     'root raz.toml lock path uses exact 10-byte length': 'package_lock_collect(\n        mp,\n        10,' in package,
@@ -28,7 +28,7 @@ checks = {
     'lockfile path join uses arena handle rather than array reference': 'i64 lock_name = raz_compiler_rt_arena_create(8);' in project and 'path_join(root, root_length, lock_name, 8, lock_path, 8192)' in project and '&lock_name' not in project,
     'project assembly records lockfile after manifest root resolution': '!project_record_lock_input(state, root, root_length)' in project,
     'lockfile input is optional for path-only projects': 'raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0' in project,
-    'incremental cache schema invalidates pre-target-layout caches': 'fn incremental_cache_schema() -> i64 {\n    return 6;\n}' in incremental,
+    'incremental cache schema invalidates pre-target-layout caches': 'fn incremental_cache_schema() -> i64 {\n    return 8;\n}' in incremental,
     'project package cache lives directly under target': 'string bytes = "target/raz.cache";' in registry,
     'project registry tracking lives directly under target': 'string bytes = "target/raz.registry";' in registry,
     'legacy package-manager state is migrated on first access': 'fn registry_project_state_prepare(' in registry and 'raz_compiler_rt_copy_file_ascii(r16, r16_length, output, length)' in registry and 'raz_compiler_rt_copy_file_ascii(root_legacy, root_length, output, length)' in registry,
@@ -37,7 +37,7 @@ checks = {
     'ordinary build preflight rehydrates Git cache': 'status = package_git_fetch_tracked();' in registry,
     'locked registry packages reuse shared store before index lookup': registry.find('registry_store_path(checksum, checksum_length, locked_store, 8192)') < registry.find('registry_resolve_mode(\n        name,\n        name_length,\n        version,'),
     'offline locked build avoids registry index when shared store is present': 'if (registry_offline()) {\n        return 64;' in registry,
-    'project assembly cache fallback uses canonical target/raz.cache path': 'fn project_registry_cache_path(' in project and 'i64 cache_path_length = project_registry_cache_path(cache_path, 20);' in project,
+    'registry state path ownership is centralized outside project assembly': 'fn project_registry_cache_path(' not in project and 'fn registry_project_state_prepare(' in registry,
 }
 failed=[name for name,ok in checks.items() if not ok]
 if failed:

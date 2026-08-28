@@ -33,6 +33,31 @@ foreach(forbidden IN ITEMS
 endforeach()
 message(STATUS "Canonical semantic compiler source layout: PASS (${compiler_source_count} modules)")
 
+
+# Compiler path-dependency packages live directly under compiler/src beside main.rz.
+# Their normal package-local src/ roots must stay flat and must not drift back to
+# an extra packages/ grouping directory or src/<package>/<package> layout.
+if(EXISTS "${PROJECT_ROOT}/compiler/packages")
+  message(FATAL_ERROR "Legacy compiler/packages directory must not exist; compiler packages belong directly under compiler/src")
+endif()
+foreach(package IN ITEMS frontend middle backend driver)
+  if(NOT EXISTS "${PROJECT_ROOT}/compiler/src/${package}/raz.toml")
+    message(FATAL_ERROR "Missing nested compiler package manifest: ${package}")
+  endif()
+  if(NOT EXISTS "${PROJECT_ROOT}/compiler/src/${package}/src/lib.rz")
+    message(FATAL_ERROR "Missing nested compiler package entrypoint: ${package}/src/lib.rz")
+  endif()
+endforeach()
+foreach(redundant IN ITEMS
+    "${PROJECT_ROOT}/compiler/src/raz_parser/src"
+    "${PROJECT_ROOT}/compiler/src/raz_codegen_forge/src;${PROJECT_ROOT}/compiler/src/raz_codegen_llvm/src;${PROJECT_ROOT}/compiler/src/raz_codegen_wasm/src;${PROJECT_ROOT}/compiler/src/raz_codegen_rxe/src;${PROJECT_ROOT}/compiler/src/raz_codegen_web/src"
+    "${PROJECT_ROOT}/compiler/src/raz_driver/src")
+  if(EXISTS "${redundant}")
+    message(FATAL_ERROR "Redundant compiler package source directory must not exist: ${redundant}")
+  endif()
+endforeach()
+message(STATUS "Flat compiler package layout: PASS")
+
 if(NOT DEFINED BOOTSTRAP_SCRIPT OR NOT EXISTS "${BOOTSTRAP_SCRIPT}")
   message(FATAL_ERROR "Bootstrap driver is missing: ${BOOTSTRAP_SCRIPT}")
 endif()
@@ -41,7 +66,7 @@ string(FIND "${bootstrap_driver}" "def compiler_modules()" semantic_discovery)
 if(semantic_discovery EQUAL -1)
   message(FATAL_ERROR "Bootstrap must discover the canonical compiler source set without ordering metadata.")
 endif()
-string(FIND "${bootstrap_driver}" "host-source-order.txt" legacy_bootstrap_order)
+string(FIND "${bootstrap_driver}" "compiler/host-source-order.txt" legacy_bootstrap_order)
 if(NOT legacy_bootstrap_order EQUAL -1)
   message(FATAL_ERROR "Bootstrap must not depend on compiler/host-source-order.txt.")
 endif()
@@ -54,7 +79,7 @@ message(STATUS "Order-independent recursive bootstrap: PASS")
 # Generic user packages may still opt into source-order.txt for compatibility;
 # that legacy package feature is separate from the canonical compiler itself.
 set(native_project_loader "${PROJECT_ROOT}/src/bootstrap/compiler/project/project.cpp")
-set(raz_project_loader "${PROJECT_ROOT}/compiler/src/driver/project.rz")
+set(raz_project_loader "${PROJECT_ROOT}/compiler/src/raz_driver/src/project.rz")
 foreach(loader IN ITEMS "${native_project_loader}" "${raz_project_loader}")
   if(NOT EXISTS "${loader}")
     message(FATAL_ERROR "Project loader missing: ${loader}")
@@ -66,3 +91,16 @@ foreach(loader IN ITEMS "${native_project_loader}" "${raz_project_loader}")
   endif()
 endforeach()
 message(STATUS "Optional package source-order compatibility: PASS")
+
+
+file(READ "${native_project_loader}" native_loader_text)
+string(FIND "${native_loader_text}" "disable_recursion_pending()" native_nested_boundary)
+if(native_nested_boundary EQUAL -1)
+  message(FATAL_ERROR "Stage-0 project loader must stop recursive discovery at nested raz.toml package boundaries")
+endif()
+file(READ "${raz_project_loader}" raz_loader_text)
+string(FIND "${raz_loader_text}" "project_filter_nested_package_sources" raz_nested_boundary)
+if(raz_nested_boundary EQUAL -1)
+  message(FATAL_ERROR "Production project loader must filter nested-package sources from parent package discovery")
+endif()
+message(STATUS "Nested package traversal boundaries: PASS")

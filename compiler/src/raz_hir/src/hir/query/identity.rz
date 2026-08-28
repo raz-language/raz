@@ -1,0 +1,120 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::query::identity;
+
+public import raz_hir::query::resolution;
+
+// Canonical semantic identities for exact generic instantiation requests.
+// Fingerprints accelerate lookup, but exact packed arguments define identity.
+fn hir_query_monomorph_arguments_same(
+    HirBuilder&mut builder,
+    i64 request,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> bool {
+    if (raz_compiler_rt_arena_get(builder.queries.query_monomorph_argument_counts, request) != argument_count) {
+        return false;
+    }
+
+    i64 start = raz_compiler_rt_arena_get(builder.queries.query_monomorph_argument_starts, request);
+    i64 argument = 0;
+
+    while (argument < argument_count) {
+        if (
+            raz_compiler_rt_arena_get(
+                builder.queries.query_monomorph_argument_structures,
+                start + argument,
+            ) != raz_compiler_rt_arena_get(argument_structures, argument) ||
+            raz_compiler_rt_arena_get(
+                builder.queries.query_monomorph_argument_types,
+                start + argument,
+            ) != raz_compiler_rt_arena_get(argument_types, argument)
+        ) {
+            return false;
+        }
+        argument += 1;
+    }
+    return true;
+}
+
+fn hir_query_intern_monomorphization(
+    HirBuilder&mut builder,
+    i64 entity_kind,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    i64 hash = hir_generic_argument_hash(generic, argument_count, argument_structures, argument_types);
+    i64 bucket = hash % 8192;
+
+    if (bucket < 0) {
+        bucket = 0 - bucket;
+    }
+
+    i64 link = raz_compiler_rt_arena_get(builder.queries.query_monomorph_buckets, bucket);
+
+    while (link > 0) {
+        i64 request = link - 1;
+
+        if (
+            raz_compiler_rt_arena_get(builder.queries.query_monomorph_entity_kinds, request) == entity_kind &&
+            raz_compiler_rt_arena_get(builder.queries.query_monomorph_templates, request) == generic &&
+            raz_compiler_rt_arena_get(builder.queries.query_monomorph_hashes, request) == hash &&
+            hir_query_monomorph_arguments_same(
+                builder,
+                request,
+                argument_count,
+                argument_structures,
+                argument_types,
+            )
+        ) {
+            return request;
+        }
+        link = raz_compiler_rt_arena_get(builder.queries.query_monomorph_next, request);
+    }
+    if (
+        builder.queries.query_monomorph_count >= 4096 ||
+        builder.queries.query_monomorph_argument_count + argument_count > 32768
+    ) {
+        return -1;
+    }
+
+    i64 request = builder.queries.query_monomorph_count;
+
+    builder.queries.query_monomorph_count += 1;
+
+    i64 start = builder.queries.query_monomorph_argument_count;
+
+    builder.queries.query_monomorph_argument_count += argument_count;
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_entity_kinds, request, entity_kind);
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_templates, request, generic);
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_argument_counts, request, argument_count);
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_hashes, request, hash);
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_argument_starts, request, start);
+    raz_compiler_rt_arena_set(
+        builder.queries.query_monomorph_next,
+        request,
+        raz_compiler_rt_arena_get(builder.queries.query_monomorph_buckets, bucket),
+    );
+    raz_compiler_rt_arena_set(builder.queries.query_monomorph_buckets, bucket, request + 1);
+
+    i64 argument = 0;
+
+    while (argument < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.queries.query_monomorph_argument_structures,
+            start + argument,
+            raz_compiler_rt_arena_get(argument_structures, argument),
+        );
+        raz_compiler_rt_arena_set(
+            builder.queries.query_monomorph_argument_types,
+            start + argument,
+            raz_compiler_rt_arena_get(argument_types, argument),
+        );
+        argument += 1;
+    }
+    return request;
+}

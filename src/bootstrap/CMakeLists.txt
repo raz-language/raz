@@ -30,8 +30,7 @@ add_library(Raz::forge_bridge ALIAS raz_forge_bridge)
 target_link_libraries(raz_forge_bridge PUBLIC Forge::forge)
 target_compile_features(raz_forge_bridge PUBLIC cxx_std_20)
 target_compile_definitions(raz_forge_bridge PRIVATE
-  RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>"
-  RAZ_RUNTIME_LINK_DEPS_MANIFEST_PATH="${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt")
+  RAZ_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:raz_runtime>")
 if(TARGET oblink)
   target_compile_definitions(raz_forge_bridge PRIVATE RAZ_OBLINK_PATH="$<TARGET_FILE:oblink>")
   add_dependencies(raz_forge_bridge oblink)

@@ -17,12 +17,12 @@ except RuntimeError as error:
     print(f"compiler-source-set: FAIL: {error}")
     sys.exit(1)
 
-source_root = root / "compiler" / "src"
-discovered = sorted(path.resolve() for path in source_root.rglob("*.rz"))
+source_roots = [root / "compiler" / "src"]
+discovered = sorted(path.resolve() for source_root in source_roots for path in source_root.rglob("*.rz"))
 if set(discovered) != set(path.resolve() for path in ordered):
     expected = {path.resolve() for path in ordered}
     actual = set(discovered)
-    print("compiler-source-set: FAIL: semantic compiler discovery does not cover compiler/src exactly")
+    print("compiler-source-set: FAIL: semantic compiler discovery does not cover the compiler package graph exactly")
     for path in sorted(actual - expected):
         print(f"  unlisted: {path.relative_to(root)}")
     for path in sorted(expected - actual):

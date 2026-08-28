@@ -6,9 +6,9 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-remap = (root / "compiler/src/mir/transform/remap.rz").read_text(encoding="utf-8")
-live = (root / "compiler/src/mir/analysis/liveness.rz").read_text(encoding="utf-8")
-dce = (root / "compiler/src/mir/transform/dce.rz").read_text(encoding="utf-8")
+remap = (root / "compiler/src/raz_mir_opt/src/mir_opt/transform/remap.rz").read_text(encoding="utf-8")
+live = (root / "compiler/src/raz_mir/src/mir/analysis/liveness.rz").read_text(encoding="utf-8")
+dce = (root / "compiler/src/raz_mir_opt/src/mir_opt/transform/dce.rz").read_text(encoding="utf-8")
 
 checks = {
     "instruction map uses one arena": "i64 entries;" in remap and "i64 next_kept;" not in remap and "i64 old_to_new;" not in remap,

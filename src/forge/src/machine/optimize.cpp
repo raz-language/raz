@@ -3,7 +3,7 @@
 
 #include "forge/machine/optimize.hpp"
 
-#include "forge/target/aarch64_immediate.hpp"
+#include "forge/platform/aarch64_immediate.hpp"
 #include "forge/machine/liveness.hpp"
 
 #include <algorithm>

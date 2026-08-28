@@ -3,8 +3,8 @@
 
 #include "forge/machine/lower.hpp"
 #include "forge/machine/optimize.hpp"
-#include "forge/target/data_layout.hpp"
-#include "forge/target/abi.hpp"
+#include "forge/platform/data_layout.hpp"
+#include "forge/platform/abi.hpp"
 #include "forge/machine/verifier.hpp"
 
 #include <algorithm>
@@ -282,7 +282,12 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
     }
 
     for (const auto& global : source.globals()) {
-        const bool aggregate = global.element_count != 1 || global.is_named_aggregate();
+        // A one-byte string literal is represented canonically as scalar i8
+        // with a byte initializer after IR parse/print. It is still byte
+        // storage, not an integer scalar, and must lower through the same path
+        // as larger i8 arrays.
+        const bool byte_storage = global.type == ir::Type(ir::TypeKind::i8) && !global.bytes.empty();
+        const bool aggregate = global.element_count != 1 || global.is_named_aggregate() || byte_storage;
         const bool callback_storage = !global.function_signature_name.empty();
         const bool wide = global.type == ir::Type(ir::TypeKind::i64) || global.type == ir::Type(ir::TypeKind::ptr);
         const auto named_size = global.is_named_aggregate()
@@ -1324,7 +1329,8 @@ LowerResult lower_module(const ir::Module& source, LowerOptions options) {
                     }
                 } else if (operation.opcode == "aggregate.move.struct" || operation.opcode == "aggregate.move.array" ||
                            operation.opcode == "aggregate.borrow.struct" || operation.opcode == "aggregate.borrow.array" ||
-                           operation.opcode == "aggregate.borrow.mut.struct" || operation.opcode == "aggregate.borrow.mut.array") {
+                           operation.opcode == "aggregate.borrow.mut.struct" || operation.opcode == "aggregate.borrow.mut.array" ||
+                           operation.opcode == "aggregate.attach.struct" || operation.opcode == "aggregate.attach.array") {
                     if (operation.type != ir::Type(ir::TypeKind::ptr) || operation.result.empty() || operation.operands.size() != 2) {
                         error(result.diagnostics, "invalid typed aggregate move in @" + function.name); failed = true;
                     } else if (const auto source_register_it = registers.find(operation.operands[0]); source_register_it != registers.end()) {

@@ -1056,7 +1056,6 @@ add_test(NAME raz-compiler-production-qualification
     -DRAZ_EXE=$<TARGET_FILE:raz_host>
     -DFORGE_CODEGEN=$<TARGET_FILE:raz-compiler-forge-codegen>
     -DRAZ_RUNTIME_LIB=$<TARGET_FILE:raz_runtime>
-    -DRAZ_RUNTIME_LINK_MANIFEST=${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt
     -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DRAZ_FORGE_BRIDGE_LIB=$<TARGET_FILE:raz_forge_bridge>
     -DFORGE_LIB=$<TARGET_FILE:forge>
@@ -1073,7 +1072,6 @@ add_test(NAME raz-compiler-mutable-parameters
     -DRAZ_EXE=$<TARGET_FILE:raz_host>
     -DFORGE_CODEGEN=$<TARGET_FILE:raz-compiler-forge-codegen>
     -DRAZ_RUNTIME_LIB=$<TARGET_FILE:raz_runtime>
-    -DRAZ_RUNTIME_LINK_MANIFEST=${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt
     -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
     -DWORK_ROOT=${CMAKE_CURRENT_BINARY_DIR}/compiler-mutable-parameters-work
@@ -1086,7 +1084,6 @@ add_test(NAME raz-compiler-reproducibility
   COMMAND ${CMAKE_COMMAND}
     -DRAZ_EXE=$<TARGET_FILE:raz_host>
     -DRAZ_RUNTIME_LIB=$<TARGET_FILE:raz_runtime>
-    -DRAZ_RUNTIME_LINK_MANIFEST=${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt
     -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DRAZ_FORGE_BRIDGE_LIB=$<TARGET_FILE:raz_forge_bridge>
     -DFORGE_LIB=$<TARGET_FILE:forge>
@@ -1190,7 +1187,6 @@ add_test(NAME raz-stdlib-execution
     --razc $<TARGET_FILE:razc_host>
     --forge-codegen $<TARGET_FILE:raz-compiler-forge-codegen>
     --runtime $<TARGET_FILE:raz_runtime>
-    --runtime-link-manifest ${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt
     --timeout 60)
 set_tests_properties(raz-stdlib-execution PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
 
@@ -1684,19 +1680,19 @@ add_test(NAME raz-sync-policy-runtime
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/sync_policy_runtime.cmake)
 set_tests_properties(raz-sync-policy-runtime PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
-add_test(NAME raz-workspace-graph
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-workspace-graph.py
-    --raz $<TARGET_FILE:raz_host>
-    --fixture ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package
-    --work ${CMAKE_CURRENT_BINARY_DIR}/workspace-graph-work)
-set_tests_properties(raz-workspace-graph PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+# The old workspace-v1.state/--verbose incremental probes were retired with the
+# package-unit cache architecture. Package/workspace behavior is qualified by
+# raz-package-workspaces plus the project snapshot/cache tests below.
 
-add_test(NAME raz-three-pass-incremental
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-incremental-stability.py
+add_test(NAME raz-project-snapshot-content-cache
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-project-snapshot-content-cache.py)
+set_tests_properties(raz-project-snapshot-content-cache PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
+add_test(NAME raz-project-snapshot-invalidation
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-project-snapshot-invalidation.py
     --raz $<TARGET_FILE:raz_host>
-    --fixture ${PROJECT_SOURCE_DIR}/tests/examples/projects/hello-package
-    --work ${CMAKE_CURRENT_BINARY_DIR}/three-pass-incremental-work)
-set_tests_properties(raz-three-pass-incremental PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    --work ${CMAKE_CURRENT_BINARY_DIR}/project-snapshot-invalidation-work)
+set_tests_properties(raz-project-snapshot-invalidation PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
 # Repository licensing is a release invariant: every maintained source/build/script
 # file carries SPDX metadata and the root legal files must remain present.
@@ -1707,6 +1703,10 @@ set_tests_properties(raz-license-headers PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
 add_test(NAME raz-repository-hygiene
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-repository-hygiene.py)
 set_tests_properties(raz-repository-hygiene PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
+add_test(NAME raz-manifest-default-entry
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-manifest-default-entry.py)
+set_tests_properties(raz-manifest-default-entry PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
 
 add_test(NAME raz-test-layout
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python/check-test-layout.py)

@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
 root=Path(__file__).resolve().parents[2]
-v=(root/'compiler/src/backend/rxe/verify.rz').read_text()
-isa=(root/'compiler/src/backend/rxe/isa.rz').read_text()
+v=(root/'compiler/src/raz_codegen_rxe/src/rxe/verify.rz').read_text()
+isa=(root/'compiler/src/raz_codegen_rxe/src/rxe/isa.rz').read_text()
 required={
  'bad-opcode':'rxe_opcode_valid',
  'bad-branch':'imm < start || imm >= end',

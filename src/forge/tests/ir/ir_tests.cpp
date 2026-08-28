@@ -6,6 +6,7 @@
 #include "forge/ir/parser.hpp"
 #include "forge/ir/printer.hpp"
 #include "forge/ir/verifier.hpp"
+#include "forge/machine/lower.hpp"
 #include "forge/pass/pass.hpp"
 #include "forge/transforms/scalar.hpp"
 #include <iostream>
@@ -132,6 +133,7 @@ entry:
 
         constexpr auto aggregate_globals = R"(module @aggregate_globals {
 constant @message: i8[8] align 8 = "Forge!\0\0"
+constant @empty: i8[1] = "\0"
 global @scratch: i8[32] align 16 = zero
 func @address() -> ptr {
 entry:
@@ -144,9 +146,13 @@ entry:
         require(forge::ir::verify_module(*aggregates.module).empty(), "aggregate-global fixture did not verify");
         const auto aggregate_text = forge::ir::print_module(*aggregates.module);
         require(aggregate_text.find("i8[8] align 8 = \"Forge!\\0\\0\"") != std::string::npos, "printer lost string constant");
+        require(aggregate_text.find("constant @empty: i8 = \"\\0\"") != std::string::npos, "printer lost one-byte string constant");
         require(aggregate_text.find("i8[32] align 16 = zero") != std::string::npos, "printer lost zero-filled global");
         auto aggregate_roundtrip = forge::ir::parse_module(aggregate_text);
         require(aggregate_roundtrip.ok(), "aggregate-global printer output did not parse");
+        require(forge::ir::verify_module(*aggregate_roundtrip.module).empty(), "aggregate-global printer output did not verify");
+        const auto aggregate_lowered = forge::machine::lower_module(*aggregate_roundtrip.module);
+        require(aggregate_lowered.ok(), "aggregate globals, including one-byte strings, did not lower to native storage");
 
 
         constexpr auto aggregate_return_source = R"(module @aggregate_returns {

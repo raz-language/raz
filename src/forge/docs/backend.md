@@ -67,7 +67,7 @@ The JIT allocates read/write memory, copies a fully relocated image, changes the
 
 ## Object emission
 
-ELF and COFF writers provide deterministic section, symbol, and relocation ordering. ELF objects include `.note.GNU-stack`; COFF raw sections use deterministic alignment. Duplicate definitions are rejected before symbol-table construction. CI verifies byte-for-byte reproducibility and links a generated ELF object into a native executable.
+ELF and COFF writers provide deterministic section, symbol, and relocation ordering. ELF objects include `.note.GNU-stack`; COFF raw sections use deterministic alignment. Duplicate definitions are rejected before symbol-table construction. The test suite checks byte-for-byte reproducibility and links generated ELF objects into native executables.
 
 ## Platform boundaries
 
@@ -83,7 +83,7 @@ These are tracked as future backend work rather than implied capabilities.
 
 ## ABI classification
 
-`<forge/target/abi.hpp>` classifies named aggregates for System V AMD64 and Windows x64. This analysis is intended for frontend signature lowering and future register-classified aggregate code generation.
+`<forge/platform/abi.hpp>` classifies named aggregates for System V AMD64 and Windows x64. This analysis is intended for frontend signature lowering and future register-classified aggregate code generation.
 
 ## Native libraries
 
@@ -113,7 +113,7 @@ hole-aware-register-reuses
 
 ## Transition-based live-range splitting
 
-Forge 1.5 inserts explicit split transitions at call boundaries when register pressure exceeds the ABI-safe register capacity. Eligible values are stored to compiler-reserved frame slots immediately before the call, reloaded into new virtual registers immediately afterward, and all dominated same-block uses are rewritten to the post-call segment.
+Forge inserts explicit split transitions at call boundaries when register pressure exceeds the ABI-safe register capacity. Eligible values are stored to compiler-reserved frame slots immediately before the call, reloaded into new virtual registers immediately afterward, and all dominated same-block uses are rewritten to the post-call segment.
 
 The initial implementation is conservative: it handles same-block post-call uses, splits all floating call-crossing values supported by the scalar backend, and splits integer values beyond the two callee-saved allocation registers. Values carried across CFG edges remain on the existing conservative allocation path.
 
@@ -127,8 +127,8 @@ The current implementation handles a single successor from the call block and re
 
 ## Global copy-affinity coalescing
 
-Forge 1.8 extends local linear-scan copy reuse with a post-allocation affinity stage. The stage uses segmented interference rather than bounding intervals, allowing copy-related virtual registers separated by control-flow layout or liveness holes to share a physical register when no real segment conflicts. Stack-backed copy destinations are recovered when the source register remains globally safe. Allocation statistics expose `global_copy_affinity_count` and `copy_spills_recovered`.
+Local linear-scan copy reuse is extended by a post-allocation affinity stage. The stage uses segmented interference rather than bounding intervals, allowing copy-related virtual registers separated by control-flow layout or liveness holes to share a physical register when no real segment conflicts. Stack-backed copy destinations are recovered when the source register remains globally safe. Allocation statistics expose `global_copy_affinity_count` and `copy_spills_recovered`.
 
 ## Native aggregate parameters
 
-Forge 1.10 lowers named aggregate parameters and returns according to the configured native x86-64 ABI. Register-passed parameters are expanded into INTEGER/SSE pieces and reconstructed in callee-local storage. Register-returned aggregates are loaded into RAX/RDX and XMM0/XMM1 as classified, and callers reconstruct them into aligned Forge aggregate storage. ABI-indirect aggregates retain the hidden result-buffer path.
+Named aggregate parameters and returns are lowered according to the configured native x86-64 ABI. Register-passed parameters are expanded into INTEGER/SSE pieces and reconstructed in callee-local storage. Register-returned aggregates are loaded into RAX/RDX and XMM0/XMM1 as classified, and callers reconstruct them into aligned Forge aggregate storage. ABI-indirect aggregates retain the hidden result-buffer path.

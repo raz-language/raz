@@ -6,16 +6,18 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-model = (root / "compiler/src/hir/core/model.rz").read_text(encoding="utf-8")
-builder = (root / "compiler/src/hir/core/builder.rz").read_text(encoding="utf-8")
-engine = (root / "compiler/src/hir/query/engine.rz").read_text(encoding="utf-8")
-invalidation = (root / "compiler/src/hir/query/invalidation.rz").read_text(encoding="utf-8")
-symbols = (root / "compiler/src/hir/query/symbols.rz").read_text(encoding="utf-8")
-types = (root / "compiler/src/hir/query/types.rz").read_text(encoding="utf-8")
-resolution = (root / "compiler/src/hir/query/resolution.rz").read_text(encoding="utf-8")
-traits = (root / "compiler/src/hir/generics/type_instantiation.rz").read_text(encoding="utf-8")
-instantiate = (root / "compiler/src/hir/generics/instantiate.rz").read_text(encoding="utf-8")
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+model = (root / "compiler/src/raz_hir/src/hir/core/model.rz").read_text(encoding="utf-8")
+query_context = (root / "compiler/src/raz_query/src/query/context.rz").read_text(encoding="utf-8")
+model += "\n" + query_context
+builder = (root / "compiler/src/raz_hir/src/hir/core/builder.rz").read_text(encoding="utf-8")
+engine = (root / "compiler/src/raz_hir/src/hir/query/engine.rz").read_text(encoding="utf-8")
+invalidation = (root / "compiler/src/raz_hir/src/hir/query/invalidation.rz").read_text(encoding="utf-8")
+symbols = (root / "compiler/src/raz_hir/src/hir/query/symbols.rz").read_text(encoding="utf-8")
+types = (root / "compiler/src/raz_hir/src/hir/query/types.rz").read_text(encoding="utf-8")
+resolution = (root / "compiler/src/raz_hir/src/hir/query/resolution.rz").read_text(encoding="utf-8")
+traits = (root / "compiler/src/raz_hir/src/hir/generics/type_instantiation.rz").read_text(encoding="utf-8")
+instantiate = (root / "compiler/src/raz_hir/src/hir/generics/instantiate.rz").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 checks = {
     "symbol interner stores exact semantic names": all(x in model + builder + symbols for x in [
@@ -45,8 +47,8 @@ checks = {
         "base_type", "item_symbol", "hir_query_intern_symbol",
         "hir_query_intern_value_type", "hir_query_kind_associated_type()"]),
     "identity modules are in the semantic compiler source graph": all(x in order for x in [
-        "src/hir/query/symbols.rz", "src/hir/query/types.rz",
-        "src/hir/query/resolution.rz", "src/hir/query/identity.rz"]),
+        "src/raz_hir/src/hir/query/symbols.rz", "src/raz_hir/src/hir/query/types.rz",
+        "src/raz_hir/src/hir/query/resolution.rz", "src/raz_hir/src/hir/query/identity.rz"]),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

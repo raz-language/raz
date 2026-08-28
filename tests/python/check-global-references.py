@@ -5,11 +5,11 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
 files = {
-    'ownership': root / 'compiler/src/hir/semantic/ownership.rz',
-    'mir': root / 'compiler/src/mir/lowering.rz',
-    'llvm': root / 'compiler/src/backend/llvm/codegen.rz',
-    'forge_sync': root / 'compiler/src/backend/forge/function_codegen.rz',
-    'forge_async': root / 'compiler/src/backend/forge/codegen.rz',
+    'ownership': root / 'compiler/src/raz_hir/src/hir/semantic/ownership.rz',
+    'mir': root / 'compiler/src/raz_mir/src/mir/lowering.rz',
+    'llvm': root / 'compiler/src/raz_codegen_llvm/src/llvm/codegen.rz',
+    'forge_sync': root / 'compiler/src/raz_codegen_forge/src/forge/function_codegen.rz',
+    'forge_async': root / 'compiler/src/raz_codegen_forge/src/forge/codegen.rz',
 }
 text = {name: path.read_text(encoding='utf-8') for name, path in files.items()}
 required = {

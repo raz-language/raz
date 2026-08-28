@@ -49,15 +49,15 @@ python tools/sync-embedded-components.py
 python tools/check-embedded-components.py
 ```
 
-The synchronization command replaces the embedded trees, including removal of stale files. CI checks byte identity across every maintained component file. Make component changes in the standalone repository first, then synchronize the Raz copy in the same release/integration pass.
+The synchronization command replaces the embedded trees, including stale-file removal. Before committing, run `python tools/check-embedded-components.py` and make sure every maintained file is byte-identical. Make component changes in the standalone repository first, then synchronize the Raz copy in the same integration pass.
 
 ## Style and comments
 
 Run the Raz formatter on the files or directories you changed before committing:
 
 ```text
-python tools/format-raz.py compiler/src/driver/my_change.rz
-python tools/format-raz.py compiler/src/driver/my_change.rz --check
+python tools/format-raz.py compiler/src/driver/src/my_change.rz
+python tools/format-raz.py compiler/src/driver/src/my_change.rz --check
 ```
 
 Raz source uses four-space indentation; Raz-owned C++ follows the repository `.clang-format`/`.editorconfig`. Vendored Forge source keeps its upstream style. Comments should explain intent, invariants, or a non-obvious tradeoff rather than narrating syntax a reader can already see. See [Source formatting](docs/FORMATTING.md) for the full repository convention.
@@ -66,7 +66,7 @@ Raz source uses four-space indentation; Raz-owned C++ follows the repository `.c
 
 Add positive and negative fixtures where appropriate. A language feature is not complete when it only parses: qualification should cover the relevant semantic, HIR, MIR, Forge IR, runtime, and native-execution behavior when those layers apply.
 
-Regression tests should describe general language/compiler behavior rather than one benchmark-specific or source-specific special case.
+Regression tests should describe the language or compiler behavior that regressed, rather than hard-coding one source file or benchmark shape.
 
 ## Commit scope
 

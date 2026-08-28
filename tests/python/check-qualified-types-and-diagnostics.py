@@ -5,10 +5,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-parser = (ROOT / 'compiler/src/frontend/parser.rz').read_text(encoding='utf-8')
-project = (ROOT / 'compiler/src/driver/project.rz').read_text(encoding='utf-8')
-statements = (ROOT / 'compiler/src/hir/semantic/statements.rz').read_text(encoding='utf-8')
-declarations = (ROOT / 'compiler/src/hir/semantic/declarations.rz').read_text(encoding='utf-8')
+parser = (ROOT / 'compiler/src/raz_parser/src/parser.rz').read_text(encoding='utf-8')
+project = (ROOT / 'compiler/src/raz_driver/src/project.rz').read_text(encoding='utf-8')
+statements = (ROOT / 'compiler/src/raz_hir/src/hir/semantic/statements.rz').read_text(encoding='utf-8')
+declarations = (ROOT / 'compiler/src/raz_hir/src/hir/semantic/declarations.rz').read_text(encoding='utf-8')
 
 checks = {
     'frontend consumes qualified type separators': 'while (parser.current.kind == TokenKind::ColonColon)' in parser,

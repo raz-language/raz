@@ -6,12 +6,14 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-model = (root / 'compiler/src/hir/core/model.rz').read_text(encoding='utf-8')
-builder = (root / 'compiler/src/hir/core/builder.rz').read_text(encoding='utf-8')
-identity = (root / 'compiler/src/hir/query/identity.rz').read_text(encoding='utf-8')
-instantiate = (root / 'compiler/src/hir/generics/instantiate.rz').read_text(encoding='utf-8')
-types = (root / 'compiler/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text(encoding='utf-8')
+query_context = (root / 'compiler/src/raz_query/src/query/context.rz').read_text(encoding='utf-8')
+model += '\n' + query_context
+builder = (root / 'compiler/src/raz_hir/src/hir/core/builder.rz').read_text(encoding='utf-8')
+identity = (root / 'compiler/src/raz_hir/src/hir/query/identity.rz').read_text(encoding='utf-8')
+instantiate = (root / 'compiler/src/raz_hir/src/hir/generics/instantiate.rz').read_text(encoding='utf-8')
+types = (root / 'compiler/src/raz_hir/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 combined = instantiate + '\n' + types
 
 legacy = [
@@ -27,15 +29,15 @@ legacy = [
 ]
 checks = {
     'legacy generic and associated-type result caches removed': not any(x in model + builder + combined for x in legacy),
-    'canonical monomorph identities are stored in HirBuilder': all(x in model for x in [
+    'canonical monomorph identities are stored in HirQueryContext': all(x in model for x in [
         'query_monomorph_count', 'query_monomorph_entity_kinds', 'query_monomorph_argument_starts',
         'query_monomorph_argument_structures', 'query_monomorph_argument_types',
         'query_monomorph_buckets', 'query_monomorph_next']),
     'canonical identity storage is centrally managed': all(x in builder for x in [
-        'query_monomorph_entity_kinds = raz_compiler_rt_arena_create',
-        'query_monomorph_argument_structures = raz_compiler_rt_arena_create',
-        'raz_compiler_rt_arena_destroy(out.query_monomorph_entity_kinds)',
-        'raz_compiler_rt_arena_destroy(out.query_monomorph_argument_structures)']),
+        'queries.query_monomorph_entity_kinds = raz_compiler_rt_arena_create',
+        'queries.query_monomorph_argument_structures = raz_compiler_rt_arena_create',
+        'raz_compiler_rt_arena_destroy(out.queries.query_monomorph_entity_kinds)',
+        'raz_compiler_rt_arena_destroy(out.queries.query_monomorph_argument_structures)']),
     'monomorph identities compare exact packed arguments': all(x in identity for x in [
         'hir_query_intern_monomorphization', 'hir_query_monomorph_arguments_same',
         'query_monomorph_argument_structures', 'query_monomorph_argument_types',
@@ -50,7 +52,7 @@ checks = {
     'associated type normalization uses canonical symbol/type identity': all(x in instantiate for x in [
         'hir_query_kind_associated_type()', 'hir_query_intern_symbol',
         'hir_query_intern_value_type', 'item_symbol', 'base_type']),
-    'query identity is a semantic compiler module': 'src/hir/query/identity.rz' in order,
+    'query identity is a semantic compiler module': 'src/raz_hir/src/hir/query/identity.rz' in order,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

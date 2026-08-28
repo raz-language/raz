@@ -1,0 +1,3344 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir::lowering;
+
+public import raz_mir::cleanup_index;
+
+// HIR -> MIR semantic lowering. This remains one unit while expression lowering,
+// lexical cleanup, and statement lowering form a deliberate recursive cluster.
+fn mir_local_index_for_slot(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
+    if (function_index < 0 || function_index >= hir.function_count || local_slot < 0) { return -1; }
+    i64 link = raz_compiler_rt_arena_get(hir.function_last_locals, function_index);
+    while (link > 0) {
+        i64 index = link - 1;
+        if (raz_compiler_rt_arena_get(hir.local_slots, index) == local_slot) {
+            return index;
+        }
+        link = raz_compiler_rt_arena_get(hir.local_previous_function_locals, index);
+    }
+    return -1;
+}
+
+fn mir_local_slot_for_index(HirModule& hir, i64 function_index, i64 local_index) -> i64 {
+    if (
+        local_index < 0 ||
+        local_index >= hir.local_count ||
+        raz_compiler_rt_arena_get(hir.local_function_indices, local_index) != function_index
+    ) {
+        return -1;
+    }
+    return raz_compiler_rt_arena_get(hir.local_slots, local_index);
+}
+
+fn mir_lower_escaping_closure_capture(
+    HirModule& hir,
+    MirModule&mut mir,
+    i64 closure_function,
+    i64 capture,
+) -> i64 {
+    i64 parent_function = mir.lowering_function_index;
+    i64 root_kind = raz_compiler_rt_arena_get(hir.closure_capture_root_kinds, capture);
+    i64 root_index = raz_compiler_rt_arena_get(hir.closure_capture_root_indices, capture);
+    i64 closure_kind = raz_compiler_rt_arena_get(hir.function_closure_kinds, closure_function);
+    bool capture_by_reference = closure_kind == 2 || closure_kind == 3;
+    if (root_kind == 2) {
+        i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, parent_function);
+        i64 parameter_slot = root_index - parameter_start;
+        if (
+            parameter_slot < 0 ||
+            parameter_slot >= raz_compiler_rt_arena_get(hir.function_parameter_counts, parent_function)
+        ) {
+            return -1;
+        }
+        i64 parameter_type = raz_compiler_rt_arena_get(hir.parameter_types, root_index);
+        if (
+            raz_compiler_rt_arena_get(hir.parameter_references, root_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_slices, root_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_array_extents, root_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_type_structs, root_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_function_types, root_index) >= 0
+        ) {
+            parameter_type = 12;
+        }
+        if (raz_compiler_rt_arena_get(hir.parameter_mutated, root_index) != 0) {
+            return mir_emit_typed(
+                mir,
+                3,
+                mir.lowering_parameter_local_base + parameter_slot,
+                0,
+                0,
+                0,
+                parameter_type,
+            );
+        }
+        return mir_emit_typed(mir, 2, parameter_slot, 0, 0, 0, parameter_type);
+    }
+    if (root_kind == 3) {
+        i64 local_slot = mir_local_slot_for_index(hir, parent_function, root_index);
+        if (local_slot < 0) {
+            return -1;
+        }
+        if (capture_by_reference) {
+            // Borrowing closures capture the parent place, not the scalar value
+            // currently stored in it. MIR opcode 25 exposes that place address
+            // and keeps the erased callable environment pointer-shaped.
+            return mir_emit_typed(mir, 25, local_slot, 0, 0, 0, 12);
+        }
+        i64 local_type = raz_compiler_rt_arena_get(hir.local_types, root_index);
+        if (
+            raz_compiler_rt_arena_get(hir.local_references, root_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_slices, root_index) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_array_extents, root_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.local_type_structs, root_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.local_function_types, root_index) >= 0
+        ) {
+            local_type = 12;
+        }
+        return mir_emit_typed(mir, 3, local_slot, 0, 0, 0, local_type);
+    }
+    return -1;
+}
+
+fn lower_hir_expression(HirModule& hir, MirModule&mut mir, i64 node) -> i64 {
+    i64 kind = raz_compiler_rt_arena_get(hir.node_kinds, node);
+    i64 node_type = raz_compiler_rt_arena_get(hir.node_types, node);
+    if (
+        raz_compiler_rt_arena_get(hir.node_references, node) != 0 ||
+        raz_compiler_rt_arena_get(hir.node_array_extents, node) > 0
+    ) {
+        // References and whole fixed-array values lower as storage handles.
+        // The HIR node type for an array remains its element scalar type, so
+        // leaving it unchanged causes bogus scalar casts when the array is
+        // borrowed, sliced, passed, or projected.
+        node_type = 12;
+    }
+    if (kind == 1) {
+        return mir_emit_typed(mir, 1, raz_compiler_rt_arena_get(hir.node_values, node), 0, 0, 0, node_type);
+    }
+    if (kind == 30) {
+        return mir_emit_typed(
+            mir,
+            1,
+            raz_compiler_rt_arena_get(hir.node_a, node),
+            raz_compiler_rt_arena_get(hir.node_b, node),
+            0,
+            0,
+            1,
+        );
+    }
+    if (kind == 46) {
+        return mir_emit_typed(
+            mir,
+            42,
+            raz_compiler_rt_arena_get(hir.node_a, node),
+            raz_compiler_rt_arena_get(hir.node_b, node),
+            raz_compiler_rt_arena_get(hir.node_c, node),
+            0,
+            13,
+        );
+    }
+    if (kind == 47) {
+        return mir_emit_typed(mir, 43, raz_compiler_rt_arena_get(hir.node_a, node), 0, 0, 0, 14);
+    }
+    if (kind == 56) {
+        // Materialize a locally optimized Fn/FnMut closure into the canonical
+        // erased-callable ABI. Its captures live in hidden locals rather than
+        // the original parent roots, so load those snapshot/reference slots and
+        // feed them to the same MIR callable-create operation used by escaping
+        // closure literals.
+        i64 callable_local = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 closure_function = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 closure_kind = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 capture = raz_compiler_rt_arena_get(
+            hir.local_callable_capture_starts,
+            callable_local,
+        );
+        i64 capture_count = raz_compiler_rt_arena_get(
+            hir.local_callable_capture_counts,
+            callable_local,
+        );
+        i64 argument_start = mir.call_argument_count;
+        i64 index = 0;
+        while (index < capture_count) {
+            if (mir.call_argument_count >= 524288) {
+                return mir_emit_typed(mir, 1, 0, 0, 0, 0, 14);
+            }
+            i64 hidden = raz_compiler_rt_arena_get(hir.callable_capture_locals, capture + index);
+            i64 slot = raz_compiler_rt_arena_get(hir.local_slots, hidden);
+            i64 type_kind = raz_compiler_rt_arena_get(hir.local_types, hidden);
+            i64 value = mir_emit_typed(mir, 3, slot, 0, 0, 0, type_kind);
+            raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, value);
+            mir.call_argument_count += 1;
+            index += 1;
+        }
+        i64 signature = raz_compiler_rt_arena_get(hir.node_function_types, node);
+        return mir_emit_typed(
+            mir,
+            50,
+            closure_function,
+            closure_kind,
+            argument_start,
+            signature,
+            14,
+        );
+    }
+    if (kind == 42) {
+        // A capturing closure that survives the expression is a first-class
+        // callable object, not a raw function pointer. Preserve the synthesized
+        // closure function plus the parent-frame capture values in MIR; the
+        // Forge backend owns environment allocation and erased dispatch ABI.
+        i64 closure_function = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 closure_kind = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 capture = raz_compiler_rt_arena_get(hir.function_closure_capture_starts, closure_function);
+        i64 capture_count = raz_compiler_rt_arena_get(hir.function_closure_capture_counts, closure_function);
+        i64 argument_start = mir.call_argument_count;
+        i64 index = 0;
+        while (index < capture_count) {
+            if (mir.call_argument_count >= 524288) {
+                return mir_emit_typed(mir, 1, 0, 0, 0, 0, 14);
+            }
+            i64 value = mir_lower_escaping_closure_capture(hir, mir, closure_function, capture + index);
+            if (value < 0) {
+                return mir_emit_typed(mir, 1, 0, 0, 0, 0, 14);
+            }
+            raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, value);
+            mir.call_argument_count += 1;
+            index += 1;
+        }
+        i64 signature = raz_compiler_rt_arena_get(hir.node_function_types, node);
+        return mir_emit_typed(mir, 50, closure_function, closure_kind, argument_start, signature, 14);
+    }
+    if (kind == 2) {
+        i64 parameter_slot = raz_compiler_rt_arena_get(hir.node_a, node);
+        if (
+            raz_compiler_rt_arena_get(
+                hir.parameter_mutated,
+                mir.lowering_parameter_start + parameter_slot
+            ) != 0
+        ) {
+            return mir_emit_typed(
+                mir,
+                3,
+                mir.lowering_parameter_local_base + parameter_slot,
+                0,
+                0,
+                0,
+                node_type,
+            );
+        }
+        return mir_emit_typed(mir, 2, parameter_slot, 0, 0, 0, node_type);
+    }
+    if (kind == 3) {
+        return mir_emit_typed(mir, 3, raz_compiler_rt_arena_get(hir.node_a, node), 0, 0, 0, node_type);
+    }
+    if (kind == 55) {
+        i64 source = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_clone_enum_value(hir, mir, source, raz_compiler_rt_arena_get(hir.node_b, node));
+    }
+    if (kind == 54) {
+        i64 global_index = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 storage_type = node_type;
+        if (
+            raz_compiler_rt_arena_get(hir.global_type_structs, global_index) >= 0 ||
+            raz_compiler_rt_arena_get(hir.global_array_extents, global_index) >= 0
+        ) {
+            storage_type = 0;
+        }
+        return mir_emit_typed(mir, 47, global_index, 0, 0, 0, storage_type);
+    }
+    if (kind >= 5 && kind <= 8) {
+        i64 left = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 right = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+        return mir_emit_typed(mir, kind - 1, left, right, 0, 0, node_type);
+    }
+    if (kind >= 9 && kind <= 14) {
+        i64 left = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 right = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+        return mir_emit_typed(mir, kind + 2, left, right, 0, 0, raz_compiler_rt_arena_get(hir.node_c, node));
+    }
+    if (kind == 18) {
+        i64 operand = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_emit(mir, 18, operand, 0, 0, 0);
+    }
+    if (kind == 19 || kind == 20) {
+        // Logical operators are control flow, not eager integer operations.
+        // Lower the RHS only on the edge where the language requires it.
+        i64 left = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 branch = mir_emit(mir, 23, left, -1, -1, -1);
+        if (kind == 19) {
+            // left && right: false skips the RHS, true evaluates it.
+            i64 rhs_block = mir_emit(mir, 24, 0, 0, 0, 0);
+            i64 right = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+            i64 rhs_jump = mir_emit(mir, 22, 0, -1, right, 0);
+            i64 false_block = mir_emit(mir, 24, 0, 0, 0, 0);
+            i64 false_value = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+            i64 false_jump = mir_emit(mir, 22, 0, -1, false_value, 0);
+            i64 merge = mir_emit(mir, 24, 1, 0, 0, 0);
+            mir_patch_operand(mir, branch, 1, false_block);
+            mir_patch_operand(mir, branch, 2, rhs_block);
+            mir_patch_target(mir, rhs_jump, merge);
+            mir_patch_target(mir, false_jump, merge);
+            return merge;
+        }
+        // left || right: true skips the RHS, false evaluates it.
+        i64 true_block = mir_emit(mir, 24, 0, 0, 0, 0);
+        i64 true_value = mir_emit_typed(mir, 1, 1, 0, 0, 0, 0);
+        i64 true_jump = mir_emit(mir, 22, 0, -1, true_value, 0);
+        i64 rhs_block = mir_emit(mir, 24, 0, 0, 0, 0);
+        i64 right = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+        i64 rhs_jump = mir_emit(mir, 22, 0, -1, right, 0);
+        i64 merge = mir_emit(mir, 24, 1, 0, 0, 0);
+        mir_patch_operand(mir, branch, 1, rhs_block);
+        mir_patch_operand(mir, branch, 2, true_block);
+        mir_patch_target(mir, true_jump, merge);
+        mir_patch_target(mir, rhs_jump, merge);
+        return merge;
+    }
+    if (kind >= 23 && kind <= 28) {
+        i64 left = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 right = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+        return mir_emit_typed(mir, kind + 11, left, right, 0, 0, node_type);
+    }
+    if (kind == 29) {
+        i64 operand = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 all_bits = mir_emit_typed(mir, 1, -1, 0, 0, 0, node_type);
+        return mir_emit_typed(mir, 37, operand, all_bits, 0, 0, node_type);
+    }
+    if (kind == 31) {
+        i64 operand = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_emit_typed(mir, 40, operand, raz_compiler_rt_arena_get(hir.node_b, node), 0, 0, node_type);
+    }
+    if (kind == 17) {
+        i64 operand = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 operand_kind = raz_compiler_rt_arena_get(hir.node_kinds, operand);
+        i64 reference = -1;
+        if (operand_kind == 3) {
+            i64 struct_check = raz_compiler_rt_arena_get(hir.node_type_structs, operand);
+            if (struct_check >= 0) {
+                reference = lower_hir_expression(hir, mir, operand);
+            } else {
+                reference = mir_emit(mir, 25, raz_compiler_rt_arena_get(hir.node_a, operand), 0, 0, 0);
+            }
+        } else if (operand_kind == 22) {
+            reference = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, operand));
+        } else if (operand_kind == 21) {
+            i64 raw_structure = raz_compiler_rt_arena_get(hir.node_type_structs, operand);
+            i64 raw_type = raz_compiler_rt_arena_get(hir.node_types, operand);
+            bool aggregate_pointee = raw_structure >= 0;
+            if (hir_type_is_enum(raw_type)) {
+                i64 raw_enum = hir_type_enum_index(raw_type);
+                aggregate_pointee = raz_compiler_rt_arena_get(hir.enum_has_payload, raw_enum) != 0;
+            }
+            if (aggregate_pointee) {
+                // Aggregate values use an arena handle as their Raz ABI value. A
+                // raw slot therefore stores that handle, not the aggregate fields
+                // inline. `&*raw` must load the handle before forming the borrow;
+                // returning the slot address would make methods interpret the
+                // address itself as an arena handle.
+                reference = lower_hir_expression(hir, mir, operand);
+            } else {
+                // Scalar `&*raw` borrows the raw storage itself. Lowering the
+                // dereference first would load the scalar and lose its address.
+                reference = lower_hir_expression(
+                    hir,
+                    mir,
+                    raz_compiler_rt_arena_get(hir.node_a, operand),
+                );
+            }
+        } else if (operand_kind == 54) {
+            // Preserve a module-storage borrow as an address operation. Loading
+            // the global here would turn `&global` into a reference to its value.
+            reference = mir_emit_typed(mir, 49, raz_compiler_rt_arena_get(hir.node_a, operand), 0, 0, 0, 12);
+        } else {
+            i64 structure = raz_compiler_rt_arena_get(hir.node_type_structs, operand);
+            i64 array_extent = raz_compiler_rt_arena_get(hir.node_array_extents, operand);
+            i64 slice = raz_compiler_rt_arena_get(hir.node_slices, operand);
+            bool storage_backed = structure >= 0 || array_extent >= 0 || slice != 0;
+            if (hir_type_is_enum(raz_compiler_rt_arena_get(hir.node_types, operand))) {
+                i64 enumeration = hir_type_enum_index(raz_compiler_rt_arena_get(hir.node_types, operand));
+                storage_backed = raz_compiler_rt_arena_get(hir.enum_has_payload, enumeration) != 0;
+            }
+            if (storage_backed) {
+                reference = lower_hir_expression(hir, mir, operand);
+            } else {
+                i64 value = lower_hir_expression(hir, mir, operand);
+                if (value < 0 || mir.lowering_function_index < 0) {
+                    return -1;
+                }
+                i64 temporary_slot = raz_compiler_rt_arena_get(
+                    mir.function_local_counts,
+                    mir.lowering_function_index
+                );
+                raz_compiler_rt_arena_set(
+                    mir.function_local_counts,
+                    mir.lowering_function_index,
+                    temporary_slot + 1
+                );
+                i64 value_type = raz_compiler_rt_arena_get(hir.node_types, operand);
+                if (raz_compiler_rt_arena_get(hir.node_references, operand) != 0) {
+                    value_type = 12;
+                }
+                mir_emit_typed(mir, 9, temporary_slot, value, 0, 0, value_type);
+                reference = mir_emit(mir, 25, temporary_slot, 0, 0, 0);
+            }
+        }
+        if (reference >= 0) {
+            if (
+                !mir_record_hir_borrow_event(
+                    hir,
+                    mir,
+                    reference,
+                    operand,
+                    raz_compiler_rt_arena_get(hir.node_values, node),
+                )
+            ) {
+                return -1;
+            }
+        }
+        return reference;
+    }
+    if (kind == 21) {
+        i64 address = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 structure = raz_compiler_rt_arena_get(hir.node_type_structs, node);
+        i64 extent = raz_compiler_rt_arena_get(hir.node_array_extents, node);
+        return mir_emit_typed(mir, 26, address, structure, extent, 0, node_type);
+    }
+    if (kind == 39) {
+        i64 operand = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 value = lower_hir_expression(hir, mir, operand);
+        i64 structure = raz_compiler_rt_arena_get(hir.node_type_structs, operand);
+        bool consumes_source = true;
+        if (structure >= 0 && raz_compiler_rt_arena_get(hir.struct_copy_flags, structure) != 0) {
+            consumes_source = false;
+        }
+        if (consumes_source) {
+            mir_record_hir_move_event(hir, mir, value, operand);
+        }
+        return value;
+    }
+    if (kind == 16) {
+        i64 base = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 field = mir_emit(mir, 1, raz_compiler_rt_arena_get(hir.node_b, node), 0, 0, 0);
+        i64 projection_type = node_type;
+        // Fixed-array fields are storage-backed aggregate values.  Their HIR
+        // element type is the scalar element type (for example u8), but MIR
+        // projection must carry the aggregate storage handle.  Treating the
+        // whole field as the element scalar truncates its address before calls
+        // and breaks crypto/network buffers embedded in structs.
+        if (raz_compiler_rt_arena_get(hir.node_array_extents, node) > 0) {
+            projection_type = 12;
+        }
+        return mir_emit_typed(mir, 28, base, field, 0, 0, projection_type);
+    }
+    if (kind == 22) {
+        i64 base_node = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 base = lower_hir_expression(hir, mir, base_node);
+        if (raz_compiler_rt_arena_get(hir.node_slices, base_node) != 0) {
+            i64 storage_field = mir_emit(mir, 1, 0, 0, 0, 0);
+            base = mir_emit_typed(mir, 28, base, storage_field, 0, 0, 12);
+        }
+        i64 index = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_b, node));
+        return mir_emit_typed(mir, 28, base, index, 0, 0, node_type);
+    }
+    if (kind == 37) {
+        i64 storage = mir_emit(mir, 30, 2, 0, 0, 0);
+        i64 base = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 field_zero = mir_emit(mir, 1, 0, 0, 0, 0);
+        mir_emit(mir, 29, storage, field_zero, base, 0);
+        i64 extent = mir_emit_typed(mir, 1, raz_compiler_rt_arena_get(hir.node_b, node), 0, 0, 0, 0);
+        i64 field_one = mir_emit(mir, 1, 1, 0, 0, 0);
+        mir_emit(mir, 29, storage, field_one, extent, 0);
+        return storage;
+    }
+    if (kind == 38) {
+        i64 slice = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 field_one = mir_emit(mir, 1, 1, 0, 0, 0);
+        return mir_emit_typed(mir, 28, slice, field_one, 0, 0, node_type);
+    }
+    if (kind == 53) {
+        i64 argument_start = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 argument_count = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 storage = mir_emit(mir, 30, argument_count, 0, 0, 0);
+        i64 argument = 0;
+        while (argument < argument_count) {
+            i64 element_index = mir_emit(mir, 1, argument, 0, 0, 0);
+            i64 element_value = lower_hir_expression(
+                hir,
+                mir,
+                raz_compiler_rt_arena_get(hir.arguments, argument_start + argument),
+            );
+            if (
+                raz_compiler_rt_arena_get(hir.node_type_structs, node) < 0 &&
+                node_type != 0 &&
+                node_type != 1
+            ) {
+                element_value = mir_emit_typed(mir, 40, element_value, node_type, 0, 0, 0);
+            }
+            mir_emit(mir, 29, storage, element_index, element_value, 0);
+            argument += 1;
+        }
+        return storage;
+    }
+    if (kind == 34) {
+        i64 structure = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 argument_start = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 argument_count = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 storage = mir_emit(mir, 30, argument_count, 1, structure, 0);
+        i64 field_start = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+        i64 argument = 0;
+        while (argument < argument_count) {
+            i64 field_index_value = mir_emit(mir, 1, argument, 0, 0, 0);
+            i64 field_value = lower_hir_expression(
+                hir,
+                mir,
+                raz_compiler_rt_arena_get(hir.arguments, argument_start + argument),
+            );
+            i64 field_metadata = field_start + argument;
+            i64 field_type = raz_compiler_rt_arena_get(hir.struct_field_types, field_metadata);
+            if (
+                raz_compiler_rt_arena_get(hir.struct_field_type_structs, field_metadata) < 0 &&
+                field_type != 0 &&
+                field_type != 1
+            ) {
+                field_value = mir_emit_typed(mir, 40, field_value, field_type, 0, 0, 0);
+            }
+            mir_emit(mir, 29, storage, field_index_value, field_value, 0);
+            argument += 1;
+        }
+        return storage;
+    }
+    if (kind == 33) {
+        i64 member = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 argument_start = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 argument_count = raz_compiler_rt_arena_get(hir.node_values, node);
+        i64 storage = mir_emit(mir, 30, argument_count + 1, 0, 0, 0);
+        i64 tag_index = mir_emit(mir, 1, 0, 0, 0, 0);
+        i64 tag_value = mir_emit(mir, 1, raz_compiler_rt_arena_get(hir.enum_member_values, member), 0, 0, 0);
+        mir_emit(mir, 29, storage, tag_index, tag_value, 0);
+        i64 payload_start = raz_compiler_rt_arena_get(hir.enum_member_payload_starts, member);
+        i64 argument = 0;
+        while (argument < argument_count) {
+            i64 payload_index = mir_emit(mir, 1, argument + 1, 0, 0, 0);
+            i64 payload_value = lower_hir_expression(
+                hir,
+                mir,
+                raz_compiler_rt_arena_get(hir.arguments, argument_start + argument),
+            );
+            i64 payload = payload_start + argument;
+            i64 payload_type = raz_compiler_rt_arena_get(hir.enum_payload_types, payload);
+            if (raz_compiler_rt_arena_get(hir.enum_payload_type_structs, payload) < 0 && payload_type != 0) {
+                payload_value = mir_emit_typed(mir, 40, payload_value, payload_type, 0, 0, 0);
+            }
+            mir_emit(mir, 29, storage, payload_index, payload_value, 0);
+            argument += 1;
+        }
+        return storage;
+    }
+    if (kind == 48) {
+        // `value?` is an expression-level early return. Preserve the failure
+        // payload first, then execute the same defer/Drop cleanup as an explicit
+        // return before leaving the function. The enclosing Result/Option may use
+        // a different success type as long as its failure channel is compatible.
+        i64 source = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 operand_enumeration = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 success_member = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 return_enumeration = raz_compiler_rt_arena_get(hir.node_values, node);
+        i64 tag_index = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+        i64 tag = mir_emit_typed(mir, 28, source, tag_index, 0, 0, 0);
+        i64 expected_tag = mir_emit_typed(
+            mir,
+            1,
+            raz_compiler_rt_arena_get(hir.enum_member_values, success_member),
+            0,
+            0,
+            0,
+            0,
+        );
+        i64 is_success = mir_emit_typed(mir, 11, tag, expected_tag, 0, 0, 0);
+        i64 branch = mir_emit(mir, 23, is_success, -1, -1, -1);
+        i64 failure_block = mir_emit(mir, 24, 0, 0, 0, 0);
+        i64 failure_value = source;
+        i64 operand_first = raz_compiler_rt_arena_get(hir.enum_member_starts, operand_enumeration);
+        i64 operand_count = raz_compiler_rt_arena_get(hir.enum_member_counts, operand_enumeration);
+        i64 success_relative = success_member - operand_first;
+        i64 failure_relative = -1;
+        i64 member_relative = 0;
+        while (member_relative < operand_count) {
+            if (member_relative != success_relative) {
+                failure_relative = member_relative;
+                break;
+            }
+            member_relative += 1;
+        }
+        if (return_enumeration != operand_enumeration && failure_relative >= 0) {
+            i64 operand_failure_member = operand_first + failure_relative;
+            i64 return_first = raz_compiler_rt_arena_get(hir.enum_member_starts, return_enumeration);
+            i64 return_failure_member = return_first + failure_relative;
+            i64 payload_count = raz_compiler_rt_arena_get(
+                hir.enum_member_payload_counts,
+                return_failure_member,
+            );
+            failure_value = mir_emit(mir, 30, payload_count + 1, 0, 0, 0);
+            i64 failure_tag_index = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+            i64 failure_tag = mir_emit_typed(
+                mir,
+                1,
+                raz_compiler_rt_arena_get(hir.enum_member_values, return_failure_member),
+                0,
+                0,
+                0,
+                0,
+            );
+            mir_emit(mir, 29, failure_value, failure_tag_index, failure_tag, 0);
+            i64 payload = 0;
+            while (payload < payload_count) {
+                i64 source_payload_index = mir_emit_typed(mir, 1, payload + 1, 0, 0, 0, 0);
+                i64 source_payload = mir_emit(mir, 28, source, source_payload_index, 0, 0);
+                i64 source_payload_metadata =
+                    raz_compiler_rt_arena_get(hir.enum_member_payload_starts, operand_failure_member) +
+                    payload;
+                i64 target_payload_metadata =
+                    raz_compiler_rt_arena_get(hir.enum_member_payload_starts, return_failure_member) +
+                    payload;
+                i64 target_payload_type = raz_compiler_rt_arena_get(
+                    hir.enum_payload_types,
+                    target_payload_metadata,
+                );
+                if (
+                    raz_compiler_rt_arena_get(hir.enum_payload_type_structs, source_payload_metadata) < 0 &&
+                    target_payload_type != 0
+                ) {
+                    source_payload = mir_emit_typed(
+                        mir,
+                        40,
+                        source_payload,
+                        target_payload_type,
+                        0,
+                        0,
+                        target_payload_type,
+                    );
+                }
+                i64 target_payload_index = mir_emit_typed(mir, 1, payload + 1, 0, 0, 0, 0);
+                mir_emit(mir, 29, failure_value, target_payload_index, source_payload, 0);
+                payload += 1;
+            }
+        }
+        i64 saved_cleanup_function = mir.lowering_cleanup_function;
+        i64 saved_cleanup_block = mir.lowering_cleanup_block;
+        i64 saved_cleanup_statement = mir.lowering_cleanup_statement;
+        if (!lower_hir_emit_early_return_cleanup(hir, mir, saved_cleanup_function, saved_cleanup_block)) {
+            return -1;
+        }
+        mir.lowering_cleanup_function = saved_cleanup_function;
+        mir.lowering_cleanup_block = saved_cleanup_block;
+        mir.lowering_cleanup_statement = saved_cleanup_statement;
+        i64 return_type = hir_enum_type_kind(return_enumeration);
+        mir_emit_typed(mir, 10, failure_value, 0, 0, 0, return_type);
+        i64 success_block = mir_emit(mir, 24, 0, 0, 0, 0);
+        i64 payload_index = mir_emit_typed(mir, 1, 1, 0, 0, 0, 0);
+        i64 success_payload_metadata = raz_compiler_rt_arena_get(hir.enum_member_payload_starts, success_member);
+        i64 success_payload_structure = -1;
+        i64 success_payload_extent = -1;
+        if (raz_compiler_rt_arena_get(hir.enum_member_payload_counts, success_member) > 0) {
+            success_payload_structure = raz_compiler_rt_arena_get(
+                hir.enum_payload_type_structs,
+                success_payload_metadata,
+            );
+            success_payload_extent = raz_compiler_rt_arena_get(
+                hir.enum_payload_array_extents,
+                success_payload_metadata,
+            );
+        }
+        i64 encoded_success_structure = 0;
+        i64 encoded_success_extent = 0;
+        if (success_payload_structure >= 0) { encoded_success_structure = success_payload_structure + 1; }
+        if (success_payload_extent >= 0) { encoded_success_extent = success_payload_extent + 1; }
+        i64 payload = mir_emit_typed(
+            mir,
+            28,
+            source,
+            payload_index,
+            encoded_success_structure,
+            encoded_success_extent,
+            node_type,
+        );
+        mir_patch_operand(mir, branch, 1, failure_block);
+        mir_patch_operand(mir, branch, 2, success_block);
+        return payload;
+    }
+    if (kind == 44) {
+        i64 future = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_emit_typed(mir, 41, future, 0, 0, 0, node_type);
+    }
+    if (kind == 45) {
+        // Preserve spawn as its own MIR effect. Async source calls already produce
+        // future handles, so Forge may lower this as a typed copy, matching the
+        // bootstrap compiler while keeping spawn visible to MIR analysis.
+        i64 future = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_emit_typed(mir, 46, future, 0, 0, 0, node_type);
+    }
+    if (kind == 41) {
+        i64 source_value = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 structure = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 target = raz_compiler_rt_arena_get(hir.struct_clone_functions, structure);
+        if (target < 0 || mir.call_argument_count >= 524288) {
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_start = mir.call_argument_count;
+        raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, source_value);
+        mir.call_argument_count += 1;
+        return mir_emit_typed(mir, 8, target, argument_start, 1, 0, node_type);
+    }
+    if (kind == 52) {
+        i64 source = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        return mir_clone_structure_value(hir, mir, source, raz_compiler_rt_arena_get(hir.node_b, node));
+    }
+    if (kind == 51) {
+        // Object-safe dyn dispatch uses the fat object's stable vtable identity.
+        // Each concrete implementation contributes one dispatch target; calls
+        // branch to the matching implementation and merge the typed result.
+        i64 object = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 data_field = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+        i64 data = mir_emit_typed(mir, 28, object, data_field, 0, 0, 14);
+        i64 vtable_field = mir_emit_typed(mir, 1, 1, 0, 0, 0, 0);
+        i64 vtable = mir_emit_typed(mir, 28, object, vtable_field, 0, 0, 1);
+        i64 packed_counts = raz_compiler_rt_arena_get(hir.node_values, node);
+        i64 argument_count = packed_counts & 65535;
+        i64 dispatch_count = packed_counts >> 16;
+        i64 dispatch_start = raz_compiler_rt_arena_get(hir.node_c, node);
+        // Dynamic-call arguments are stored immediately before the dispatch table.
+        // Derive the start instead of requiring a fifth generic HIR node payload.
+        i64 argument_start = dispatch_start - argument_count;
+        i64 trait_index = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 pending_registers = raz_compiler_rt_arena_create(argument_count + 1);
+        if (pending_registers == 0) {
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_index = 0;
+        while (argument_index < argument_count) {
+            raz_compiler_rt_arena_set(
+                pending_registers,
+                argument_index,
+                lower_hir_expression(
+                    hir,
+                    mir,
+                    raz_compiler_rt_arena_get(hir.arguments, argument_start + argument_index),
+                ),
+            );
+            argument_index += 1;
+        }
+        i64 jump_slots = raz_compiler_rt_arena_create(dispatch_count + 1);
+        if (jump_slots == 0) {
+            raz_compiler_rt_arena_destroy(pending_registers);
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 jump_count = 0;
+        i64 dispatch = 0;
+        while (dispatch < dispatch_count) {
+            i64 structure = raz_compiler_rt_arena_get(hir.arguments, dispatch_start + dispatch * 2);
+            i64 target = raz_compiler_rt_arena_get(hir.arguments, dispatch_start + dispatch * 2 + 1);
+            if (dispatch + 1 < dispatch_count) {
+                i64 identity = ((trait_index + 1) * 8192) + structure + 1;
+                i64 expected_vtable = mir_emit_typed(mir, 1, identity, 0, 0, 0, 1);
+                i64 matches = mir_emit_typed(mir, 11, vtable, expected_vtable, 0, 0, 1);
+                i64 branch = mir_emit(mir, 23, matches, -1, -1, -1);
+                i64 match_block = mir_emit(mir, 24, 0, 0, 0, 0);
+                i64 call_argument_start = mir.call_argument_count;
+                raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, data);
+                mir.call_argument_count += 1;
+                argument_index = 0;
+                while (argument_index < argument_count) {
+                    raz_compiler_rt_arena_set(
+                        mir.call_arguments,
+                        mir.call_argument_count,
+                        raz_compiler_rt_arena_get(pending_registers, argument_index),
+                    );
+                    mir.call_argument_count += 1;
+                    argument_index += 1;
+                }
+                i64 result = mir_emit_typed(
+                    mir,
+                    8,
+                    target,
+                    call_argument_start,
+                    argument_count + 1,
+                    0,
+                    node_type,
+                );
+                i64 jump = mir_emit(mir, 22, 0, -1, result, 0);
+                raz_compiler_rt_arena_set(jump_slots, jump_count, jump);
+                jump_count += 1;
+                i64 next_block = mir_emit(mir, 24, 0, 0, 0, 0);
+                mir_patch_operand(mir, branch, 1, next_block);
+                mir_patch_operand(mir, branch, 2, match_block);
+            } else {
+                i64 call_argument_start = mir.call_argument_count;
+                raz_compiler_rt_arena_set(mir.call_arguments, mir.call_argument_count, data);
+                mir.call_argument_count += 1;
+                argument_index = 0;
+                while (argument_index < argument_count) {
+                    raz_compiler_rt_arena_set(
+                        mir.call_arguments,
+                        mir.call_argument_count,
+                        raz_compiler_rt_arena_get(pending_registers, argument_index),
+                    );
+                    mir.call_argument_count += 1;
+                    argument_index += 1;
+                }
+                i64 result = mir_emit_typed(
+                    mir,
+                    8,
+                    target,
+                    call_argument_start,
+                    argument_count + 1,
+                    0,
+                    node_type,
+                );
+                i64 jump = mir_emit(mir, 22, 0, -1, result, 0);
+                raz_compiler_rt_arena_set(jump_slots, jump_count, jump);
+                jump_count += 1;
+            }
+            dispatch += 1;
+        }
+        i64 merge = mir_emit(mir, 24, 1, 0, 0, 0);
+        i64 jump_index = 0;
+        while (jump_index < jump_count) {
+            mir_patch_target(mir, raz_compiler_rt_arena_get(jump_slots, jump_index), merge);
+            jump_index += 1;
+        }
+        raz_compiler_rt_arena_destroy(jump_slots);
+        raz_compiler_rt_arena_destroy(pending_registers);
+        return merge;
+    }
+    if (kind == 50) {
+        // dyn Trait values are represented as a two-word fat object in the
+        // compilered pipeline: [borrowed data reference, vtable identity].
+        // The vtable identity is stable per (trait, concrete structure) pair;
+        // later dispatch lowering can resolve it to concrete method entries.
+        i64 storage = mir_emit(mir, 30, 2, 0, 0, 0);
+        i64 data = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 data_field = mir_emit_typed(mir, 1, 0, 0, 0, 0, 0);
+        mir_emit(mir, 29, storage, data_field, data, 0);
+        i64 trait_index = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 structure = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 vtable_identity = ((trait_index + 1) * 8192) + structure + 1;
+        i64 vtable = mir_emit_typed(mir, 1, vtable_identity, 0, 0, 0, 0);
+        i64 vtable_field = mir_emit_typed(mir, 1, 1, 0, 0, 0, 0);
+        mir_emit(mir, 29, storage, vtable_field, vtable, 0);
+        return storage;
+    }
+    if (kind == 49) {
+        i64 callee = lower_hir_expression(hir, mir, raz_compiler_rt_arena_get(hir.node_a, node));
+        i64 first = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 count = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 pending_registers = raz_compiler_rt_arena_create(count + 1);
+        if (pending_registers == 0) {
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_index = 0;
+        while (argument_index < count) {
+            i64 argument_register = lower_hir_expression(
+                hir,
+                mir,
+                raz_compiler_rt_arena_get(hir.arguments, first + argument_index),
+            );
+            raz_compiler_rt_arena_set(pending_registers, argument_index, argument_register);
+            argument_index += 1;
+        }
+        if (mir.call_argument_count + count >= 524288) {
+            raz_compiler_rt_arena_destroy(pending_registers);
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_start = mir.call_argument_count;
+        argument_index = 0;
+        while (argument_index < count) {
+            raz_compiler_rt_arena_set(
+                mir.call_arguments,
+                mir.call_argument_count,
+                raz_compiler_rt_arena_get(pending_registers, argument_index),
+            );
+            mir.call_argument_count += 1;
+            argument_index += 1;
+        }
+        raz_compiler_rt_arena_destroy(pending_registers);
+        i64 signature = raz_compiler_rt_arena_get(hir.node_values, node);
+        i64 callee_node = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 callee_type = raz_compiler_rt_arena_get(hir.node_types, callee_node);
+        if (callee_type >= 16 && callee_type <= 18) {
+            return mir_emit_typed(mir, 51, callee, argument_start, count, signature, node_type);
+        }
+        return mir_emit_typed(mir, 44, callee, argument_start, count, signature, node_type);
+    }
+    if (kind == 4) {
+        i64 first = raz_compiler_rt_arena_get(hir.node_b, node);
+        i64 count = raz_compiler_rt_arena_get(hir.node_c, node);
+        i64 pending_registers = raz_compiler_rt_arena_create(count + 1);
+        if (pending_registers == 0) {
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_index = 0;
+        while (argument_index < count) {
+            i64 argument_register = lower_hir_expression(
+                hir,
+                mir,
+                raz_compiler_rt_arena_get(hir.arguments, first + argument_index),
+            );
+            raz_compiler_rt_arena_set(pending_registers, argument_index, argument_register);
+            argument_index += 1;
+        }
+        if (mir.call_argument_count + count >= 524288) {
+            raz_compiler_rt_arena_destroy(pending_registers);
+            return mir_emit(mir, 1, 0, 0, 0, 0);
+        }
+        i64 argument_start = mir.call_argument_count;
+        argument_index = 0;
+        while (argument_index < count) {
+            raz_compiler_rt_arena_set(
+                mir.call_arguments,
+                mir.call_argument_count,
+                raz_compiler_rt_arena_get(pending_registers, argument_index),
+            );
+            mir.call_argument_count += 1;
+            argument_index += 1;
+        }
+        raz_compiler_rt_arena_destroy(pending_registers);
+        return mir_emit_typed(
+            mir,
+            8,
+            raz_compiler_rt_arena_get(hir.node_a, node),
+            argument_start,
+            count,
+            0,
+            node_type,
+        );
+    }
+    return mir_emit(mir, 1, 0, 0, 0, 0);
+}
+
+fn lower_compound_value(MirModule&mut out, i64 operation, i64 current, i64 value, i64 type_kind) -> i64 {
+    if (operation == 1) {
+        return mir_emit_typed(out, 4, current, value, 0, 0, type_kind);
+    }
+    if (operation == 2) {
+        return mir_emit_typed(out, 5, current, value, 0, 0, type_kind);
+    }
+    if (operation == 3) {
+        return mir_emit_typed(out, 6, current, value, 0, 0, type_kind);
+    }
+    if (operation == 4) {
+        return mir_emit_typed(out, 7, current, value, 0, 0, type_kind);
+    }
+    if (operation == 5) {
+        return mir_emit_typed(out, 34, current, value, 0, 0, type_kind);
+    }
+    if (operation == 6) {
+        return mir_emit_typed(out, 35, current, value, 0, 0, type_kind);
+    }
+    if (operation == 7) {
+        return mir_emit_typed(out, 36, current, value, 0, 0, type_kind);
+    }
+    if (operation == 8) {
+        return mir_emit_typed(out, 37, current, value, 0, 0, type_kind);
+    }
+    if (operation == 9) {
+        return mir_emit_typed(out, 38, current, value, 0, 0, type_kind);
+    }
+    if (operation == 10) {
+        return mir_emit_typed(out, 39, current, value, 0, 0, type_kind);
+    }
+    return value;
+}
+
+fn hir_statement_range_terminates(HirModule& hir, i64 statement, i64 end) -> bool {
+    i64 cursor = statement;
+    while (cursor < end) {
+        i64 kind = raz_compiler_rt_arena_get(hir.statement_kinds, cursor);
+        if (kind == 2 || kind == 3 || kind == 11 || kind == 12) {
+            return true;
+        }
+        if (kind == 7) {
+            i64 then_block = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 else_block = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            if (else_block >= 0) {
+                i64 then_start = raz_compiler_rt_arena_get(hir.block_statement_starts, then_block);
+                i64 then_end = then_start + raz_compiler_rt_arena_get(hir.block_statement_counts, then_block);
+                i64 else_start = raz_compiler_rt_arena_get(hir.block_statement_starts, else_block);
+                i64 else_end = else_start + raz_compiler_rt_arena_get(hir.block_statement_counts, else_block);
+                if (
+                    hir_statement_range_terminates(hir, then_start, then_end) &&
+                    hir_statement_range_terminates(hir, else_start, else_end)
+                ) {
+                    return true;
+                }
+            }
+        }
+        if (kind == 14) {
+            i64 nested_block = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, nested_block);
+            i64 nested_end =
+                nested_start +
+                raz_compiler_rt_arena_get(hir.block_statement_counts, nested_block);
+            if (hir_statement_range_terminates(hir, nested_start, nested_end)) {
+                return true;
+            }
+        }
+        if (kind == 15) {
+            i64 arm = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 arm_end = arm + raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            bool all_terminate = true;
+            while (arm < arm_end) {
+                i64 arm_block = raz_compiler_rt_arena_get(hir.match_arm_blocks, arm);
+                i64 arm_start = raz_compiler_rt_arena_get(hir.block_statement_starts, arm_block);
+                i64 arm_statement_end =
+                    arm_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, arm_block);
+                if (!hir_statement_range_terminates(hir, arm_start, arm_statement_end)) {
+                    all_terminate = false;
+                }
+                arm += 1;
+            }
+            if (all_terminate) {
+                return true;
+            }
+        }
+        cursor += 1;
+    }
+    return false;
+}
+
+fn hir_final_path_moved(HirModule& hir, i64 root_kind, i64 root_index, i64 path) -> bool {
+    if (path == 0) {
+        if (root_kind == 3) {
+            return raz_compiler_rt_arena_get(hir.local_final_moved, root_index) != 0;
+        }
+        if (root_kind == 2) {
+            return raz_compiler_rt_arena_get(hir.parameter_final_moved, root_index) != 0;
+        }
+    }
+    i64 index = 0;
+    while (index < hir.final_moved_path_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.final_moved_path_root_kinds, index) == root_kind &&
+            raz_compiler_rt_arena_get(hir.final_moved_path_root_indices, index) == root_index
+        ) {
+            i64 moved_path = raz_compiler_rt_arena_get(hir.final_moved_paths, index);
+            i64 cursor = path;
+            while (cursor > 0) {
+                if (cursor == moved_path) {
+                    return true;
+                }
+                cursor = cursor / 4096;
+            }
+        }
+        index += 1;
+    }
+    return false;
+}
+
+fn hir_predrop_path_moved(HirModule& hir, i64 statement, i64 path) -> bool {
+    i64 start = raz_compiler_rt_arena_get(hir.statement_predrop_moved_starts, statement);
+    i64 count = raz_compiler_rt_arena_get(hir.statement_predrop_moved_counts, statement);
+    i64 index = 0;
+    while (index < count) {
+        i64 moved_path = raz_compiler_rt_arena_get(hir.predrop_moved_paths, start + index);
+        i64 cursor = path;
+        while (cursor > 0) {
+            if (cursor == moved_path) {
+                return true;
+            }
+            cursor = cursor / 4096;
+        }
+        index += 1;
+    }
+    return false;
+}
+
+fn lower_hir_emit_structure_drop_impl(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 structure,
+    i64 storage,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 depth,
+    i64 predrop_statement,
+    bool destroy_storage,
+) -> bool {
+    bool moved = false;
+    if (predrop_statement >= 0) {
+        moved = hir_predrop_path_moved(hir, predrop_statement, path);
+    } else {
+        moved = hir_final_path_moved(hir, root_kind, root_index, path);
+    }
+    if (structure < 0 || depth > 64 || !hir_structure_needs_drop(hir, structure, depth) || moved) {
+        return true;
+    }
+    i64 drop_function = raz_compiler_rt_arena_get(hir.struct_drop_functions, structure);
+    if (drop_function >= 0) {
+        if (out.call_argument_count + 1 >= 524288) {
+            return false;
+        }
+        i64 argument_start = out.call_argument_count;
+        raz_compiler_rt_arena_set(out.call_arguments, out.call_argument_count, storage);
+        out.call_argument_count += 1;
+        mir_emit_typed(out, 8, drop_function, argument_start, 1, 0, 0);
+    }
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 field = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    while (field > 0) {
+        field -= 1;
+        i64 metadata = first + field;
+        if (raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0) {
+            i64 nested = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+            i64 child_path = path * 4096 + field + 1;
+            if (
+                nested >= 0 &&
+                hir_structure_needs_drop(hir, nested, depth + 1) &&
+                !hir_final_path_moved(hir, root_kind, root_index, child_path)
+            ) {
+                i64 field_index = mir_emit(out, 1, field, 0, 0, 0);
+                i64 field_storage = mir_emit(out, 28, storage, field_index, 0, 0);
+                if (
+                    !lower_hir_emit_structure_drop_impl(
+                        hir,
+                        out,
+                        nested,
+                        field_storage,
+                        root_kind,
+                        root_index,
+                        child_path,
+                        depth + 1,
+                        predrop_statement,
+                        true,
+                    )
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (destroy_storage) {
+        mir_emit(out, 31, storage, 0, 0, 0);
+    }
+    return true;
+}
+
+fn lower_hir_emit_structure_drop(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 structure,
+    i64 storage,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 depth,
+    i64 predrop_statement,
+) -> bool {
+    return lower_hir_emit_structure_drop_impl(
+        hir,
+        out,
+        structure,
+        storage,
+        root_kind,
+        root_index,
+        path,
+        depth,
+        predrop_statement,
+        true,
+    );
+}
+
+fn lower_hir_emit_structure_contents_drop(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 structure,
+    i64 storage,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 depth,
+    i64 predrop_statement,
+) -> bool {
+    return lower_hir_emit_structure_drop_impl(
+        hir,
+        out,
+        structure,
+        storage,
+        root_kind,
+        root_index,
+        path,
+        depth,
+        predrop_statement,
+        false,
+    );
+}
+
+fn lower_hir_emit_scope_drops(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 function_index,
+    i64 block_index,
+    i64 skip_root_kind,
+    i64 skip_root_index,
+    i64 exit_statement,
+) -> bool {
+    i64 link = 0;
+    if (block_index >= 0) {
+        if (block_index >= hir.block_count) { return false; }
+        link = raz_compiler_rt_arena_get_unchecked(out.lowering_block_local_heads, block_index);
+    } else {
+        if (function_index < 0 || function_index >= hir.function_count) { return false; }
+        link = raz_compiler_rt_arena_get_unchecked(out.lowering_function_root_local_heads, function_index);
+    }
+    i64 exit_offset = -1;
+    i64 exit_kind = -1;
+    i64 declaration_local = -1;
+    if (exit_statement >= 0) {
+        exit_offset = raz_compiler_rt_arena_get(hir.statement_source_offsets, exit_statement);
+        exit_kind = raz_compiler_rt_arena_get(hir.statement_kinds, exit_statement);
+        if (exit_kind == 8 || exit_kind == 9 || exit_kind == 10 || exit_kind == 24) {
+            declaration_local = raz_compiler_rt_arena_get(hir.statement_c, exit_statement);
+        }
+    }
+    while (link > 0) {
+        i64 local = link - 1;
+        link = raz_compiler_rt_arena_get_unchecked(out.lowering_local_next, local);
+        bool live_before_exit = true;
+        if (exit_statement >= 0) {
+            i64 declaration_offset = raz_compiler_rt_arena_get(hir.local_declaration_offsets, local);
+            live_before_exit = local != declaration_local && declaration_offset < exit_offset;
+        }
+        if (
+            live_before_exit &&
+            raz_compiler_rt_arena_get(hir.local_function_indices, local) == function_index &&
+            raz_compiler_rt_arena_get(hir.local_block_indices, local) == block_index &&
+            raz_compiler_rt_arena_get(hir.local_references, local) == 0 &&
+            !(skip_root_kind == 3 && skip_root_index == local)
+        ) {
+            i64 structure = raz_compiler_rt_arena_get(hir.local_type_structs, local);
+            i64 slot = raz_compiler_rt_arena_get(hir.local_slots, local);
+            if (
+                structure >= 0 &&
+                hir_structure_needs_drop(hir, structure, 0) &&
+                !hir_final_path_moved(hir, 3, local, 0)
+            ) {
+                i64 storage = mir_emit(out, 3, slot, 0, 0, 0);
+                if (!lower_hir_emit_structure_drop(hir, out, structure, storage, 3, local, 0, 0, -1)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+fn lower_hir_emit_parameter_drops(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 function_index,
+    i64 skip_root_kind,
+    i64 skip_root_index,
+) -> bool {
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+    i64 parameter = parameter_start + parameter_count;
+    while (parameter > parameter_start) {
+        parameter -= 1;
+        if (
+            raz_compiler_rt_arena_get(hir.parameter_references, parameter) == 0 &&
+            !(skip_root_kind == 2 && skip_root_index == parameter)
+        ) {
+            i64 structure = raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter);
+            if (
+                structure >= 0 &&
+                hir_structure_needs_drop(hir, structure, 0) &&
+                !hir_final_path_moved(hir, 2, parameter, 0)
+            ) {
+                i64 parameter_slot = parameter - parameter_start;
+                i64 storage = mir_emit(out, 2, parameter_slot, 0, 0, 0);
+                if (!lower_hir_emit_structure_drop(hir, out, structure, storage, 2, parameter, 0, 0, -1)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+fn lower_hir_emit_early_return_cleanup(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 cleanup_function,
+    i64 cleanup_block,
+) -> bool {
+    if (cleanup_function < 0) {
+        return true;
+    }
+    i64 defer_block = cleanup_block;
+    while (defer_block >= 0) {
+        i64 cleanup_remaining = raz_compiler_rt_arena_get(hir.block_defer_counts, defer_block);
+        i64 cleanup_start = raz_compiler_rt_arena_get(hir.block_defer_starts, defer_block);
+        while (cleanup_remaining > 0) {
+            cleanup_remaining -= 1;
+            i64 deferred_block = raz_compiler_rt_arena_get(
+                hir.defer_blocks,
+                cleanup_start + cleanup_remaining
+            );
+            i64 deferred_start = raz_compiler_rt_arena_get(hir.block_statement_starts, deferred_block);
+            i64 deferred_end =
+                deferred_start +
+                raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    deferred_start,
+                    deferred_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+                )
+            ) {
+                return false;
+            }
+        }
+        defer_block = raz_compiler_rt_arena_get(hir.block_parent_indices, defer_block);
+    }
+    i64 function_cleanup_remaining = raz_compiler_rt_arena_get(hir.function_defer_counts, cleanup_function);
+    i64 function_cleanup_start = raz_compiler_rt_arena_get(hir.function_defer_starts, cleanup_function);
+    while (function_cleanup_remaining > 0) {
+        function_cleanup_remaining -= 1;
+        i64 deferred_block = raz_compiler_rt_arena_get(
+            hir.defer_blocks,
+            function_cleanup_start + function_cleanup_remaining,
+        );
+        i64 deferred_start = raz_compiler_rt_arena_get(hir.block_statement_starts, deferred_block);
+        i64 deferred_end =
+            deferred_start +
+            raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+        if (
+            !lower_hir_statement_range(
+                hir,
+                out,
+                deferred_start,
+                deferred_end,
+                raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+            )
+        ) {
+            return false;
+        }
+    }
+    i64 drop_block = cleanup_block;
+    while (drop_block >= 0) {
+        if (!lower_hir_emit_scope_drops(hir, out, cleanup_function, drop_block, 0, -1, out.lowering_cleanup_statement)) {
+            return false;
+        }
+        drop_block = raz_compiler_rt_arena_get(hir.block_parent_indices, drop_block);
+    }
+    if (!lower_hir_emit_scope_drops(hir, out, cleanup_function, -1, 0, -1, out.lowering_cleanup_statement)) {
+        return false;
+    }
+    return lower_hir_emit_parameter_drops(hir, out, cleanup_function, 0, -1);
+}
+
+fn lower_hir_prepare_cleanup_indexes(HirModule& hir, MirModule&mut out) -> bool {
+    if (!mir_prepare_scope_local_index(hir, out)) { return false; }
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        i64 needs_drop_cleanup = hir_function_needs_drop_cleanup_uncached(hir, function_index) as i64;
+        raz_compiler_rt_arena_set_unchecked(
+            out.lowering_function_drop_flags,
+            function_index,
+            needs_drop_cleanup,
+        );
+        function_index += 1;
+    }
+    return true;
+}
+
+fn lower_hir_allocate_array(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 extent,
+    i64 element_type,
+    i64 element_structure,
+) -> i64 {
+    if (extent <= 0) {
+        return mir_emit(out, 30, 1, 2, element_structure, element_type);
+    }
+    i64 storage = mir_emit(out, 30, extent, 2, element_structure, element_type);
+    if (element_structure >= 0) {
+        i64 element = 0;
+        while (element < extent) {
+            i64 child = lower_hir_allocate_structure(hir, out, element_structure);
+            i64 index = mir_emit(out, 1, element, 0, 0, 0);
+            mir_emit(out, 29, storage, index, child, 0);
+            element += 1;
+        }
+    }
+    return storage;
+}
+
+fn lower_hir_allocate_structure(HirModule& hir, MirModule&mut out, i64 structure) -> i64 {
+    i64 field_count = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    i64 storage = mir_emit(out, 30, field_count, 1, structure, 0);
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 field = 0;
+    while (field < field_count) {
+        i64 metadata = first + field;
+        i64 nested = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+        i64 reference = raz_compiler_rt_arena_get(hir.struct_field_references, metadata);
+        i64 extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+        if (reference == 0 && (nested >= 0 || extent >= 0)) {
+            i64 nested_storage = 0;
+            if (extent >= 0) {
+                nested_storage = lower_hir_allocate_array(
+                    hir,
+                    out,
+                    extent,
+                    raz_compiler_rt_arena_get(hir.struct_field_types, metadata),
+                    nested,
+                );
+            } else {
+                nested_storage = lower_hir_allocate_structure(hir, out, nested);
+            }
+            i64 field_index = mir_emit(out, 1, field, 0, 0, 0);
+            mir_emit(out, 29, storage, field_index, nested_storage, 0);
+        }
+        field += 1;
+    }
+    return storage;
+}
+
+fn lower_hir_copy_array(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 extent,
+    i64 element_type,
+    i64 element_structure,
+    i64 source,
+) -> i64 {
+    i64 destination = mir_emit(out, 30, extent, 2, element_structure, element_type);
+    i64 element = 0;
+    while (element < extent) {
+        i64 index = mir_emit(out, 1, element, 0, 0, 0);
+        i64 load_type = element_type;
+        if (element_structure >= 0) {
+            load_type = 0;
+        }
+        i64 value = mir_emit_typed(out, 28, source, index, 0, 0, load_type);
+        if (element_structure >= 0) {
+            value = lower_hir_copy_structure(hir, out, element_structure, value);
+        }
+        mir_emit(out, 29, destination, index, value, 0);
+        element += 1;
+    }
+    return destination;
+}
+
+fn lower_hir_copy_array_into(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 extent,
+    i64 element_type,
+    i64 element_structure,
+    i64 source,
+    i64 destination,
+) -> bool {
+    i64 element = 0;
+    while (element < extent) {
+        i64 index = mir_emit(out, 1, element, 0, 0, 0);
+        i64 load_type = element_type;
+        if (element_structure >= 0) {
+            load_type = 0;
+        }
+        i64 value = mir_emit_typed(out, 28, source, index, 0, 0, load_type);
+        if (element_structure >= 0) {
+            value = lower_hir_copy_structure(hir, out, element_structure, value);
+        }
+        mir_emit(out, 29, destination, index, value, 0);
+        element += 1;
+    }
+    return true;
+}
+
+fn lower_hir_copy_structure(HirModule& hir, MirModule&mut out, i64 structure, i64 source) -> i64 {
+    i64 field_count = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    i64 destination = mir_emit(out, 30, field_count, 1, structure, 0);
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 field = 0;
+    while (field < field_count) {
+        i64 metadata = first + field;
+        i64 nested = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+        i64 reference = raz_compiler_rt_arena_get(hir.struct_field_references, metadata);
+        i64 extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+        i64 field_type = raz_compiler_rt_arena_get(hir.struct_field_types, metadata);
+        i64 field_index = mir_emit(out, 1, field, 0, 0, 0);
+        i64 load_type = field_type;
+        if (reference != 0) {
+            load_type = 12;
+        } else if (nested >= 0 || extent >= 0) {
+            load_type = 0;
+        }
+        i64 value = mir_emit_typed(out, 28, source, field_index, 0, 0, load_type);
+        if (reference == 0 && extent >= 0) {
+            value = lower_hir_copy_array(hir, out, extent, field_type, nested, value);
+        } else if (nested >= 0 && reference == 0) {
+            value = lower_hir_copy_structure(hir, out, nested, value);
+        }
+        mir_emit(out, 29, destination, field_index, value, 0);
+        field += 1;
+    }
+    return destination;
+}
+
+// Move an aggregate value into an existing aggregate storage image. Aggregate
+// references in the Stage-1 ABI are the aggregate arena handle itself (rather
+// than a reference to the caller's slot), so whole-value assignment through
+// `T&mut` must replace the destination fields in place. The source arena shell
+// is no longer owned after the move and can be released once its field handles
+// have been transferred.
+fn lower_hir_move_structure_into(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 structure,
+    i64 source,
+    i64 destination,
+) -> bool {
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 field_count = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    i64 field = 0;
+    while (field < field_count) {
+        i64 metadata = first + field;
+        i64 nested = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+        i64 reference = raz_compiler_rt_arena_get(hir.struct_field_references, metadata);
+        i64 extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+        i64 field_type = raz_compiler_rt_arena_get(hir.struct_field_types, metadata);
+        i64 load_type = field_type;
+        if (reference != 0) {
+            load_type = 12;
+        } else if (nested >= 0 || extent >= 0) {
+            load_type = 0;
+        }
+        i64 field_index = mir_emit(out, 1, field, 0, 0, 0);
+        i64 field_value = mir_emit_typed(out, 28, source, field_index, 0, 0, load_type);
+        mir_emit(out, 29, destination, field_index, field_value, 0);
+        field += 1;
+    }
+    // `move` transfers the field ownership but not the source arena shell.
+    mir_emit(out, 31, source, 0, 0, 0);
+    return true;
+}
+
+fn lower_hir_emit_array_release(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 extent,
+    i64 element_structure,
+    i64 storage,
+    i64 depth,
+) -> bool {
+    if (depth > 64 || extent < 0) {
+        return false;
+    }
+    if (element_structure >= 0) {
+        i64 element = extent;
+        while (element > 0) {
+            element -= 1;
+            i64 index = mir_emit(out, 1, element, 0, 0, 0);
+            i64 child = mir_emit(out, 28, storage, index, 0, 0);
+            if (!lower_hir_emit_structure_release(hir, out, element_structure, child, depth + 1)) {
+                return false;
+            }
+        }
+    }
+    mir_emit(out, 31, storage, 0, 0, 0);
+    return true;
+}
+
+fn lower_hir_emit_structure_release(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 structure,
+    i64 storage,
+    i64 depth,
+) -> bool {
+    // Release an owned aggregate image regardless of whether it has a user
+    // Drop implementation. Arena-backed structs always own their storage; Drop
+    // augments that lifetime rather than being the condition for reclamation.
+    if (structure < 0 || depth > 64) {
+        return false;
+    }
+    i64 drop_function = raz_compiler_rt_arena_get(hir.struct_drop_functions, structure);
+    if (drop_function >= 0) {
+        if (out.call_argument_count + 1 >= 524288) {
+            return false;
+        }
+        i64 argument_start = out.call_argument_count;
+        raz_compiler_rt_arena_set(out.call_arguments, out.call_argument_count, storage);
+        out.call_argument_count += 1;
+        mir_emit_typed(out, 8, drop_function, argument_start, 1, 0, 0);
+    }
+    i64 first = raz_compiler_rt_arena_get(hir.struct_field_starts, structure);
+    i64 field = raz_compiler_rt_arena_get(hir.struct_field_counts, structure);
+    while (field > 0) {
+        field -= 1;
+        i64 metadata = first + field;
+        if (raz_compiler_rt_arena_get(hir.struct_field_references, metadata) == 0) {
+            i64 nested = raz_compiler_rt_arena_get(hir.struct_field_type_structs, metadata);
+            i64 extent = raz_compiler_rt_arena_get(hir.struct_field_array_extents, metadata);
+            if (nested >= 0 || extent >= 0) {
+                i64 field_index = mir_emit(out, 1, field, 0, 0, 0);
+                i64 field_storage = mir_emit(out, 28, storage, field_index, 0, 0);
+                if (extent >= 0) {
+                    if (!lower_hir_emit_array_release(hir, out, extent, nested, field_storage, depth + 1)) {
+                        return false;
+                    }
+                } else if (!lower_hir_emit_structure_release(hir, out, nested, field_storage, depth + 1)) {
+                    return false;
+                }
+            }
+        }
+    }
+    mir_emit(out, 31, storage, 0, 0, 0);
+    return true;
+}
+
+fn lower_hir_emit_statement_predrop(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 statement,
+    i64 target_storage,
+) -> bool {
+    i64 structure = raz_compiler_rt_arena_get(hir.statement_predrop_structures, statement);
+    if (structure < 0) {
+        return true;
+    }
+    return lower_hir_emit_structure_drop(
+        hir,
+        out,
+        structure,
+        target_storage,
+        raz_compiler_rt_arena_get(hir.statement_predrop_root_kinds, statement),
+        raz_compiler_rt_arena_get(hir.statement_predrop_root_indices, statement),
+        raz_compiler_rt_arena_get(hir.statement_predrop_paths, statement),
+        0,
+        statement,
+    );
+}
+
+fn lower_hir_emit_statement_predrop_contents(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 statement,
+    i64 target_storage,
+) -> bool {
+    i64 structure = raz_compiler_rt_arena_get(hir.statement_predrop_structures, statement);
+    if (structure < 0) {
+        return true;
+    }
+    return lower_hir_emit_structure_contents_drop(
+        hir,
+        out,
+        structure,
+        target_storage,
+        raz_compiler_rt_arena_get(hir.statement_predrop_root_kinds, statement),
+        raz_compiler_rt_arena_get(hir.statement_predrop_root_indices, statement),
+        raz_compiler_rt_arena_get(hir.statement_predrop_paths, statement),
+        0,
+        statement,
+    );
+}
+
+fn lower_match_path_value(HirModule& hir, MirModule&mut out, i64 subject, i64 path) -> i64 {
+    if (path < 0) { return subject; }
+    i64 parent = raz_compiler_rt_arena_get(hir.match_path_parents, path);
+    i64 base = subject;
+    if (parent >= 0) {
+        base = lower_match_path_value(hir, out, subject, parent);
+    }
+    i64 path_step = raz_compiler_rt_arena_get(hir.match_path_payload_indices, path);
+    i64 slot_index = path_step + 1;
+    if (path_step < 0) {
+        // Struct-field path steps use -(field_index + 1). Unlike enum payloads,
+        // aggregate fields have no leading discriminant slot.
+        slot_index = -path_step - 1;
+    }
+    i64 slot = mir_emit(out, 1, slot_index, 0, 0, 0);
+    return mir_emit(out, 28, base, slot, 0, 0);
+}
+
+fn lower_match_path_reference(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 subject,
+    i64 path,
+    i64 borrow_kind,
+) -> i64 {
+    if (path < 0) { return -1; }
+    i64 parent = raz_compiler_rt_arena_get(hir.match_path_parents, path);
+    i64 base = subject;
+    if (parent >= 0) {
+        base = lower_match_path_value(hir, out, subject, parent);
+    }
+    i64 path_step = raz_compiler_rt_arena_get(hir.match_path_payload_indices, path);
+    i64 slot_index = path_step + 1;
+    if (path_step < 0) {
+        slot_index = -path_step - 1;
+    }
+    i64 slot = mir_emit(out, 1, slot_index, 0, 0, 0);
+    // MIR opcode 45 is the canonical indexed-place borrow used by borrowed
+    // iteration. Reusing it here gives pattern bindings the exact same native
+    // address, LLVM GEP, WASM address and ownership/loan semantics.
+    return mir_emit_typed(out, 45, base, slot, borrow_kind, 0, 12);
+}
+
+fn lower_hir_statement_range(
+    HirModule& hir,
+    MirModule&mut out,
+    i64 statement,
+    i64 end,
+    i64 scope_defer_start,
+    i64 scope_defer_count,
+) -> bool {
+    i64 range_start = statement;
+    i64 cursor = statement;
+    while (cursor < end) {
+        out.lowering_cleanup_function = raz_compiler_rt_arena_get(hir.statement_function_indices, cursor);
+        out.lowering_cleanup_block = raz_compiler_rt_arena_get(hir.statement_block_indices, cursor);
+        out.lowering_cleanup_statement = cursor;
+        i64 kind = raz_compiler_rt_arena_get(hir.statement_kinds, cursor);
+        if (kind == 9) {
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 initializer = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 local_index = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 array_extent = raz_compiler_rt_arena_get(hir.local_array_extents, local_index);
+            i64 element_start = raz_compiler_rt_arena_get(hir.local_array_element_starts, local_index);
+            i64 element_count = raz_compiler_rt_arena_get(hir.local_array_element_counts, local_index);
+            i64 storage = -1;
+            if (
+                element_count == 0 &&
+                initializer >= 0 &&
+                raz_compiler_rt_arena_get(hir.node_array_extents, initializer) == array_extent
+            ) {
+                i64 source = lower_hir_expression(hir, out, initializer);
+                storage = lower_hir_copy_array(
+                    hir,
+                    out,
+                    array_extent,
+                    raz_compiler_rt_arena_get(hir.local_types, local_index),
+                    raz_compiler_rt_arena_get(hir.local_type_structs, local_index),
+                    source,
+                );
+            } else {
+                storage = lower_hir_allocate_array(
+                    hir,
+                    out,
+                    array_extent,
+                    raz_compiler_rt_arena_get(hir.local_types, local_index),
+                    raz_compiler_rt_arena_get(hir.local_type_structs, local_index),
+                );
+                i64 element_index = 0;
+                while (element_index < element_count) {
+                    i64 index_value = mir_emit(out, 1, element_index, 0, 0, 0);
+                    i64 element = raz_compiler_rt_arena_get(
+                        hir.array_elements,
+                        element_start + element_index
+                    );
+                    i64 element_value = lower_hir_expression(hir, out, element);
+                    mir_emit(out, 29, storage, index_value, element_value, 0);
+                    element_index += 1;
+                }
+            }
+            mir_emit(out, 9, slot, storage, 0, 0);
+            mir_emit(out, 33, slot, 0, 0, 0);
+        } else if (kind == 24) {
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 local_index = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+            i64 source = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_b, cursor));
+            i64 storage = lower_hir_copy_structure(hir, out, structure, source);
+            mir_emit(out, 9, slot, storage, 0, 0);
+            mir_emit(out, 33, slot, 0, 0, 0);
+        } else if (kind == 10) {
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 local_index = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+            i64 initializer = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 storage = -1;
+            if (
+                initializer >= 0 &&
+                raz_compiler_rt_arena_get(hir.node_type_structs, initializer) == structure
+            ) {
+                // Aggregate locals have value semantics. The initializer may be
+                // a projection into another aggregate (for example
+                // `Lexer lookahead = builder.scan`). Reusing that storage would
+                // alias the source and let mutations of the local corrupt the
+                // original value. Materialize an independent aggregate image,
+                // matching the native host compiler's MIR contract.
+                i64 source = lower_hir_expression(hir, out, initializer);
+                storage = lower_hir_copy_structure(hir, out, structure, source);
+            } else {
+                storage = lower_hir_allocate_structure(hir, out, structure);
+            }
+            mir_emit(out, 9, slot, storage, 0, 0);
+            mir_emit(out, 33, slot, 0, 0, 0);
+        } else if (kind == 8) {
+            i64 value = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_b, cursor));
+            i64 local_index = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            mir_emit_typed(
+                out,
+                9,
+                raz_compiler_rt_arena_get(hir.statement_a, cursor),
+                value,
+                0,
+                0,
+                raz_compiler_rt_arena_get(hir.local_types, local_index),
+            );
+        } else if (kind == 1) {
+            i64 value = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_b, cursor));
+            if (
+                raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                hir_structure_needs_drop(
+                    hir,
+                    raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                    0,
+                )
+            ) {
+                i64 old_storage = mir_emit_typed(
+                    out,
+                    3,
+                    raz_compiler_rt_arena_get(hir.statement_a, cursor),
+                    0,
+                    0,
+                    0,
+                    raz_compiler_rt_arena_get(hir.statement_c, cursor),
+                );
+                if (!lower_hir_emit_statement_predrop(hir, out, cursor, old_storage)) {
+                    return false;
+                }
+            }
+            mir_emit_typed(
+                out,
+                9,
+                raz_compiler_rt_arena_get(hir.statement_a, cursor),
+                value,
+                0,
+                0,
+                raz_compiler_rt_arena_get(hir.statement_c, cursor),
+            );
+        } else if (kind == 2) {
+            i64 return_node = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 return_type = 0;
+            if (return_node >= 0) {
+                return_type = raz_compiler_rt_arena_get(hir.node_types, return_node);
+            }
+            // Raz defer semantics observe the final value of locals on return. Run
+            // deferred actions first, then evaluate the return expression while all
+            // lexical storage is still alive. Scope/parameter drops follow after the
+            // return value has been captured.
+            i64 cleanup_block = raz_compiler_rt_arena_get(hir.statement_block_indices, cursor);
+            i64 defer_block = cleanup_block;
+            while (defer_block >= 0) {
+                i64 cleanup_remaining = raz_compiler_rt_arena_get(hir.block_defer_counts, defer_block);
+                i64 cleanup_start = raz_compiler_rt_arena_get(hir.block_defer_starts, defer_block);
+                while (cleanup_remaining > 0) {
+                    cleanup_remaining -= 1;
+                    i64 deferred_block = raz_compiler_rt_arena_get(
+                        hir.defer_blocks,
+                        cleanup_start + cleanup_remaining,
+                    );
+                    i64 deferred_start = raz_compiler_rt_arena_get(
+                        hir.block_statement_starts,
+                        deferred_block
+                    );
+                    i64 deferred_end =
+                        deferred_start +
+                        raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+                    if (
+                        !lower_hir_statement_range(
+                            hir,
+                            out,
+                            deferred_start,
+                            deferred_end,
+                            raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                            raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+                defer_block = raz_compiler_rt_arena_get(hir.block_parent_indices, defer_block);
+            }
+            i64 cleanup_function = raz_compiler_rt_arena_get(hir.statement_function_indices, cursor);
+            i64 function_cleanup_remaining = raz_compiler_rt_arena_get(
+                hir.function_defer_counts,
+                cleanup_function,
+            );
+            i64 function_cleanup_start = raz_compiler_rt_arena_get(
+                hir.function_defer_starts,
+                cleanup_function
+            );
+            while (function_cleanup_remaining > 0) {
+                function_cleanup_remaining -= 1;
+                i64 deferred_block = raz_compiler_rt_arena_get(
+                    hir.defer_blocks,
+                    function_cleanup_start + function_cleanup_remaining,
+                );
+                i64 deferred_start = raz_compiler_rt_arena_get(hir.block_statement_starts, deferred_block);
+                i64 deferred_end =
+                    deferred_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+                if (
+                    !lower_hir_statement_range(
+                        hir,
+                        out,
+                        deferred_start,
+                        deferred_end,
+                        raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                        raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+                    )
+                ) {
+                    return false;
+                }
+            }
+            i64 return_value = -1;
+            if (return_node >= 0) {
+                return_value = lower_hir_expression(hir, out, return_node);
+            }
+            // Returning an owning non-Copy aggregate local/parameter transfers
+            // its storage to the caller.  The return value is an arena handle,
+            // so running Drop on the source before the return would invalidate
+            // the very storage being returned.  Keep this skip path local to
+            // the return edge instead of poisoning global ownership state.
+            i64 return_transfer_kind = 0;
+            i64 return_transfer_index = -1;
+            if (return_node >= 0 && raz_compiler_rt_arena_get(hir.node_type_structs, return_node) >= 0) {
+                i64 return_structure = raz_compiler_rt_arena_get(hir.node_type_structs, return_node);
+                if (raz_compiler_rt_arena_get(hir.struct_copy_flags, return_structure) == 0) {
+                    i64 return_kind = raz_compiler_rt_arena_get(hir.node_kinds, return_node);
+                    if (return_kind == 3) {
+                        return_transfer_kind = 3;
+                        return_transfer_index = mir_local_index_for_slot(
+                            hir,
+                            cleanup_function,
+                            raz_compiler_rt_arena_get(hir.node_a, return_node),
+                        );
+                    } else if (return_kind == 2) {
+                        return_transfer_kind = 2;
+                        return_transfer_index =
+                            raz_compiler_rt_arena_get(hir.function_parameter_starts, cleanup_function) +
+                            raz_compiler_rt_arena_get(hir.node_a, return_node);
+                    }
+                }
+            }
+            i64 drop_block = cleanup_block;
+            while (drop_block >= 0) {
+                if (
+                    !lower_hir_emit_scope_drops(
+                        hir,
+                        out,
+                        cleanup_function,
+                        drop_block,
+                        return_transfer_kind,
+                        return_transfer_index,
+                        cursor,
+                    )
+                ) {
+                    return false;
+                }
+                drop_block = raz_compiler_rt_arena_get(hir.block_parent_indices, drop_block);
+            }
+            if (
+                !lower_hir_emit_scope_drops(
+                    hir,
+                    out,
+                    cleanup_function,
+                    -1,
+                    return_transfer_kind,
+                    return_transfer_index,
+                    cursor,
+                )
+            ) {
+                return false;
+            }
+            if (
+                !lower_hir_emit_parameter_drops(
+                    hir,
+                    out,
+                    cleanup_function,
+                    return_transfer_kind,
+                    return_transfer_index,
+                )
+            ) {
+                return false;
+            }
+            if (return_node < 0) {
+                mir_emit(out, 21, 0, 0, 0, 0);
+            } else {
+                mir_emit_typed(out, 10, return_value, 0, 0, 0, return_type);
+            }
+        } else if (kind == 4) {
+            i64 target = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 value = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_b, cursor));
+            if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 2) {
+                i64 parameter_slot =
+                    out.lowering_parameter_local_base +
+                    raz_compiler_rt_arena_get(hir.node_a, target);
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                if (
+                    operation == 0 &&
+                    raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                    hir_structure_needs_drop(
+                        hir,
+                        raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                        0,
+                    )
+                ) {
+                    i64 old_storage = mir_emit_typed(out, 3, parameter_slot, 0, 0, 0, target_type);
+                    if (!lower_hir_emit_statement_predrop(hir, out, cursor, old_storage)) {
+                        return false;
+                    }
+                }
+                if (operation != 0) {
+                    i64 current = mir_emit_typed(out, 3, parameter_slot, 0, 0, 0, target_type);
+                    value = lower_compound_value(out, operation, current, value, target_type);
+                }
+                mir_emit_typed(out, 9, parameter_slot, value, 0, 0, target_type);
+            } else if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 3) {
+                i64 slot = raz_compiler_rt_arena_get(hir.node_a, target);
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                i64 function_index = raz_compiler_rt_arena_get(hir.statement_function_indices, cursor);
+                i64 local_index = mir_local_index_for_slot(hir, function_index, slot);
+                i64 array_extent = raz_compiler_rt_arena_get(hir.local_array_extents, local_index);
+                if (operation == 0 && array_extent >= 0) {
+                    i64 destination = mir_emit_typed(out, 3, slot, 0, 0, 0, 0);
+                    if (
+                        !lower_hir_copy_array_into(
+                            hir,
+                            out,
+                            array_extent,
+                            raz_compiler_rt_arena_get(hir.local_types, local_index),
+                            raz_compiler_rt_arena_get(hir.local_type_structs, local_index),
+                            value,
+                            destination,
+                        )
+                    ) {
+                        return false;
+                    }
+                } else {
+                    if (
+                        operation == 0 &&
+                        raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                        hir_structure_needs_drop(
+                            hir,
+                            raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                            0,
+                        )
+                    ) {
+                        i64 old_storage = mir_emit_typed(
+                            out,
+                            3,
+                            slot,
+                            0,
+                            0,
+                            0,
+                            raz_compiler_rt_arena_get(hir.node_types, target),
+                        );
+                        if (!lower_hir_emit_statement_predrop(hir, out, cursor, old_storage)) {
+                            return false;
+                        }
+                    }
+                    i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                    if (operation != 0) {
+                        i64 current = mir_emit_typed(out, 3, slot, 0, 0, 0, target_type);
+                        value = lower_compound_value(out, operation, current, value, target_type);
+                    }
+                    mir_emit_typed(out, 9, slot, value, 0, 0, target_type);
+                }
+            } else if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 54) {
+                i64 global_index = raz_compiler_rt_arena_get(hir.node_a, target);
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                if (
+                    raz_compiler_rt_arena_get(hir.global_type_structs, global_index) >= 0 ||
+                    raz_compiler_rt_arena_get(hir.global_array_extents, global_index) >= 0
+                ) {
+                    target_type = 0;
+                }
+                bool aggregate_global =
+                    raz_compiler_rt_arena_get(hir.global_type_structs, global_index) >= 0 ||
+                    raz_compiler_rt_arena_get(hir.global_array_extents, global_index) >= 0;
+                if (operation != 0) {
+                    i64 current = mir_emit_typed(out, 47, global_index, 0, 0, 0, target_type);
+                    value = lower_compound_value(out, operation, current, value, target_type);
+                } else if (aggregate_global) {
+                    i64 old_storage = mir_emit_typed(out, 47, global_index, 0, 0, 0, 0);
+                    i64 structure = raz_compiler_rt_arena_get(hir.global_type_structs, global_index);
+                    if (structure >= 0) {
+                        if (!lower_hir_emit_structure_release(hir, out, structure, old_storage, 0)) {
+                            return false;
+                        }
+                    } else {
+                        // Fixed module arrays currently contain scalar leaves, so
+                        // releasing the arena is sufficient for whole replacement.
+                        mir_emit(out, 31, old_storage, 0, 0, 0);
+                    }
+                }
+                mir_emit_typed(out, 48, global_index, value, 0, 0, target_type);
+            } else if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 16) {
+                i64 base = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.node_a, target));
+                i64 field = mir_emit(out, 1, raz_compiler_rt_arena_get(hir.node_b, target), 0, 0, 0);
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                if (
+                    operation == 0 &&
+                    raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                    hir_structure_needs_drop(
+                        hir,
+                        raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                        0,
+                    )
+                ) {
+                    i64 old_storage = mir_emit(out, 28, base, field, 0, 0);
+                    if (!lower_hir_emit_statement_predrop(hir, out, cursor, old_storage)) {
+                        return false;
+                    }
+                }
+                if (operation != 0) {
+                    i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                    if (raz_compiler_rt_arena_get(hir.node_references, target) != 0) {
+                        target_type = 12;
+                    }
+                    i64 current = mir_emit_typed(out, 28, base, field, 0, 0, target_type);
+                    value = lower_compound_value(out, operation, current, value, target_type);
+                }
+                i64 store_instruction = mir_emit(out, 29, base, field, value, 0);
+                mir_record_hir_path_event(hir, out, store_instruction, 2, target);
+            } else if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 21) {
+                i64 pointer_node = raz_compiler_rt_arena_get(hir.node_a, target);
+                i64 address = lower_hir_expression(hir, out, pointer_node);
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                i64 target_structure = raz_compiler_rt_arena_get(hir.node_type_structs, target);
+                i64 pointer_kind = raz_compiler_rt_arena_get(hir.node_references, pointer_node);
+                if (operation == 0 && pointer_kind == 1 && target_structure >= 0) {
+                    // Aggregate borrows carry the aggregate arena handle itself.
+                    // Replacing `*borrow` therefore means dropping the old
+                    // contents while preserving that arena shell, then moving
+                    // the source fields into it. A scalar ref_set would treat
+                    // the aggregate handle as an address and corrupt its header.
+                    if (
+                        raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                        hir_structure_needs_drop(
+                            hir,
+                            raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                            0,
+                        ) &&
+                        !lower_hir_emit_statement_predrop_contents(hir, out, cursor, address)
+                    ) {
+                        return false;
+                    }
+                    i64 source = value;
+                    i64 value_node = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+                    if (
+                        raz_compiler_rt_arena_get(hir.struct_copy_flags, target_structure) != 0 &&
+                        raz_compiler_rt_arena_get(hir.node_kinds, value_node) != 39
+                    ) {
+                        source = lower_hir_copy_structure(hir, out, target_structure, value);
+                    }
+                    if (!lower_hir_move_structure_into(hir, out, target_structure, source, address)) {
+                        return false;
+                    }
+                } else {
+                    if (operation != 0) {
+                        i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                        // Preserve the pointee's scalar type on dereference.
+                        // Legacy MIR emitted an untyped ref_get here, which
+                        // made structured Forge load compound-assignment
+                        // operands with the default scalar width (for example
+                        // `*index += 1` through i64&mut).
+                        i64 current = mir_emit_typed(
+                            out,
+                            26,
+                            address,
+                            target_structure,
+                            raz_compiler_rt_arena_get(hir.node_array_extents, target),
+                            0,
+                            target_type,
+                        );
+                        value = lower_compound_value(
+                            out,
+                            operation,
+                            current,
+                            value,
+                            target_type,
+                        );
+                    }
+                    mir_emit(
+                        out,
+                        27,
+                        address,
+                        value,
+                        target_structure,
+                        raz_compiler_rt_arena_get(hir.node_array_extents, target),
+                    );
+                }
+            } else if (raz_compiler_rt_arena_get(hir.node_kinds, target) == 22) {
+                i64 indexed_base_node = raz_compiler_rt_arena_get(hir.node_a, target);
+                i64 base = lower_hir_expression(hir, out, indexed_base_node);
+                if (raz_compiler_rt_arena_get(hir.node_slices, indexed_base_node) != 0) {
+                    i64 storage_field = mir_emit(out, 1, 0, 0, 0, 0);
+                    base = mir_emit_typed(out, 28, base, storage_field, 0, 0, 12);
+                }
+                i64 index = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.node_b, target));
+                i64 operation = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+                if (
+                    operation == 0 &&
+                    raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor) >= 0 &&
+                    hir_structure_needs_drop(
+                        hir,
+                        raz_compiler_rt_arena_get(hir.statement_predrop_structures, cursor),
+                        0,
+                    )
+                ) {
+                    i64 old_storage = mir_emit(out, 28, base, index, 0, 0);
+                    if (!lower_hir_emit_statement_predrop(hir, out, cursor, old_storage)) {
+                        return false;
+                    }
+                }
+                if (operation != 0) {
+                    i64 target_type = raz_compiler_rt_arena_get(hir.node_types, target);
+                    if (raz_compiler_rt_arena_get(hir.node_references, target) != 0) {
+                        target_type = 12;
+                    }
+                    i64 current = mir_emit_typed(out, 28, base, index, 0, 0, target_type);
+                    value = lower_compound_value(out, operation, current, value, target_type);
+                }
+                mir_emit(out, 29, base, index, value, 0);
+            }
+        } else if (kind == 5) {
+            lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_a, cursor));
+        } else if (kind == 11) {
+            i64 cleanup_block = raz_compiler_rt_arena_get(hir.statement_block_indices, cursor);
+            i64 cleanup_loop_depth = -1;
+            if (cleanup_block >= 0) {
+                cleanup_loop_depth = raz_compiler_rt_arena_get(hir.block_loop_depths, cleanup_block);
+            }
+            while (cleanup_block >= 0) {
+                i64 cleanup_remaining = raz_compiler_rt_arena_get(hir.block_defer_counts, cleanup_block);
+                i64 cleanup_start = raz_compiler_rt_arena_get(hir.block_defer_starts, cleanup_block);
+                while (cleanup_remaining > 0) {
+                    cleanup_remaining -= 1;
+                    i64 deferred_block = raz_compiler_rt_arena_get(
+                        hir.defer_blocks,
+                        cleanup_start + cleanup_remaining,
+                    );
+                    i64 deferred_start = raz_compiler_rt_arena_get(
+                        hir.block_statement_starts,
+                        deferred_block
+                    );
+                    i64 deferred_end =
+                        deferred_start +
+                        raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+                    if (
+                        !lower_hir_statement_range(
+                            hir,
+                            out,
+                            deferred_start,
+                            deferred_end,
+                            raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                            raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+                i64 cleanup_parent = raz_compiler_rt_arena_get(hir.block_parent_indices, cleanup_block);
+                if (
+                    cleanup_parent < 0 ||
+                    raz_compiler_rt_arena_get(hir.block_loop_depths, cleanup_parent) < cleanup_loop_depth
+                ) {
+                    cleanup_block = -1;
+                } else {
+                    cleanup_block = cleanup_parent;
+                }
+            }
+            mir_emit(out, 22, 0, -2, -1, 0);
+        } else if (kind == 12) {
+            i64 cleanup_block = raz_compiler_rt_arena_get(hir.statement_block_indices, cursor);
+            i64 cleanup_loop_depth = -1;
+            if (cleanup_block >= 0) {
+                cleanup_loop_depth = raz_compiler_rt_arena_get(hir.block_loop_depths, cleanup_block);
+            }
+            while (cleanup_block >= 0) {
+                i64 cleanup_remaining = raz_compiler_rt_arena_get(hir.block_defer_counts, cleanup_block);
+                i64 cleanup_start = raz_compiler_rt_arena_get(hir.block_defer_starts, cleanup_block);
+                while (cleanup_remaining > 0) {
+                    cleanup_remaining -= 1;
+                    i64 deferred_block = raz_compiler_rt_arena_get(
+                        hir.defer_blocks,
+                        cleanup_start + cleanup_remaining,
+                    );
+                    i64 deferred_start = raz_compiler_rt_arena_get(
+                        hir.block_statement_starts,
+                        deferred_block
+                    );
+                    i64 deferred_end =
+                        deferred_start +
+                        raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+                    if (
+                        !lower_hir_statement_range(
+                            hir,
+                            out,
+                            deferred_start,
+                            deferred_end,
+                            raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                            raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+                i64 cleanup_parent = raz_compiler_rt_arena_get(hir.block_parent_indices, cleanup_block);
+                if (
+                    cleanup_parent < 0 ||
+                    raz_compiler_rt_arena_get(hir.block_loop_depths, cleanup_parent) < cleanup_loop_depth
+                ) {
+                    cleanup_block = -1;
+                } else {
+                    cleanup_block = cleanup_parent;
+                }
+            }
+            mir_emit(out, 22, 0, -3, -1, 0);
+        } else if (kind == 14) {
+            i64 nested_block = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, nested_block);
+            i64 nested_end =
+                nested_start +
+                raz_compiler_rt_arena_get(hir.block_statement_counts, nested_block);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    nested_start,
+                    nested_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, nested_block),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, nested_block),
+                )
+            ) {
+                return false;
+            }
+        } else if (kind == 15) {
+            i64 subject_node = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 subject = lower_hir_expression(hir, out, subject_node);
+            i64 arm = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 arm_end = arm + raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 match_enum = -1;
+            i64 enum_probe = arm;
+            while (enum_probe < arm_end && match_enum < 0) {
+                match_enum = raz_compiler_rt_arena_get(hir.match_arm_enum_indices, enum_probe);
+                enum_probe += 1;
+            }
+            bool payload_enum =
+                match_enum >= 0 &&
+                raz_compiler_rt_arena_get(hir.enum_has_payload, match_enum) != 0;
+            i64 subject_tag = subject;
+            if (payload_enum) {
+                i64 tag_index = mir_emit(out, 1, 0, 0, 0, 0);
+                subject_tag = mir_emit(out, 28, subject, tag_index, 0, 0);
+            }
+            i64 match_instruction_start = out.instruction_count;
+            while (arm < arm_end) {
+                i64 arm_block = raz_compiler_rt_arena_get(hir.match_arm_blocks, arm);
+                i64 branch = -1;
+                i64 guard_branch = -1;
+                if (raz_compiler_rt_arena_get(hir.match_arm_wildcards, arm) == 0) {
+                    i64 pattern = mir_emit(
+                        out,
+                        1,
+                        raz_compiler_rt_arena_get(hir.match_arm_values, arm),
+                        0,
+                        0,
+                        0,
+                    );
+                    i64 condition = mir_emit(out, 11, subject_tag, pattern, 0, 0);
+                    i64 nested_test = raz_compiler_rt_arena_get(hir.match_arm_nested_test_starts, arm);
+                    i64 nested_test_end =
+                        nested_test + raz_compiler_rt_arena_get(hir.match_arm_nested_test_counts, arm);
+                    while (nested_test < nested_test_end) {
+                        i64 nested_path = raz_compiler_rt_arena_get(
+                            hir.match_nested_test_path_indices,
+                            nested_test,
+                        );
+                        i64 nested_value = lower_match_path_value(hir, out, subject, nested_path);
+                        i64 tag_slot = mir_emit(out, 1, 0, 0, 0, 0);
+                        i64 nested_tag = mir_emit(out, 28, nested_value, tag_slot, 0, 0);
+                        i64 nested_pattern = mir_emit(
+                            out,
+                            1,
+                            raz_compiler_rt_arena_get(hir.match_nested_test_values, nested_test),
+                            0,
+                            0,
+                            0,
+                        );
+                        i64 nested_condition = mir_emit(out, 11, nested_tag, nested_pattern, 0, 0);
+                        condition = mir_emit(out, 19, condition, nested_condition, 0, 0);
+                        nested_test += 1;
+                    }
+                    branch = mir_emit(out, 23, condition, -1, -1, -1);
+                    mir_emit(out, 24, 0, 0, 0, 0);
+                }
+                i64 binding_start = raz_compiler_rt_arena_get(hir.match_arm_binding_starts, arm);
+                i64 binding_count = raz_compiler_rt_arena_get(hir.match_arm_binding_counts, arm);
+                i64 member_index = raz_compiler_rt_arena_get(hir.match_arm_member_indices, arm);
+                i64 payload_start = 0;
+                if (member_index >= 0) {
+                    payload_start = raz_compiler_rt_arena_get(hir.enum_member_payload_starts, member_index);
+                }
+                i64 binding = 0;
+                while (binding < binding_count) {
+                    i64 local_slot = raz_compiler_rt_arena_get(
+                        hir.match_binding_local_slots,
+                        binding_start + binding,
+                    );
+                    if (local_slot >= 0) {
+                        i64 binding_path = raz_compiler_rt_arena_get(
+                            hir.match_binding_path_indices,
+                            binding_start + binding,
+                        );
+                        i64 binding_mode = raz_compiler_rt_arena_get(
+                            hir.match_binding_modes,
+                            binding_start + binding,
+                        );
+                        i64 payload_value = -1;
+                        if (binding_mode == 0) {
+                            payload_value = lower_match_path_value(hir, out, subject, binding_path);
+                        } else {
+                            payload_value = lower_match_path_reference(
+                                hir,
+                                out,
+                                subject,
+                                binding_path,
+                                binding_mode,
+                            );
+                        }
+                        i64 local_index = mir_local_index_for_slot(
+                            hir,
+                            out.lowering_function_index,
+                            local_slot,
+                        );
+                        i64 payload_type = 0;
+                        i64 payload_structure = -1;
+                        i64 payload_extent = -1;
+                        if (local_index >= 0) {
+                            payload_type = raz_compiler_rt_arena_get(hir.local_types, local_index);
+                            payload_structure = raz_compiler_rt_arena_get(hir.local_type_structs, local_index);
+                            payload_extent = raz_compiler_rt_arena_get(hir.local_array_extents, local_index);
+                        }
+                        // Match payload projections (MIR get/opcode 28) need to
+                        // retain aggregate shape explicitly. Payload-bearing enum
+                        // images are compatibility arenas rather than HIR structs,
+                        // so native shape discovery cannot infer a String/array
+                        // child from the parent image alone. Without this metadata
+                        // structured Forge loads the first word of the payload as a
+                        // scalar instead of carrying the inline aggregate address.
+                        if (
+                            binding_mode == 0 &&
+                            payload_value >= 0 &&
+                            raz_compiler_rt_arena_get(out.opcodes, payload_value) == 28 &&
+                            (payload_structure >= 0 || payload_extent >= 0)
+                        ) {
+                            i64 encoded_structure = 0;
+                            i64 encoded_extent = 0;
+                            if (payload_structure >= 0) { encoded_structure = payload_structure + 1; }
+                            if (payload_extent >= 0) { encoded_extent = payload_extent + 1; }
+                            raz_compiler_rt_arena_set(out.op_c, payload_value, encoded_structure);
+                            raz_compiler_rt_arena_set(out.op_d, payload_value, encoded_extent);
+                        }
+                        if (binding_mode == 0 && payload_structure < 0 && payload_type != 0) {
+                            payload_value = mir_emit_typed(out, 40, payload_value, 0, 0, 0, payload_type);
+                        }
+                        i64 stored_type = payload_type;
+                        if (binding_mode != 0) { stored_type = 12; }
+                        mir_emit_typed(out, 9, local_slot, payload_value, 0, 0, stored_type);
+                    }
+                    binding += 1;
+                }
+                i64 guard_node = raz_compiler_rt_arena_get(hir.match_arm_guards, arm);
+                if (guard_node >= 0) {
+                    // Bindings are initialized before the guard, so the guard can
+                    // inspect destructured values. A false guard falls through
+                    // to the next structural arm rather than terminating match.
+                    i64 guard_condition = lower_hir_expression(hir, out, guard_node);
+                    guard_branch = mir_emit(out, 23, guard_condition, -1, -1, -1);
+                    mir_emit(out, 24, 0, 0, 0, 0);
+                }
+                i64 arm_start = raz_compiler_rt_arena_get(hir.block_statement_starts, arm_block);
+                i64 arm_statement_end =
+                    arm_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, arm_block);
+                if (
+                    !lower_hir_statement_range(
+                        hir,
+                        out,
+                        arm_start,
+                        arm_statement_end,
+                        raz_compiler_rt_arena_get(hir.block_defer_starts, arm_block),
+                        raz_compiler_rt_arena_get(hir.block_defer_counts, arm_block),
+                    )
+                ) {
+                    return false;
+                }
+                if (!hir_statement_range_terminates(hir, arm_start, arm_statement_end)) {
+                    mir_emit(out, 22, 0, -4, -1, 0);
+                }
+                if (branch >= 0 || guard_branch >= 0) {
+                    i64 next_label = mir_emit(out, 24, 0, 0, 0, 0);
+                    if (branch >= 0) {
+                        if (
+                            !mir_patch_operand(out, branch, 1, next_label) ||
+                            !mir_patch_operand(out, branch, 2, branch + 1)
+                        ) {
+                            return false;
+                        }
+                    }
+                    if (guard_branch >= 0) {
+                        if (
+                            !mir_patch_operand(out, guard_branch, 1, next_label) ||
+                            !mir_patch_operand(out, guard_branch, 2, guard_branch + 1)
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+                arm += 1;
+            }
+            i64 merge_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 patch = match_instruction_start;
+            while (patch < merge_label) {
+                if (
+                    raz_compiler_rt_arena_get(out.opcodes, patch) == 22 &&
+                    raz_compiler_rt_arena_get(out.op_b, patch) == -4
+                ) {
+                    if (!mir_patch_target(out, patch, merge_label)) {
+                        return false;
+                    }
+                }
+                patch += 1;
+            }
+        } else if (kind == 19) {
+            // Custom iteration is desugared to the stable IntoIterator /
+            // Iterator protocol without introducing a separate runtime ABI:
+            // iterator = iterable.into_iter(); while iterator.next() {
+            //     item = iterator.current(); body
+            // }
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 iterator_loop = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 body = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 iterator_slot = raz_compiler_rt_arena_get(hir.node_values, iterator_loop);
+            i64 iterator_value = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.node_a, iterator_loop),
+            );
+            // An aggregate local's slot holds a pointer to its storage, so the
+            // `self` receiver for next()/current() is the pointer read out of
+            // that slot. Taking the slot's own address instead passes a
+            // pointer-to-pointer and the iterator reads garbage fields.
+            i64 iterator_type = raz_compiler_rt_arena_get(
+                hir.node_types,
+                raz_compiler_rt_arena_get(hir.node_a, iterator_loop)
+            );
+            mir_emit_typed(out, 9, iterator_slot, iterator_value, 0, 0, iterator_type);
+            i64 loop_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 iterator_ref = mir_emit_typed(out, 3, iterator_slot, 0, 0, 0, iterator_type);
+            i64 next_argument_start = out.call_argument_count;
+            raz_compiler_rt_arena_set(out.call_arguments, out.call_argument_count, iterator_ref);
+            out.call_argument_count += 1;
+            i64 next_function = raz_compiler_rt_arena_get(hir.node_b, iterator_loop);
+            i64 condition = mir_emit_typed(out, 8, next_function, next_argument_start, 1, 0, 10);
+            i64 branch = mir_emit(out, 23, condition, -1, -1, -1);
+            i64 body_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 current_ref = mir_emit_typed(out, 3, iterator_slot, 0, 0, 0, iterator_type);
+            i64 current_argument_start = out.call_argument_count;
+            raz_compiler_rt_arena_set(out.call_arguments, out.call_argument_count, current_ref);
+            out.call_argument_count += 1;
+            i64 current_function = raz_compiler_rt_arena_get(hir.node_c, iterator_loop);
+            i64 current_type = raz_compiler_rt_arena_get(hir.function_return_types, current_function);
+            i64 current_storage_type = current_type;
+            if (raz_compiler_rt_arena_get(hir.function_return_references, current_function) != 0) {
+                current_storage_type = 12;
+            }
+            i64 current_value = mir_emit_typed(
+                out,
+                8,
+                current_function,
+                current_argument_start,
+                1,
+                0,
+                current_storage_type,
+            );
+            mir_emit_typed(out, 9, slot, current_value, 0, 0, current_storage_type);
+            i64 body_instruction_start = out.instruction_count;
+            i64 body_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 body_end = body_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    body_start,
+                    body_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, body),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, body),
+                )
+            ) {
+                return false;
+            }
+            if (!hir_statement_range_terminates(hir, body_start, body_end)) {
+                mir_emit(out, 22, 0, loop_label, -1, 0);
+            }
+            i64 exit_label = mir_emit(out, 24, 0, 0, 0, 0);
+            if (
+                !mir_patch_operand(out, branch, 1, exit_label) ||
+                !mir_patch_operand(out, branch, 2, body_label)
+            ) {
+                return false;
+            }
+            i64 patch = body_instruction_start;
+            while (patch < exit_label) {
+                if (raz_compiler_rt_arena_get(out.opcodes, patch) == 22) {
+                    i64 target = raz_compiler_rt_arena_get(out.op_b, patch);
+                    if (target == -2) {
+                        if (!mir_patch_target(out, patch, exit_label)) {
+                            return false;
+                        }
+                    } else if (target == -3) {
+                        if (!mir_patch_target(out, patch, loop_label)) {
+                            return false;
+                        }
+                    }
+                }
+                patch += 1;
+            }
+        } else if (kind == 17) {
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 array_loop = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 body = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 element_type = raz_compiler_rt_arena_get(hir.node_types, array_loop);
+            i64 element_structure = raz_compiler_rt_arena_get(hir.node_type_structs, array_loop);
+            i64 array_value = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.node_a, array_loop)
+            );
+            i64 array_extent = raz_compiler_rt_arena_get(hir.node_b, array_loop);
+            i64 index_slot = raz_compiler_rt_arena_get(hir.node_c, array_loop);
+            i64 zero = mir_emit_typed(out, 1, 0, 0, 0, 0, 0);
+            mir_emit_typed(out, 9, index_slot, zero, 0, 0, 0);
+            i64 loop_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 current_index = mir_emit_typed(out, 3, index_slot, 0, 0, 0, 0);
+            i64 extent_value = mir_emit_typed(out, 1, array_extent, 0, 0, 0, 0);
+            i64 condition = mir_emit_typed(out, 13, current_index, extent_value, 0, 0, 0);
+            i64 branch = mir_emit(out, 23, condition, -1, -1, -1);
+            i64 body_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 borrow_kind = raz_compiler_rt_arena_get(hir.node_values, array_loop);
+            i64 element_value = -1;
+            if (borrow_kind != 0) {
+                // Arrays use the stage arena representation in compilered
+                // lowering, so the same reference handle used for locals can
+                // point directly at an aggregate element. This preserves real
+                // element-reference semantics for `for x in &array`.
+                element_value = mir_emit_typed(out, 45, array_value, current_index, borrow_kind, 0, 12);
+                mir_emit_typed(out, 9, slot, element_value, 0, 0, 12);
+            } else {
+                i64 raw_element = mir_emit(out, 28, array_value, current_index, 0, 0);
+                element_value = raw_element;
+                if (element_structure < 0 && element_type != 0) {
+                    element_value = mir_emit_typed(out, 40, raw_element, 0, 0, 0, element_type);
+                }
+                mir_emit_typed(out, 9, slot, element_value, 0, 0, element_type);
+            }
+            i64 body_instruction_start = out.instruction_count;
+            i64 body_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 body_end = body_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    body_start,
+                    body_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, body),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, body),
+                )
+            ) {
+                return false;
+            }
+            i64 increment_label = mir_emit(out, 24, 0, 0, 0, 0);
+            if (!hir_statement_range_terminates(hir, body_start, body_end)) {
+                i64 loaded_index = mir_emit_typed(out, 3, index_slot, 0, 0, 0, 0);
+                i64 one = mir_emit_typed(out, 1, 1, 0, 0, 0, 0);
+                i64 next_index = mir_emit_typed(out, 4, loaded_index, one, 0, 0, 0);
+                mir_emit_typed(out, 9, index_slot, next_index, 0, 0, 0);
+                mir_emit(out, 22, 0, loop_label, -1, 0);
+            } else {
+                i64 patch_cursor = body_instruction_start;
+                bool has_continue = false;
+                while (patch_cursor < increment_label) {
+                    if (
+                        raz_compiler_rt_arena_get(out.opcodes, patch_cursor) == 22 &&
+                        raz_compiler_rt_arena_get(out.op_b, patch_cursor) == -3
+                    ) {
+                        has_continue = true;
+                    }
+                    patch_cursor += 1;
+                }
+                if (has_continue) {
+                    i64 loaded_index = mir_emit_typed(out, 3, index_slot, 0, 0, 0, 0);
+                    i64 one = mir_emit_typed(out, 1, 1, 0, 0, 0, 0);
+                    i64 next_index = mir_emit_typed(out, 4, loaded_index, one, 0, 0, 0);
+                    mir_emit_typed(out, 9, index_slot, next_index, 0, 0, 0);
+                    mir_emit(out, 22, 0, loop_label, -1, 0);
+                }
+            }
+            i64 exit_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 patch = body_instruction_start;
+            while (patch < exit_label) {
+                if (raz_compiler_rt_arena_get(out.opcodes, patch) == 22) {
+                    i64 target = raz_compiler_rt_arena_get(out.op_b, patch);
+                    if (target == -2) {
+                        if (!mir_patch_target(out, patch, exit_label)) {
+                            return false;
+                        }
+                    } else if (target == -3) {
+                        if (!mir_patch_target(out, patch, increment_label)) {
+                            return false;
+                        }
+                    }
+                }
+                patch += 1;
+            }
+            if (
+                !mir_patch_operand(out, branch, 1, exit_label) ||
+                !mir_patch_operand(out, branch, 2, body_label)
+            ) {
+                return false;
+            }
+        } else if (kind == 13) {
+            i64 slot = raz_compiler_rt_arena_get(hir.statement_a, cursor);
+            i64 range = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 body = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            i64 range_type = raz_compiler_rt_arena_get(hir.node_types, range);
+            i64 start_value = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.node_a, range));
+            i64 end_value = lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.node_b, range));
+            mir_emit_typed(out, 9, slot, start_value, 0, 0, range_type);
+            i64 loop_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 current_value = mir_emit_typed(out, 3, slot, 0, 0, 0, range_type);
+            i64 compare_opcode = 13;
+            if (raz_compiler_rt_arena_get(hir.node_c, range) != 0) {
+                compare_opcode = 14;
+            }
+            i64 condition = mir_emit_typed(out, compare_opcode, current_value, end_value, 0, 0, range_type);
+            i64 branch = mir_emit(out, 23, condition, -1, -1, -1);
+            i64 body_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 body_instruction_start = out.instruction_count;
+            i64 body_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 body_end = body_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 nested_end = nested_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    nested_start,
+                    nested_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, body),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, body),
+                )
+            ) {
+                return false;
+            }
+            i64 increment_label = mir_emit(out, 24, 0, 0, 0, 0);
+            if (!hir_statement_range_terminates(hir, body_start, body_end)) {
+                i64 loaded = mir_emit_typed(out, 3, slot, 0, 0, 0, range_type);
+                i64 one = mir_emit_typed(out, 1, 1, 0, 0, 0, range_type);
+                i64 next_value = mir_emit_typed(out, 4, loaded, one, 0, 0, range_type);
+                mir_emit_typed(out, 9, slot, next_value, 0, 0, range_type);
+                mir_emit(out, 22, 0, loop_label, -1, 0);
+            } else {
+                // A continue terminator still needs the induction update.
+                i64 patch_cursor = body_instruction_start;
+                bool has_continue = false;
+                while (patch_cursor < increment_label) {
+                    if (
+                        raz_compiler_rt_arena_get(out.opcodes, patch_cursor) == 22 &&
+                        raz_compiler_rt_arena_get(out.op_b, patch_cursor) == -3
+                    ) {
+                        has_continue = true;
+                    }
+                    patch_cursor += 1;
+                }
+                if (has_continue) {
+                    i64 loaded = mir_emit_typed(out, 3, slot, 0, 0, 0, range_type);
+                    i64 one = mir_emit_typed(out, 1, 1, 0, 0, 0, range_type);
+                    i64 next_value = mir_emit_typed(out, 4, loaded, one, 0, 0, range_type);
+                    mir_emit_typed(out, 9, slot, next_value, 0, 0, range_type);
+                    mir_emit(out, 22, 0, loop_label, -1, 0);
+                }
+            }
+            i64 exit_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 patch = body_instruction_start;
+            while (patch < exit_label) {
+                if (raz_compiler_rt_arena_get(out.opcodes, patch) == 22) {
+                    i64 target = raz_compiler_rt_arena_get(out.op_b, patch);
+                    if (target == -2) {
+                        if (!mir_patch_target(out, patch, exit_label)) {
+                            return false;
+                        }
+                    } else if (target == -3) {
+                        if (!mir_patch_target(out, patch, increment_label)) {
+                            return false;
+                        }
+                    }
+                }
+                patch += 1;
+            }
+            if (
+                !mir_patch_operand(out, branch, 1, exit_label) ||
+                !mir_patch_operand(out, branch, 2, body_label)
+            ) {
+                return false;
+            }
+        } else if (kind == 6) {
+            i64 loop_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 condition = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.statement_a, cursor)
+            );
+            i64 branch = mir_emit(out, 23, condition, -1, -1, -1);
+            i64 body_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 body_instruction_start = out.instruction_count;
+            i64 body = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 body_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 body_end = body_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, body);
+            i64 nested_end = nested_start + raz_compiler_rt_arena_get(hir.block_statement_counts, body);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    nested_start,
+                    nested_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, body),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, body),
+                )
+            ) {
+                return false;
+            }
+            if (!hir_statement_range_terminates(hir, body_start, body_end)) {
+                mir_emit(out, 22, 0, loop_label, -1, 0);
+            }
+            i64 exit_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 patch = body_instruction_start;
+            while (patch < exit_label) {
+                if (raz_compiler_rt_arena_get(out.opcodes, patch) == 22) {
+                    i64 target = raz_compiler_rt_arena_get(out.op_b, patch);
+                    if (target == -2) {
+                        if (!mir_patch_target(out, patch, exit_label)) {
+                            return false;
+                        }
+                    } else if (target == -3) {
+                        if (!mir_patch_target(out, patch, loop_label)) {
+                            return false;
+                        }
+                    }
+                }
+                patch += 1;
+            }
+            if (
+                !mir_patch_operand(out, branch, 1, exit_label) ||
+                !mir_patch_operand(out, branch, 2, body_label)
+            ) {
+                return false;
+            }
+        } else if (kind == 7) {
+            i64 condition = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.statement_a, cursor)
+            );
+            i64 branch = mir_emit(out, 23, condition, -1, -1, -1);
+            i64 then_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 then_block = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 then_start = raz_compiler_rt_arena_get(hir.block_statement_starts, then_block);
+            i64 then_end = then_start + raz_compiler_rt_arena_get(hir.block_statement_counts, then_block);
+            i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, then_block);
+            i64 nested_end = nested_start + raz_compiler_rt_arena_get(hir.block_statement_counts, then_block);
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    nested_start,
+                    nested_end,
+                    raz_compiler_rt_arena_get(hir.block_defer_starts, then_block),
+                    raz_compiler_rt_arena_get(hir.block_defer_counts, then_block),
+                )
+            ) {
+                return false;
+            }
+            bool then_terminates = hir_statement_range_terminates(hir, then_start, then_end);
+            i64 then_jump = -1;
+            if (!then_terminates) {
+                then_jump = mir_emit(out, 22, 0, -1, -1, 0);
+            }
+            i64 else_label = mir_emit(out, 24, 0, 0, 0, 0);
+            i64 else_block = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            if (else_block >= 0) {
+                i64 else_start = raz_compiler_rt_arena_get(hir.block_statement_starts, else_block);
+                i64 else_end = else_start + raz_compiler_rt_arena_get(hir.block_statement_counts, else_block);
+                i64 nested_start = raz_compiler_rt_arena_get(hir.block_statement_starts, else_block);
+                i64 nested_end =
+                    nested_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, else_block);
+                if (
+                    !lower_hir_statement_range(
+                        hir,
+                        out,
+                        nested_start,
+                        nested_end,
+                        raz_compiler_rt_arena_get(hir.block_defer_starts, else_block),
+                        raz_compiler_rt_arena_get(hir.block_defer_counts, else_block),
+                    )
+                ) {
+                    return false;
+                }
+            }
+            i64 merge_label = mir_emit(out, 24, 0, 0, 0, 0);
+            if (
+                !mir_patch_operand(out, branch, 1, else_label) ||
+                !mir_patch_operand(out, branch, 2, then_label)
+            ) {
+                return false;
+            }
+            if (then_jump >= 0 && !mir_patch_target(out, then_jump, merge_label)) {
+                return false;
+            }
+        } else {
+            i64 condition = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.statement_a, cursor)
+            );
+            i64 then_value = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.statement_b, cursor)
+            );
+            i64 else_value = lower_hir_expression(
+                hir,
+                out,
+                raz_compiler_rt_arena_get(hir.statement_c, cursor)
+            );
+            i64 selected = mir_emit(out, 17, condition, then_value, else_value, 0);
+            mir_emit(out, 10, selected, 0, 0, 0);
+        }
+        if (kind == 2 || kind == 3 || kind == 11 || kind == 12) {
+            return true;
+        }
+        if (kind == 7) {
+            i64 terminating_then = raz_compiler_rt_arena_get(hir.statement_b, cursor);
+            i64 terminating_else = raz_compiler_rt_arena_get(hir.statement_c, cursor);
+            if (terminating_else >= 0) {
+                i64 terminating_then_start = raz_compiler_rt_arena_get(
+                    hir.block_statement_starts,
+                    terminating_then,
+                );
+                i64 terminating_then_end =
+                    terminating_then_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, terminating_then);
+                i64 terminating_else_start = raz_compiler_rt_arena_get(
+                    hir.block_statement_starts,
+                    terminating_else,
+                );
+                i64 terminating_else_end =
+                    terminating_else_start +
+                    raz_compiler_rt_arena_get(hir.block_statement_counts, terminating_else);
+                if (
+                    hir_statement_range_terminates(hir, terminating_then_start, terminating_then_end) &&
+                    hir_statement_range_terminates(hir, terminating_else_start, terminating_else_end)
+                ) {
+                    return true;
+                }
+            }
+        }
+        cursor += 1;
+    }
+    i64 cleanup_remaining = scope_defer_count;
+    while (cleanup_remaining > 0) {
+        cleanup_remaining -= 1;
+        i64 deferred_block = raz_compiler_rt_arena_get(
+            hir.defer_blocks,
+            scope_defer_start + cleanup_remaining
+        );
+        i64 deferred_start = raz_compiler_rt_arena_get(hir.block_statement_starts, deferred_block);
+        i64 deferred_end =
+            deferred_start +
+            raz_compiler_rt_arena_get(hir.block_statement_counts, deferred_block);
+        if (
+            !lower_hir_statement_range(
+                hir,
+                out,
+                deferred_start,
+                deferred_end,
+                raz_compiler_rt_arena_get(hir.block_defer_starts, deferred_block),
+                raz_compiler_rt_arena_get(hir.block_defer_counts, deferred_block),
+            )
+        ) {
+            return false;
+        }
+    }
+    if (!hir_statement_range_terminates(hir, range_start, end)) {
+        i64 scope_function = -1;
+        i64 scope_block = -1;
+        if (range_start < end) {
+            scope_function = raz_compiler_rt_arena_get(hir.statement_function_indices, range_start);
+            scope_block = raz_compiler_rt_arena_get(hir.statement_block_indices, range_start);
+        }
+        if (
+            scope_function >= 0 &&
+            !lower_hir_emit_scope_drops(hir, out, scope_function, scope_block, 0, -1, -1)
+        ) {
+            return false;
+        }
+        if (
+            scope_function >= 0 &&
+            scope_block < 0 &&
+            !lower_hir_emit_parameter_drops(hir, out, scope_function, 0, -1)
+        ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn lower_hir_spill_parameters(HirModule& hir, MirModule&mut out, i64 function_index) -> bool {
+    i64 declared_local_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
+    i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    out.lowering_parameter_local_base = declared_local_count;
+    out.lowering_parameter_start = parameter_start;
+    out.lowering_function_index = function_index;
+    bool has_mutated_parameter = false;
+    i64 parameter = 0;
+    while (parameter < parameter_count) {
+        if (raz_compiler_rt_arena_get(hir.parameter_mutated, parameter_start + parameter) != 0) {
+            has_mutated_parameter = true;
+        }
+        parameter += 1;
+    }
+    if (has_mutated_parameter) {
+        raz_compiler_rt_arena_set(
+            out.function_local_counts,
+            function_index,
+            declared_local_count + parameter_count,
+        );
+    } else {
+        raz_compiler_rt_arena_set(out.function_local_counts, function_index, declared_local_count);
+    }
+    if (raz_compiler_rt_arena_get(hir.function_is_extern, function_index) != 0 || !has_mutated_parameter) {
+        return true;
+    }
+    parameter = 0;
+    while (parameter < parameter_count) {
+        if (raz_compiler_rt_arena_get(hir.parameter_mutated, parameter_start + parameter) != 0) {
+            i64 type_kind = raz_compiler_rt_arena_get(hir.parameter_types, parameter_start + parameter);
+            if (raz_compiler_rt_arena_get(hir.parameter_references, parameter_start + parameter) != 0) {
+                type_kind = 12;
+            }
+            i64 incoming = mir_emit_typed(out, 2, parameter, 0, 0, 0, type_kind);
+            mir_emit_typed(out, 9, declared_local_count + parameter, incoming, 0, 0, type_kind);
+        }
+        parameter += 1;
+    }
+    return true;
+}
+
+fn mir_materialize_static_global_value(HirModule& hir, i64 node) -> i64 {
+    if (node < 0) {
+        return 0;
+    }
+    i64 kind = raz_compiler_rt_arena_get(hir.node_kinds, node);
+    if (kind == 1 || kind == 30 || kind == 47) {
+        return raz_compiler_rt_arena_get(hir.node_values, node);
+    }
+    if (kind == 53 || kind == 34) {
+        i64 argument_start = raz_compiler_rt_arena_get(hir.node_a, node);
+        i64 argument_count = raz_compiler_rt_arena_get(hir.node_b, node);
+        if (kind == 34) {
+            argument_start = raz_compiler_rt_arena_get(hir.node_b, node);
+            argument_count = raz_compiler_rt_arena_get(hir.node_c, node);
+        }
+        i64 storage = raz_compiler_rt_arena_create(argument_count);
+        if (storage == 0) {
+            return 0;
+        }
+        i64 argument = 0;
+        while (argument < argument_count) {
+            i64 child = raz_compiler_rt_arena_get(hir.arguments, argument_start + argument);
+            raz_compiler_rt_arena_set(storage, argument, mir_materialize_static_global_value(hir, child));
+            argument += 1;
+        }
+        return storage;
+    }
+    return 0;
+}
+
+public fn lower_hir(HirModule& hir, MirModule&mut out) -> bool {
+    if (!init_mir(out)) {
+        return false;
+    }
+    out.function_count = hir.function_count;
+    out.global_count = hir.global_count;
+    out.module_count = hir.incremental_module_fingerprint_count;
+    if (!lower_hir_prepare_cleanup_indexes(hir, out)) {
+        return false;
+    }
+    i64 module_index = 0;
+    while (module_index < out.module_count) {
+        raz_compiler_rt_arena_set(
+            out.module_ids,
+            module_index,
+            raz_compiler_rt_arena_get(hir.incremental_module_ids, module_index),
+        );
+        raz_compiler_rt_arena_set(
+            out.module_function_starts,
+            module_index,
+            raz_compiler_rt_arena_get(hir.incremental_module_function_starts, module_index),
+        );
+        raz_compiler_rt_arena_set(
+            out.module_function_counts,
+            module_index,
+            raz_compiler_rt_arena_get(hir.incremental_module_function_counts, module_index),
+        );
+        module_index += 1;
+    }
+    i64 module_function_index = 0;
+    while (module_function_index < hir.function_count) {
+        raz_compiler_rt_arena_set(
+            out.module_function_indices,
+            module_function_index,
+            raz_compiler_rt_arena_get(hir.incremental_module_function_indices, module_function_index),
+        );
+        module_function_index += 1;
+    }
+    i64 global_index = 0;
+    while (global_index < hir.global_count) {
+        i64 external_global = raz_compiler_rt_arena_get(hir.global_extern_flags, global_index);
+        raz_compiler_rt_arena_set(out.global_extern_flags, global_index, external_global);
+        i64 initial_value = 0;
+        if (external_global == 0) {
+            i64 initializer = raz_compiler_rt_arena_get(hir.global_initializer_nodes, global_index);
+            if (initializer >= 0) {
+                initial_value = mir_materialize_static_global_value(hir, initializer);
+            }
+        }
+        raz_compiler_rt_arena_set(out.global_values, global_index, initial_value);
+        global_index += 1;
+    }
+    if (
+        hir.function_count == 1 &&
+        !mir_function_needs_drop_cleanup(out, 0) &&
+        raz_compiler_rt_arena_get(hir.function_statement_counts, 0) == 1 &&
+        raz_compiler_rt_arena_get(hir.function_defer_counts, 0) == 0
+    ) {
+        i64 direct_statement = raz_compiler_rt_arena_get(hir.function_statement_starts, 0);
+        if (raz_compiler_rt_arena_get(hir.statement_kinds, direct_statement) == 2) {
+            raz_compiler_rt_arena_set(out.function_instruction_starts, 0, out.instruction_count);
+            raz_compiler_rt_arena_set(
+                out.function_module_ids,
+                0,
+                raz_compiler_rt_arena_get(hir.incremental_function_module_ids, 0),
+            );
+            raz_compiler_rt_arena_set(
+                out.function_parameter_counts,
+                0,
+                raz_compiler_rt_arena_get(hir.function_parameter_counts, 0),
+            );
+            raz_compiler_rt_arena_set(
+                out.function_is_extern,
+                0,
+                raz_compiler_rt_arena_get(hir.function_is_extern, 0),
+            );
+            raz_compiler_rt_arena_set(
+                out.function_extern_kinds,
+                0,
+                raz_compiler_rt_arena_get(hir.function_extern_kinds, 0),
+            );
+            if (!lower_hir_spill_parameters(hir, out, 0)) {
+                return false;
+            }
+            i64 direct_return_node = raz_compiler_rt_arena_get(hir.statement_a, direct_statement);
+            i64 direct_return_opcode = 21;
+            i64 direct_return_operand = 0;
+            if (direct_return_node >= 0) {
+                direct_return_opcode = 10;
+                direct_return_operand = lower_hir_expression(hir, out, direct_return_node);
+            }
+            i64 direct_terminator = mir_emit(out, direct_return_opcode, direct_return_operand, 0, 0, 0);
+            raz_compiler_rt_arena_set(
+                out.function_instruction_counts,
+                0,
+                out.instruction_count - raz_compiler_rt_arena_get(out.function_instruction_starts, 0),
+            );
+            return true;
+        }
+    }
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        raz_compiler_rt_arena_set(out.function_instruction_starts, function_index, out.instruction_count);
+        raz_compiler_rt_arena_set(
+            out.function_module_ids,
+            function_index,
+            raz_compiler_rt_arena_get(hir.incremental_function_module_ids, function_index),
+        );
+        raz_compiler_rt_arena_set(
+            out.function_parameter_counts,
+            function_index,
+            raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index),
+        );
+        raz_compiler_rt_arena_set(
+            out.function_is_extern,
+            function_index,
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index),
+        );
+        raz_compiler_rt_arena_set(
+            out.function_extern_kinds,
+            function_index,
+            raz_compiler_rt_arena_get(hir.function_extern_kinds, function_index),
+        );
+        if (!lower_hir_spill_parameters(hir, out, function_index)) {
+            return false;
+        }
+        i64 statement = raz_compiler_rt_arena_get(hir.function_statement_starts, function_index);
+        i64 end = statement + raz_compiler_rt_arena_get(hir.function_statement_counts, function_index);
+        bool lowered_direct = false;
+        if (
+            !mir_function_needs_drop_cleanup(out, function_index) &&
+            raz_compiler_rt_arena_get(hir.function_defer_counts, function_index) == 0 &&
+            end == statement + 1 &&
+            raz_compiler_rt_arena_get(hir.statement_kinds, statement) == 2
+        ) {
+            i64 direct_return = raz_compiler_rt_arena_get(hir.statement_a, statement);
+            if (direct_return < 0) {
+                mir_emit(out, 21, 0, 0, 0, 0);
+            } else {
+                i64 direct_value = lower_hir_expression(hir, out, direct_return);
+                mir_emit(out, 10, direct_value, 0, 0, 0);
+            }
+            lowered_direct = true;
+        }
+        i64 scan_statement = statement;
+        bool linear =
+            raz_compiler_rt_arena_get(hir.function_defer_counts, function_index) == 0 &&
+            !mir_function_needs_drop_cleanup(out, function_index);
+        while (!lowered_direct && scan_statement < end) {
+            i64 scan_kind = raz_compiler_rt_arena_get(hir.statement_kinds, scan_statement);
+            if (scan_kind != 1 && scan_kind != 2 && scan_kind != 4 && scan_kind != 5 && scan_kind != 8) {
+                linear = false;
+            }
+            if (scan_kind == 4) {
+                i64 scan_target = raz_compiler_rt_arena_get(hir.statement_a, scan_statement);
+                if (raz_compiler_rt_arena_get(hir.node_kinds, scan_target) != 3) {
+                    linear = false;
+                }
+            }
+            scan_statement += 1;
+        }
+        if (lowered_direct) {} else if (linear) {
+            while (statement < end) {
+                i64 linear_kind = raz_compiler_rt_arena_get(hir.statement_kinds, statement);
+                if (linear_kind == 8 || linear_kind == 1) {
+                    i64 linear_value = lower_hir_expression(
+                        hir,
+                        out,
+                        raz_compiler_rt_arena_get(hir.statement_b, statement),
+                    );
+                    i64 linear_store_type = raz_compiler_rt_arena_get(hir.statement_c, statement);
+                    if (linear_kind == 8) {
+                        i64 linear_local_index = raz_compiler_rt_arena_get(hir.statement_c, statement);
+                        linear_store_type = raz_compiler_rt_arena_get(hir.local_types, linear_local_index);
+                    }
+                    mir_emit_typed(
+                        out,
+                        9,
+                        raz_compiler_rt_arena_get(hir.statement_a, statement),
+                        linear_value,
+                        0,
+                        0,
+                        linear_store_type,
+                    );
+                } else if (linear_kind == 2) {
+                    i64 linear_return = raz_compiler_rt_arena_get(hir.statement_a, statement);
+                    if (linear_return < 0) {
+                        mir_emit(out, 21, 0, 0, 0, 0);
+                    } else {
+                        i64 linear_return_value = lower_hir_expression(hir, out, linear_return);
+                        mir_emit(out, 10, linear_return_value, 0, 0, 0);
+                    }
+                    statement = end;
+                } else if (linear_kind == 4) {
+                    i64 linear_target = raz_compiler_rt_arena_get(hir.statement_a, statement);
+                    if (raz_compiler_rt_arena_get(hir.node_kinds, linear_target) != 3) {
+                        return false;
+                    }
+                    i64 linear_assignment = lower_hir_expression(
+                        hir,
+                        out,
+                        raz_compiler_rt_arena_get(hir.statement_b, statement),
+                    );
+                    i64 linear_slot = raz_compiler_rt_arena_get(hir.node_a, linear_target);
+                    i64 linear_operation = raz_compiler_rt_arena_get(hir.statement_c, statement);
+                    i64 linear_target_type = raz_compiler_rt_arena_get(hir.node_types, linear_target);
+                    if (linear_operation != 0) {
+                        i64 linear_current = mir_emit_typed(out, 3, linear_slot, 0, 0, 0, linear_target_type);
+                        linear_assignment = lower_compound_value(
+                            out,
+                            linear_operation,
+                            linear_current,
+                            linear_assignment,
+                            linear_target_type,
+                        );
+                    }
+                    mir_emit_typed(out, 9, linear_slot, linear_assignment, 0, 0, linear_target_type);
+                } else if (linear_kind == 5) {
+                    lower_hir_expression(hir, out, raz_compiler_rt_arena_get(hir.statement_a, statement));
+                } else {
+                    return false;
+                }
+                statement += 1;
+            }
+        } else {
+            if (
+                !lower_hir_statement_range(
+                    hir,
+                    out,
+                    statement,
+                    end,
+                    raz_compiler_rt_arena_get(hir.function_defer_starts, function_index),
+                    raz_compiler_rt_arena_get(hir.function_defer_counts, function_index),
+                )
+            ) {
+                return false;
+            }
+        }
+        raz_compiler_rt_arena_set(
+            out.function_instruction_counts,
+            function_index,
+            out.instruction_count - raz_compiler_rt_arena_get(out.function_instruction_starts, function_index),
+        );
+        function_index += 1;
+    }
+    return out.function_count > 0;
+}

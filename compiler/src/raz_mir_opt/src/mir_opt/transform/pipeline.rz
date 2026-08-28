@@ -1,0 +1,56 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::pipeline;
+
+public import raz_mir_opt::transform::cfg_cleanup;
+
+// Canonical MIR structural/optimization pipeline. Ownership legality is an
+// independent compiler phase in raz_borrowck and is checked by the driver both
+// before and after this transform pipeline. Backends still receive one common,
+// structurally verified MIR form and never own language semantics.
+public fn run_mir_pipeline(MirModule&mut mir, i64 optimization_level) -> bool {
+    if (!verify_mir_structure(mir)) {
+        return false;
+    }
+    i64 effective_optimization = optimization_level;
+
+    if (effective_optimization < 0) {
+        effective_optimization = 2;
+    }
+    // O0 is deliberately verification-only. Language legality still passes the
+    // complete structural and ownership firewalls, but no canonicalization or
+    // optimization transform is required before a backend consumes MIR.
+    if (effective_optimization == 0) {
+        return true;
+    }
+    if (!simplify_mir_cfg(mir)) {
+        return false;
+    }
+    if (!propagate_mir_constants(mir)) {
+        return false;
+    }
+    if (!propagate_mir_copies(mir)) {
+        return false;
+    }
+    if (!simplify_mir_scalars(mir)) {
+        return false;
+    }
+    if (!eliminate_mir_dead_values(mir)) {
+        return false;
+    }
+    if (!cleanup_mir_cfg(mir)) {
+        return false;
+    }
+    if (!eliminate_mir_dead_values(mir)) {
+        return false;
+    }
+
+    bool final_structure = verify_mir_structure(mir);
+
+    if (!final_structure) {
+        return false;
+    }
+
+    return true;
+}

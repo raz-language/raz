@@ -1,0 +1,712 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_borrowck::loan_regions;
+
+public import raz_borrowck::borrows;
+
+// Borrow events use ownership kinds 3 (shared) and 4 (exclusive). Their source
+// is a canonical ownership path; the loan end is derived from the last MIR use
+// of the produced reference, or from the last load of a local that stores it.
+fn mir_event_is_loan(MirModule& mir, i64 event) -> bool {
+    i64 kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, event);
+
+    return kind == 3 || kind == 4;
+}
+
+fn mir_loan_holder_slot(MirModule& mir, i64 event) -> i64 {
+    i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+    i64 ip = instruction + 1;
+
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 9 && raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == instruction) {
+            return raz_compiler_rt_arena_get_unchecked(mir.op_a, ip);
+        }
+        if (opcode == 24 || opcode == 21 || opcode == 22 || opcode == 23) {
+            break;
+        }
+        ip += 1;
+    }
+    return -1;
+}
+
+fn mir_instruction_uses_value(MirModule& mir, i64 ip, i64 value) -> bool {
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+    if (opcode >= 4 && opcode <= 7) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value
+        );
+    }
+    if (opcode >= 11 && opcode <= 20) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value
+        );
+    }
+    if (opcode >= 34 && opcode <= 39) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value
+        );
+    }
+    if (opcode == 9) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value;
+    }
+    if (opcode == 10 || opcode == 18 || opcode == 26 || opcode == 31 || opcode == 40) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value;
+    }
+    if (opcode == 22) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_c, ip) == value;
+    }
+    if (opcode == 23) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_d, ip) == value
+        );
+    }
+    if (opcode == 27) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value
+        );
+    }
+    if (opcode == 28) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value
+        );
+    }
+    if (opcode == 29) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value ||
+            raz_compiler_rt_arena_get_unchecked(mir.op_c, ip) == value
+        );
+    }
+    if (opcode == 41 || opcode == 46) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value;
+    }
+    if (opcode == 44 || opcode == 45) {
+        return (
+            raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == value ||
+            (opcode == 45 && raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value)
+        );
+    }
+    if (opcode == 48) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) == value;
+    }
+    return false;
+}
+
+fn mir_call_instruction_uses_value(MirModule& mir, i64 ip, i64 value) -> bool {
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+    if (opcode != 8 && opcode != 44) {
+        return false;
+    }
+
+    i64 first = raz_compiler_rt_arena_get_unchecked(mir.op_b, ip);
+    i64 count = raz_compiler_rt_arena_get_unchecked(mir.op_c, ip);
+    i64 argument = 0;
+
+    while (argument < count) {
+        if (raz_compiler_rt_arena_get(mir.call_arguments, first + argument) == value) {
+            return true;
+        }
+        argument += 1;
+    }
+    return false;
+}
+
+fn mir_value_last_use(MirModule& mir, i64 value, i64 after) -> i64 {
+    i64 last_use = after;
+    i64 ip = after + 1;
+
+    while (ip < mir.instruction_count) {
+        if (mir_instruction_uses_value(mir, ip, value) || mir_call_instruction_uses_value(mir, ip, value)) {
+            last_use = ip;
+        }
+        ip += 1;
+    }
+    return last_use;
+}
+
+fn mir_loan_last_use(MirModule& mir, i64 event) -> i64 {
+    i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+    i64 holder = mir_loan_holder_slot(mir, event);
+    i64 last_use = instruction;
+    i64 ip = instruction + 1;
+
+    while (ip < mir.instruction_count) {
+        if (holder >= 0) {
+            i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+            if (
+                (opcode == 3 || opcode == 25) &&
+                raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == holder
+            ) {
+                i64 reference_value_last_use = mir_value_last_use(mir, ip, ip);
+
+                if (reference_value_last_use > last_use) {
+                    last_use = reference_value_last_use;
+                }
+            }
+            if (
+                opcode == 9 &&
+                raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == holder &&
+                raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) != instruction
+            ) {
+                break;
+            }
+        } else if (
+            mir_instruction_uses_value(mir, ip, instruction) ||
+            mir_call_instruction_uses_value(mir, ip, instruction)
+        ) {
+            last_use = ip;
+        }
+        ip += 1;
+    }
+    return last_use;
+}
+
+fn mir_loan_parent_chain_contains(MirModule& mir, i64 child, i64 ancestor) -> bool {
+    i64 current = child;
+    i64 depth = 0;
+
+    while (current >= 0 && current < mir.ownership.ownership_event_count && depth < 256) {
+        i64 parent = raz_compiler_rt_arena_get(mir.ownership.ownership_event_parents, current);
+
+        if (parent == ancestor) {
+            return true;
+        }
+        if (parent < 0 || parent >= current) {
+            return false;
+        }
+        current = parent;
+        depth += 1;
+    }
+    return false;
+}
+
+fn mir_active_loan_conflicts(MirModule& mir, i64 active, i64 current, bool mutation) -> bool {
+    i64 event = 0;
+    i64 current_kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, current);
+
+    while (event < mir.ownership.ownership_event_count) {
+        if (
+            raz_compiler_rt_arena_get(active, event) != 0 &&
+            mir_event_is_loan(mir, event) &&
+            mir_ownership_paths_overlap(mir, event, current)
+        ) {
+            i64 active_kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, event);
+
+            // Reborrow creation may overlap any provenance ancestor. Those
+            // ancestor loans remain active reservations against unrelated loans
+            // and mutations; only this descendant creation receives the bypass.
+            if (mir_loan_parent_chain_contains(mir, current, event) && !mutation) {
+                if (active_kind == 3 && current_kind == 4) {
+                    return true;
+                }
+            } else if (mutation || current_kind == 4 || active_kind == 4) {
+                return true;
+            }
+        }
+        event += 1;
+    }
+    return false;
+}
+
+fn mir_loan_matrix_get(i64 matrix, i64 width, i64 block, i64 event) -> i64 {
+    return raz_compiler_rt_arena_get(matrix, block * width + event);
+}
+
+fn mir_loan_matrix_set(i64 matrix, i64 width, i64 block, i64 event, i64 value) {
+    raz_compiler_rt_arena_set(matrix, block * width + event, value);
+}
+
+fn mir_fast_record_last_use(i64 last_uses, i64 instruction_count, i64 user, i64 value) {
+    if (value >= 0 && value < instruction_count) {
+        raz_compiler_rt_arena_set_unchecked(last_uses, value, user);
+    }
+}
+
+fn build_mir_fast_value_last_uses(MirModule& mir, i64 last_uses) -> bool {
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        raz_compiler_rt_arena_set_unchecked(last_uses, ip, -1);
+        ip += 1;
+    }
+    ip = 0;
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get_unchecked(mir.opcodes, ip);
+        i64 register_mask = mir_register_operand_mask(opcode);
+        i64 operand = 0;
+
+        while (operand < 4) {
+            if ((register_mask&(1 << operand)) != 0) {
+                i64 value = 0;
+
+                if (operand == 0) {
+                    value = raz_compiler_rt_arena_get_unchecked(mir.op_a, ip);
+                } else if (operand == 1) {
+                    value = raz_compiler_rt_arena_get_unchecked(mir.op_b, ip);
+                } else if (operand == 2) {
+                    value = raz_compiler_rt_arena_get_unchecked(mir.op_c, ip);
+                } else {
+                    value = raz_compiler_rt_arena_get_unchecked(mir.op_d, ip);
+                }
+                mir_fast_record_last_use(last_uses, mir.instruction_count, ip, value);
+            }
+            operand += 1;
+        }
+        if (opcode == 8 || opcode == 44) {
+            i64 first = raz_compiler_rt_arena_get_unchecked(mir.op_b, ip);
+            i64 count = raz_compiler_rt_arena_get_unchecked(mir.op_c, ip);
+            i64 argument = 0;
+
+            if (first < 0 || count < 0 || first + count > mir.call_argument_count) {
+                return false;
+            }
+            while (argument < count) {
+                mir_fast_record_last_use(
+                    last_uses,
+                    mir.instruction_count,
+                    ip,
+                    raz_compiler_rt_arena_get(mir.call_arguments, first + argument),
+                );
+                argument += 1;
+            }
+        }
+        ip += 1;
+    }
+    return true;
+}
+
+fn build_mir_loan_last_use_table(MirModule& mir, MirCfg& cfg, i64 loan_last_uses) -> bool {
+    i64 value_last_uses = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (value_last_uses == 0) {
+        return false;
+    }
+    if (!build_mir_fast_value_last_uses(mir, value_last_uses)) {
+        raz_compiler_rt_arena_destroy(value_last_uses);
+        return false;
+    }
+
+    i64 event = 0;
+
+    while (event < mir.ownership.ownership_event_count) {
+        i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+
+        if (instruction < 0 || instruction >= mir.instruction_count) {
+            raz_compiler_rt_arena_destroy(value_last_uses);
+            return false;
+        }
+
+        i64 last_use = instruction;
+
+        if (mir_event_is_loan(mir, event)) {
+            i64 direct_last = raz_compiler_rt_arena_get(value_last_uses, instruction);
+
+            if (direct_last > last_use) {
+                last_use = direct_last;
+            }
+
+            i64 holder = mir_loan_holder_slot(mir, event);
+
+            if (holder >= 0) {
+                i64 block = mir_cfg_block_for_instruction(cfg, instruction);
+
+                if (block < 0 || block >= cfg.block_count) {
+                    raz_compiler_rt_arena_destroy(value_last_uses);
+                    return false;
+                }
+
+                i64 owner = raz_compiler_rt_arena_get(cfg.block_functions, block);
+
+                i64 end =
+                    raz_compiler_rt_arena_get(mir.function_instruction_starts, owner) +
+                    raz_compiler_rt_arena_get(mir.function_instruction_counts, owner);
+                i64 ip = instruction + 1;
+
+                while (ip < end) {
+                    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+                    if (
+                        (opcode == 3 || opcode == 25) &&
+                        raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == holder
+                    ) {
+                        i64 loaded_last = raz_compiler_rt_arena_get(value_last_uses, ip);
+
+                        if (loaded_last < ip) {
+                            loaded_last = ip;
+                        }
+                        if (loaded_last > last_use) {
+                            last_use = loaded_last;
+                        }
+                    }
+                    if (
+                        opcode == 9 &&
+                        raz_compiler_rt_arena_get_unchecked(mir.op_a, ip) == holder &&
+                        raz_compiler_rt_arena_get_unchecked(mir.op_b, ip) != instruction
+                    ) {
+                        break;
+                    }
+                    ip += 1;
+                }
+            }
+        }
+        raz_compiler_rt_arena_set(loan_last_uses, event, last_use);
+        event += 1;
+    }
+    raz_compiler_rt_arena_destroy(value_last_uses);
+    return true;
+}
+
+fn mir_expire_loans_before(MirModule& mir, i64 active, i64 loan_last_uses, i64 ip) {
+    i64 event = 0;
+
+    while (event < mir.ownership.ownership_event_count) {
+        if (
+            raz_compiler_rt_arena_get(active, event) != 0 &&
+            mir_event_is_loan(mir, event) &&
+            raz_compiler_rt_arena_get(loan_last_uses, event) < ip
+        ) {
+            raz_compiler_rt_arena_set(active, event, 0);
+        }
+        event += 1;
+    }
+}
+
+fn mir_local_loan_matrix_get(i64 matrix, i64 width, i64 block, i64 event) -> i64 {
+    return raz_compiler_rt_arena_get(matrix, block * width + event);
+}
+
+fn mir_local_loan_matrix_set(i64 matrix, i64 width, i64 block, i64 event, i64 value) {
+    raz_compiler_rt_arena_set(matrix, block * width + event, value);
+}
+
+fn mir_local_active_loan_conflicts(
+    MirModule& mir,
+    i64 active,
+    i64 events,
+    i64 event_count,
+    i64 current,
+    bool mutation,
+) -> bool {
+    i64 local_event = 0;
+    i64 current_kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, current);
+
+    while (local_event < event_count) {
+        i64 event = raz_compiler_rt_arena_get(events, local_event);
+
+        if (
+            raz_compiler_rt_arena_get(active, local_event) != 0 &&
+            mir_event_is_loan(mir, event) &&
+            mir_ownership_paths_overlap(mir, event, current)
+        ) {
+            i64 active_kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, event);
+
+            if (mir_loan_parent_chain_contains(mir, current, event) && !mutation) {
+                if (active_kind == 3 && current_kind == 4) {
+                    return true;
+                }
+            } else if (mutation || current_kind == 4 || active_kind == 4) {
+                return true;
+            }
+        }
+        local_event += 1;
+    }
+    return false;
+}
+
+fn verify_mir_loan_regions_with_cfg(MirModule& mir, MirCfg& cfg, i64 loan_last_uses) -> bool {
+    if (mir.ownership.ownership_event_count == 0) {
+        return true;
+    }
+
+    bool has_loan = false;
+    i64 scan_event = 0;
+
+    while (scan_event < mir.ownership.ownership_event_count && !has_loan) {
+        has_loan = mir_event_is_loan(mir, scan_event);
+        scan_event += 1;
+    }
+    if (!has_loan) {
+        return true;
+    }
+    if (cfg.block_count == 0) {
+        return true;
+    }
+
+    bool valid = true;
+    i64 function_index = 0;
+
+    while (function_index < mir.function_count && valid) {
+        i64 function_start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+
+        i64 function_end =
+            function_start +
+            raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+        i64 function_event_count = 0;
+        i64 event = 0;
+        bool function_has_loan = false;
+
+        while (event < mir.ownership.ownership_event_count) {
+            i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+
+            if (instruction >= function_start && instruction < function_end) {
+                function_event_count += 1;
+                if (mir_event_is_loan(mir, event)) {
+                    function_has_loan = true;
+                }
+            }
+            event += 1;
+        }
+        if (!function_has_loan || function_event_count == 0) {
+            function_index += 1;
+            continue;
+        }
+
+        i64 first_block = raz_compiler_rt_arena_get(cfg.function_block_starts, function_index);
+        i64 block_count = raz_compiler_rt_arena_get(cfg.function_block_counts, function_index);
+
+        if (block_count == 0) {
+            function_index += 1;
+            continue;
+        }
+
+        i64 events = raz_compiler_rt_arena_create(function_event_count + 1);
+        i64 active = raz_compiler_rt_arena_create(function_event_count + 1);
+        i64 matrix = raz_compiler_rt_arena_create(block_count * function_event_count + 1);
+        i64 ready = raz_compiler_rt_arena_create(block_count + 1);
+
+        if (events == 0 || active == 0 || matrix == 0 || ready == 0) {
+            if (events != 0) {
+                raz_compiler_rt_arena_destroy(events);
+            }
+            if (active != 0) {
+                raz_compiler_rt_arena_destroy(active);
+            }
+            if (matrix != 0) {
+                raz_compiler_rt_arena_destroy(matrix);
+            }
+            if (ready != 0) {
+                raz_compiler_rt_arena_destroy(ready);
+            }
+            valid = false;
+            break;
+        }
+
+        i64 local_event = 0;
+
+        event = 0;
+        while (event < mir.ownership.ownership_event_count) {
+            i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+
+            if (instruction >= function_start && instruction < function_end) {
+                raz_compiler_rt_arena_set(events, local_event, event);
+                local_event += 1;
+            }
+            event += 1;
+        }
+
+        i64 clear = 0;
+
+        while (clear < block_count * function_event_count + 1) {
+            raz_compiler_rt_arena_set(matrix, clear, 0);
+            clear += 1;
+        }
+        clear = 0;
+        while (clear < block_count + 1) {
+            raz_compiler_rt_arena_set(ready, clear, 0);
+            clear += 1;
+        }
+        raz_compiler_rt_arena_set(ready, 0, 1);
+
+        bool changed = true;
+        i64 iteration = 0;
+
+        while (changed && valid && iteration < block_count * 4 + 8) {
+            changed = false;
+            iteration += 1;
+
+            i64 local_block = 0;
+
+            while (local_block < block_count && valid) {
+                local_event = 0;
+                while (local_event < function_event_count) {
+                    raz_compiler_rt_arena_set(active, local_event, 0);
+                    local_event += 1;
+                }
+
+                i64 block = first_block + local_block;
+                bool have_predecessor = false;
+                i64 predecessor_local = 0;
+
+                while (predecessor_local < block_count) {
+                    i64 predecessor = first_block + predecessor_local;
+
+                    if (
+                        predecessor_local != local_block &&
+                        raz_compiler_rt_arena_get(ready, predecessor_local) != 0 &&
+                        (
+                            raz_compiler_rt_arena_get(cfg.successor_a, predecessor) == block ||
+                            raz_compiler_rt_arena_get(cfg.successor_b, predecessor) == block
+                        )
+                    ) {
+                        local_event = 0;
+                        while (local_event < function_event_count) {
+                            if (
+                                mir_local_loan_matrix_get(
+                                    matrix,
+                                    function_event_count,
+                                    predecessor_local,
+                                    local_event,
+                                ) != 0
+                            ) {
+                                raz_compiler_rt_arena_set(active, local_event, 1);
+                            }
+                            local_event += 1;
+                        }
+                        have_predecessor = true;
+                    }
+                    predecessor_local += 1;
+                }
+                if (local_block != 0 && !have_predecessor) {
+                    local_block += 1;
+                    continue;
+                }
+
+                i64 ip = raz_compiler_rt_arena_get(cfg.block_starts, block);
+                i64 end = raz_compiler_rt_arena_get(cfg.block_ends, block);
+
+                while (ip < end && valid) {
+                    local_event = 0;
+                    while (local_event < function_event_count) {
+                        i64 active_event = raz_compiler_rt_arena_get(events, local_event);
+
+                        if (
+                            raz_compiler_rt_arena_get(active, local_event) != 0 &&
+                            mir_event_is_loan(mir, active_event) &&
+                            raz_compiler_rt_arena_get(loan_last_uses, active_event) < ip
+                        ) {
+                            raz_compiler_rt_arena_set(active, local_event, 0);
+                        }
+                        local_event += 1;
+                    }
+                    local_event = 0;
+                    while (local_event < function_event_count && valid) {
+                        i64 current = raz_compiler_rt_arena_get(events, local_event);
+
+                        if (raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, current) == ip) {
+                            i64 kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, current);
+
+                            if (kind == 3 || kind == 4) {
+                                if (
+                                    mir_local_active_loan_conflicts(
+                                        mir,
+                                        active,
+                                        events,
+                                        function_event_count,
+                                        current,
+                                        false,
+                                    )
+                                ) {
+                                    valid = false;
+                                } else {
+                                    raz_compiler_rt_arena_set(active, local_event, 1);
+                                }
+                            } else if (kind == 1 || kind == 2) {
+                                if (
+                                    mir_local_active_loan_conflicts(
+                                        mir,
+                                        active,
+                                        events,
+                                        function_event_count,
+                                        current,
+                                        true,
+                                    )
+                                ) {
+                                    valid = false;
+                                }
+                            }
+                        }
+                        local_event += 1;
+                    }
+                    ip += 1;
+                }
+                if (valid) {
+                    local_event = 0;
+                    while (local_event < function_event_count) {
+                        i64 value = raz_compiler_rt_arena_get(active, local_event);
+
+                        if (
+                            mir_local_loan_matrix_get(
+                                matrix,
+                                function_event_count,
+                                local_block,
+                                local_event,
+                            ) != value
+                        ) {
+                            mir_local_loan_matrix_set(
+                                matrix,
+                                function_event_count,
+                                local_block,
+                                local_event,
+                                value,
+                            );
+                            changed = true;
+                        }
+                        local_event += 1;
+                    }
+                    if (raz_compiler_rt_arena_get(ready, local_block) == 0) {
+                        raz_compiler_rt_arena_set(ready, local_block, 1);
+                        changed = true;
+                    }
+                }
+                local_block += 1;
+            }
+        }
+        if (iteration >= block_count * 4 + 8 && changed) {
+            valid = false;
+        }
+        raz_compiler_rt_arena_destroy(events);
+        raz_compiler_rt_arena_destroy(active);
+        raz_compiler_rt_arena_destroy(matrix);
+        raz_compiler_rt_arena_destroy(ready);
+        function_index += 1;
+    }
+    return valid;
+}
+
+// Compatibility entry point for focused verifier tests. The production
+// ownership firewall shares one CFG across all ownership analyses.
+fn verify_mir_loan_regions(MirModule& mir) -> bool {
+    MirCfg cfg;
+
+    if (!build_mir_cfg(mir, &mut cfg)) {
+        return false;
+    }
+
+    i64 loan_last_uses = raz_compiler_rt_arena_create(mir.ownership.ownership_event_count + 1);
+
+    if (loan_last_uses == 0 || !build_mir_loan_last_use_table(mir, &cfg, loan_last_uses)) {
+        if (loan_last_uses != 0) {
+            raz_compiler_rt_arena_destroy(loan_last_uses);
+        }
+        destroy_mir_cfg(&mut cfg);
+        return false;
+    }
+
+    bool valid = verify_mir_loan_regions_with_cfg(mir, &cfg, loan_last_uses);
+
+    raz_compiler_rt_arena_destroy(loan_last_uses);
+    destroy_mir_cfg(&mut cfg);
+    return valid;
+}

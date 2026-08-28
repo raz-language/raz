@@ -1,0 +1,1538 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::razup;
+
+public import raz_driver::commands;
+
+// `razup` is intentionally implemented in Raz and shipped as another command
+// image of the production compiler. The native runtime only supplies OS, TLS,
+// hashing, and process ABI boundaries. Toolchain policy stays here.
+fn razup_arg_equals(i64 index, string expected) -> bool {
+    i64 expected_length = compiler_literal_length(expected);
+    i64 value = raz_compiler_rt_arena_create(4096);
+    if (value == 0) { return false; }
+    i64 length = raz_compiler_rt_process_arg(index, value, 4096);
+    bool same = length == expected_length;
+    i64 i = 0;
+    while (same && i < expected_length) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected, i)) { same = false; }
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(value);
+    return same;
+}
+
+fn razup_invoked() -> bool {
+    i64 value = raz_compiler_rt_arena_create(4096);
+
+    if (value == 0) {
+        return false;
+    }
+
+    i64 length = raz_compiler_rt_process_arg(0, value, 4096);
+    i64 start = length - 1;
+
+    while (
+        start >= 0 &&
+        raz_compiler_rt_arena_get(value, start) != 47 &&
+        raz_compiler_rt_arena_get(value, start) != 92
+    ) {
+        start -= 1;
+    }
+    start += 1;
+
+    i64 count = length - start;
+    bool matched = false;
+
+    if (count == 5) {
+        string name = "razup";
+
+        matched = true;
+
+        i64 i = 0;
+
+        while (matched && i < 5) {
+            if (raz_compiler_rt_arena_get(value, start + i) != compiler_literal_byte(name, i)) {
+                matched = false;
+            }
+            i += 1;
+        }
+    } else if (count == 9) {
+        string name = "razup.exe";
+
+        matched = true;
+
+        i64 i = 0;
+
+        while (matched && i < 9) {
+            if (raz_compiler_rt_arena_get(value, start + i) != compiler_literal_byte(name, i)) {
+                matched = false;
+            }
+            i += 1;
+        }
+    }
+    raz_compiler_rt_arena_destroy(value);
+    return matched;
+}
+
+fn razup_write_literal(string text) {
+    cli_write_literal(text);
+}
+
+fn razup_error(string text) -> i64 {
+    cli_write_literal_stream(2, text);
+    cli_write_literal_stream(2, "\n");
+    return 1;
+}
+
+fn razup_print_help() {
+        razup_write_literal("Raz toolchain manager\n\n");
+
+        razup_write_literal("Usage:\n  razup install [stable|nightly|VERSION]\n  razup update [stable|nightly]\n  razup default <stable|nightly|VERSION>\n  razup toolchain list\n  razup uninstall <VERSION>\n  razup show\n  razup env\n\n");
+
+        razup_write_literal("Environment:\n  RAZUP_HOME          Override ~/.razup\n  RAZUP_CHANNEL_BASE  Override channel manifest base URL\n");
+}
+
+fn razup_root(i64 output, i64 capacity) -> i64 {
+    i64 length = registry_env_ascii_literal("RAZUP_HOME", output, capacity);
+
+    if (length > 0) {
+        return length;
+    }
+
+    i64 home = raz_compiler_rt_arena_create(8192);
+
+    if (home == 0) {
+        return -1;
+    }
+
+    i64 hl = registry_env_ascii_literal("HOME", home, 8192);
+
+    if (hl <= 0) {
+        hl = registry_env_ascii_literal("USERPROFILE", home, 8192);
+    }
+    if (hl <= 0) {
+        raz_compiler_rt_arena_destroy(home);
+        return -1;
+    }
+
+    string tail = "/.razup";
+
+    // Append the conventional per-user toolchain root directly.
+    if (hl + 7 > capacity) {
+        raz_compiler_rt_arena_destroy(home);
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<hl) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(home, i));
+        i += 1;
+    }
+    i = 0;
+    while (i<7) {
+        raz_compiler_rt_arena_set(output, hl + i, compiler_literal_byte(tail, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(home);
+    return hl + 7;
+}
+
+fn razup_join_literal(
+    i64 base,
+    i64 base_length,
+    string tail,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    i64 tail_length = compiler_literal_length(tail);
+    i64 temp = raz_compiler_rt_arena_create(tail_length + 1);
+    if (temp == 0) { return -1; }
+    i64 i = 0;
+    while (i < tail_length) {
+        raz_compiler_rt_arena_set(temp, i, compiler_literal_byte(tail, i));
+        i += 1;
+    }
+    i64 result = path_join(base, base_length, temp, tail_length, output, capacity);
+    raz_compiler_rt_arena_destroy(temp);
+    return result;
+}
+
+fn razup_copy_literal(i64 output, i64 capacity, string value) -> i64 {
+    i64 length = compiler_literal_length(value);
+    if (length > capacity) { return -1; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(value, i));
+        i += 1;
+    }
+    return length;
+}
+
+fn razup_platform(i64 output, i64 capacity) -> i64 {
+    i64 os = raz_compiler_rt_host_platform();
+    i64 arch = raz_rt_host_arch();
+
+    if (os == 1 && arch == 1) {
+        return razup_copy_literal(output, capacity, "windows-x86_64");
+    }
+    if (os == 1 && arch == 2) {
+        return razup_copy_literal(output, capacity, "windows-aarch64");
+    }
+    if (os == 2 && arch == 1) {
+        return razup_copy_literal(output, capacity, "linux-x86_64");
+    }
+    if (os == 2 && arch == 2) {
+        return razup_copy_literal(output, capacity, "linux-aarch64");
+    }
+    if (os == 3 && arch == 1) {
+        return razup_copy_literal(output, capacity, "macos-x86_64");
+    }
+    if (os == 3 && arch == 2) {
+        string v = "macos-aarch64";
+
+        if (capacity<13) {
+            return -1;
+        }
+
+        i64 i = 0;
+
+        while (i<13) {
+            raz_compiler_rt_arena_set(output, i, compiler_literal_byte(v, i));
+            i += 1;
+        }
+        return 13;
+    }
+    return -1;
+}
+
+fn razup_manifest_value(i64 data, i64 length, i64 key, i64 key_length, i64 output, i64 capacity) -> i64 {
+    i64 pos = 0;
+
+    while (pos<length) {
+        i64 start = pos;
+
+        while (
+            pos<length &&
+            raz_compiler_rt_arena_get(data, pos) != 10 &&
+            raz_compiler_rt_arena_get(data, pos) != 13
+        ) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        while (
+            pos<length &&
+            (raz_compiler_rt_arena_get(data, pos) == 10 || raz_compiler_rt_arena_get(data, pos) == 13)
+        ) {
+            pos += 1;
+        }
+
+        i64 eq = start;
+
+        while (eq<end && raz_compiler_rt_arena_get(data, eq) != 61) {
+            eq += 1;
+        }
+        if (eq<end && eq - start == key_length) {
+            bool same = true;
+            i64 i = 0;
+
+            while (same && i<key_length) {
+                if (raz_compiler_rt_arena_get(data, start + i) != raz_compiler_rt_arena_get(key, i)) {
+                    same = false;
+                }
+                i += 1;
+            }
+            if (same) {
+                i64 vs = eq + 1;
+                i64 vl = end - vs;
+
+                if (vl> capacity) {
+                    return -1;
+                }
+                i = 0;
+                while (i<vl) {
+                    raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(data, vs + i));
+                    i += 1;
+                }
+                if (vl<capacity) {
+                    raz_compiler_rt_arena_set(output, vl, 0);
+                }
+                return vl;
+            }
+        }
+    }
+    return 0;
+}
+
+fn razup_channel_base(i64 output, i64 capacity) -> i64 {
+    i64 n = registry_env_ascii_literal("RAZUP_CHANNEL_BASE", output, capacity);
+
+    if (n> 0) {
+        return n;
+    }
+
+    string base = "https://raw.githubusercontent.com/raz-language/installer/main/channels";
+
+    if (capacity<70) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<70) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(base, i));
+        i += 1;
+    }
+    return 70;
+}
+
+fn razup_channel_manifest(i64 channel, i64 channel_length, i64 output, i64 capacity) -> i64 {
+    i64 base = raz_compiler_rt_arena_create(8192);
+    i64 suffix = raz_compiler_rt_arena_create(256);
+    i64 url = raz_compiler_rt_arena_create(16384);
+
+    if (base == 0 || suffix == 0 || url == 0) {
+        return -1;
+    }
+    // Mirrors and deterministic tests can override the complete channel base.
+
+    string env_key = "RAZUP_CHANNEL_BASE";
+    i64 bl = registry_env_ascii_literal(env_key, base, 8192);
+
+    if (bl> 0) {
+        i64 sc = 0;
+
+        package_append(suffix, 256, &mut sc, channel, 0, channel_length);
+
+        
+
+        package_append_string_literal(suffix, 256, &mut sc, ".txt");
+
+        i64 ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
+        i64 n = registry_http_get(url, ul, output, capacity);
+
+        raz_compiler_rt_arena_destroy(base);
+        raz_compiler_rt_arena_destroy(suffix);
+        raz_compiler_rt_arena_destroy(url);
+        return n;
+    }
+    // Stable follows GitHub's latest non-prerelease release. Keeping the channel
+    // manifest beside the immutable release assets avoids a second commit just
+    // to make a newly published toolchain discoverable.
+
+    bool stable = channel_length == 6;
+    string stable_name = "stable";
+    i64 i = 0;
+
+    while (stable && i<6) {
+        if (raz_compiler_rt_arena_get(channel, i) != compiler_literal_byte(stable_name, i)) {
+            stable = false;
+        }
+        i += 1;
+    }
+    if (stable) {
+        
+        i64 uc = 0;
+
+        package_append_string_literal(url, 16384, &mut uc, "https://github.com/raz-language/installer/releases/latest/download/stable.txt");
+
+        i64 n = registry_http_get(url, uc, output, capacity);
+
+        raz_compiler_rt_arena_destroy(base);
+        raz_compiler_rt_arena_destroy(suffix);
+        raz_compiler_rt_arena_destroy(url);
+        return n;
+    }
+    // Nightly remains a repository pointer so it can move independently of the
+    // latest stable GitHub Release.
+    bl = razup_channel_base(base, 8192);
+
+    i64 sc = 0;
+
+    package_append(suffix, 256, &mut sc, channel, 0, channel_length);
+
+    
+
+    package_append_string_literal(suffix, 256, &mut sc, ".txt");
+
+    i64 ul = registry_join_url(base, bl, suffix, 0, sc, url, 16384);
+    i64 n = registry_http_get(url, ul, output, capacity);
+
+    raz_compiler_rt_arena_destroy(base);
+    raz_compiler_rt_arena_destroy(suffix);
+    raz_compiler_rt_arena_destroy(url);
+    return n;
+}
+
+fn razup_hex_digit(i64 value) -> i64 {
+    if (value<10) {
+        return 48 + value;
+    }
+    return 87 + value;
+}
+
+fn razup_sha256_matches(i64 data, i64 length, i64 expected, i64 expected_length) -> bool {
+    if (expected_length != 64) {
+        return false;
+    }
+
+    usize packed = compiler_ascii_pack(data, 0, length);
+
+    if (length> 0 && packed == 0) {
+        return false;
+    }
+
+    usize digest = raz_rt_alloc_aligned(32, 8);
+
+    if (digest == 0) {
+        if (packed != 0) {
+            raz_rt_dealloc_aligned(packed, 8);
+        }
+        return false;
+    }
+
+    i64 status = raz_rt_sha256(packed, length, digest, 32);
+
+    if (packed != 0) {
+        raz_rt_dealloc_aligned(packed, 8);
+    }
+    if (status != 32) {
+        raz_rt_dealloc_aligned(digest, 8);
+        return false;
+    }
+
+    bool same = true;
+    i64 i = 0;
+
+    while (same && i<32) {
+        i64 b = raz_rt_load_u8(digest + i);
+        i64 h = razup_hex_digit((b >> 4)&15);
+        i64 l = razup_hex_digit(b&15);
+        i64 eh = raz_compiler_rt_arena_get(expected, i*2);
+        i64 el = raz_compiler_rt_arena_get(expected, i*2 + 1);
+
+        if (eh >= 65 && eh <= 70) {
+            eh += 32;
+        }
+        if (el >= 65 && el <= 70) {
+            el += 32;
+        }
+        if (h != eh || l != el) {
+            same = false;
+        }
+        i += 1;
+    }
+    raz_rt_dealloc_aligned(digest, 8);
+    return same;
+}
+
+fn razup_valid_version(i64 value, i64 length) -> bool {
+    if (length <= 0 || length> 128) {
+        return false;
+    }
+
+    i64 dots = 0;
+    i64 i = 0;
+    bool core = true;
+    bool segment_digit = false;
+
+    while (i<length) {
+        i64 ch = raz_compiler_rt_arena_get(value, i);
+        bool digit = ch >= 48 && ch <= 57;
+        bool alpha = (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122);
+
+        if (core) {
+            if (digit) {
+                segment_digit = true;
+            } else if (ch == 46) {
+                if (!segment_digit || dots >= 2) {
+                    return false;
+                }
+                dots += 1;
+                segment_digit = false;
+            } else if (ch == 45 || ch == 43) {
+                if (dots != 2 || !segment_digit || i + 1 >= length) {
+                    return false;
+                }
+                core = false;
+            } else {
+                return false;
+            }
+        } else {
+            if (!(digit || alpha || ch == 46 || ch == 45 || ch == 43)) {
+                return false;
+            }
+        }
+        i += 1;
+    }
+
+    i64 last = raz_compiler_rt_arena_get(value, length - 1);
+    bool last_safe = (last >= 48 && last <= 57) || (last >= 65 && last <= 90) || (last >= 97 && last <= 122);
+
+    return dots == 2 && segment_digit && last_safe;
+}
+
+fn razup_process_arg(
+    i64 blob,
+    i64 capacity,
+    i64&mut length,
+    i64&mut count,
+    i64 data,
+    i64 data_length,
+) -> bool {
+    if (*length + data_length + 1> capacity) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<data_length) {
+        raz_compiler_rt_arena_set(blob, *length + i, raz_compiler_rt_arena_get(data, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_set(blob, *length + data_length, 0);
+    *length += data_length + 1;
+    *count += 1;
+    return true;
+}
+
+fn razup_process_literal(
+    i64 blob,
+    i64 capacity,
+    i64&mut length,
+    i64&mut count,
+    string data,
+) -> bool {
+    i64 data_length = compiler_literal_length(data);
+    i64 tmp = raz_compiler_rt_arena_create(data_length);
+
+    if (tmp == 0) { return false; }
+    i64 i = 0;
+    while (i < data_length) {
+        raz_compiler_rt_arena_set(tmp, i, compiler_literal_byte(data, i));
+        i += 1;
+    }
+    bool ok = razup_process_arg(blob, capacity, length, count, tmp, data_length);
+    raz_compiler_rt_arena_destroy(tmp);
+    return ok;
+}
+
+fn razup_extract(i64 archive, i64 archive_length, i64 destination, i64 destination_length) -> bool {
+    i64 program = raz_compiler_rt_arena_create(16);
+    i64 args = raz_compiler_rt_arena_create(32768);
+
+    if (program == 0 || args == 0) {
+        return false;
+    }
+
+    i64 pl = 0;
+
+    if (raz_compiler_rt_host_platform() == 1) {
+        pl = razup_copy_literal(program, 16, "tar.exe");
+    } else {
+        string p = "tar";
+        i64 i = 0;
+
+        while (i<3) {
+            raz_compiler_rt_arena_set(program, i, compiler_literal_byte(p, i));
+            i += 1;
+        }
+        pl = 3;
+    }
+    if (raz_compiler_rt_tool_available(program, pl) != 1) {
+        raz_compiler_rt_arena_destroy(program);
+        raz_compiler_rt_arena_destroy(args);
+        return false;
+    }
+
+    i64 al = 0;
+    i64 ac = 0;
+    bool ok =
+        razup_process_literal(args, 32768, &mut al, &mut ac, "-xf") &&
+        razup_process_arg(args, 32768, &mut al, &mut ac, archive, archive_length) &&
+        razup_process_literal(args, 32768, &mut al, &mut ac, "-C") &&
+        razup_process_arg(args, 32768, &mut al, &mut ac, destination, destination_length);
+    i64 status = -1;
+
+    if (ok) {
+        status = raz_compiler_rt_process_run_argv_ascii(program, pl, args, al, ac);
+    }
+    raz_compiler_rt_arena_destroy(program);
+    raz_compiler_rt_arena_destroy(args);
+    return status == 0;
+}
+
+fn razup_registry_upsert(
+    i64 root,
+    i64 root_length,
+    i64 id,
+    i64 id_length,
+    i64 channel,
+    i64 channel_length,
+) -> bool {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 old = raz_compiler_rt_arena_create(1048576);
+    i64 out = raz_compiler_rt_arena_create(1048576);
+
+    if (path == 0 || old == 0 || out == 0) {
+        return false;
+    }
+
+        i64 pl = razup_join_literal(root, root_length, "toolchains.txt", path, 8192);
+    i64 ol = raz_compiler_rt_read_ascii(path, pl, old, 1048576);
+
+    if (ol<0) {
+        ol = 0;
+    }
+
+    i64 oc = 0;
+    i64 pos = 0;
+
+    while (pos<ol) {
+        i64 start = pos;
+
+        while (pos<ol && raz_compiler_rt_arena_get(old, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos<ol) {
+            pos += 1;
+        }
+
+        i64 bar = start;
+
+        while (bar<end && raz_compiler_rt_arena_get(old, bar) != 124) {
+            bar += 1;
+        }
+
+        bool same = bar - start == id_length;
+        i64 i = 0;
+
+        while (same && i<id_length) {
+            if (raz_compiler_rt_arena_get(old, start + i) != raz_compiler_rt_arena_get(id, i)) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (!same && end> start) {
+            package_append(out, 1048576, &mut oc, old, start, end - start);
+
+            
+
+            package_append_string_literal(out, 1048576, &mut oc, "\n");
+        }
+    }
+    package_append(out, 1048576, &mut oc, id, 0, id_length);
+
+    
+
+    package_append_string_literal(out, 1048576, &mut oc, "|");
+    if (channel_length> 0) {
+        package_append(out, 1048576, &mut oc, channel, 0, channel_length);
+    }
+
+    
+
+    package_append_string_literal(out, 1048576, &mut oc, "\n");
+
+    bool ok = raz_compiler_rt_write_ascii(path, pl, out, oc) == oc;
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(old);
+    raz_compiler_rt_arena_destroy(out);
+    return ok;
+}
+
+fn razup_registry_remove(i64 root, i64 root_length, i64 id, i64 id_length) -> bool {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 old = raz_compiler_rt_arena_create(1048576);
+    i64 out = raz_compiler_rt_arena_create(1048576);
+
+    if (path == 0 || old == 0 || out == 0) {
+        return false;
+    }
+
+        i64 pl = razup_join_literal(root, root_length, "toolchains.txt", path, 8192);
+    i64 ol = raz_compiler_rt_read_ascii(path, pl, old, 1048576);
+
+    if (ol<0) {
+        ol = 0;
+    }
+
+    i64 oc = 0;
+    i64 pos = 0;
+
+    while (pos<ol) {
+        i64 start = pos;
+
+        while (pos<ol && raz_compiler_rt_arena_get(old, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        if (pos<ol) {
+            pos += 1;
+        }
+
+        i64 bar = start;
+
+        while (bar<end && raz_compiler_rt_arena_get(old, bar) != 124) {
+            bar += 1;
+        }
+
+        bool same = bar - start == id_length;
+        i64 i = 0;
+
+        while (same && i<id_length) {
+            if (raz_compiler_rt_arena_get(old, start + i) != raz_compiler_rt_arena_get(id, i)) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (!same && end> start) {
+            package_append(out, 1048576, &mut oc, old, start, end - start);
+
+            
+
+            package_append_string_literal(out, 1048576, &mut oc, "\n");
+        }
+    }
+
+    bool ok = raz_compiler_rt_write_ascii(path, pl, out, oc) == oc;
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(old);
+    raz_compiler_rt_arena_destroy(out);
+    return ok;
+}
+
+fn razup_settings_write(
+    i64 root,
+    i64 root_length,
+    i64 id,
+    i64 id_length,
+    i64 channel,
+    i64 channel_length,
+) -> bool {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 out = raz_compiler_rt_arena_create(8192);
+
+    if (path == 0 || out == 0) {
+        return false;
+    }
+
+        i64 pl = razup_join_literal(root, root_length, "settings.txt", path, 8192);
+    i64 c = 0;
+    
+
+    package_append_string_literal(out, 8192, &mut c, "default=");
+    package_append(out, 8192, &mut c, id, 0, id_length);
+
+    package_append_string_literal(out, 8192, &mut c, "\n");
+
+    
+
+    package_append_string_literal(out, 8192, &mut c, "channel=");
+    if (channel_length> 0) {
+        package_append(out, 8192, &mut c, channel, 0, channel_length);
+    }
+    package_append_string_literal(out, 8192, &mut c, "\n");
+
+    bool ok = raz_compiler_rt_write_ascii(path, pl, out, c) == c;
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(out);
+    return ok;
+}
+
+fn razup_default_select(
+    i64 root,
+    i64 root_length,
+    i64 id,
+    i64 id_length,
+    i64 channel,
+    i64 channel_length,
+) -> i64 {
+    i64 tcroot = raz_compiler_rt_arena_create(8192);
+    i64 source = raz_compiler_rt_arena_create(8192);
+    i64 current = raz_compiler_rt_arena_create(8192);
+
+    if (tcroot == 0 || source == 0 || current == 0) {
+        return 1;
+    }
+
+        i64 tl = razup_join_literal(root, root_length, "toolchains", tcroot, 8192);
+    i64 sl = path_join(tcroot, tl, id, id_length, source, 8192);
+
+    if (raz_compiler_rt_path_exists_ascii(source, sl) == 0) {
+        cli_write_literal_stream(2, "toolchain is not installed: ");
+        cli_write_arena(id, id_length);
+
+        
+
+        cli_write_literal_stream(2, "\n");
+        return 1;
+    }
+
+        i64 cl = razup_join_literal(root, root_length, "current", current, 8192);
+
+    if (raz_compiler_rt_copy_tree_ascii(source, sl, current, cl) != 0) {
+        return 1;
+    }
+    if (!razup_settings_write(root, root_length, id, id_length, channel, channel_length)) {
+        return 1;
+    }
+
+    
+
+    cli_write_literal("default toolchain: ");
+    cli_write_arena(id, id_length);
+
+    
+
+    cli_write_literal("\n");
+    return 0;
+}
+
+fn razup_resolve_channel(
+    i64 channel,
+    i64 channel_length,
+    i64 version,
+    i64 version_capacity,
+    i64 url,
+    i64 url_capacity,
+    i64 hash,
+    i64 hash_capacity,
+    i64 platform,
+    i64 platform_length,
+) -> i64 {
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 key = raz_compiler_rt_arena_create(256);
+
+    if (manifest == 0 || key == 0) {
+        return 1;
+    }
+
+    i64 ml = razup_channel_manifest(channel, channel_length, manifest, 65536);
+
+    if (ml <= 0) {
+        return 1;
+    }
+
+    string status_key = "status";
+    i64 status_text = raz_compiler_rt_arena_create(64);
+    i64 i = 0;
+
+    while (i<6) {
+        raz_compiler_rt_arena_set(key, i, compiler_literal_byte(status_key, i));
+        i += 1;
+    }
+
+    i64 sl = razup_manifest_value(manifest, ml, key, 6, status_text, 64);
+
+    if (sl> 0) {
+        string published_bytes = "published";
+        bool ok = sl == 9;
+
+        i = 0;
+        while (ok && i<9) {
+            if (raz_compiler_rt_arena_get(status_text, i) != compiler_literal_byte(published_bytes, i)) {
+                ok = false;
+            }
+            i += 1;
+        }
+        if (!ok) {
+            return 2;
+        }
+    }
+
+    string verkey = "version";
+
+    i = 0;
+    while (i<7) {
+        raz_compiler_rt_arena_set(key, i, compiler_literal_byte(verkey, i));
+        i += 1;
+    }
+
+    i64 vl = razup_manifest_value(manifest, ml, key, 7, version, version_capacity);
+
+    if (vl <= 0) {
+        return 1;
+    }
+
+    i64 kc = 0;
+
+    package_append(key, 256, &mut kc, platform, 0, platform_length);
+
+    
+
+    package_append_string_literal(key, 256, &mut kc, ".url");
+
+    i64 ul = razup_manifest_value(manifest, ml, key, kc, url, url_capacity);
+
+    kc = 0;
+    package_append(key, 256, &mut kc, platform, 0, platform_length);
+
+    
+
+    package_append_string_literal(key, 256, &mut kc, ".sha256");
+
+    i64 hl = razup_manifest_value(manifest, ml, key, kc, hash, hash_capacity);
+
+    raz_compiler_rt_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(key);
+    raz_compiler_rt_arena_destroy(status_text);
+    if (ul <= 0 || hl != 64) {
+        return 1;
+    }
+    return vl;
+}
+
+fn razup_synthesize_version(
+    i64 version,
+    i64 version_length,
+    i64 platform,
+    i64 platform_length,
+    i64 url,
+    i64 capacity,
+) -> i64 {
+    
+    i64 c = 0;
+
+    package_append_string_literal(url, capacity, &mut c, "https://github.com/raz-language/installer/releases/download/v");
+    package_append(url, capacity, &mut c, version, 0, version_length);
+
+    
+
+    package_append_string_literal(url, capacity, &mut c, "/raz-");
+    package_append(url, capacity, &mut c, version, 0, version_length);
+
+    
+
+    package_append_string_literal(url, capacity, &mut c, "-");
+    package_append(url, capacity, &mut c, platform, 0, platform_length);
+    if (raz_compiler_rt_host_platform() == 1) {
+        
+
+        package_append_string_literal(url, capacity, &mut c, ".zip");
+    } else {
+        
+
+        package_append_string_literal(url, capacity, &mut c, ".tar.gz");
+    }
+    return c;
+}
+
+fn razup_fetch_version_hash(i64 url, i64 url_length, i64 hash, i64 capacity) -> i64 {
+    i64 shaurl = raz_compiler_rt_arena_create(16384);
+
+    if (shaurl == 0) {
+        return -1;
+    }
+
+    i64 c = 0;
+
+    package_append(shaurl, 16384, &mut c, url, 0, url_length);
+
+    
+
+    package_append_string_literal(shaurl, 16384, &mut c, ".sha256");
+
+    i64 text = raz_compiler_rt_arena_create(512);
+
+    if (text == 0) {
+        raz_compiler_rt_arena_destroy(shaurl);
+        return -1;
+    }
+
+    i64 n = registry_http_get(shaurl, c, text, 512);
+
+    if (n<64) {
+        raz_compiler_rt_arena_destroy(shaurl);
+        raz_compiler_rt_arena_destroy(text);
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i<64) {
+        raz_compiler_rt_arena_set(hash, i, raz_compiler_rt_arena_get(text, i));
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(shaurl);
+    raz_compiler_rt_arena_destroy(text);
+    return 64;
+}
+
+fn razup_install_named(i64 name, i64 name_length, bool select_default) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 platform = raz_compiler_rt_arena_create(64);
+    i64 version = raz_compiler_rt_arena_create(256);
+    i64 url = raz_compiler_rt_arena_create(16384);
+    i64 hash = raz_compiler_rt_arena_create(128);
+
+    if (root == 0 || platform == 0 || version == 0 || url == 0 || hash == 0) {
+        return 1;
+    }
+
+    i64 rl = razup_root(root, 8192);
+    i64 pl = razup_platform(platform, 64);
+
+    if (rl <= 0 || pl <= 0) {
+        return 1;
+    }
+    raz_compiler_rt_create_dir_ascii(root, rl);
+
+    bool channel = false;
+    string stable = "stable";
+    string nightly = "nightly";
+
+    if (name_length == 6) {
+        channel = true;
+
+        i64 i = 0;
+
+        while (channel && i<6) {
+            if (raz_compiler_rt_arena_get(name, i) != compiler_literal_byte(stable, i)) {
+                channel = false;
+            }
+            i += 1;
+        }
+    }
+
+    bool night = false;
+
+    if (name_length == 7) {
+        night = true;
+
+        i64 i = 0;
+
+        while (night && i<7) {
+            if (raz_compiler_rt_arena_get(name, i) != compiler_literal_byte(nightly, i)) {
+                night = false;
+            }
+            i += 1;
+        }
+    }
+    channel = channel || night;
+
+    i64 vl = 0;
+    i64 ul = 0;
+    i64 hl = 0;
+
+    if (channel) {
+        i64 resolved = razup_resolve_channel(
+            name,
+            name_length,
+            version,
+            256,
+            url,
+            16384,
+            hash,
+            128,
+            platform,
+            pl,
+        );
+        if (resolved == 2) {
+                        return razup_error("channel has not been published yet");
+        }
+        if (resolved <= 0) {
+            return 1;
+        }
+        vl = resolved;
+        ul = 0;
+        while (ul<16384 && raz_compiler_rt_arena_get(url, ul) != 0) {
+            ul += 1;
+        }
+        hl = 64;
+    } else {
+        if (!razup_valid_version(name, name_length)) {
+                        return razup_error("invalid toolchain version");
+        }
+        vl = name_length;
+
+        i64 i = 0;
+
+        while (i<vl) {
+            raz_compiler_rt_arena_set(version, i, raz_compiler_rt_arena_get(name, i));
+            i += 1;
+        }
+        ul = razup_synthesize_version(version, vl, platform, pl, url, 16384);
+        hl = razup_fetch_version_hash(url, ul, hash, 128);
+        if (hl != 64) {
+            return 1;
+        }
+    }
+
+    i64 archive = raz_compiler_rt_arena_create(134217728);
+
+    if (archive == 0) {
+        return 1;
+    }
+
+    i64 al = registry_http_get(url, ul, archive, 134217728);
+
+    if (al <= 0) {
+        return 1;
+    }
+    if (!razup_sha256_matches(archive, al, hash, 64)) {
+                return razup_error("toolchain SHA-256 verification failed");
+    }
+
+    i64 downloads = raz_compiler_rt_arena_create(8192);
+    i64 archive_path = raz_compiler_rt_arena_create(8192);
+    i64 tmp = raz_compiler_rt_arena_create(8192);
+    i64 extracted = raz_compiler_rt_arena_create(8192);
+    i64 toolchains = raz_compiler_rt_arena_create(8192);
+    i64 target = raz_compiler_rt_arena_create(8192);
+    i64 id = raz_compiler_rt_arena_create(512);
+        i64 dl = razup_join_literal(root, rl, "downloads", downloads, 8192);
+
+    raz_compiler_rt_create_dir_ascii(downloads, dl);
+
+    i64 ic = 0;
+
+    package_append(id, 512, &mut ic, version, 0, vl);
+
+    
+
+    package_append_string_literal(id, 512, &mut ic, "-");
+    package_append(id, 512, &mut ic, platform, 0, pl);
+
+    string prefix = "raz-";
+    i64 archive_name = raz_compiler_rt_arena_create(768);
+    i64 archive_name_length = 0;
+
+    package_append_string_literal(archive_name, 768, &mut archive_name_length, prefix);
+    package_append(archive_name, 768, &mut archive_name_length, id, 0, ic);
+    if (raz_compiler_rt_host_platform() == 1) {
+        
+
+        package_append_string_literal(archive_name, 768, &mut archive_name_length, ".zip");
+    } else {
+        
+
+        package_append_string_literal(archive_name, 768, &mut archive_name_length, ".tar.gz");
+    }
+
+    i64 apl = path_join(downloads, dl, archive_name, archive_name_length, archive_path, 8192);
+
+    if (raz_compiler_rt_write_ascii(archive_path, apl, archive, al) != al) {
+        return 1;
+    }
+
+        i64 tmpl = razup_join_literal(root, rl, "tmp", tmp, 8192);
+
+    raz_compiler_rt_remove_path_ascii(tmp, tmpl);
+    raz_compiler_rt_create_dir_ascii(tmp, tmpl);
+    if (!razup_extract(archive_path, apl, tmp, tmpl)) {
+        return 1;
+    }
+
+    i64 el = 0;
+
+    // Reconstruct extracted directory name without the archive extension.
+
+    i64 dirn = raz_compiler_rt_arena_create(768);
+    i64 dc = 0;
+
+    package_append_string_literal(dirn, 768, &mut dc, prefix);
+    package_append(dirn, 768, &mut dc, id, 0, ic);
+    el = path_join(tmp, tmpl, dirn, dc, extracted, 8192);
+
+        i64 tcl = razup_join_literal(root, rl, "toolchains", toolchains, 8192);
+
+    raz_compiler_rt_create_dir_ascii(toolchains, tcl);
+
+    i64 targetl = path_join(toolchains, tcl, id, ic, target, 8192);
+
+    if (raz_compiler_rt_copy_tree_ascii(extracted, el, target, targetl) != 0) {
+        return 1;
+    }
+    raz_compiler_rt_remove_path_ascii(tmp, tmpl);
+
+    i64 channel_data = 0;
+    i64 channel_data_length = 0;
+
+    if (channel) {
+        channel_data = name;
+        channel_data_length = name_length;
+    }
+    if (!razup_registry_upsert(root, rl, id, ic, channel_data, channel_data_length)) {
+        return 1;
+    }
+
+    
+
+    cli_write_literal("installed toolchain: ");
+    cli_write_arena(id, ic);
+
+    
+
+    cli_write_literal("\n");
+    if (select_default) {
+        return razup_default_select(root, rl, id, ic, channel_data, channel_data_length);
+    }
+    return 0;
+}
+
+fn razup_read_setting(i64 root, i64 root_length, string key, i64 out, i64 capacity) -> i64 {
+    i64 key_length = compiler_literal_length(key);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 data = raz_compiler_rt_arena_create(8192);
+    i64 k = raz_compiler_rt_arena_create(64);
+
+    if (path == 0 || data == 0 || k == 0) {
+        return 0;
+    }
+
+        i64 pl = razup_join_literal(root, root_length, "settings.txt", path, 8192);
+    i64 dl = raz_compiler_rt_read_ascii(path, pl, data, 8192);
+
+    if (dl <= 0) {
+        return 0;
+    }
+
+    i64 i = 0;
+
+    while (i<key_length) {
+        raz_compiler_rt_arena_set(k, i, compiler_literal_byte(key, i));
+        i += 1;
+    }
+
+    i64 n = razup_manifest_value(data, dl, k, key_length, out, capacity);
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(data);
+    raz_compiler_rt_arena_destroy(k);
+    return n;
+}
+
+fn razup_show() -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 value = raz_compiler_rt_arena_create(512);
+
+    if (root == 0 || value == 0) {
+        return 1;
+    }
+
+    i64 rl = razup_root(root, 8192);
+    
+
+    cli_write_literal("RAZUP_HOME: ");
+    cli_write_arena(root, rl);
+
+    cli_write_literal("\n");
+
+    i64 vl = razup_read_setting(root, rl, "default", value, 512);
+    
+
+    cli_write_literal("default: ");
+    if (vl> 0) {
+        cli_write_arena(value, vl);
+    } else {
+        
+
+        cli_write_literal("(none)");
+    }
+    cli_write_literal("\n");
+    return 0;
+}
+
+fn razup_list() -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 data = raz_compiler_rt_arena_create(1048576);
+
+    if (root == 0 || path == 0 || data == 0) {
+        return 1;
+    }
+
+    i64 rl = razup_root(root, 8192);
+        i64 pl = razup_join_literal(root, rl, "toolchains.txt", path, 8192);
+    i64 dl = raz_compiler_rt_read_ascii(path, pl, data, 1048576);
+
+    if (dl <= 0) {
+        
+
+        cli_write_literal("no toolchains installed\n");
+        return 0;
+    }
+    cli_write_arena(data, dl);
+    return 0;
+}
+
+fn razup_env() -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 current = raz_compiler_rt_arena_create(8192);
+    i64 bin = raz_compiler_rt_arena_create(8192);
+
+    if (root == 0 || current == 0 || bin == 0) {
+        return 1;
+    }
+
+    i64 rl = razup_root(root, 8192);
+        i64 cl = razup_join_literal(root, rl, "current", current, 8192);
+        i64 bl = razup_join_literal(current, cl, "bin", bin, 8192);
+
+    cli_write_arena(bin, bl);
+
+    
+
+    cli_write_literal("\n");
+    return 0;
+}
+
+fn razup_default_command(i64 argc) -> i64 {
+    if (argc != 3) {
+        razup_print_help();
+        return 1;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(512);
+
+    if (arg == 0) {
+        return 1;
+    }
+
+    i64 al = raz_compiler_rt_process_arg(2, arg, 512);
+    string stable = "stable";
+    string nightly = "nightly";
+    bool channel = false;
+
+    if (al == 6) {
+        channel = true;
+
+        i64 i = 0;
+
+        while (channel && i<6) {
+            if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(stable, i)) {
+                channel = false;
+            }
+            i += 1;
+        }
+    }
+    if (!channel && al == 7) {
+        channel = true;
+
+        i64 i = 0;
+
+        while (channel && i<7) {
+            if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(nightly, i)) {
+                channel = false;
+            }
+            i += 1;
+        }
+    }
+    if (channel) {
+        return razup_install_named(arg, al, true);
+    }
+    if (!razup_valid_version(arg, al)) {
+                return razup_error("invalid toolchain version");
+    }
+
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 platform = raz_compiler_rt_arena_create(64);
+    i64 id = raz_compiler_rt_arena_create(768);
+    i64 rl = razup_root(root, 8192);
+    i64 pl = razup_platform(platform, 64);
+    i64 c = 0;
+
+    package_append(id, 768, &mut c, arg, 0, al);
+
+    
+
+    package_append_string_literal(id, 768, &mut c, "-");
+    package_append(id, 768, &mut c, platform, 0, pl);
+    return razup_default_select(root, rl, id, c, 0, 0);
+}
+
+fn razup_update_command(i64 argc) -> i64 {
+    if (argc> 3) {
+        razup_print_help();
+        return 1;
+    }
+    if (argc == 3) {
+        i64 c = raz_compiler_rt_arena_create(64);
+        i64 cl = raz_compiler_rt_process_arg(2, c, 64);
+
+        return razup_install_named(c, cl, true);
+    }
+
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 channel = raz_compiler_rt_arena_create(64);
+    i64 rl = razup_root(root, 8192);
+    i64 cl = razup_read_setting(root, rl, "channel", channel, 64);
+
+    if (cl <= 0) {
+        string stable = "stable";
+        i64 tmp = raz_compiler_rt_arena_create(6);
+        i64 i = 0;
+
+        while (i<6) {
+            raz_compiler_rt_arena_set(tmp, i, compiler_literal_byte(stable, i));
+            i += 1;
+        }
+        return razup_install_named(tmp, 6, true);
+    }
+    return razup_install_named(channel, cl, true);
+}
+
+fn razup_uninstall_command(i64 argc) -> i64 {
+    if (argc != 3) {
+        razup_print_help();
+        return 1;
+    }
+
+    i64 version = raz_compiler_rt_arena_create(256);
+    i64 platform = raz_compiler_rt_arena_create(64);
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 toolchains = raz_compiler_rt_arena_create(8192);
+    i64 id = raz_compiler_rt_arena_create(512);
+    i64 target = raz_compiler_rt_arena_create(8192);
+    i64 selected = raz_compiler_rt_arena_create(512);
+
+    if (
+        version == 0 ||
+        platform == 0 ||
+        root == 0 ||
+        toolchains == 0 ||
+        id == 0 ||
+        target == 0 ||
+        selected == 0
+    ) {
+        return 1;
+    }
+
+    i64 vl = raz_compiler_rt_process_arg(2, version, 256);
+
+    if (!razup_valid_version(version, vl)) {
+                return razup_error("invalid toolchain version");
+    }
+
+    i64 pl = razup_platform(platform, 64);
+    i64 rl = razup_root(root, 8192);
+    i64 id_length = 0;
+
+    package_append(id, 512, &mut id_length, version, 0, vl);
+
+    
+
+    package_append_string_literal(id, 512, &mut id_length, "-");
+    package_append(id, 512, &mut id_length, platform, 0, pl);
+
+        i64 toolchains_length = razup_join_literal(root, rl, "toolchains", toolchains, 8192);
+    i64 target_length = path_join(toolchains, toolchains_length, id, id_length, target, 8192);
+
+    if (raz_compiler_rt_remove_path_ascii(target, target_length) != 0) {
+        return 1;
+    }
+    if (!razup_registry_remove(root, rl, id, id_length)) {
+        return 1;
+    }
+    // Removing the selected toolchain also clears the materialized current view.
+
+    i64 selected_length = razup_read_setting(root, rl, "default", selected, 512);
+    bool was_selected = selected_length == id_length;
+    i64 i = 0;
+
+    while (was_selected && i<id_length) {
+        if (raz_compiler_rt_arena_get(selected, i) != raz_compiler_rt_arena_get(id, i)) {
+            was_selected = false;
+        }
+        i += 1;
+    }
+    if (was_selected) {
+        i64 current = raz_compiler_rt_arena_create(8192);
+        i64 settings = raz_compiler_rt_arena_create(8192);
+
+        if (current != 0 && settings != 0) {
+                        i64 current_length = razup_join_literal(root, rl, "current", current, 8192);
+
+            raz_compiler_rt_remove_path_ascii(current, current_length);
+
+                        i64 settings_length = razup_join_literal(root, rl, "settings.txt", settings, 8192);
+
+            raz_compiler_rt_remove_path_ascii(settings, settings_length);
+        }
+    }
+
+    
+
+    cli_write_literal("removed toolchain: ");
+    cli_write_arena(id, id_length);
+
+    
+
+    cli_write_literal("\n");
+    return 0;
+}
+
+fn razup_command(i64 argc) -> i64 {
+    if (argc <= 1) {
+        razup_print_help();
+        return 0;
+    }
+
+                                        if (razup_arg_equals(1, "help")) {
+        razup_print_help();
+        return 0;
+    }
+    if (razup_arg_equals(1, "--version")) {
+        
+
+        cli_write_literal("razup 1.0.0\n");
+        return 0;
+    }
+    if (razup_arg_equals(1, "install")) {
+        if (argc> 3) {
+            razup_print_help();
+            return 1;
+        }
+        if (argc == 2) {
+            i64 s = raz_compiler_rt_arena_create(6);
+            string st = "stable";
+            i64 i = 0;
+
+            while (i<6) {
+                raz_compiler_rt_arena_set(s, i, compiler_literal_byte(st, i));
+                i += 1;
+            }
+            return razup_install_named(s, 6, false);
+        }
+
+        i64 n = raz_compiler_rt_arena_create(256);
+        i64 nl = raz_compiler_rt_process_arg(2, n, 256);
+
+        return razup_install_named(n, nl, false);
+    }
+    if (razup_arg_equals(1, "update")) {
+        return razup_update_command(argc);
+    }
+    if (razup_arg_equals(1, "default")) {
+        return razup_default_command(argc);
+    }
+    if (razup_arg_equals(1, "uninstall")) {
+        return razup_uninstall_command(argc);
+    }
+    if (razup_arg_equals(1, "show")) {
+        return razup_show();
+    }
+    if (razup_arg_equals(1, "env")) {
+        return razup_env();
+    }
+    if (razup_arg_equals(1, "toolchain") && argc == 3) {
+                if (razup_arg_equals(2, "list")) {
+            return razup_list();
+        }
+    }
+    razup_print_help();
+    return 1;
+}

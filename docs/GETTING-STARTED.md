@@ -1,12 +1,10 @@
 # Getting Started with Raz
 
-**Raz 1.0.0 - A practical guide to the Raz systems programming language**
+**A practical guide to Raz 1.0.0**
 
-Language design by **Mario Vinciguerra**.
+Raz is a statically typed systems language built for predictable performance, deterministic resource management, ownership safety, and direct control over native software. This guide starts with a small project and works outward into ownership, generics, traits, async code, packages, native interop, and the compiler toolchain.
 
-Raz is a statically typed native systems programming language built for predictable performance, deterministic resource management, ownership safety, and direct control over native software. Raz 1.0 lowers source through typed HIR and backend-neutral MIR, then dispatches to either Forge, the default bundled native backend, or the Raz-written LLVM IR backend. Forge emits native objects in-process; the LLVM backend emits textual LLVM IR in Raz and uses an external Clang/LLVM toolchain when native objects or executables are requested.
-
-This guide reflects the Raz 1.0 compiler, syntax, package model, standard library, Forge and LLVM backends, ownership system, compile-time facilities, async model, and tooling.
+You do not need to understand the compiler pipeline before writing Raz. When the details matter, Raz lowers source through typed HIR and backend-neutral MIR, then hands the verified program to Forge, LLVM, WebAssembly, or RXE code generation.
 
 ---
 
@@ -33,7 +31,7 @@ Raz aims to make low-level code easy to reason about without hiding the cost mod
 
 ### A language first, not a backend demo
 
-Raz was also built as a serious real-world frontend for **[Forge](https://github.com/Ascension-Digital-Technologies/Forge)**, a compact native compiler infrastructure project. Forge remains the default bundled backend and is linked in-process. Raz also includes a first-class LLVM IR emitter written in Raz itself, allowing the same frontend and MIR semantics to target the wider LLVM ecosystem without bundling LLVM's C++ source tree.
+Raz is also the primary real-world frontend for **[Forge](https://github.com/raz-language/forge)**, its compact native compiler infrastructure project. Forge remains the default bundled backend and is linked in-process. Raz also includes a first-class LLVM IR emitter written in Raz itself, allowing the same frontend and MIR semantics to target the wider LLVM ecosystem without bundling LLVM's C++ source tree.
 
 Both paths produce native code. Performance depends on Raz's semantic lowering, the selected backend and optimization pipeline, the standard library/runtime boundary, and the target machine. Forge keeps a compact in-process integration surface; LLVM mode emits LLVM IR internally and delegates native code generation to an installed external Clang/LLVM toolchain.
 
@@ -150,7 +148,7 @@ public fn add(i64 left, i64 right) -> i64 {
 A function with no return value can omit the arrow result where accepted by the stable grammar:
 
 ```raz
-fn increment(i64& mut value) {
+fn increment(i64&mut value) {
     *value += 1;
 }
 ```
@@ -228,14 +226,14 @@ i64 values[4] = [10, 20, 30, 40];
 i64 first = values[0];
 ```
 
-A shared reference is written `T&`; a mutable reference is `T& mut`:
+A shared reference is written `T&`; a mutable reference is `T&mut`:
 
 ```raz
 fn read(i64& value) -> i64 {
     return *value;
 }
 
-fn increment(i64& mut value) {
+fn increment(i64&mut value) {
     *value += 1;
 }
 ```
@@ -245,7 +243,7 @@ Borrow expressions use `&` and `&mut`:
 ```raz
 i64 value = 41;
 i64& view = &value;
-i64& mut edit = &mut value;
+i64&mut edit = &mut value;
 ```
 
 Slices provide a borrowed view over contiguous data. Fixed arrays and slices remain bounds-aware on safe indexing paths.
@@ -338,7 +336,7 @@ impl Point {
         return self.x + self.y;
     }
 
-    fn translate(Point& mut self, i64 dx, i64 dy) {
+    fn translate(Point&mut self, i64 dx, i64 dy) {
         self.x += dx;
         self.y += dy;
     }
@@ -478,7 +476,7 @@ The important model is simple:
 - one active owner is responsible for an owned resource;
 - `move` transfers ownership;
 - `T&` borrows shared access;
-- `T& mut` borrows exclusive mutable access;
+- `T&mut` borrows exclusive mutable access;
 - reborrows cannot outlive the source borrow; and
 - references cannot escape a lifetime the source value cannot satisfy.
 
@@ -498,9 +496,9 @@ Values move by default. After a move the source binding is unusable, which is wh
 Shared and mutable borrows are checked for conflicts:
 
 ```raz
-fn increment_twice(i64& mut input) -> i64 {
+fn increment_twice(i64&mut input) -> i64 {
     {
-        i64& mut child = &mut*input;
+        i64&mut child = &mut*input;
         *child += 1;
     }
 
@@ -544,7 +542,7 @@ struct Resource {
 }
 
 impl Drop for Resource {
-    fn drop(Resource& mut self) {
+    fn drop(Resource&mut self) {
         // Release the resource represented by self.handle.
         self;
     }
@@ -680,7 +678,7 @@ Raz's `for` syntax is not limited to built-in arrays. Custom iterator types can 
 ```raz
 trait Iterator {
     type Item;
-    fn next(Self& mut self) -> bool;
+    fn next(Self&mut self) -> bool;
     fn current(Self& self) -> Item;
 }
 
@@ -692,7 +690,7 @@ struct Counter {
 impl Iterator for Counter {
     type Item = i64;
 
-    fn next(Counter& mut self) -> bool {
+    fn next(Counter&mut self) -> bool {
         if (self.current_value < self.end) {
             self.current_value += 1;
             return true;
@@ -1165,7 +1163,7 @@ The complete program combines ownership, enums, error propagation, and the stand
 | Struct field | `i64 value;` |
 | Fixed array | `i64 values[4] = [1, 2, 3, 4];` |
 | Shared reference type | `T&` |
-| Mutable reference type | `T& mut` |
+| Mutable reference type | `T&mut` |
 | Shared borrow | `&value` |
 | Mutable borrow | `&mut value` |
 | Dereference | `*value` |
@@ -1208,8 +1206,8 @@ Raz 1.0 is intended to make native systems programming direct: explicit where th
 
 **Raz language design:** Mario Vinciguerra.
 
-**Forge backend:** [Ascension Digital Technologies / Forge](https://github.com/Ascension-Digital-Technologies/Forge). Forge is a separate project and is vendored under its own Apache-2.0 license when included with Raz.
+**Forge backend:** [`raz-language/forge`](https://github.com/raz-language/forge). Forge is maintained as a separate project and is embedded in Raz under its own Apache-2.0 license.
 
-**LLVM backend:** the LLVM IR emitter and orchestration layer are implemented in Raz under `compiler/src/backend/llvm/`. LLVM itself is not vendored; native LLVM-mode object and executable emission requires an external Clang/LLVM toolchain.
+**LLVM backend:** the LLVM IR emitter and orchestration layer are implemented in Raz under `compiler/src/raz_codegen_llvm/src/llvm/`. LLVM itself is not vendored; native LLVM-mode object and executable emission requires an external Clang/LLVM toolchain.
 
 Raz 1.0 was built in part to prove Forge as a practical native alternative for language frontend developers who want verified IR, optimization, machine lowering, and native object generation without taking on LLVM's integration scale. The LLVM path complements that design with access to LLVM targets and optimization infrastructure. Raz remains a native systems language, and real performance is an end-to-end responsibility shared by frontend lowering, the selected backend, the runtime, and the standard library.

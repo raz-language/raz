@@ -149,6 +149,10 @@ int main(int argc, char** argv) {
       options.entry = arguments[i]; options.infer_crt_startup = false; continue;
     }
     if (arg == "--no-crt-startup") { options.infer_crt_startup = false; continue; }
+    // Compiler drivers conventionally forward -pthread to both compilation and
+    // link steps. PE/COFF has no direct linker switch for it, so accept it as
+    // a no-op compatibility flag rather than rejecting an otherwise valid link.
+    if (arg == "-pthread") { continue; }
     if (arg == "--verbose") { options.verbose = true; continue; }
     if (arg == "--map") {
       if (++i >= arguments.size()) { std::cerr << "oblink: error: --map requires a path\n"; return 2; }

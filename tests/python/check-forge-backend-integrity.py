@@ -21,9 +21,9 @@ checks = {
     "aggregate returns are lowered": ("src/machine/lower.cpp", "Opcode::return_aggregate"),
     "live ranges split around calls": ("src/machine/register_allocation.cpp", "split_live_ranges_around_calls"),
     "machine optimizer exists": ("src/machine/optimize.cpp", "optimize"),
-    "System V ABI classification exists": ("src/target/abi.cpp", "NativeAbi::system_v_x86_64"),
-    "Windows x64 ABI classification exists": ("src/target/abi.cpp", "NativeAbi::windows_x64"),
-    "AAPCS64 ABI classification exists": ("src/target/abi.cpp", "NativeAbi::aapcs64"),
+    "System V ABI classification exists": ("src/platform/abi.cpp", "NativeAbi::system_v_x86_64"),
+    "Windows x64 ABI classification exists": ("src/platform/abi.cpp", "NativeAbi::windows_x64"),
+    "AAPCS64 ABI classification exists": ("src/platform/abi.cpp", "NativeAbi::aapcs64"),
     "AArch64 register allocator exists": ("src/codegen/aarch64/register_allocation.cpp", "allocate_registers"),
     "AArch64 allocator uses callee-saved integer bank": ("src/codegen/aarch64/register_allocation.cpp", "integer_pool{19, 20, 21, 22, 23, 24, 25, 26, 27, 28}"),
     "AArch64 canonical machine combines exist": ("src/machine/optimize.cpp", "optimize_aarch64_canonical_module"),
@@ -53,11 +53,13 @@ checks = {
     "O3 pipeline exists": ("src/pass/pipeline.cpp", "OptimizationLevel::o3"),
     "Os pipeline exists": ("src/pass/pipeline.cpp", "OptimizationLevel::os"),
     "Oz pipeline exists": ("src/pass/pipeline.cpp", "OptimizationLevel::oz"),
+    "large-module O2 compile-time guard exists": ("src/capi/forge.cpp", "kLargeModuleFunctionThreshold = 1024"),
+    "large-module O2 guard preserves ordinary modules": ("src/capi/forge.cpp", "module->value->functions().size() >= kLargeModuleFunctionThreshold"),
 }
 
 raz_checks = {
     "compiler decimal writer handles i64 minimum": (
-        root / "compiler" / "src" / "backend" / "forge" / "writer.rz",
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "writer.rz",
         "value == (-9223372036854775807 - 1)",
     ),
     "Forge call mismatch diagnostic reports producer": (
@@ -65,11 +67,11 @@ raz_checks = {
         "produced by",
     ),
     "legacy Forge fallback emits typed f64 reference loads": (
-        root / "compiler" / "src" / "backend" / "forge" / "function_codegen.rz",
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "function_codegen.rz",
         "writer_runtime_name(out, 11)",
     ),
     "legacy Forge fallback uses ordinary stage1 runtime ABI": (
-        root / "compiler" / "src" / "backend" / "forge" / "writer.rz",
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "writer.rz",
         "fn emit_stage1_legacy_runtime_declarations",
     ),
     "runtime exposes allocation-free stage1 references": (
@@ -81,7 +83,7 @@ raz_checks = {
         "double raz_rt_stage1_ref_get_f64(std::int64_t reference)",
     ),
     "structured Forge uses compact opcode bridge": (
-        root / "compiler" / "src" / "backend" / "forge" / "native_support.rz",
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "native_support.rz",
         "raz_compiler_forge_block_append_operation_word_i64",
     ),
     "Forge O0 object path skips redundant optimizer verification": (
@@ -89,8 +91,28 @@ raz_checks = {
         "if (optimization_level != 0)",
     ),
     "Forge structure identity decisions are cached": (
-        root / "compiler" / "src" / "backend" / "forge" / "writer.rz",
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "writer.rz",
         "struct_identity_suffix_cache",
+    ),
+    "Forge synthetic boolean registers use disjoint namespace": (
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "writer.rz",
+        "fn writer_true_register() -> i64",
+    ),
+    "structured Forge builds a function reachability graph": (
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "native_functions.rz",
+        "backend_build_function_reachability_for_module(",
+    ),
+    "structured Forge filters ordinary function declarations by reachability": (
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "native_functions.rz",
+        "bool reachable_function =",
+    ),
+    "structured Forge filters function bodies by reachability": (
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "native_functions.rz",
+        "raz_compiler_rt_arena_get(reachable_functions, function_index) != 0",
+    ),
+    "structured Forge filters callable adapters by reachable owners": (
+        root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "native_operations.rz",
+        "i64 reachable_functions",
     ),
 }
 
@@ -107,9 +129,18 @@ for label, (path, needle) in raz_checks.items():
     if not path.is_file() or needle not in path.read_text(encoding="utf-8"):
         failed.append(label)
 
-writer_path = root / "compiler" / "src" / "backend" / "forge" / "writer.rz"
+writer_path = root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge" / "writer.rz"
 if writer_path.is_file() and "value + 1 == 0" in writer_path.read_text(encoding="utf-8"):
     failed.append("legacy broken i64-min decimal guard removed")
+
+# Never borrow plausible MIR instruction ids as backend-only SSA sentinels.
+# The self-hosted compiler has already grown beyond the old 999998/999999
+# constants, which made otherwise valid Forge IR contain duplicate SSA names.
+forge_backend_root = root / "compiler" / "src" / "raz_codegen_forge" / "src" / "forge"
+for path in forge_backend_root.glob("*.rz"):
+    text = path.read_text(encoding="utf-8")
+    if "999998" in text or "999999" in text:
+        failed.append(f"hardcoded Forge SSA sentinel removed ({path.name})")
 
 if failed:
     for label in failed:

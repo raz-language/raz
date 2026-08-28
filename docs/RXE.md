@@ -1,6 +1,6 @@
 # RXE Backend
 
-RXE (Raz Executable) is Raz's deterministic bytecode target. It consumes verified MIR and is implemented in Raz under `compiler/src/backend/rxe/`. RXE is independent from Forge and LLVM lowering and does not redefine source-language type, ownership, or lifetime semantics.
+RXE (Raz Executable) is Raz's deterministic bytecode target. It consumes verified MIR and is implemented in Raz under `compiler/src/raz_codegen_rxe/src/rxe/`. RXE is independent from Forge and LLVM lowering and does not redefine source-language type, ownership, or lifetime semantics.
 
 ## Execution contract
 

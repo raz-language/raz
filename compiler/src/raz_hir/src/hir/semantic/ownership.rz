@@ -1,0 +1,3763 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::ownership;
+
+public import raz_hir::generics::const_generics;
+import raz_hir::semantic::expressions;
+import raz_hir::semantic::statements;
+
+// Ownership, borrowing, lifetimes, moves, and callable capture rules.
+// Keep these checks conservative: accepting an invalid alias is worse than rejecting one.
+fn hir_find_function(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    i64 epoch = builder.module.function_count * 4099 + builder.namespace_import_count;
+    i64 cached_result = -1;
+
+    if (hir_symbol_cache_get(builder, 1, offset, offset, length, epoch, &mut cached_result)) {
+        return cached_result;
+    }
+
+    i64 index = hir_function_lookup_head(builder, offset, length);
+
+    while (index >= 0) {
+        i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, index);
+
+        if (
+            raz_compiler_rt_arena_get(builder.module.function_inherent_structs, index) == -1 &&
+            hir_namespace_same(builder, offset, declaration_offset) &&
+            token_same(
+                &builder.scan.input,
+                declaration_offset,
+                raz_compiler_rt_arena_get(builder.module.function_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, index);
+            return index;
+        }
+        index = hir_function_lookup_next_index(builder, index);
+    }
+    if (builder.namespace_lookup_target_hash >= 0) {
+        hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, -1);
+        return -1;
+    }
+
+    i64 imported = -1;
+    i64 imported_offset = -1;
+
+    index = hir_function_lookup_head(builder, offset, length);
+    while (index >= 0) {
+        i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, index);
+
+        if (
+            raz_compiler_rt_arena_get(builder.module.function_inherent_structs, index) == -1 &&
+            hir_namespace_imported(builder, offset, declaration_offset) &&
+            token_same(
+                &builder.scan.input,
+                declaration_offset,
+                raz_compiler_rt_arena_get(builder.module.function_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            if (imported >= 0 && hir_namespace_ambiguous(builder, imported_offset, declaration_offset)) {
+                hir_fail(builder, DiagnosticCode::AmbiguousName);
+                return -1;
+            }
+            imported = index;
+            imported_offset = declaration_offset;
+        }
+        index = hir_function_lookup_next_index(builder, index);
+    }
+    hir_symbol_cache_put(builder, 1, offset, offset, length, epoch, imported);
+    return imported;
+}
+
+fn hir_find_constant(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    if (builder.namespace_lookup_target_hash < 0) {
+        i64 index = builder.module.constant_count - 1;
+
+        while (index >= 0) {
+            i64 owner_function = raz_compiler_rt_arena_get(builder.module.constant_function_indices, index);
+            i64 owner_block = raz_compiler_rt_arena_get(builder.module.constant_block_indices, index);
+            i64 source_offset = raz_compiler_rt_arena_get(builder.module.constant_source_offsets, index);
+            bool visible = false;
+
+            if (owner_function == builder.current_function && source_offset < offset) {
+                visible = owner_block < 0;
+
+                i64 scope = builder.current_block;
+
+                while (!visible && scope >= 0) {
+                    if (scope == owner_block) {
+                        visible = true;
+                    } else {
+                        scope = raz_compiler_rt_arena_get(builder.module.block_parent_indices, scope);
+                    }
+                }
+            }
+
+            i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.constant_name_offsets, index);
+
+            if (
+                owner_function >= 0 &&
+                visible &&
+                token_same(
+                    &builder.scan.input,
+                    declaration_offset,
+                    raz_compiler_rt_arena_get(builder.module.constant_name_lengths, index),
+                    offset,
+                    length,
+                )
+            ) {
+                return index;
+            }
+            index -= 1;
+        }
+    }
+
+    i64 index = builder.module.constant_count - 1;
+
+    while (index >= 0) {
+        if (raz_compiler_rt_arena_get(builder.module.constant_function_indices, index) < 0) {
+            i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.constant_name_offsets, index);
+
+            if (
+                hir_namespace_same(builder, offset, declaration_offset) &&
+                token_same(
+                    &builder.scan.input,
+                    declaration_offset,
+                    raz_compiler_rt_arena_get(builder.module.constant_name_lengths, index),
+                    offset,
+                    length,
+                )
+            ) {
+                return index;
+            }
+        }
+        index -= 1;
+    }
+    if (builder.namespace_lookup_target_hash >= 0) {
+        return -1;
+    }
+
+    i64 imported = -1;
+    i64 imported_offset = -1;
+
+    index = builder.module.constant_count - 1;
+    while (index >= 0) {
+        if (raz_compiler_rt_arena_get(builder.module.constant_function_indices, index) < 0) {
+            i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.constant_name_offsets, index);
+
+            if (
+                hir_namespace_imported(builder, offset, declaration_offset) &&
+                token_same(
+                    &builder.scan.input,
+                    declaration_offset,
+                    raz_compiler_rt_arena_get(builder.module.constant_name_lengths, index),
+                    offset,
+                    length,
+                )
+            ) {
+                if (imported >= 0 && hir_namespace_ambiguous(builder, imported_offset, declaration_offset)) {
+                    hir_fail(builder, DiagnosticCode::AmbiguousName);
+                    return -1;
+                }
+                imported = index;
+                imported_offset = declaration_offset;
+            }
+        }
+        index -= 1;
+    }
+    return imported;
+}
+
+fn hir_find_global(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    i64 epoch = builder.module.global_count * 4099 + builder.namespace_import_count;
+    i64 cached_result = -1;
+
+    if (hir_symbol_cache_get(builder, 8, offset, offset, length, epoch, &mut cached_result)) {
+        return cached_result;
+    }
+
+    i64 index = 0;
+
+    while (index < builder.module.global_count) {
+        i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.global_name_offsets, index);
+
+        if (
+            hir_namespace_same(builder, offset, declaration_offset) &&
+            token_same(
+                &builder.scan.input,
+                declaration_offset,
+                raz_compiler_rt_arena_get(builder.module.global_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            hir_symbol_cache_put(builder, 8, offset, offset, length, epoch, index);
+            return index;
+        }
+        index += 1;
+    }
+    if (builder.namespace_lookup_target_hash >= 0) {
+        hir_symbol_cache_put(builder, 8, offset, offset, length, epoch, -1);
+        return -1;
+    }
+
+    i64 imported = -1;
+    i64 imported_offset = -1;
+
+    index = 0;
+    while (index < builder.module.global_count) {
+        i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.global_name_offsets, index);
+
+        if (
+            hir_namespace_imported(builder, offset, declaration_offset) &&
+            token_same(
+                &builder.scan.input,
+                declaration_offset,
+                raz_compiler_rt_arena_get(builder.module.global_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            if (imported >= 0 && hir_namespace_ambiguous(builder, imported_offset, declaration_offset)) {
+                hir_fail(builder, DiagnosticCode::AmbiguousName);
+                return -1;
+            }
+            imported = index;
+            imported_offset = declaration_offset;
+        }
+        index += 1;
+    }
+    hir_symbol_cache_put(builder, 8, offset, offset, length, epoch, imported);
+    return imported;
+}
+
+fn hir_register_local(HirBuilder&mut builder, i64 index, i64 slot) {
+    i64 previous = raz_compiler_rt_arena_get(builder.module.function_last_locals, builder.current_function);
+
+    raz_compiler_rt_arena_set(builder.module.local_previous_function_locals, index, previous);
+    i64 declaration_offset = raz_compiler_rt_arena_get(builder.module.local_name_offsets, index);
+
+    if (declaration_offset <= 0) {
+        declaration_offset = builder.current.offset;
+    }
+    raz_compiler_rt_arena_set(builder.module.local_declaration_offsets, index, declaration_offset);
+    raz_compiler_rt_arena_set(builder.module.local_slots, index, slot);
+    raz_compiler_rt_arena_set(builder.module.function_last_locals, builder.current_function, index + 1);
+}
+
+fn hir_lexical_cache_slot(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 block_index,
+    i64 offset,
+    i64 length,
+) -> i64 {
+    i64 seed = (function_index * 131 + (block_index + 2) * 17 + 29) % 281474976710597;
+
+    return raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 8192;
+}
+
+fn hir_find_name(HirBuilder&mut builder, i64 offset, i64 length, i64&mut kind, i64&mut slot) -> bool {
+    i64 function_index = builder.current_function;
+    i64 parameter_count = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index);
+    i64 local_epoch = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+    i64 cache_slot = hir_lexical_cache_slot(builder, function_index, builder.current_block, offset, length);
+
+    if (
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_blocks, cache_slot) == builder.current_block &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_parameter_epochs, cache_slot) == parameter_count &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_local_epochs, cache_slot) == local_epoch &&
+        raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_name_lengths, cache_slot) == length &&
+        token_same(
+            &builder.scan.input,
+            raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_name_offsets, cache_slot),
+            length,
+            offset,
+            length,
+        )
+    ) {
+        builder.scope_cache_hits += 1;
+
+        i64 cached_kind = raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_kinds, cache_slot);
+
+        if (cached_kind < 0) {
+            return false;
+        }
+        *kind = cached_kind;
+        *slot = raz_compiler_rt_arena_get_unchecked(builder.lexical_cache_slots, cache_slot);
+        return true;
+    }
+    builder.scope_cache_misses += 1;
+
+    i64 found_kind = -1;
+    i64 found_slot = -1;
+    i64 parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, function_index);
+    i64 parameter_index = parameter_start;
+    i64 parameter_end = parameter_start + parameter_count;
+
+    while (parameter_index < parameter_end) {
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.parameter_name_offsets, parameter_index),
+                raz_compiler_rt_arena_get(builder.module.parameter_name_lengths, parameter_index),
+                offset,
+                length,
+            )
+        ) {
+            found_kind = 2;
+            found_slot = parameter_index - parameter_start;
+            parameter_index = parameter_end;
+        } else {
+            parameter_index += 1;
+        }
+    }
+    if (found_kind < 0) {
+        i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+
+        while (link > 0 && found_kind < 0) {
+            i64 index = link - 1;
+
+            if (
+                raz_compiler_rt_arena_get(builder.module.local_name_offsets, index) < offset &&
+                token_same(
+                    &builder.scan.input,
+                    raz_compiler_rt_arena_get(builder.module.local_name_offsets, index),
+                    raz_compiler_rt_arena_get(builder.module.local_name_lengths, index),
+                    offset,
+                    length,
+                )
+            ) {
+                i64 local_block = raz_compiler_rt_arena_get(builder.module.local_block_indices, index);
+                bool visible = local_block < 0;
+                i64 scope = builder.current_block;
+
+                while (!visible && scope >= 0) {
+                    if (scope == local_block) {
+                        visible = true;
+                    } else {
+                        scope = raz_compiler_rt_arena_get(builder.module.block_parent_indices, scope);
+                    }
+                }
+                if (visible) {
+                    found_kind = 3;
+                    found_slot = raz_compiler_rt_arena_get(builder.module.local_slots, index);
+                }
+            }
+            link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, index);
+        }
+    }
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_blocks, cache_slot, builder.current_block);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_name_offsets, cache_slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_name_lengths, cache_slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_parameter_epochs, cache_slot, parameter_count);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_kinds, cache_slot, found_kind);
+    raz_compiler_rt_arena_set_unchecked(builder.lexical_cache_slots, cache_slot, found_slot);
+    if (found_kind < 0) {
+        return false;
+    }
+    *kind = found_kind;
+    *slot = found_slot;
+    return true;
+}
+
+fn hir_local_index_from_slot(HirBuilder&mut builder, i64 slot) -> i64 {
+    i64 function_index = builder.current_function;
+    i64 local_epoch = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+    i64 cache_slot = (function_index * 131 + slot * 17 + 47) % 8192;
+
+    if (
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_slots, cache_slot) == slot &&
+        raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_local_epochs, cache_slot) == local_epoch
+    ) {
+        builder.scope_cache_hits += 1;
+        return raz_compiler_rt_arena_get_unchecked(builder.slot_local_cache_results, cache_slot);
+    }
+    builder.scope_cache_misses += 1;
+
+    i64 result = -1;
+    i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+
+    while (link > 0 && result < 0) {
+        i64 index = link - 1;
+
+        if (raz_compiler_rt_arena_get(builder.module.local_slots, index) == slot) {
+            result = index;
+        } else {
+            link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, index);
+        }
+    }
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_slots, cache_slot, slot);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.slot_local_cache_results, cache_slot, result);
+    return result;
+}
+
+fn hir_local_visible_in_scope(HirBuilder&mut builder, i64 index) -> bool {
+    if (
+        index < 0 ||
+        raz_compiler_rt_arena_get(builder.module.local_function_indices, index) != builder.current_function
+    ) {
+        return false;
+    }
+    // Blocks are populated in HIR block order, not strictly source order. A
+    // local in an enclosing block is only visible if its declaration precedes
+    // the token currently being analyzed; otherwise a later declaration could
+    // incorrectly create a borrow/move conflict in an earlier nested block.
+    if (raz_compiler_rt_arena_get(builder.module.local_name_offsets, index) >= builder.current.offset) {
+        return false;
+    }
+
+    i64 local_block = raz_compiler_rt_arena_get(builder.module.local_block_indices, index);
+
+    if (local_block < 0) {
+        return true;
+    }
+
+    i64 scope = builder.current_block;
+
+    while (scope >= 0) {
+        if (scope == local_block) {
+            return true;
+        }
+        scope = raz_compiler_rt_arena_get(builder.module.block_parent_indices, scope);
+    }
+    return false;
+}
+
+fn hir_node_path(
+    HirBuilder&mut builder,
+    i64 node,
+    i64&mut root_kind,
+    i64&mut root_index,
+    i64&mut path,
+) -> bool {
+    if (node < 0) {
+        return false;
+    }
+
+    i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, node);
+
+    if (kind == 2) {
+        *root_kind = 2;
+        *root_index =
+            raz_compiler_rt_arena_get(builder.module.function_parameter_starts, builder.current_function) +
+            raz_compiler_rt_arena_get(builder.module.node_a, node);
+        *path = 0;
+        return true;
+    }
+    if (kind == 3) {
+        *root_kind = 3;
+        *root_index = hir_local_index_from_slot(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node),
+        );
+        *path = 0;
+        return *root_index >= 0;
+    }
+    if (kind == 54) {
+        *root_kind = 4;
+        *root_index = raz_compiler_rt_arena_get(builder.module.node_a, node);
+        *path = 0;
+        return *root_index >= 0 && *root_index < builder.module.global_count;
+    }
+    if (kind == 16) {
+        if (
+            !hir_node_path(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                root_kind,
+                root_index,
+                path,
+            )
+        ) {
+            return false;
+        }
+        *path = *path * 4096 + raz_compiler_rt_arena_get(builder.module.node_b, node) + 1;
+        return true;
+    }
+    if (kind == 22) {
+        if (
+            !hir_node_path(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                root_kind,
+                root_index,
+                path,
+            )
+        ) {
+            return false;
+        }
+
+        i64 index_node = raz_compiler_rt_arena_get(builder.module.node_b, node);
+
+        if (raz_compiler_rt_arena_get(builder.module.node_kinds, index_node) != 1) {
+            *path = 0;
+            return true;
+        }
+
+        i64 fixed_index = raz_compiler_rt_arena_get(builder.module.node_values, index_node);
+
+        if (fixed_index < 0 || fixed_index >= 2047) {
+            *path = 0;
+            return true;
+        }
+        *path = *path * 4096 + 2048 + fixed_index;
+        return true;
+    }
+    if (kind == 21 || kind == 37 || kind == 39) {
+        return hir_node_path(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node),
+            root_kind,
+            root_index,
+            path,
+        );
+    }
+    return false;
+}
+
+fn hir_node_root(HirBuilder&mut builder, i64 node, i64&mut root_kind, i64&mut root_index) -> bool {
+    i64 path = 0;
+
+    return hir_node_path(builder, node, root_kind, root_index, &mut path);
+}
+
+fn hir_paths_overlap(i64 left, i64 right) -> bool {
+    if (left == 0 || right == 0) {
+        return true;
+    }
+
+    i64 cursor = left;
+
+    while (cursor > 0) {
+        if (cursor == right) {
+            return true;
+        }
+        cursor = cursor / 4096;
+    }
+    cursor = right;
+    while (cursor > 0) {
+        if (cursor == left) {
+            return true;
+        }
+        cursor = cursor / 4096;
+    }
+    return false;
+}
+
+fn hir_root_is_whole_moved(HirBuilder&mut builder, i64 root_kind, i64 root_index) -> bool {
+    if (root_kind == 2) {
+        return raz_compiler_rt_arena_get(builder.parameter_moved, root_index) != 0;
+    }
+    if (root_kind == 3) {
+        return raz_compiler_rt_arena_get(builder.local_moved, root_index) != 0;
+    }
+    return false;
+}
+
+fn hir_path_is_moved(HirBuilder&mut builder, i64 root_kind, i64 root_index, i64 path) -> bool {
+    if (hir_root_is_whole_moved(builder, root_kind, root_index)) {
+        return true;
+    }
+
+    i64 index = 0;
+
+    while (index < builder.moved_path_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.moved_path_root_kinds, index) == root_kind &&
+            raz_compiler_rt_arena_get(builder.moved_path_root_indices, index) == root_index
+        ) {
+            i64 moved_path = raz_compiler_rt_arena_get(builder.moved_paths, index);
+
+            if (moved_path >= 0 && hir_paths_overlap(moved_path, path)) {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    return false;
+}
+
+fn hir_path_uninitialized_at_root(HirBuilder&mut builder, i64 root_kind, i64 root_index, i64 path) -> bool {
+    if (hir_root_is_whole_moved(builder, root_kind, root_index)) {
+        return true;
+    }
+
+    i64 index = 0;
+
+    while (index < builder.moved_path_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.moved_path_root_kinds, index) == root_kind &&
+            raz_compiler_rt_arena_get(builder.moved_path_root_indices, index) == root_index
+        ) {
+            i64 moved_path = raz_compiler_rt_arena_get(builder.moved_paths, index);
+
+            if (moved_path >= 0) {
+                i64 cursor = path;
+
+                while (cursor > 0) {
+                    if (cursor == moved_path) {
+                        return true;
+                    }
+                    cursor = cursor / 4096;
+                }
+            }
+        }
+        index += 1;
+    }
+    return false;
+}
+
+fn hir_record_predrop(
+    HirBuilder&mut builder,
+    i64 statement,
+    i64 structure,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+) -> bool {
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_structures, statement, structure);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_root_kinds, statement, root_kind);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_root_indices, statement, root_index);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_paths, statement, path);
+
+    i64 start = builder.module.predrop_moved_path_count;
+    i64 count = 0;
+    i64 index = 0;
+
+    while (index < builder.moved_path_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.moved_path_root_kinds, index) == root_kind &&
+            raz_compiler_rt_arena_get(builder.moved_path_root_indices, index) == root_index
+        ) {
+            i64 moved_path = raz_compiler_rt_arena_get(builder.moved_paths, index);
+
+            if (moved_path >= 0 && hir_paths_overlap(moved_path, path)) {
+                if (builder.module.predrop_moved_path_count >= 262144) {
+                    hir_fail(builder, DiagnosticCode::TooManyItems);
+                    return false;
+                }
+                raz_compiler_rt_arena_set(
+                    builder.module.predrop_moved_paths,
+                    builder.module.predrop_moved_path_count,
+                    moved_path,
+                );
+                builder.module.predrop_moved_path_count += 1;
+                count += 1;
+            }
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_moved_starts, statement, start);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_moved_counts, statement, count);
+    return true;
+}
+
+fn hir_clear_path_moved(HirBuilder&mut builder, i64 root_kind, i64 root_index, i64 path) {
+    if (path == 0) {
+        if (root_kind == 2) {
+            raz_compiler_rt_arena_set(builder.parameter_moved, root_index, 0);
+        } else if (root_kind == 3) {
+            raz_compiler_rt_arena_set(builder.local_moved, root_index, 0);
+        }
+    }
+
+    i64 index = 0;
+
+    while (index < builder.moved_path_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.moved_path_root_kinds, index) == root_kind &&
+            raz_compiler_rt_arena_get(builder.moved_path_root_indices, index) == root_index
+        ) {
+            i64 moved_path = raz_compiler_rt_arena_get(builder.moved_paths, index);
+
+            if (moved_path >= 0 && (path == 0 || hir_paths_overlap(moved_path, path))) {
+                raz_compiler_rt_arena_set(builder.moved_paths, index, -1);
+            }
+        }
+        index += 1;
+    }
+}
+
+fn hir_mark_path_moved(HirBuilder&mut builder, i64 root_kind, i64 root_index, i64 path) -> bool {
+    if (path == 0) {
+        hir_clear_path_moved(builder, root_kind, root_index, 0);
+        if (root_kind == 2) {
+            raz_compiler_rt_arena_set(builder.parameter_moved, root_index, 1);
+        } else if (root_kind == 3) {
+            raz_compiler_rt_arena_set(builder.local_moved, root_index, 1);
+        }
+        return true;
+    }
+    if (builder.moved_path_count >= 16384) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 index = builder.moved_path_count;
+
+    builder.moved_path_count += 1;
+    raz_compiler_rt_arena_set(builder.moved_path_root_kinds, index, root_kind);
+    raz_compiler_rt_arena_set(builder.moved_path_root_indices, index, root_index);
+    raz_compiler_rt_arena_set(builder.moved_paths, index, path);
+    return true;
+}
+
+fn hir_compute_local_reference_last_use(HirBuilder&mut builder, i64 local) -> i64 {
+    i64 name_offset = raz_compiler_rt_arena_get(builder.module.local_name_offsets, local);
+    i64 name_length = raz_compiler_rt_arena_get(builder.module.local_name_lengths, local);
+    i64 owner_block = raz_compiler_rt_arena_get(builder.module.local_block_indices, local);
+
+    if (name_length <= 0) {
+        if (owner_block >= 0) {
+            return raz_compiler_rt_arena_get(builder.module.block_ends, owner_block);
+        }
+        return builder.scan.input.length;
+    }
+
+    i64 end_offset = builder.scan.input.length;
+
+    if (owner_block >= 0) {
+        end_offset = raz_compiler_rt_arena_get(builder.module.block_ends, owner_block);
+    }
+
+    Lexer scan;
+
+    init_lexer(&mut scan, builder.scan.input);
+    scan.offset = name_offset + name_length;
+
+    Token current;
+    i64 last_use = name_offset;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && current.offset < end_offset) {
+        if (
+            current.kind == TokenKind::Identifier &&
+            token_same(&builder.scan.input, name_offset, name_length, current.offset, current.length)
+        ) {
+            last_use = current.offset;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    return last_use;
+}
+
+fn hir_local_reference_used_after(HirBuilder&mut builder, i64 local, i64 after_offset) -> bool {
+    return raz_compiler_rt_arena_get(builder.local_reference_last_uses, local) > after_offset;
+}
+
+fn hir_has_active_borrow_at(
+    HirBuilder&mut builder,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 requested_kind,
+    i64 at_offset,
+) -> bool {
+    i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, builder.current_function);
+
+    while (link > 0) {
+        i64 index = link - 1;
+
+        if (hir_local_visible_in_scope(builder, index)) {
+            i64 borrow_kind = raz_compiler_rt_arena_get(builder.local_borrow_kinds, index);
+
+            if (
+                borrow_kind != 0 &&
+                hir_local_reference_used_after(builder, index, at_offset) &&
+                raz_compiler_rt_arena_get(builder.local_borrow_source_kinds, index) == root_kind &&
+                raz_compiler_rt_arena_get(builder.local_borrow_source_indices, index) == root_index
+            ) {
+                i64 borrow_path = raz_compiler_rt_arena_get(builder.local_borrow_source_paths, index);
+
+                if (hir_paths_overlap(borrow_path, path) && (requested_kind == 2 || borrow_kind == 2)) {
+                    return true;
+                }
+            }
+        }
+        link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, index);
+    }
+    return false;
+}
+
+fn hir_has_active_borrow(
+    HirBuilder&mut builder,
+    i64 root_kind,
+    i64 root_index,
+    i64 path,
+    i64 requested_kind,
+) -> bool {
+    return hir_has_active_borrow_at(
+        builder,
+        root_kind,
+        root_index,
+        path,
+        requested_kind,
+        builder.current.offset,
+    );
+}
+
+fn hir_validate_borrow(HirBuilder&mut builder, i64 operand, i64 mutable_borrow) -> bool {
+    i64 root_kind = 0;
+    i64 root_index = -1;
+    i64 path = 0;
+
+    if (!hir_node_path(builder, operand, &mut root_kind, &mut root_index, &mut path)) {
+        hir_fail(builder, DiagnosticCode::InvalidMove);
+        return false;
+    }
+    if (hir_path_is_moved(builder, root_kind, root_index, path)) {
+        // Whole-value move order is finalized by the CFG ownership pass.
+        // Deferred child blocks are parsed after later root statements, so a
+        // future `move value` may already be visible here even though this
+        // borrow occurs earlier in source order. Partial-path moves remain an
+        // immediate error because they are not represented by that whole-root
+        // CFG state.
+        if (!hir_root_is_whole_moved(builder, root_kind, root_index)) {
+            hir_fail(builder, DiagnosticCode::UseAfterMove);
+            return false;
+        }
+    }
+    if (
+        root_kind == 4 &&
+        mutable_borrow != 0 &&
+        raz_compiler_rt_arena_get(builder.module.global_mutable_flags, root_index) == 0
+    ) {
+        hir_fail(builder, DiagnosticCode::BorrowConflict);
+        return false;
+    }
+
+    i64 requested_kind = 1;
+
+    if (mutable_borrow != 0) {
+        requested_kind = 2;
+    }
+    if (hir_has_active_borrow(builder, root_kind, root_index, path, requested_kind)) {
+        hir_fail(builder, DiagnosticCode::BorrowConflict);
+        return false;
+    }
+    return true;
+}
+
+fn hir_record_local_borrow(HirBuilder&mut builder, i64 local_index, i64 initializer) {
+    raz_compiler_rt_arena_set(builder.local_borrow_kinds, local_index, 0);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_kinds, local_index, 0);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_indices, local_index, -1);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_paths, local_index, 0);
+    raz_compiler_rt_arena_set(builder.local_reference_last_uses, local_index, -1);
+    if (initializer < 0) {
+        return;
+    }
+
+    i64 source = initializer;
+    i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, source);
+
+    if (kind == 37) {
+        source = raz_compiler_rt_arena_get(builder.module.node_a, source);
+        kind = raz_compiler_rt_arena_get(builder.module.node_kinds, source);
+    }
+    if (kind != 17) {
+        return;
+    }
+
+    i64 root_kind = 0;
+    i64 root_index = -1;
+    i64 path = 0;
+    i64 operand = raz_compiler_rt_arena_get(builder.module.node_a, source);
+
+    if (!hir_node_path(builder, operand, &mut root_kind, &mut root_index, &mut path)) {
+        return;
+    }
+
+    i64 borrow_kind = 1;
+
+    if (raz_compiler_rt_arena_get(builder.module.node_values, source) != 0) {
+        borrow_kind = 2;
+    }
+    raz_compiler_rt_arena_set(builder.local_borrow_kinds, local_index, borrow_kind);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_kinds, local_index, root_kind);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_indices, local_index, root_index);
+    raz_compiler_rt_arena_set(builder.local_borrow_source_paths, local_index, path);
+    raz_compiler_rt_arena_set(
+        builder.local_reference_last_uses,
+        local_index,
+        hir_compute_local_reference_last_use(builder, local_index),
+    );
+}
+
+fn hir_reference_origin_is_raw_storage(HirBuilder&mut builder, i64 node) -> bool {
+    if (node < 0) {
+        return false;
+    }
+
+    i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, node);
+
+    if (kind == 17) {
+        i64 operand = raz_compiler_rt_arena_get(builder.module.node_a, node);
+
+        if (raz_compiler_rt_arena_get(builder.module.node_kinds, operand) != 21) {
+            return false;
+        }
+
+        i64 raw_pointer = raz_compiler_rt_arena_get(builder.module.node_a, operand);
+        i64 raw_pointer_kind = raz_compiler_rt_arena_get(builder.module.node_references, raw_pointer);
+
+        return raw_pointer_kind == 2 || raw_pointer_kind == 3;
+    }
+    if (kind == 37 || kind == 39) {
+        return hir_reference_origin_is_raw_storage(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node),
+        );
+    }
+    return false;
+}
+
+fn hir_reference_origin_is_local(HirBuilder&mut builder, i64 node) -> bool {
+    if (node < 0) {
+        return false;
+    }
+
+    i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, node);
+
+    if (kind == 17) {
+        i64 root_kind = 0;
+        i64 root_index = -1;
+        i64 path = 0;
+
+        if (
+            hir_node_path(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                &mut root_kind,
+                &mut root_index,
+                &mut path,
+            )
+        ) {
+            return root_kind == 3;
+        }
+        return false;
+    }
+    if (kind == 3) {
+        i64 local = hir_local_index_from_slot(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node)
+        );
+        if (local < 0) {
+            return false;
+        }
+        if (raz_compiler_rt_arena_get(builder.module.local_references, local) == 1) {
+            return raz_compiler_rt_arena_get(builder.local_borrow_source_kinds, local) == 3;
+        }
+
+        i64 statement = 0;
+
+        while (statement < builder.module.statement_count) {
+            i64 statement_kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+            if (
+                (statement_kind == 8 || statement_kind == 9 || statement_kind == 10) &&
+                raz_compiler_rt_arena_get(
+                    builder.module.statement_function_indices,
+                    statement,
+                ) == builder.current_function &&
+                raz_compiler_rt_arena_get(builder.module.statement_c, statement) == local
+            ) {
+                return hir_reference_origin_is_local(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                );
+            }
+            statement += 1;
+        }
+        return false;
+    }
+    if (kind == 16 || kind == 22 || kind == 37 || kind == 39) {
+        return hir_reference_origin_is_local(builder, raz_compiler_rt_arena_get(builder.module.node_a, node));
+    }
+    if (kind == 34) {
+        i64 argument = raz_compiler_rt_arena_get(builder.module.node_b, node);
+        i64 end = argument + raz_compiler_rt_arena_get(builder.module.node_c, node);
+
+        while (argument < end) {
+            if (
+                hir_reference_origin_is_local(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, argument),
+                )
+            ) {
+                return true;
+            }
+            argument += 1;
+        }
+        return false;
+    }
+    if (kind == 53) {
+        i64 argument = raz_compiler_rt_arena_get(builder.module.node_a, node);
+        i64 end = argument + raz_compiler_rt_arena_get(builder.module.node_b, node);
+
+        while (argument < end) {
+            if (
+                hir_reference_origin_is_local(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, argument),
+                )
+            ) {
+                return true;
+            }
+            argument += 1;
+        }
+        return false;
+    }
+    if (kind == 3) {
+        i64 local = hir_local_index_from_slot(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node)
+        );
+        if (local < 0) {
+            return false;
+        }
+
+        i64 statement = 0;
+
+        while (statement < builder.module.statement_count) {
+            i64 statement_kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+            if (
+                (statement_kind == 8 || statement_kind == 9 || statement_kind == 10) &&
+                raz_compiler_rt_arena_get(
+                    builder.module.statement_function_indices,
+                    statement,
+                ) == builder.current_function &&
+                raz_compiler_rt_arena_get(builder.module.statement_c, statement) == local
+            ) {
+                return hir_reference_origin_is_local(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                );
+            }
+            statement += 1;
+        }
+    }
+    return false;
+}
+
+fn hir_apply_name_type(HirBuilder&mut builder, i64 kind, i64 slot, i64 node) {
+    if (kind == 2) {
+        i64 index =
+            raz_compiler_rt_arena_get(builder.module.function_parameter_starts, builder.current_function) +
+            slot;
+        raz_compiler_rt_arena_set(
+            builder.module.node_type_structs,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_type_structs, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_types,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_types, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_references,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_references, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_reference_mutable,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_reference_mutable, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_lifetimes,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_lifetimes, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slices,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_slices, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slice_mutable,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_slice_mutable, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_array_extents,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_array_extents, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_function_types,
+            node,
+            raz_compiler_rt_arena_get(builder.module.parameter_function_types, index),
+        );
+        return;
+    }
+
+    i64 index = hir_local_index_from_slot(builder, slot);
+
+    if (index >= 0) {
+        raz_compiler_rt_arena_set(
+            builder.module.node_type_structs,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_type_structs, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_types,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_types, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_references,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_references, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_reference_mutable,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_reference_mutable, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_lifetimes,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_lifetimes, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slices,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_slices, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slice_mutable,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_slice_mutable, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_array_extents,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_array_extents, index),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_function_types,
+            node,
+            raz_compiler_rt_arena_get(builder.module.local_function_types, index),
+        );
+    }
+}
+
+fn hir_coerce_slice(HirBuilder&mut builder, i64 value, i64 required_mutable, i64&mut out) -> bool {
+    if (value < 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.node_slices, value) != 0) {
+        if (
+            required_mutable != 0 &&
+            raz_compiler_rt_arena_get(builder.module.node_slice_mutable, value) == 0
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        *out = value;
+        return true;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.node_kinds, value) != 17) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 operand = raz_compiler_rt_arena_get(builder.module.node_a, value);
+    i64 extent = raz_compiler_rt_arena_get(builder.module.node_array_extents, operand);
+    i64 borrow_mutable = raz_compiler_rt_arena_get(builder.module.node_values, value);
+
+    if (extent < 0 || (required_mutable != 0 && borrow_mutable == 0)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 slice = -1;
+
+    if (!hir_add_node(builder, 37, operand, extent, 0, borrow_mutable, &mut slice)) {
+        return false;
+    }
+    hir_copy_node_type(builder, slice, operand);
+    raz_compiler_rt_arena_set(builder.module.node_slices, slice, 1);
+    raz_compiler_rt_arena_set(builder.module.node_slice_mutable, slice, borrow_mutable);
+    raz_compiler_rt_arena_set(builder.module.node_array_extents, slice, -1);
+    *out = slice;
+    return true;
+}
+
+fn hir_find_dyn_method_target(
+    HirBuilder&mut builder,
+    i64 trait_index,
+    i64 method_offset,
+    i64 method_length,
+    i64&mut out_method,
+    i64&mut out_target,
+) -> bool {
+    i64 method_start = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+    i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+    i64 slot = 0;
+
+    while (slot < method_count) {
+        i64 method = method_start + slot;
+
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, method),
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, method),
+                method_offset,
+                method_length,
+            )
+        ) {
+            i64 implementation = 0;
+
+            while (implementation < builder.module.trait_impl_count) {
+                if (
+                    raz_compiler_rt_arena_get(builder.module.trait_impl_traits, implementation) == trait_index
+                ) {
+                    i64 structure = raz_compiler_rt_arena_get(
+                        builder.module.trait_impl_structures,
+                        implementation,
+                    );
+
+                    i64 inherent = hir_find_inherent_method(builder, structure, method_offset, method_length);
+
+                    if (
+                        inherent >= 0 &&
+                        raz_compiler_rt_arena_get(builder.module.inherent_method_receivers, inherent) != 0
+                    ) {
+                        *out_method = method;
+                        *out_target = raz_compiler_rt_arena_get(
+                            builder.module.inherent_method_functions,
+                            inherent,
+                        );
+                        return true;
+                    }
+                }
+                implementation += 1;
+            }
+            return false;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+fn hir_parse_dyn_trait_call(
+    HirBuilder&mut builder,
+    i64 receiver,
+    i64 trait_index,
+    i64 method_offset,
+    i64 method_length,
+    i64&mut out,
+) -> bool {
+    i64 trait_method = -1;
+    i64 representative = -1;
+
+    if (
+        !hir_find_dyn_method_target(
+            builder,
+            trait_index,
+            method_offset,
+            method_length,
+            &mut trait_method,
+            &mut representative,
+        )
+    ) {
+        // A declared dyn-trait method can still be unavailable when the
+        // assembled package graph contains no concrete implementation from
+        // which to derive the erased call signature/dispatch target.  Report
+        // that separately from an actually unknown member name.
+        i64 method_start = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+        i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+        i64 slot = 0;
+        bool declared = false;
+        while (slot < method_count && !declared) {
+            i64 candidate = method_start + slot;
+            declared = token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, candidate),
+                raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, candidate),
+                method_offset,
+                method_length,
+            );
+            slot += 1;
+        }
+        if (declared) {
+            hir_fail(builder, DiagnosticCode::DynTraitMethodUnavailable);
+        } else {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+        }
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::LeftParen) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+
+    i64 pending_arguments = raz_compiler_rt_arena_create(256);
+
+    if (pending_arguments == 0) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 argument_count = 0;
+
+    if (builder.current.kind != TokenKind::RightParen) {
+        bool parsing_arguments = true;
+
+        while (parsing_arguments) {
+            i64 argument = -1;
+
+            if (!hir_parse_expression(builder, &mut argument)) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            if (argument_count >= 255) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            raz_compiler_rt_arena_set(pending_arguments, argument_count, argument);
+            argument_count += 1;
+            if (builder.current.kind == TokenKind::Comma) {
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::RightParen) {
+                    parsing_arguments = false;
+                }
+            } else {
+                parsing_arguments = false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        return false;
+    }
+
+    i64 expected = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, representative);
+
+    if (expected == 0 || argument_count + 1 != expected) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::WrongArgumentCount);
+        return false;
+    }
+
+    i64 parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, representative);
+    i64 index = 0;
+
+    while (index < argument_count) {
+        i64 argument = raz_compiler_rt_arena_get(pending_arguments, index);
+        i64 parameter = parameter_start + index + 1;
+        i64 parameter_structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter);
+        i64 parameter_slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, parameter);
+        i64 parameter_reference = raz_compiler_rt_arena_get(builder.module.parameter_references, parameter);
+        i64 argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+
+        // Dynamic dispatch uses the same explicit-argument coercion contract as
+        // an ordinary/inherent call. The receiver itself is erased into the dyn
+        // handle, but every user argument still has to preserve references,
+        // mutable references, slices, and aggregate identity from the selected
+        // trait method signature.
+        if (parameter_slice != 0) {
+            i64 sliced = -1;
+
+            if (
+                !hir_coerce_slice(
+                    builder,
+                    argument,
+                    raz_compiler_rt_arena_get(builder.module.parameter_slice_mutable, parameter),
+                    &mut sliced,
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            argument = sliced;
+            argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+        }
+        if (parameter_reference != 0) {
+            if (
+                !hir_require_reference_type(
+                    builder,
+                    &mut argument,
+                    parameter_reference,
+                    parameter_structure,
+                    raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+        } else if (parameter_structure >= 0) {
+            if (argument_structure != parameter_structure) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else if (
+            argument_structure < 0 &&
+            !hir_require_value_type(
+                builder,
+                &mut argument,
+                raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+            )
+        ) {
+            raz_compiler_rt_arena_destroy(pending_arguments);
+            return false;
+        }
+        raz_compiler_rt_arena_set(pending_arguments, index, argument);
+        index += 1;
+    }
+    if (builder.module.argument_count + argument_count >= 262144) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 argument_start = builder.module.argument_count;
+
+    index = 0;
+    while (index < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.arguments,
+            builder.module.argument_count,
+            raz_compiler_rt_arena_get(pending_arguments, index),
+        );
+        builder.module.argument_count += 1;
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(pending_arguments);
+
+    i64 dispatch_start = builder.module.argument_count;
+    i64 dispatch_count = 0;
+    i64 implementation = 0;
+
+    while (implementation < builder.module.trait_impl_count) {
+        if (raz_compiler_rt_arena_get(builder.module.trait_impl_traits, implementation) == trait_index) {
+            i64 structure = raz_compiler_rt_arena_get(builder.module.trait_impl_structures, implementation);
+            i64 inherent = hir_find_inherent_method(builder, structure, method_offset, method_length);
+
+            if (inherent >= 0 && builder.module.argument_count + 2 < 262144) {
+                raz_compiler_rt_arena_set(builder.module.arguments, builder.module.argument_count, structure);
+                builder.module.argument_count += 1;
+                raz_compiler_rt_arena_set(
+                    builder.module.arguments,
+                    builder.module.argument_count,
+                    raz_compiler_rt_arena_get(builder.module.inherent_method_functions, inherent),
+                );
+                builder.module.argument_count += 1;
+                dispatch_count += 1;
+            }
+        }
+        implementation += 1;
+    }
+    if (dispatch_count == 0) {
+        hir_fail(builder, DiagnosticCode::UnknownName);
+        return false;
+    }
+
+    i64 call = -1;
+
+    if (!hir_add_node(builder, 51, receiver, trait_index, dispatch_start, argument_start, &mut call)) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(builder.module.node_values, call, argument_count | (dispatch_count << 16));
+    hir_set_node_type(
+        builder,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_types, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_references,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_references, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_reference_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_reference_mutable, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_type_structs,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_type_structs, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slices,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slices, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slice_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slice_mutable, representative),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_function_types,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_function_types, representative),
+    );
+    *out = call;
+    return true;
+}
+
+fn hir_parse_inherent_call(
+    HirBuilder&mut builder,
+    i64 target,
+    i64 receiver,
+    i64 include_receiver,
+    i64&mut out,
+) -> bool {
+    if (builder.current.kind != TokenKind::LeftParen) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+
+    i64 pending_arguments = raz_compiler_rt_arena_create(256);
+
+    if (pending_arguments == 0) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 argument_count = 0;
+
+    if (include_receiver != 0) {
+        raz_compiler_rt_arena_set(pending_arguments, argument_count, receiver);
+        argument_count += 1;
+    }
+    if (builder.current.kind != TokenKind::RightParen) {
+        bool parsing_arguments = true;
+
+        while (parsing_arguments) {
+            i64 argument = -1;
+
+            if (!hir_parse_expression(builder, &mut argument)) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            if (argument_count >= 256) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            raz_compiler_rt_arena_set(pending_arguments, argument_count, argument);
+            argument_count += 1;
+            if (builder.current.kind == TokenKind::Comma) {
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::RightParen) {
+                    parsing_arguments = false;
+                }
+            } else {
+                parsing_arguments = false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        return false;
+    }
+
+    i64 expected = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, target);
+
+    if (argument_count != expected) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::WrongArgumentCount);
+        return false;
+    }
+
+    i64 parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, target);
+    i64 index = 0;
+
+    while (index < argument_count) {
+        i64 argument = raz_compiler_rt_arena_get(pending_arguments, index);
+        i64 parameter = parameter_start + index;
+        i64 parameter_structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter);
+        i64 parameter_slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, parameter);
+        i64 parameter_reference = raz_compiler_rt_arena_get(builder.module.parameter_references, parameter);
+        i64 argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+
+        // Method syntax owns receiver auto-borrowing. Ordinary function calls
+        // still require an explicit `&`/`&mut`, while `value.method()` works
+        // for both addressable places and temporary scalar values.
+        if (index == 0 && include_receiver != 0 && parameter_reference == 1) {
+            if (raz_compiler_rt_arena_get(builder.module.node_references, argument) == 0) {
+                i64 mutable_borrow = raz_compiler_rt_arena_get(
+                    builder.module.parameter_reference_mutable,
+                    parameter
+                );
+
+                i64 root_kind = 0;
+                i64 root_index = -1;
+                i64 root_path = 0;
+
+                if (
+                    hir_node_path(builder, argument, &mut root_kind, &mut root_index, &mut root_path) &&
+                    !hir_validate_borrow(builder, argument, mutable_borrow)
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    return false;
+                }
+
+                i64 borrowed = -1;
+
+                if (!hir_add_node(builder, 17, argument, 0, 0, mutable_borrow, &mut borrowed)) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    return false;
+                }
+                hir_copy_node_type(builder, borrowed, argument);
+                raz_compiler_rt_arena_set(builder.module.node_references, borrowed, 1);
+                raz_compiler_rt_arena_set(builder.module.node_reference_mutable, borrowed, mutable_borrow);
+                argument = borrowed;
+                argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+            }
+        }
+        if (parameter_slice != 0) {
+            i64 sliced = -1;
+
+            if (
+                !hir_coerce_slice(
+                    builder,
+                    argument,
+                    raz_compiler_rt_arena_get(builder.module.parameter_slice_mutable, parameter),
+                    &mut sliced,
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            argument = sliced;
+            argument_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, argument);
+        }
+        if (parameter_reference != 0) {
+            if (
+                !hir_require_reference_type(
+                    builder,
+                    &mut argument,
+                    parameter_reference,
+                    parameter_structure,
+                    raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+        } else if (parameter_structure >= 0) {
+            if (argument_structure != parameter_structure) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else if (
+            argument_structure < 0 &&
+            !hir_require_value_type(
+                builder,
+                &mut argument,
+                raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+            )
+        ) {
+            raz_compiler_rt_arena_destroy(pending_arguments);
+            return false;
+        }
+        raz_compiler_rt_arena_set(pending_arguments, index, argument);
+        index += 1;
+    }
+    if (builder.module.argument_count + argument_count >= 262144) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 argument_start = builder.module.argument_count;
+
+    index = 0;
+    while (index < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.arguments,
+            builder.module.argument_count,
+            raz_compiler_rt_arena_get(pending_arguments, index),
+        );
+        builder.module.argument_count += 1;
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(pending_arguments);
+
+    i64 call = -1;
+
+    if (!hir_add_node(builder, 4, target, argument_start, argument_count, 0, &mut call)) {
+        return false;
+    }
+    hir_set_node_type(builder, call, raz_compiler_rt_arena_get(builder.module.function_return_types, target));
+    raz_compiler_rt_arena_set(
+        builder.module.node_references,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_references, target),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_reference_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_reference_mutable, target),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_lifetimes,
+        call,
+        hir_resolve_call_return_lifetime(builder, target, argument_start, argument_count),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_type_structs,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_type_structs, target),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slices,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slices, target),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_slice_mutable,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_slice_mutable, target),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_function_types,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_function_types, target),
+    );
+    *out = call;
+    return true;
+}
+
+fn hir_capture_structure_needs_drop(HirBuilder&mut builder, i64 structure, i64 depth) -> bool {
+    if (structure < 0 || depth > 32) {
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0) {
+        return true;
+    }
+
+    i64 field = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    i64 end = field + raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+
+    while (field < end) {
+        if (raz_compiler_rt_arena_get(builder.module.struct_field_references, field) == 0) {
+            i64 child = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field);
+
+            if (child >= 0 && hir_capture_structure_needs_drop(builder, child, depth + 1)) {
+                return true;
+            }
+        }
+        field += 1;
+    }
+    return false;
+}
+
+fn hir_find_name_in_function(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 block_index,
+    i64 before_offset,
+    i64 offset,
+    i64 length,
+    i64&mut root_kind,
+    i64&mut root_index,
+) -> bool {
+    i64 parameter_count = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index);
+    i64 local_epoch = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+    i64 seed = (function_index * 131 + (block_index + 2) * 17 + (before_offset % 104729) + 71) % 281474976710597;
+    i64 cache_slot = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, seed) % 8192;
+
+    if (
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_functions, cache_slot) == function_index + 1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_blocks, cache_slot) == block_index &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_before_offsets, cache_slot) == before_offset &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_parameter_epochs, cache_slot) == parameter_count &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_local_epochs, cache_slot) == local_epoch &&
+        raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_name_lengths, cache_slot) == length &&
+        token_same(
+            &builder.scan.input,
+            raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_name_offsets, cache_slot),
+            length,
+            offset,
+            length,
+        )
+    ) {
+        builder.scope_cache_hits += 1;
+
+        i64 cached_kind = raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_kinds, cache_slot);
+
+        if (cached_kind < 0) {
+            return false;
+        }
+        *root_kind = cached_kind;
+        *root_index = raz_compiler_rt_arena_get_unchecked(builder.function_name_cache_indices, cache_slot);
+        return true;
+    }
+    builder.scope_cache_misses += 1;
+
+    i64 found_kind = -1;
+    i64 found_index = -1;
+    i64 parameter = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, function_index);
+    i64 parameter_end = parameter + parameter_count;
+
+    while (parameter < parameter_end && found_kind < 0) {
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.parameter_name_offsets, parameter),
+                raz_compiler_rt_arena_get(builder.module.parameter_name_lengths, parameter),
+                offset,
+                length,
+            )
+        ) {
+            found_kind = 2;
+            found_index = parameter;
+        }
+        parameter += 1;
+    }
+
+    i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, function_index);
+
+    while (link > 0 && found_kind < 0) {
+        i64 local = link - 1;
+
+        if (
+            raz_compiler_rt_arena_get(builder.module.local_name_offsets, local) < before_offset &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.local_name_offsets, local),
+                raz_compiler_rt_arena_get(builder.module.local_name_lengths, local),
+                offset,
+                length,
+            )
+        ) {
+            i64 owner_block = raz_compiler_rt_arena_get(builder.module.local_block_indices, local);
+            bool visible = owner_block < 0;
+            i64 scope = block_index;
+
+            while (!visible && scope >= 0) {
+                if (scope == owner_block) {
+                    visible = true;
+                } else {
+                    scope = raz_compiler_rt_arena_get(builder.module.block_parent_indices, scope);
+                }
+            }
+            if (visible) {
+                found_kind = 3;
+                found_index = local;
+            }
+        }
+        link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, local);
+    }
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_functions, cache_slot, function_index + 1);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_blocks, cache_slot, block_index);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_before_offsets, cache_slot, before_offset);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_name_offsets, cache_slot, offset);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_name_lengths, cache_slot, length);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_parameter_epochs, cache_slot, parameter_count);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_local_epochs, cache_slot, local_epoch);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_kinds, cache_slot, found_kind);
+    raz_compiler_rt_arena_set_unchecked(builder.function_name_cache_indices, cache_slot, found_index);
+    if (found_kind < 0) {
+        return false;
+    }
+    *root_kind = found_kind;
+    *root_index = found_index;
+    return true;
+}
+
+fn hir_closure_captures_parent_stack_by_reference(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 parent_function,
+) -> bool {
+    i64 closure_kind = raz_compiler_rt_arena_get(builder.module.function_closure_kinds, function_index);
+
+    if (closure_kind != 2 && closure_kind != 3) {
+        return false;
+    }
+
+    i64 capture = raz_compiler_rt_arena_get(builder.module.function_closure_capture_starts, function_index);
+
+    i64 end =
+        capture +
+        raz_compiler_rt_arena_get(builder.module.function_closure_capture_counts, function_index);
+    while (capture < end) {
+        i64 root_kind = raz_compiler_rt_arena_get(builder.module.closure_capture_root_kinds, capture);
+        i64 root_index = raz_compiler_rt_arena_get(builder.module.closure_capture_root_indices, capture);
+
+        if (
+            root_kind == 3 &&
+            root_index >= 0 &&
+            raz_compiler_rt_arena_get(builder.module.local_function_indices, root_index) == parent_function
+        ) {
+            return true;
+        }
+        capture += 1;
+    }
+    return false;
+}
+
+fn hir_closure_capture_exists(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 root_kind,
+    i64 root_index,
+) -> bool {
+    i64 capture = raz_compiler_rt_arena_get(builder.module.function_closure_capture_starts, function_index);
+
+    i64 end =
+        capture +
+        raz_compiler_rt_arena_get(builder.module.function_closure_capture_counts, function_index);
+    while (capture < end) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.closure_capture_root_kinds, capture) == root_kind &&
+            raz_compiler_rt_arena_get(builder.module.closure_capture_root_indices, capture) == root_index
+        ) {
+            return true;
+        }
+        capture += 1;
+    }
+    return false;
+}
+
+fn hir_append_closure_capture(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 root_kind,
+    i64 root_index,
+    i64 name_offset,
+    i64 name_length,
+) -> bool {
+    if (hir_closure_capture_exists(builder, function_index, root_kind, root_index)) {
+        return true;
+    }
+    if (builder.module.closure_capture_count >= 262144 || builder.module.parameter_count >= 32768) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 structure = -1;
+    i64 type_kind = 0;
+    i64 reference = 0;
+    i64 slice = 0;
+    i64 slice_mutable = 0;
+    i64 array_extent = -1;
+
+    if (root_kind == 2) {
+        structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, root_index);
+        type_kind = raz_compiler_rt_arena_get(builder.module.parameter_types, root_index);
+        reference = raz_compiler_rt_arena_get(builder.module.parameter_references, root_index);
+        slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, root_index);
+        slice_mutable = raz_compiler_rt_arena_get(builder.module.parameter_slice_mutable, root_index);
+        array_extent = raz_compiler_rt_arena_get(builder.module.parameter_array_extents, root_index);
+    } else {
+        structure = raz_compiler_rt_arena_get(builder.module.local_type_structs, root_index);
+        type_kind = raz_compiler_rt_arena_get(builder.module.local_types, root_index);
+        reference = raz_compiler_rt_arena_get(builder.module.local_references, root_index);
+        slice = raz_compiler_rt_arena_get(builder.module.local_slices, root_index);
+        slice_mutable = raz_compiler_rt_arena_get(builder.module.local_slice_mutable, root_index);
+        array_extent = raz_compiler_rt_arena_get(builder.module.local_array_extents, root_index);
+    }
+
+    i64 closure_kind = raz_compiler_rt_arena_get(builder.module.function_closure_kinds, function_index);
+
+    if (closure_kind == 2 || closure_kind == 3) {
+        reference = 1;
+    } else if (
+        closure_kind == 1 &&
+        reference == 0 &&
+        structure >= 0 &&
+        raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure) == 0
+    ) {
+        hir_fail(builder, DiagnosticCode::InvalidMove);
+        return false;
+    }
+
+    i64 capture = builder.module.closure_capture_count;
+
+    builder.module.closure_capture_count += 1;
+    raz_compiler_rt_arena_set(builder.module.closure_capture_root_kinds, capture, root_kind);
+    raz_compiler_rt_arena_set(builder.module.closure_capture_root_indices, capture, root_index);
+    raz_compiler_rt_arena_set(
+        builder.module.function_closure_capture_counts,
+        function_index,
+        raz_compiler_rt_arena_get(builder.module.function_closure_capture_counts, function_index) + 1,
+    );
+
+    i64 parameter = builder.module.parameter_count;
+
+    builder.module.parameter_count += 1;
+    raz_compiler_rt_arena_set(builder.module.parameter_name_offsets, parameter, name_offset);
+    raz_compiler_rt_arena_set(builder.module.parameter_name_lengths, parameter, name_length);
+    raz_compiler_rt_arena_set(builder.module.parameter_function_indices, parameter, function_index);
+    raz_compiler_rt_arena_set(builder.module.parameter_type_structs, parameter, structure);
+    raz_compiler_rt_arena_set(builder.module.parameter_types, parameter, type_kind);
+    raz_compiler_rt_arena_set(builder.module.parameter_references, parameter, reference);
+
+    i64 capture_reference_mutable = 0;
+
+    if (closure_kind == 3) {
+        capture_reference_mutable = 1;
+    }
+    raz_compiler_rt_arena_set(
+        builder.module.parameter_reference_mutable,
+        parameter,
+        capture_reference_mutable
+    );
+    raz_compiler_rt_arena_set(builder.module.parameter_slices, parameter, slice);
+    raz_compiler_rt_arena_set(builder.module.parameter_slice_mutable, parameter, slice_mutable);
+    raz_compiler_rt_arena_set(builder.module.parameter_array_extents, parameter, array_extent);
+    raz_compiler_rt_arena_set(builder.module.parameter_function_types, parameter, -1);
+    raz_compiler_rt_arena_set(builder.parameter_moved, parameter, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.function_parameter_counts,
+        function_index,
+        raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index) + 1,
+    );
+    return true;
+}
+
+fn hir_scan_closure_captures(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 parent_function,
+    i64 parent_block,
+    i64 before_offset,
+    i64 body_start,
+    i64 body_end,
+) -> bool {
+    Lexer scan;
+
+    init_lexer(&mut scan, builder.scan.input);
+    scan.offset = body_start;
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+
+    TokenKind previous = TokenKind::Unknown;
+
+    while (current.kind != TokenKind::End && current.offset < body_end) {
+        if (
+            current.kind == TokenKind::Identifier &&
+            previous != TokenKind::Dot &&
+            previous != TokenKind::ColonColon
+        ) {
+            bool explicit_parameter = false;
+
+            i64 parameter = raz_compiler_rt_arena_get(
+                builder.module.function_parameter_starts,
+                function_index
+            );
+            i64 explicit_end =
+                parameter +
+                raz_compiler_rt_arena_get(builder.module.function_closure_explicit_parameter_counts, function_index);
+            while (!explicit_parameter && parameter < explicit_end) {
+                if (
+                    token_same(
+                        &builder.scan.input,
+                        raz_compiler_rt_arena_get(builder.module.parameter_name_offsets, parameter),
+                        raz_compiler_rt_arena_get(builder.module.parameter_name_lengths, parameter),
+                        current.offset,
+                        current.length,
+                    )
+                ) {
+                    explicit_parameter = true;
+                }
+                parameter += 1;
+            }
+            if (!explicit_parameter) {
+                i64 root_kind = 0;
+                i64 root_index = -1;
+
+                if (
+                    hir_find_name_in_function(
+                        builder,
+                        parent_function,
+                        parent_block,
+                        before_offset,
+                        current.offset,
+                        current.length,
+                        &mut root_kind,
+                        &mut root_index,
+                    )
+                ) {
+                    if (
+                        !hir_append_closure_capture(
+                            builder,
+                            function_index,
+                            root_kind,
+                            root_index,
+                            current.offset,
+                            current.length,
+                        )
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+        previous = current.kind;
+        next_token(&mut scan, &mut current);
+    }
+    return true;
+}
+
+fn hir_closure_capture_root_is_copy(
+    HirBuilder&mut builder,
+    i64 root_kind,
+    i64 root_index,
+) -> bool {
+    i64 structure = -1;
+    i64 type_kind = 0;
+    i64 reference = 0;
+    i64 slice = 0;
+    i64 array_extent = -1;
+
+    if (root_kind == 2) {
+        structure = raz_compiler_rt_arena_get(builder.module.parameter_type_structs, root_index);
+        type_kind = raz_compiler_rt_arena_get(builder.module.parameter_types, root_index);
+        reference = raz_compiler_rt_arena_get(builder.module.parameter_references, root_index);
+        slice = raz_compiler_rt_arena_get(builder.module.parameter_slices, root_index);
+        array_extent = raz_compiler_rt_arena_get(builder.module.parameter_array_extents, root_index);
+    } else {
+        structure = raz_compiler_rt_arena_get(builder.module.local_type_structs, root_index);
+        type_kind = raz_compiler_rt_arena_get(builder.module.local_types, root_index);
+        reference = raz_compiler_rt_arena_get(builder.module.local_references, root_index);
+        slice = raz_compiler_rt_arena_get(builder.module.local_slices, root_index);
+        array_extent = raz_compiler_rt_arena_get(builder.module.local_array_extents, root_index);
+    }
+    if (reference != 0 || slice != 0 || array_extent >= 0) {
+        return false;
+    }
+    return hir_type_satisfies_bound(builder, structure, type_kind, -4);
+}
+
+fn hir_make_closure_capture_argument(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 capture,
+    i64&mut out,
+) -> bool {
+    i64 root_kind = raz_compiler_rt_arena_get(builder.module.closure_capture_root_kinds, capture);
+    i64 root_index = raz_compiler_rt_arena_get(builder.module.closure_capture_root_indices, capture);
+    i64 slot = -1;
+    i64 node = -1;
+
+    if (root_kind == 2) {
+        slot = root_index - raz_compiler_rt_arena_get(
+            builder.module.function_parameter_starts,
+            builder.current_function,
+        );
+        if (slot < 0 || !hir_add_node(builder, 2, slot, 0, 0, 0, &mut node)) {
+            return false;
+        }
+    } else {
+        if (
+            root_index < 0 ||
+            root_index >= builder.module.local_count ||
+            raz_compiler_rt_arena_get(
+                builder.module.local_function_indices,
+                root_index
+            ) != builder.current_function
+        ) {
+            return false;
+        }
+        slot = raz_compiler_rt_arena_get(builder.module.local_slots, root_index);
+        if (!hir_add_node(builder, 3, slot, 0, 0, 0, &mut node)) {
+            return false;
+        }
+    }
+    hir_apply_name_type(builder, root_kind, slot, node);
+    if (hir_path_is_moved(builder, root_kind, root_index, 0)) {
+        hir_fail(builder, DiagnosticCode::UseAfterMove);
+        return false;
+    }
+
+    i64 closure_kind = raz_compiler_rt_arena_get(builder.module.function_closure_kinds, function_index);
+
+    if (closure_kind == 2 || closure_kind == 3) {
+        i64 mutable_borrow = 0;
+
+        if (closure_kind == 3) {
+            mutable_borrow = 1;
+        }
+        if (!hir_validate_borrow(builder, node, mutable_borrow)) {
+            return false;
+        }
+
+        i64 borrowed = -1;
+
+        if (!hir_add_node(builder, 17, node, 0, 0, mutable_borrow, &mut borrowed)) {
+            return false;
+        }
+        hir_copy_node_type(builder, borrowed, node);
+        raz_compiler_rt_arena_set(builder.module.node_references, borrowed, 1);
+        node = borrowed;
+    } else if (closure_kind == 4) {
+        if (hir_has_active_borrow(builder, root_kind, root_index, 0, 2)) {
+            hir_fail(builder, DiagnosticCode::BorrowConflict);
+            return false;
+        }
+        if (
+            !hir_closure_capture_root_is_copy(builder, root_kind, root_index) &&
+            !hir_mark_path_moved(builder, root_kind, root_index, 0)
+        ) {
+            return false;
+        }
+
+        i64 moved = -1;
+
+        if (!hir_add_node(builder, 39, node, 0, 0, 0, &mut moved)) {
+            return false;
+        }
+        hir_copy_node_type(builder, moved, node);
+        node = moved;
+    }
+    *out = node;
+    return true;
+}
+
+fn hir_mark_escaping_move_closure_captures(HirBuilder&mut builder, i64 function_index) -> bool {
+    if (raz_compiler_rt_arena_get(builder.module.function_closure_kinds, function_index) != 4) {
+        return true;
+    }
+
+    i64 capture = raz_compiler_rt_arena_get(
+        builder.module.function_closure_capture_starts,
+        function_index,
+    );
+    i64 end =
+        capture +
+        raz_compiler_rt_arena_get(builder.module.function_closure_capture_counts, function_index);
+
+    while (capture < end) {
+        i64 root_kind = raz_compiler_rt_arena_get(
+            builder.module.closure_capture_root_kinds,
+            capture,
+        );
+        i64 root_index = raz_compiler_rt_arena_get(
+            builder.module.closure_capture_root_indices,
+            capture,
+        );
+
+        if (hir_path_is_moved(builder, root_kind, root_index, 0)) {
+            hir_fail(builder, DiagnosticCode::UseAfterMove);
+            return false;
+        }
+        if (hir_has_active_borrow(builder, root_kind, root_index, 0, 2)) {
+            hir_fail(builder, DiagnosticCode::BorrowConflict);
+            return false;
+        }
+        if (
+            !hir_closure_capture_root_is_copy(builder, root_kind, root_index) &&
+            !hir_mark_path_moved(builder, root_kind, root_index, 0)
+        ) {
+            return false;
+        }
+        capture += 1;
+    }
+    return true;
+}
+
+fn hir_append_closure_call_captures(HirBuilder&mut builder, i64 function_index) -> bool {
+    i64 capture = raz_compiler_rt_arena_get(builder.module.function_closure_capture_starts, function_index);
+
+    i64 end =
+        capture +
+        raz_compiler_rt_arena_get(builder.module.function_closure_capture_counts, function_index);
+    while (capture < end) {
+        if (builder.module.argument_count >= 262144) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+
+        i64 node = -1;
+
+        if (!hir_make_closure_capture_argument(builder, function_index, capture, &mut node)) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(builder.module.arguments, builder.module.argument_count, node);
+        builder.module.argument_count += 1;
+        capture += 1;
+    }
+    return true;
+}
+
+fn hir_initialize_closure_function(
+    HirBuilder&mut builder,
+    i64 function_index,
+    i64 closure_id,
+    i64 closure_kind,
+    i64 source_offset,
+) {
+    raz_compiler_rt_arena_set(builder.module.function_name_offsets, function_index, source_offset);
+    raz_compiler_rt_arena_set(builder.module.function_name_lengths, function_index, 2);
+    raz_compiler_rt_arena_set(
+        builder.module.function_parameter_starts,
+        function_index,
+        builder.module.parameter_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.function_parameter_counts, function_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.function_local_starts,
+        function_index,
+        builder.module.local_count
+    );
+    raz_compiler_rt_arena_set(builder.module.function_local_counts, function_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.function_statement_starts,
+        function_index,
+        builder.module.statement_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.function_statement_counts, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_is_extern, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_is_async, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_is_unsafe, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_extern_kinds, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_return_types, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_returns_value, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_return_references, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_return_type_structs, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_return_slices, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_return_slice_mutable, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_return_lifetimes, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_return_function_types, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_drop_structs, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_clone_structs, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_ids, function_index, closure_id);
+    raz_compiler_rt_arena_set(builder.module.function_closure_kinds, function_index, closure_kind);
+    raz_compiler_rt_arena_set(builder.module.function_closure_body_starts, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_body_ends, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_root_blocks, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_body_parsed, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_closure_parent_functions, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_parent_blocks, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_closure_explicit_parameter_counts, function_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.function_closure_capture_starts,
+        function_index,
+        builder.module.closure_capture_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.function_closure_capture_counts, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_inherent_structs, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_inherent_source_offsets, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_inherent_body_parsed, function_index, 1);
+    raz_compiler_rt_arena_set(builder.module.function_generic_template_indices, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_generic_type_structs, function_index, -1);
+    raz_compiler_rt_arena_set(builder.module.function_generic_types, function_index, 0);
+    raz_compiler_rt_arena_set(builder.module.function_generic_body_parsed, function_index, 1);
+    raz_compiler_rt_arena_set(
+        builder.module.function_defer_starts,
+        function_index,
+        builder.module.defer_count
+    );
+    raz_compiler_rt_arena_set(builder.module.function_defer_counts, function_index, 0);
+}
+
+fn hir_parse_immediate_closure(HirBuilder&mut builder, i64 fn_offset, i64 closure_kind, i64&mut out) -> bool {
+    if (builder.module.function_count >= 16384) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 saved_function = builder.current_function;
+    i64 saved_block = builder.current_block;
+    i64 saved_loop_depth = builder.loop_depth;
+    i64 function_index = builder.module.function_count;
+
+    builder.module.function_count += 1;
+
+    i64 closure_id = builder.module.closure_count;
+
+    builder.module.closure_count += 1;
+    hir_initialize_closure_function(builder, function_index, closure_id, closure_kind, fn_offset);
+    hir_function_lookup_insert(builder, function_index);
+    raz_compiler_rt_arena_set(
+        builder.module.function_closure_parent_functions,
+        function_index,
+        saved_function
+    );
+    raz_compiler_rt_arena_set(builder.module.function_closure_parent_blocks, function_index, saved_block);
+    builder.current_function = function_index;
+    builder.current_block = -1;
+    builder.loop_depth = 0;
+    if (!hir_expect(builder, TokenKind::LeftParen)) {
+        return false;
+    }
+    if (builder.current.kind != TokenKind::RightParen) {
+        bool parsing_parameters = true;
+
+        while (parsing_parameters) {
+            if (!hir_parse_parameter(builder)) {
+                return false;
+            }
+            if (builder.current.kind == TokenKind::Comma) {
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::RightParen) {
+                    parsing_parameters = false;
+                }
+            } else {
+                parsing_parameters = false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen)) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(
+        builder.module.function_closure_explicit_parameter_counts,
+        function_index,
+        raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index),
+    );
+    if (builder.current.kind == TokenKind::Arrow) {
+        hir_advance(builder);
+        raz_compiler_rt_arena_set(builder.module.function_returns_value, function_index, 1);
+
+        i64 return_structure = -1;
+        i64 return_type = 0;
+        i64 return_reference = 0;
+        i64 return_slice = 0;
+        i64 return_slice_mutable = 0;
+
+        if (
+            !hir_parse_type_spec(
+                builder,
+                &mut return_structure,
+                &mut return_type,
+                &mut return_reference,
+                &mut return_slice,
+                &mut return_slice_mutable,
+            )
+        ) {
+            return false;
+        }
+        if (return_reference != 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        raz_compiler_rt_arena_set(
+            builder.module.function_return_type_structs,
+            function_index,
+            return_structure,
+        );
+        raz_compiler_rt_arena_set(builder.module.function_return_types, function_index, return_type);
+        raz_compiler_rt_arena_set(builder.module.function_return_slices, function_index, return_slice);
+        raz_compiler_rt_arena_set(
+            builder.module.function_return_slice_mutable,
+            function_index,
+            return_slice_mutable,
+        );
+    }
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 body_start = builder.current.offset;
+    i64 body_end = body_start;
+    i64 brace_depth = 1;
+
+    while (brace_depth > 0 && builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            brace_depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+            brace_depth -= 1;
+            if (brace_depth == 0) {
+                body_end = builder.current.offset;
+                hir_advance(builder);
+                break;
+            }
+        }
+        if (brace_depth > 0) {
+            hir_advance(builder);
+        }
+    }
+    if (brace_depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    raz_compiler_rt_arena_set(builder.module.function_closure_body_starts, function_index, body_start);
+    raz_compiler_rt_arena_set(builder.module.function_closure_body_ends, function_index, body_end);
+    if (
+        !hir_scan_closure_captures(
+            builder,
+            function_index,
+            saved_function,
+            saved_block,
+            fn_offset,
+            body_start,
+            body_end,
+        )
+    ) {
+        return false;
+    }
+    builder.current_function = saved_function;
+    builder.current_block = saved_block;
+    builder.loop_depth = saved_loop_depth;
+    if (builder.current.kind != TokenKind::LeftParen) {
+        i64 closure_value = -1;
+
+        if (!hir_mark_escaping_move_closure_captures(builder, function_index)) {
+            return false;
+        }
+        if (!hir_add_node(builder, 42, function_index, closure_kind, 0, 0, &mut closure_value)) {
+            return false;
+        }
+        *out = closure_value;
+        return true;
+    }
+    hir_advance(builder);
+
+    i64 pending_arguments = raz_compiler_rt_arena_create(256);
+
+    if (pending_arguments == 0) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 argument_count = 0;
+
+    if (builder.current.kind != TokenKind::RightParen) {
+        bool parsing_arguments = true;
+
+        while (parsing_arguments) {
+            i64 argument = -1;
+
+            if (!hir_parse_expression(builder, &mut argument)) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                return false;
+            }
+            raz_compiler_rt_arena_set(pending_arguments, argument_count, argument);
+            argument_count += 1;
+            if (builder.current.kind == TokenKind::Comma) {
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::RightParen) {
+                    parsing_arguments = false;
+                }
+            } else {
+                parsing_arguments = false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen)) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        return false;
+    }
+    if (
+        argument_count != raz_compiler_rt_arena_get(
+            builder.module.function_closure_explicit_parameter_counts,
+            function_index,
+        )
+    ) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::WrongArgumentCount);
+        return false;
+    }
+
+    i64 parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, function_index);
+    i64 index = 0;
+
+    while (index < argument_count) {
+        i64 argument = raz_compiler_rt_arena_get(pending_arguments, index);
+        i64 parameter = parameter_start + index;
+
+        if (
+            raz_compiler_rt_arena_get(builder.module.parameter_references, parameter) == 0 &&
+            raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter) < 0 &&
+            raz_compiler_rt_arena_get(builder.module.parameter_types, parameter) == 0 &&
+            raz_compiler_rt_arena_get(builder.module.node_kinds, argument) == 1
+        ) {
+            bool argument_is_bool = raz_compiler_rt_arena_get(builder.module.node_c, argument) == 1;
+            bool parameter_is_bool = hir_parameter_spells_bool(builder, parameter);
+
+            if (argument_is_bool != parameter_is_bool) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        }
+        if (raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter) >= 0) {
+            if (
+                raz_compiler_rt_arena_get(
+                    builder.module.node_type_structs,
+                    argument,
+                ) != raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter)
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else if (
+            !hir_require_value_type(
+                builder,
+                &mut argument,
+                raz_compiler_rt_arena_get(builder.module.parameter_types, parameter),
+            )
+        ) {
+            raz_compiler_rt_arena_destroy(pending_arguments);
+            return false;
+        }
+        raz_compiler_rt_arena_set(pending_arguments, index, argument);
+        index += 1;
+    }
+
+    i64 argument_start = builder.module.argument_count;
+
+    index = 0;
+    while (index < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.arguments,
+            builder.module.argument_count,
+            raz_compiler_rt_arena_get(pending_arguments, index),
+        );
+        builder.module.argument_count += 1;
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(pending_arguments);
+    if (!hir_append_closure_call_captures(builder, function_index)) {
+        return false;
+    }
+    argument_count += raz_compiler_rt_arena_get(
+        builder.module.function_closure_capture_counts,
+        function_index
+    );
+
+    i64 call = -1;
+
+    if (!hir_add_node(builder, 4, function_index, argument_start, argument_count, 0, &mut call)) {
+        return false;
+    }
+    hir_set_node_type(
+        builder,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_types, function_index),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.node_type_structs,
+        call,
+        raz_compiler_rt_arena_get(builder.module.function_return_type_structs, function_index),
+    );
+    *out = call;
+    return true;
+}
+
+// Revalidate reference-return provenance after all deferred blocks have been
+// populated. Block bodies are parsed out of source order, so return escape
+// checks performed during initial block population cannot be the sole source
+// of truth for function-level lifetime semantics.
+fn hir_validate_reference_returns(HirBuilder&mut builder) -> bool {
+    i64 statement = 0;
+    i64 saved_function = builder.current_function;
+    i64 saved_block = builder.current_block;
+
+    while (statement < builder.module.statement_count) {
+        if (raz_compiler_rt_arena_get(builder.module.statement_kinds, statement) == 2) {
+            i64 function_index = raz_compiler_rt_arena_get(
+                builder.module.statement_function_indices,
+                statement,
+            );
+
+            i64 expression = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
+
+            if (function_index >= 0 && expression >= 0) {
+                builder.current_function = function_index;
+                builder.current_block = raz_compiler_rt_arena_get(
+                    builder.module.statement_block_indices,
+                    statement,
+                );
+                if (hir_reference_origin_is_local(builder, expression)) {
+                    hir_fail(builder, DiagnosticCode::BorrowConflict);
+                    builder.current_function = saved_function;
+                    builder.current_block = saved_block;
+                    return false;
+                }
+                if (
+                    raz_compiler_rt_arena_get(builder.module.function_return_references, function_index) != 0
+                ) {
+                    i64 declared_lifetime = raz_compiler_rt_arena_get(
+                        builder.module.function_return_lifetimes,
+                        function_index,
+                    );
+                    i64 actual_lifetime = raz_compiler_rt_arena_get(
+                        builder.module.node_lifetimes,
+                        expression
+                    );
+                    if (
+                        declared_lifetime >= 0 &&
+                        actual_lifetime >= 0 &&
+                        declared_lifetime != actual_lifetime
+                    ) {
+                        hir_fail(builder, DiagnosticCode::BorrowConflict);
+                        builder.current_function = saved_function;
+                        builder.current_block = saved_block;
+                        return false;
+                    }
+                }
+            }
+        }
+        statement += 1;
+    }
+    builder.current_function = saved_function;
+    builder.current_block = saved_block;
+    return true;
+}
+
+fn hir_has_live_local_reference_to_local_storage(HirBuilder&mut builder) -> bool {
+    i64 link = raz_compiler_rt_arena_get(builder.module.function_last_locals, builder.current_function);
+
+    while (link > 0) {
+        i64 local = link - 1;
+
+        if (
+            hir_local_visible_in_scope(builder, local) &&
+            raz_compiler_rt_arena_get(builder.module.local_references, local) != 0 &&
+            raz_compiler_rt_arena_get(builder.local_borrow_kinds, local) != 0 &&
+            raz_compiler_rt_arena_get(builder.local_borrow_source_kinds, local) == 3
+        ) {
+            return true;
+        }
+        link = raz_compiler_rt_arena_get(builder.module.local_previous_function_locals, local);
+    }
+    return false;
+}
+
+// Recompute whole-value move availability over the completed HIR control-flow
+// graph. Deferred child blocks are populated after their parents, so parse-time
+// move state cannot correctly model joins. This pass gives each branch its own
+// state and merges with a conservative union: a value is unavailable after a
+// join if it is moved on any continuing path. A whole-value assignment clears
+// the moved bit, which also handles reinitialization on every branch.
+fn hir_flow_local_state_capacity(HirBuilder&mut builder) -> i64 {
+    return raz_compiler_rt_arena_get(builder.module.function_local_counts, builder.current_function, ) + 1;
+}
+
+fn hir_flow_parameter_state_capacity(HirBuilder&mut builder) -> i64 {
+    return raz_compiler_rt_arena_get(builder.module.function_parameter_counts, builder.current_function, ) +
+        1;
+}
+
+fn hir_flow_local_state_slot(HirBuilder&mut builder, i64 local) -> i64 {
+    if (local < 0) {
+        return -1;
+    }
+    return raz_compiler_rt_arena_get(builder.module.local_slots, local);
+}
+
+fn hir_flow_parameter_state_slot(HirBuilder&mut builder, i64 parameter) -> i64 {
+    return parameter - raz_compiler_rt_arena_get(
+        builder.module.function_parameter_starts,
+        builder.current_function,
+    );
+}
+
+fn hir_flow_copy_state(HirBuilder&mut builder, i64 source, i64 destination, bool locals, ) {
+    i64 index = 0;
+    i64 end = 0;
+
+    if (locals) {
+        end = raz_compiler_rt_arena_get(builder.module.function_local_counts, builder.current_function, );
+    } else {
+        end = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, builder.current_function, );
+    }
+    while (index < end) {
+        raz_compiler_rt_arena_set(destination, index, raz_compiler_rt_arena_get(source, index), );
+        index += 1;
+    }
+}
+
+fn hir_flow_union_state(HirBuilder&mut builder, i64 left, i64 right, i64 destination, bool locals, ) {
+    i64 index = 0;
+    i64 end = 0;
+
+    if (locals) {
+        end = raz_compiler_rt_arena_get(builder.module.function_local_counts, builder.current_function, );
+    } else {
+        end = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, builder.current_function, );
+    }
+    while (index < end) {
+        i64 moved = 0;
+
+        if (raz_compiler_rt_arena_get(left, index) != 0 || raz_compiler_rt_arena_get(right, index) != 0) {
+            moved = 1;
+        }
+        raz_compiler_rt_arena_set(destination, index, moved);
+        index += 1;
+    }
+}
+
+fn hir_flow_clear_function_state(HirBuilder&mut builder, i64 local_state, i64 parameter_state, ) {
+    i64 local = 0;
+
+    i64 local_end = raz_compiler_rt_arena_get(
+        builder.module.function_local_counts,
+        builder.current_function,
+    );
+    while (local < local_end) {
+        raz_compiler_rt_arena_set(local_state, local, 0);
+        local += 1;
+    }
+
+    i64 parameter = 0;
+
+    i64 parameter_end = raz_compiler_rt_arena_get(
+        builder.module.function_parameter_counts,
+        builder.current_function,
+    );
+    while (parameter < parameter_end) {
+        raz_compiler_rt_arena_set(parameter_state, parameter, 0);
+        parameter += 1;
+    }
+}
+
+fn hir_flow_local_index(HirBuilder&mut builder, i64 slot) -> i64 {
+    return hir_local_index_from_slot(builder, slot);
+}
+
+// Plain assignment reinitializes the exact destination place. This includes
+// whole values reached through a mutable reference (`move *self; *self = ...`).
+fn hir_flow_reinitialize_assignment_target(
+    HirBuilder&mut builder,
+    i64 target,
+    i64 local_state,
+    i64 parameter_state,
+) -> bool {
+    i64 root_kind = 0;
+    i64 root_index = -1;
+    i64 path = 0;
+
+    if (!hir_node_path(builder, target, &mut root_kind, &mut root_index, &mut path) || path != 0) {
+        return false;
+    }
+    if (root_kind == 3) {
+        i64 slot = hir_flow_local_state_slot(builder, root_index);
+
+        if (slot >= 0) {
+            raz_compiler_rt_arena_set(local_state, slot, 0);
+            return true;
+        }
+    } else if (root_kind == 2) {
+        i64 slot = hir_flow_parameter_state_slot(builder, root_index);
+
+        if (slot >= 0) {
+            raz_compiler_rt_arena_set(parameter_state, slot, 0);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn hir_flow_check_node(HirBuilder&mut builder, i64 node, i64 local_state, i64 parameter_state) -> bool {
+    if (node < 0) {
+        return true;
+    }
+
+    i64 kind = raz_compiler_rt_arena_get(builder.module.node_kinds, node);
+
+    if (kind == 2) {
+        i64 parameter = raz_compiler_rt_arena_get(builder.module.node_a, node);
+
+        if (raz_compiler_rt_arena_get(parameter_state, parameter) != 0) {
+            hir_fail(builder, DiagnosticCode::UseAfterMove);
+            return false;
+        }
+        return true;
+    }
+    if (kind == 3) {
+        i64 local = raz_compiler_rt_arena_get(builder.module.node_a, node);
+
+        if (raz_compiler_rt_arena_get(local_state, local) != 0) {
+            hir_fail(builder, DiagnosticCode::UseAfterMove);
+            return false;
+        }
+        return true;
+    }
+    if (kind == 39) {
+        i64 operand = raz_compiler_rt_arena_get(builder.module.node_a, node);
+
+        if (!hir_flow_check_node(builder, operand, local_state, parameter_state)) {
+            return false;
+        }
+
+        i64 operand_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, operand);
+
+        bool consumes =
+            operand_structure >= 0 &&
+            raz_compiler_rt_arena_get(builder.module.struct_copy_flags, operand_structure) == 0;
+        if (consumes) {
+            i64 root_kind = 0;
+            i64 root_index = -1;
+            i64 path = 0;
+
+            if (hir_node_path(builder, operand, &mut root_kind, &mut root_index, &mut path) && path == 0) {
+                if (root_kind == 3) {
+                    raz_compiler_rt_arena_set(
+                        local_state,
+                        hir_flow_local_state_slot(builder, root_index),
+                        1,
+                    );
+                } else if (root_kind == 2) {
+                    raz_compiler_rt_arena_set(
+                        parameter_state,
+                        hir_flow_parameter_state_slot(builder, root_index),
+                        1,
+                    );
+                }
+            }
+        }
+        return true;
+    }
+    if (kind == 4) {
+        i64 first = raz_compiler_rt_arena_get(builder.module.node_b, node);
+        i64 count = raz_compiler_rt_arena_get(builder.module.node_c, node);
+        i64 argument = 0;
+
+        while (argument < count) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, first + argument),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            argument += 1;
+        }
+        return true;
+    }
+    if ((kind >= 5 && kind <= 14) || kind == 19 || kind == 20 || (kind >= 23 && kind <= 28)) {
+        return (
+            hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                local_state,
+                parameter_state,
+            ) &&
+            hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_b, node),
+                local_state,
+                parameter_state,
+            )
+        );
+    }
+    if (
+        kind == 16 ||
+        kind == 17 ||
+        kind == 18 ||
+        kind == 21 ||
+        kind == 29 ||
+        kind == 31 ||
+        kind == 37 ||
+        kind == 38 ||
+        kind == 41 ||
+        kind == 44 ||
+        kind == 45 ||
+        kind == 48 ||
+        kind == 50 ||
+        kind == 52
+    ) {
+        return hir_flow_check_node(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.node_a, node),
+            local_state,
+            parameter_state,
+        );
+    }
+    if (kind == 22) {
+        return (
+            hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                local_state,
+                parameter_state,
+            ) &&
+            hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_b, node),
+                local_state,
+                parameter_state,
+            )
+        );
+    }
+    if (kind == 33) {
+        i64 first = raz_compiler_rt_arena_get(builder.module.node_c, node);
+        i64 count = raz_compiler_rt_arena_get(builder.module.node_values, node);
+        i64 argument = 0;
+
+        while (argument < count) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, first + argument),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            argument += 1;
+        }
+        return true;
+    }
+    if (kind == 34) {
+        i64 first = raz_compiler_rt_arena_get(builder.module.node_b, node);
+        i64 count = raz_compiler_rt_arena_get(builder.module.node_c, node);
+        i64 argument = 0;
+
+        while (argument < count) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, first + argument),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            argument += 1;
+        }
+        return true;
+    }
+    if (kind == 49) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 first = raz_compiler_rt_arena_get(builder.module.node_b, node);
+        i64 count = raz_compiler_rt_arena_get(builder.module.node_c, node);
+        i64 argument = 0;
+
+        while (argument < count) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, first + argument),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            argument += 1;
+        }
+        return true;
+    }
+    if (kind == 51) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.node_a, node),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 packed = raz_compiler_rt_arena_get(builder.module.node_values, node);
+        i64 count = packed & 65535;
+        i64 dispatch_start = raz_compiler_rt_arena_get(builder.module.node_c, node);
+        i64 first = dispatch_start - count;
+        i64 argument = 0;
+
+        while (argument < count) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.arguments, first + argument),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            argument += 1;
+        }
+        return true;
+    }
+    return true;
+}
+
+fn hir_flow_block_falls_through(HirBuilder&mut builder, i64 block) -> bool {
+    if (block < 0) {
+        return true;
+    }
+    i64 start = raz_compiler_rt_arena_get(builder.module.block_statement_starts, block);
+    i64 end = start + raz_compiler_rt_arena_get(builder.module.block_statement_counts, block);
+    i64 statement = start;
+
+    while (statement < end) {
+        i64 kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+        if (kind == 2 || kind == 11 || kind == 12) {
+            return false;
+        }
+        if (kind == 14) {
+            if (!hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.statement_a, statement))) {
+                return false;
+            }
+        } else if (kind == 7) {
+            i64 then_block = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+            i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+
+            if (
+                else_block >= 0 &&
+                !hir_flow_block_falls_through(builder, then_block) &&
+                !hir_flow_block_falls_through(builder, else_block)
+            ) {
+                return false;
+            }
+        } else if (kind == 15) {
+            i64 arm = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+            i64 arm_end = arm + raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            bool any_falls_through = false;
+
+            while (arm < arm_end) {
+                if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                    any_falls_through = true;
+                    break;
+                }
+                arm += 1;
+            }
+            if (!any_falls_through) {
+                return false;
+            }
+        }
+        statement += 1;
+    }
+    return true;
+}
+
+fn hir_flow_check_block(HirBuilder&mut builder, i64 block, i64 local_state, i64 parameter_state) -> bool {
+    i64 start = raz_compiler_rt_arena_get(builder.module.block_statement_starts, block);
+    i64 end = start + raz_compiler_rt_arena_get(builder.module.block_statement_counts, block);
+    i64 statement = start;
+
+    while (statement < end) {
+        i64 kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+        if (kind == 7) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+
+            i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+            i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+            i64 left_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+            i64 left_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+            if (entry_locals == 0 || entry_parameters == 0 || left_locals == 0 || left_parameters == 0) {
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            hir_flow_copy_state(builder, local_state, entry_locals, true);
+            hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+            if (
+                !hir_flow_check_block(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            hir_flow_copy_state(builder, local_state, left_locals, true);
+            hir_flow_copy_state(builder, parameter_state, left_parameters, false);
+            bool then_falls_through = hir_flow_block_falls_through(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_b, statement)
+            );
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+
+            i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            bool else_falls_through = true;
+
+            if (else_block >= 0) {
+                if (!hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
+                    return false;
+                }
+                else_falls_through = hir_flow_block_falls_through(builder, else_block);
+            }
+            if (then_falls_through && else_falls_through) {
+                hir_flow_union_state(builder, left_locals, local_state, local_state, true);
+                hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+            } else if (then_falls_through) {
+                hir_flow_copy_state(builder, left_locals, local_state, true);
+                hir_flow_copy_state(builder, left_parameters, parameter_state, false);
+            } else if (!else_falls_through) {
+                hir_flow_copy_state(builder, entry_locals, local_state, true);
+                hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+            }
+            raz_compiler_rt_arena_destroy(entry_locals);
+            raz_compiler_rt_arena_destroy(entry_parameters);
+            raz_compiler_rt_arena_destroy(left_locals);
+            raz_compiler_rt_arena_destroy(left_parameters);
+        } else if (kind == 6) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+
+            i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+            i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+            if (entry_locals == 0 || entry_parameters == 0) {
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            hir_flow_copy_state(builder, local_state, entry_locals, true);
+            hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+            if (
+                !hir_flow_check_block(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            hir_flow_union_state(builder, entry_locals, local_state, local_state, true);
+            hir_flow_union_state(builder, entry_parameters, parameter_state, parameter_state, false, );
+            raz_compiler_rt_arena_destroy(entry_locals);
+            raz_compiler_rt_arena_destroy(entry_parameters);
+        } else if (kind == 15) {
+            if (
+                !hir_flow_check_node(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+
+            i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+            i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+            i64 merged_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+            i64 merged_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+            if (entry_locals == 0 || entry_parameters == 0 || merged_locals == 0 || merged_parameters == 0) {
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            hir_flow_copy_state(builder, local_state, entry_locals, true);
+            hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+
+            i64 arm = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+            i64 arm_end = arm + raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            bool first = true;
+
+            while (arm < arm_end) {
+                hir_flow_copy_state(builder, entry_locals, local_state, true);
+                hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+                i64 arm_guard = raz_compiler_rt_arena_get(builder.module.match_arm_guards, arm);
+                if (arm_guard >= 0 && !hir_flow_check_node(builder, arm_guard, local_state, parameter_state)) {
+                    return false;
+                }
+                if (
+                    !hir_flow_check_block(
+                        builder,
+                        raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm),
+                        local_state,
+                        parameter_state,
+                    )
+                ) {
+                    return false;
+                }
+                if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                    if (first) {
+                        hir_flow_copy_state(builder, local_state, merged_locals, true);
+                        hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
+                        first = false;
+                    } else {
+                        hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true, );
+                        hir_flow_union_state(
+                            builder,
+                            merged_parameters,
+                            parameter_state,
+                            merged_parameters,
+                            false,
+                        );
+                    }
+                }
+                arm += 1;
+            }
+            if (!first) {
+                hir_flow_copy_state(builder, merged_locals, local_state, true);
+                hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+            } else {
+                hir_flow_copy_state(builder, entry_locals, local_state, true);
+                hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+            }
+            raz_compiler_rt_arena_destroy(entry_locals);
+            raz_compiler_rt_arena_destroy(entry_parameters);
+            raz_compiler_rt_arena_destroy(merged_locals);
+            raz_compiler_rt_arena_destroy(merged_parameters);
+        } else if (kind == 14) {
+            if (
+                !hir_flow_check_block(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+        } else if (kind == 1 || kind == 8 || kind == 9 || kind == 10) {
+            i64 value = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+
+            if (value >= 0 && !hir_flow_check_node(builder, value, local_state, parameter_state)) {
+                return false;
+            }
+
+            i64 local = -1;
+
+            if (kind == 1) {
+                local = hir_flow_local_index(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                );
+            } else {
+                local = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+            }
+            if (local >= 0) {
+                raz_compiler_rt_arena_set(local_state, hir_flow_local_state_slot(builder, local), 0);
+            }
+        } else if (kind == 4) {
+            i64 value = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+
+            if (!hir_flow_check_node(builder, value, local_state, parameter_state)) {
+                return false;
+            }
+
+            i64 target = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
+            i64 operation = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+
+            if (
+                operation == 0 &&
+                hir_flow_reinitialize_assignment_target(builder, target, local_state, parameter_state)
+            ) {
+                // Assignment writes new storage; it does not read the moved destination.
+            } else if (!hir_flow_check_node(builder, target, local_state, parameter_state)) {
+                return false;
+            }
+        } else if (kind == 2 || kind == 5) {
+            i64 node = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
+
+            if (node >= 0 && !hir_flow_check_node(builder, node, local_state, parameter_state)) {
+                return false;
+            }
+        }
+        statement += 1;
+    }
+    return true;
+}
+
+fn hir_flow_check_root_statement(
+    HirBuilder&mut builder,
+    i64 statement,
+    i64 local_state,
+    i64 parameter_state,
+) -> bool {
+    i64 kind = raz_compiler_rt_arena_get(builder.module.statement_kinds, statement);
+
+    if (kind == 7) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+        i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+        i64 left_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+        i64 left_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+        if (entry_locals == 0 || entry_parameters == 0 || left_locals == 0 || left_parameters == 0) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+        hir_flow_copy_state(builder, local_state, entry_locals, true);
+        hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+        if (
+            !hir_flow_check_block(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+        hir_flow_copy_state(builder, local_state, left_locals, true);
+        hir_flow_copy_state(builder, parameter_state, left_parameters, false);
+        bool then_falls_through = hir_flow_block_falls_through(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.statement_b, statement)
+        );
+        hir_flow_copy_state(builder, entry_locals, local_state, true);
+        hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+
+        i64 else_block = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+        bool else_falls_through = true;
+
+        if (else_block >= 0) {
+            if (!hir_flow_check_block(builder, else_block, local_state, parameter_state)) {
+                return false;
+            }
+            else_falls_through = hir_flow_block_falls_through(builder, else_block);
+        }
+        if (then_falls_through && else_falls_through) {
+            hir_flow_union_state(builder, left_locals, local_state, local_state, true);
+            hir_flow_union_state(builder, left_parameters, parameter_state, parameter_state, false, );
+        } else if (then_falls_through) {
+            hir_flow_copy_state(builder, left_locals, local_state, true);
+            hir_flow_copy_state(builder, left_parameters, parameter_state, false);
+        } else if (!else_falls_through) {
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+        }
+        raz_compiler_rt_arena_destroy(entry_locals);
+        raz_compiler_rt_arena_destroy(entry_parameters);
+        raz_compiler_rt_arena_destroy(left_locals);
+        raz_compiler_rt_arena_destroy(left_parameters);
+        return true;
+    }
+    if (kind == 6) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+        i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+        if (entry_locals == 0 || entry_parameters == 0) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+        hir_flow_copy_state(builder, local_state, entry_locals, true);
+        hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+        if (
+            !hir_flow_check_block(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+        hir_flow_union_state(builder, entry_locals, local_state, local_state, true);
+        hir_flow_union_state(builder, entry_parameters, parameter_state, parameter_state, false, );
+        raz_compiler_rt_arena_destroy(entry_locals);
+        raz_compiler_rt_arena_destroy(entry_parameters);
+        return true;
+    }
+    if (kind == 15) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 entry_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+        i64 entry_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+        i64 merged_locals = raz_compiler_rt_arena_create(hir_flow_local_state_capacity(builder));
+        i64 merged_parameters = raz_compiler_rt_arena_create(hir_flow_parameter_state_capacity(builder));
+
+        if (entry_locals == 0 || entry_parameters == 0 || merged_locals == 0 || merged_parameters == 0) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+        hir_flow_copy_state(builder, local_state, entry_locals, true);
+        hir_flow_copy_state(builder, parameter_state, entry_parameters, false);
+
+        i64 arm = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+        i64 arm_end = arm + raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+        bool first = true;
+
+        while (arm < arm_end) {
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+            if (
+                !hir_flow_check_block(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm),
+                    local_state,
+                    parameter_state,
+                )
+            ) {
+                return false;
+            }
+            if (hir_flow_block_falls_through(builder, raz_compiler_rt_arena_get(builder.module.match_arm_blocks, arm))) {
+                if (first) {
+                    hir_flow_copy_state(builder, local_state, merged_locals, true);
+                    hir_flow_copy_state(builder, parameter_state, merged_parameters, false);
+                    first = false;
+                } else {
+                    hir_flow_union_state(builder, merged_locals, local_state, merged_locals, true);
+                    hir_flow_union_state(builder, merged_parameters, parameter_state, merged_parameters, false, );
+                }
+            }
+            arm += 1;
+        }
+        if (!first) {
+            hir_flow_copy_state(builder, merged_locals, local_state, true);
+            hir_flow_copy_state(builder, merged_parameters, parameter_state, false);
+        } else {
+            hir_flow_copy_state(builder, entry_locals, local_state, true);
+            hir_flow_copy_state(builder, entry_parameters, parameter_state, false);
+        }
+        raz_compiler_rt_arena_destroy(entry_locals);
+        raz_compiler_rt_arena_destroy(entry_parameters);
+        raz_compiler_rt_arena_destroy(merged_locals);
+        raz_compiler_rt_arena_destroy(merged_parameters);
+        return true;
+    }
+    if (kind == 14) {
+        return hir_flow_check_block(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+            local_state,
+            parameter_state,
+        );
+    }
+    if (kind == 1 || kind == 8 || kind == 9 || kind == 10) {
+        i64 value = raz_compiler_rt_arena_get(builder.module.statement_b, statement);
+
+        if (value >= 0 && !hir_flow_check_node(builder, value, local_state, parameter_state)) {
+            return false;
+        }
+
+        i64 local = -1;
+
+        if (kind == 1) {
+            local = hir_flow_local_index(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_a, statement),
+            );
+        } else {
+            local = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+        }
+        if (local >= 0) {
+            raz_compiler_rt_arena_set(local_state, hir_flow_local_state_slot(builder, local), 0);
+        }
+        return true;
+    }
+    if (kind == 4) {
+        if (
+            !hir_flow_check_node(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.statement_b, statement),
+                local_state,
+                parameter_state,
+            )
+        ) {
+            return false;
+        }
+
+        i64 target = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
+        i64 operation = raz_compiler_rt_arena_get(builder.module.statement_c, statement);
+
+        if (
+            operation == 0 &&
+            hir_flow_reinitialize_assignment_target(builder, target, local_state, parameter_state)
+        ) {
+            return true;
+        }
+        return hir_flow_check_node(builder, target, local_state, parameter_state);
+    }
+    if (kind == 2 || kind == 5) {
+        i64 node = raz_compiler_rt_arena_get(builder.module.statement_a, statement);
+
+        if (node >= 0) {
+            return hir_flow_check_node(builder, node, local_state, parameter_state);
+        }
+    }
+    return true;
+}
+
+fn hir_validate_control_flow_moves(HirBuilder&mut builder) -> bool {
+    i64 max_local_count = 0;
+    i64 max_parameter_count = 0;
+    i64 capacity_function = 0;
+
+    while (capacity_function < builder.module.function_count) {
+        i64 local_count = raz_compiler_rt_arena_get(
+            builder.module.function_local_counts,
+            capacity_function,
+        );
+        i64 parameter_count = raz_compiler_rt_arena_get(
+            builder.module.function_parameter_counts,
+            capacity_function,
+        );
+        if (local_count > max_local_count) {
+            max_local_count = local_count;
+        }
+        if (parameter_count > max_parameter_count) {
+            max_parameter_count = parameter_count;
+        }
+        capacity_function += 1;
+    }
+
+    i64 local_state = raz_compiler_rt_arena_create(max_local_count + 1);
+    i64 parameter_state = raz_compiler_rt_arena_create(max_parameter_count + 1);
+    i64 root_heads = raz_compiler_rt_arena_create(builder.module.function_count + 1);
+    i64 root_tails = raz_compiler_rt_arena_create(builder.module.function_count + 1);
+    i64 root_next = raz_compiler_rt_arena_create(builder.module.statement_count + 1);
+
+    if (local_state == 0 || parameter_state == 0 || root_heads == 0 || root_tails == 0 || root_next == 0) {
+        if (local_state != 0) {
+            raz_compiler_rt_arena_destroy(local_state);
+        }
+        if (parameter_state != 0) {
+            raz_compiler_rt_arena_destroy(parameter_state);
+        }
+        if (root_heads != 0) {
+            raz_compiler_rt_arena_destroy(root_heads);
+        }
+        if (root_tails != 0) {
+            raz_compiler_rt_arena_destroy(root_tails);
+        }
+        if (root_next != 0) {
+            raz_compiler_rt_arena_destroy(root_next);
+        }
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 function_index = 0;
+
+    while (function_index < builder.module.function_count) {
+        raz_compiler_rt_arena_set(root_heads, function_index, 0);
+        raz_compiler_rt_arena_set(root_tails, function_index, 0);
+        function_index += 1;
+    }
+    // Build the per-function root-statement index once. Deferred child blocks
+    // remain reachable from their root control-flow statements and therefore do
+    // not need to participate in the global function scan.
+
+    i64 statement = 0;
+
+    while (statement < builder.module.statement_count) {
+        i64 owner = raz_compiler_rt_arena_get(builder.module.statement_function_indices, statement, );
+
+        if (
+            owner >= 0 &&
+            owner < builder.module.function_count &&
+            raz_compiler_rt_arena_get(builder.module.statement_block_indices, statement) < 0
+        ) {
+            i64 tail = raz_compiler_rt_arena_get(root_tails, owner);
+
+            raz_compiler_rt_arena_set(root_next, statement, 0);
+            if (tail > 0) {
+                raz_compiler_rt_arena_set(root_next, tail - 1, statement + 1);
+            } else {
+                raz_compiler_rt_arena_set(root_heads, owner, statement + 1);
+            }
+            raz_compiler_rt_arena_set(root_tails, owner, statement + 1);
+        }
+        statement += 1;
+    }
+
+    i64 saved_function = builder.current_function;
+    i64 saved_block = builder.current_block;
+
+    function_index = 0;
+    while (function_index < builder.module.function_count) {
+        builder.current_function = function_index;
+        builder.current_block = -1;
+        hir_flow_clear_function_state(builder, local_state, parameter_state);
+
+        i64 root = raz_compiler_rt_arena_get(root_heads, function_index);
+
+        while (root > 0) {
+            statement = root - 1;
+            if (!hir_flow_check_root_statement(builder, statement, local_state, parameter_state)) {
+                builder.current_function = saved_function;
+                builder.current_block = saved_block;
+                raz_compiler_rt_arena_destroy(local_state);
+                raz_compiler_rt_arena_destroy(parameter_state);
+                raz_compiler_rt_arena_destroy(root_heads);
+                raz_compiler_rt_arena_destroy(root_tails);
+                raz_compiler_rt_arena_destroy(root_next);
+                return false;
+            }
+            root = raz_compiler_rt_arena_get(root_next, statement);
+        }
+        function_index += 1;
+    }
+    builder.current_function = saved_function;
+    builder.current_block = saved_block;
+    raz_compiler_rt_arena_destroy(local_state);
+    raz_compiler_rt_arena_destroy(parameter_state);
+    raz_compiler_rt_arena_destroy(root_heads);
+    raz_compiler_rt_arena_destroy(root_tails);
+    raz_compiler_rt_arena_destroy(root_next);
+    return true;
+}

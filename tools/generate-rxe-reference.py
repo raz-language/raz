@@ -5,8 +5,8 @@
 from pathlib import Path
 import re, hashlib
 root=Path(__file__).resolve().parents[1]
-isa=(root/'compiler/src/backend/rxe/isa.rz').read_text(encoding='utf-8')
-decoder=(root/'compiler/src/backend/rxe/decoder.rz').read_text(encoding='utf-8')
+isa=(root/'compiler/src/raz_codegen_rxe/src/rxe/isa.rz').read_text(encoding='utf-8')
+decoder=(root/'compiler/src/raz_codegen_rxe/src/rxe/decoder.rz').read_text(encoding='utf-8')
 fmt=re.search(r'rxe_format_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)
 ver=re.search(r'rxe_isa_version\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)
 regs=re.search(r'rxe_register_count\(\)\s*->\s*i64\s*\{\s*return\s+(\d+);\s*\}',isa).group(1)

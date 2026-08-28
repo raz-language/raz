@@ -4,7 +4,7 @@ The `raz` command is the project, package, and toolchain driver. `razc` is the d
 
 ## Backend contract
 
-Raz lowers every program through typed HIR and backend-neutral MIR. Forge is the default production backend on x86-64 Windows/Linux. LLVM is a first-class production backend and remains the automatic native default on AArch64 and macOS. Forge now provides an experimental AArch64 ELF machine/object path, but it is not yet the qualified default.
+Raz lowers every program through typed HIR and backend-neutral MIR. Forge is the default production backend on x86-64 Windows/Linux. LLVM is a first-class production backend and remains the automatic native default on AArch64 and macOS. Forge provides qualified deterministic AArch64 machine/object generation; LLVM remains the default native-link path on AArch64 until the complete host runtime/link path is qualified there.
 
 Backend selection must not change language semantics. See [Backends](BACKENDS.md) for target, optimization, linkage, and backend qualification details.
 
@@ -25,17 +25,19 @@ See [Compiler reproducibility](COMPILER-REPRODUCIBILITY.md).
 
 ## Native artifacts
 
-Supported x86-64 hosts can produce native artifacts through Forge or LLVM/Clang. Linux AArch64 and macOS arm64 use LLVM/Clang with the same backend-neutral MIR and runtime contract. Qualification covers Windows x64/COFF, System V AMD64/ELF, AAPCS64/ELF, and Darwin AArch64/Mach-O object production. Forge production-parity native code generation remains x86-64; experimental AArch64 ELF64 and Darwin Mach-O arm64 encoders are available for qualification work.
+Supported x86-64 hosts can produce native artifacts through Forge or LLVM/Clang. Linux AArch64 and macOS arm64 use LLVM/Clang with the same backend-neutral MIR and runtime contract. Qualification covers Windows x64/COFF, System V AMD64/ELF, AAPCS64/ELF, and Darwin AArch64/Mach-O object production. Forge production qualification covers x86-64 plus deterministic AArch64 ELF64 and Darwin Mach-O arm64 object generation. LLVM/Clang remains the default complete native executable path on AArch64/macOS while Forge host-link qualification is completed independently.
 
 ## Installed layout
 
 Release archives and installers use a shared redistributable layout:
 
 ```text
-bin/                 raz, razc (language server is `raz lsp`)
-lib/                 native runtime components
-share/raz/library/   Raz standard library
-manifest.sha256      redistributable integrity manifest
+bin/                    raz, razc, razup, Forge tool suite, ObLink
+lib/                    native runtime and Forge bridge components
+share/raz/library/      Raz standard library
+share/raz/completions/ generated shell completion scripts
+BUILD_INFO.json         qualified build/tool identity
+manifest.sha256         redistributable payload integrity manifest
 ```
 
 Windows MSI installation supports optional PATH registration. Portable installation supports user PATH, machine PATH, or no PATH modification.

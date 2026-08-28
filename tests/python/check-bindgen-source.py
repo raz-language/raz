@@ -4,12 +4,12 @@
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2]
-source=(ROOT/'compiler/src/driver/bindgen.rz').read_text(encoding='utf-8')
-cli=(ROOT/'compiler/src/driver/cli.rz').read_text(encoding='utf-8')
-commands=(ROOT/'compiler/src/driver/commands.rz').read_text(encoding='utf-8')
-order={path.relative_to(ROOT/'compiler').as_posix() for path in (ROOT/'compiler/src').rglob('*.rz')}
+source=(ROOT/'compiler/src/raz_driver/src/bindgen.rz').read_text(encoding='utf-8')
+cli=(ROOT/'compiler/src/raz_driver/src/cli.rz').read_text(encoding='utf-8')
+commands=(ROOT/'compiler/src/raz_driver/src/commands.rz').read_text(encoding='utf-8')
+order={path.relative_to(ROOT/'compiler').as_posix() for path in list((ROOT/'compiler').rglob('*.rz'))}
 checks={
- 'bindgen production module':'src/driver/bindgen.rz' in order,
+ 'bindgen production module':'src/raz_driver/src/bindgen.rz' in order,
  'bindgen CLI command':'cli_arg_equals_literal(value, length, "bindgen")' in cli and 'return 43;' in cli,
  'bindgen dispatch':'cli_command == 43' in commands and 'bindgen_command(process_argc)' in commands,
  'C layout structs':'@repr(C)' in source or '114,101,112,114,40,67,41' in source,

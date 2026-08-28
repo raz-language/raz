@@ -16,24 +16,24 @@ ROOT = Path(__file__).resolve().parents[1]
 def text(rel):
     return (ROOT / rel).read_text(encoding="utf-8")
 
-lexer = text("compiler/src/frontend/lexer.rz")
-parser = text("compiler/src/frontend/parser.rz")
-types = text("compiler/src/hir/core/types.rz") + "\n" + text("compiler/src/hir/generics/instantiate.rz")
-expr = text("compiler/src/hir/semantic/expressions.rz")
-stmt = text("compiler/src/hir/semantic/statements.rz")
-decl = text("compiler/src/hir/semantic/declarations.rz") + "\n" + text("compiler/src/hir/traits/solver.rz")
-comp = text("compiler/src/hir/semantic/comptime.rz")
-own = text("compiler/src/hir/semantic/ownership.rz")
-mir = "\n".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "compiler/src/mir").rglob("*.rz")))
+lexer = text("compiler/src/raz_lexer/src/lexer.rz")
+parser = text("compiler/src/raz_parser/src/parser.rz")
+types = text("compiler/src/raz_hir/src/hir/core/types.rz") + "\n" + text("compiler/src/raz_hir/src/hir/generics/instantiate.rz")
+expr = text("compiler/src/raz_hir/src/hir/semantic/expressions.rz")
+stmt = text("compiler/src/raz_hir/src/hir/semantic/statements.rz")
+decl = text("compiler/src/raz_hir/src/hir/semantic/declarations.rz") + "\n" + text("compiler/src/raz_hir/src/hir/traits/solver.rz")
+comp = text("compiler/src/raz_hir/src/hir/semantic/comptime.rz")
+own = text("compiler/src/raz_hir/src/hir/semantic/ownership.rz")
+mir = "\n".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "compiler/src/raz_mir/src/mir").rglob("*.rz")))
 forge = "\n".join([
-    text("compiler/src/backend/forge/writer.rz"),
-    text("compiler/src/backend/forge/globals_codegen.rz"),
-    text("compiler/src/backend/forge/function_codegen.rz"),
-    text("compiler/src/backend/forge/codegen.rz"),
+    text("compiler/src/raz_codegen_forge/src/forge/writer.rz"),
+    text("compiler/src/raz_codegen_forge/src/forge/globals_codegen.rz"),
+    text("compiler/src/raz_codegen_forge/src/forge/function_codegen.rz"),
+    text("compiler/src/raz_codegen_forge/src/forge/codegen.rz"),
 ])
-model = text("compiler/src/hir/core/model.rz")
-const_generics = text("compiler/src/hir/generics/const_generics.rz")
-reflection = text("compiler/src/hir/semantic/reflection.rz")
+model = text("compiler/src/raz_hir/src/hir/core/model.rz")
+const_generics = text("compiler/src/raz_hir/src/hir/generics/const_generics.rz")
+reflection = text("compiler/src/raz_hir/src/hir/semantic/reflection.rz")
 all_hir = "\n".join([types, const_generics, reflection, expr, stmt, decl, comp, own, model])
 
 FULL, PARTIAL, MISSING = "FULL", "PARTIAL", "MISSING"
@@ -52,16 +52,17 @@ add("declarations", "traits / impls", FULL if "hir_parse_trait_declaration" in d
 add("declarations", "extern functions", FULL if "hir_parse_extern_function" in all_hir else MISSING, "extern declarations are represented")
 unsafe_full = "function_is_unsafe" in model and "unsafe_depth" in model and "token_is_unsafe" in decl.split("fn hir_parse_function",1)[1].split("fn ",1)[0] and "token_is_unsafe" in parser.split("fn parse_function",1)[1].split("fn ",1)[0]
 add("declarations", "unsafe functions", FULL if unsafe_full else PARTIAL, "unsafe function qualifiers are preserved through precheck/HIR metadata and establish an unsafe semantic context")
-parser_authoritative = "HIR is the sole normative Raz grammar/semantic parser" in text("compiler/src/main.rz") and "parse_module(input" not in text("compiler/src/main.rz")
+driver_main = text("compiler/src/raz_driver/src/compiler_main.rz")
+parser_authoritative = "build_hir(input" in driver_main and "parse_module(input" not in driver_main
 add("parser/AST", "authoritative syntax/semantic tree for stable constructs", FULL if parser_authoritative else PARTIAL, "production compilation parses source once through the authoritative HIR frontend; parser.rz is retained only as an optional bootstrap/preflight utility")
-attribute_partial = "hir_parse_pending_attributes" in comp and "function_abi_kinds" in model and "function_link_name_offsets" in model and "function_target_feature_offsets" in model and "pending_target_feature_length" in model and "function_is_unsafe" in model and "function_link_name_lengths" in text("compiler/src/backend/forge/writer.rz") and "Generic instantiation reparses the template body" in decl
+attribute_partial = "hir_parse_pending_attributes" in comp and "function_abi_kinds" in model and "function_link_name_offsets" in model and "function_target_feature_offsets" in model and "pending_target_feature_length" in model and "function_is_unsafe" in model and "function_link_name_lengths" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") and "Generic instantiation reparses the template body" in decl
 target_feature_backend = "function_target_feature_lengths" in forge and 'fn.target_feature = "avx2"' in text("src/forge/src/ir/parser.cpp") and "target_feature" in text("src/forge/src/machine/lower.cpp")
 add("declarations", "declaration attributes (@abi/@link_name/@target_feature)", FULL if (attribute_partial and target_feature_backend) else (PARTIAL if attribute_partial else (MISSING if "TokenKind::At" not in lexer else PARTIAL)), "attributes survive generic reparsing; @link_name and @abi affect Forge symbols/calling convention, while @target_feature is emitted as a FIR function contract and consumed/validated by target lowering")
 
 # Primitive and compound types.
 add("types", "integer widths + usize", FULL if "token_is_numeric_type" in lexer and "primitive_type_width" in lexer else MISSING, "integer family is recognized and width-aware")
-add("types", "f64", FULL if "token_is_f64" in lexer and "writer_f64" in text("compiler/src/backend/forge/writer.rz") else MISSING, "f64 has lexer/type/backend handling")
-add("types", "f32", FULL if "fn token_is_f32" in lexer and "type_kind == 11" in lexer and "writer_f32" in text("compiler/src/backend/forge/writer.rz") and "writer_numeric_cast_opcode(out, 1, 11)" in forge else PARTIAL, "distinct f32 kind, width-aware casts/storage, and Forge f32 spelling are present")
+add("types", "f64", FULL if "token_is_f64" in lexer and "writer_f64" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") else MISSING, "f64 has lexer/type/backend handling")
+add("types", "f32", FULL if "fn token_is_f32" in lexer and "type_kind == 11" in lexer and "writer_f32" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") and "writer_numeric_cast_opcode(out, 1, 11)" in forge else PARTIAL, "distinct f32 kind, width-aware casts/storage, and Forge f32 spelling are present")
 add("types", "bool / char", FULL if "source_byte(source, offset) == 98" in lexer and "source_byte(source, offset) == 99" in lexer and "type_kind == 10" in lexer else MISSING, "both are recognized by scalar type classification")
 string_full = "token_is_string_type" in lexer and "TokenKind::String" in expr and "kind == 46" in mir and "emit_forge_string_globals" in forge and "global.address" not in forge
 # global.address is emitted byte-by-byte, so the structural markers above are the reliable source-level gate.
@@ -75,7 +76,7 @@ add("types", "references", FULL if "TokenKind::Ampersand" in types and "hir_vali
 raw_pointer_full = "expected_reference == 2" in types and "actual_reference != 3" in types and "node_type = 12" in mir and "writer_ptr(out)" in forge and "TokenKind::Star" in parser.split("fn parse_type_reference",1)[1].split("fn ",1)[0]
 add("types", "raw pointers (*const/*mut)", FULL if raw_pointer_full else PARTIAL, "raw pointer flavor is checked in HIR and lowered to the physical Forge ptr type")
 function_pointer_syntax = "callable_type_kind = hir_callable_type_kind" in types and "scanning_function_pointer" in stmt and "kind == 47" in mir and "opcode == 43" in forge
-function_pointer_full = function_pointer_syntax and "function_type_parameter_function_types" in model and "hir_function_pointer_signatures_equal" in types and "hir_add_node(builder, 49" in expr and "mir_emit_typed(mir, 44" in mir and "opcode == 44" in forge and "emit_forge_function_signatures" in text("compiler/src/backend/forge/writer.rz") and "writer_function_signature_name" in text("compiler/src/backend/forge/writer.rz")
+function_pointer_full = function_pointer_syntax and "function_type_parameter_function_types" in model and "hir_function_pointer_signatures_equal" in types and "hir_add_node(builder, 49" in expr and "mir_emit_typed(mir, 44" in mir and "opcode == 44" in forge and "emit_forge_function_signatures" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") and "writer_function_signature_name" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz")
 add("types", "function-pointer types", FULL if function_pointer_full else (PARTIAL if function_pointer_syntax else MISSING), "fn(...) -> ... has structural signature identity, assignment/argument/return compatibility, func.address signature assertions, and typed call.indirect lowering")
 dyn_partial = "trait_object_safe_flags" in model and "hir_coerce_trait_object" in types and "token_is_dyn" in types and "trait_method_starts" in model and "kind == 50" in mir
 dyn_full = dyn_partial and "hir_parse_dyn_trait_call" in own and "hir_add_node(builder, 51" in own and "if (kind == 51)" in mir and "Object-safe dyn dispatch" in mir
@@ -145,7 +146,7 @@ add("async", "async fn", FULL if "function_is_async" in model and "token_is_asyn
 add("async", "await + frame spill", FULL if "async_mir_await_count" in forge and "kind == 44" in mir else MISSING, "await reaches MIR/Forge async lowering")
 spawn_full = "kind == 45" in mir and "mir_emit_typed(mir, 46" in mir and "opcode == 46" in forge and "Spawning is an async effect" in expr
 add("async", "spawn", FULL if spawn_full else PARTIAL, "spawn is async-only, remains a distinct MIR task-spawn effect, and lowers to the future handle produced by the async source call")
-extern_abi_full = "function_extern_kinds" in model and "function_abi_kinds" in model and "emit_forge_extern_function" in text("compiler/src/backend/forge/writer.rz") and "function_abi_kinds, function_index) == 1" in text("compiler/src/backend/forge/writer.rz")
+extern_abi_full = "function_extern_kinds" in model and "function_abi_kinds" in model and "emit_forge_extern_function" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") and "function_abi_kinds, function_index) == 1" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz")
 add("native ABI", "extern ABI", FULL if extern_abi_full else PARTIAL, "user extern declarations are emitted into Forge; @link_name selects the symbol and @abi(C) selects Forge's explicit C calling convention while system/Raz retain platform convention")
 
 # Backend coverage sanity.

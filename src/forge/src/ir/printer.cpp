@@ -78,6 +78,13 @@ void print_args(std::ostringstream& out, const std::vector<std::string>& args) {
     }
     out << ')';
 }
+
+void print_attributes(std::ostringstream& out, const std::vector<Attribute>& attributes) {
+    for (const auto& attribute : attributes) {
+        out << " attr " << attribute.name << ' ';
+        print_bytes(out, std::vector<std::uint8_t>(attribute.value.begin(), attribute.value.end()));
+    }
+}
 }
 
 std::string print_module(const Module& module) {
@@ -152,6 +159,7 @@ std::string print_module(const Module& module) {
                 else if(op.opcode=="func.address" || op.opcode=="callback.address") { out<<' '<<op.type.str()<<' '<<op.operands[0]; if(op.operands.size()>1) out<<" as "<<op.operands[1]; }
                 else if(op.opcode=="call" || op.opcode=="call.indirect") { out<<' '<<op.type.str()<<' '<<op.operands[0]; std::size_t first=1; if(op.opcode=="call.indirect" && op.operands.size()>1 && op.operands[1].starts_with("@")){ out<<" as "<<op.operands[1]; first=2; } out<<'('; for(std::size_t i=first;i<op.operands.size();++i){ if(i>first)out<<", "; out<<op.operands[i]; } out<<')'; }
                 else if(op.opcode!="unreachable") { out<<' '<<op.type.str(); for(const auto& x:op.operands) out<<' '<<x; if(op.alignment) out<<" align "<<op.alignment; }
+                print_attributes(out, op.attributes);
                 out<<'\n';
             }
         } out<<"  }\n";

@@ -4,7 +4,7 @@ Status: normative for the Raz 1.0 stable language surface.
 
 Raz is a statically typed native systems programming language. The frontend owns language semantics through typed HIR and MIR; the production compiler then lowers to Forge IR for verification, optimization, machine lowering, and native object emission.
 
-This document is the normative prose reference. [Language stability](LANGUAGE-STABILITY.md) defines what the 1.x compatibility promise covers, and the repository conformance suite is the executable compatibility reference. Where this document and the conformance suite disagree, the disagreement is a defect in one of them and should be reported.
+This specification is the normative prose reference. [Language stability](LANGUAGE-STABILITY.md) defines what the 1.x compatibility promise covers, and the repository conformance suite is the executable compatibility reference. Where this document and the conformance suite disagree, the disagreement is a defect in one of them and should be reported.
 
 ## Contents
 

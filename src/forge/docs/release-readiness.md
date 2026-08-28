@@ -61,4 +61,4 @@ Forge 2.0.0 uses two explicit gates. The strict production matrix runs all 66 te
 
 ## Release artifacts
 
-`scripts/release-gate.sh` and `scripts/release-gate.ps1` now build the strict release matrix, verify the reported `2.0.0` version, generate binary and source packages with CPack, and write `_packages/SHA256SUMS`. A release is incomplete unless the strict tests, installed-consumer tests, package creation, and checksums all succeed.
+`scripts/release-gate.sh` and `scripts/release-gate.ps1` build the strict release matrix, verify the reported `2.0.0` version, generate binary and source packages with CPack, and write `_packages/SHA256SUMS`. A release is incomplete unless the strict tests, installed-consumer tests, package creation, and checksums all succeed.

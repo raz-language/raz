@@ -5,12 +5,12 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-backend = (root / "compiler/src/backend/wasm/codegen.rz").read_text(encoding="utf-8")
-writer = (root / "compiler/src/backend/wasm/writer.rz").read_text(encoding="utf-8")
-cfg = (root / "compiler/src/backend/wasm/cfg.rz").read_text(encoding="utf-8")
-dispatch = (root / "compiler/src/driver/backend.rz").read_text(encoding="utf-8")
-cli = (root / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+backend = (root / "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz").read_text(encoding="utf-8")
+writer = (root / "compiler/src/raz_codegen_wasm/src/wasm/writer.rz").read_text(encoding="utf-8")
+cfg = (root / "compiler/src/raz_codegen_wasm/src/wasm/cfg.rz").read_text(encoding="utf-8")
+dispatch = (root / "compiler/src/raz_driver/src/backend.rz").read_text(encoding="utf-8")
+cli = (root / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 required_backend = [
     "fn emit_wasm_module(",
@@ -33,9 +33,9 @@ assert "--backend=wasm" in dispatch
 assert "return 2;" in dispatch
 assert "emit_wasm_module" in dispatch
 assert 'cli_arg_equals_literal(value, length, "--wasm")' in cli
-assert "src/backend/wasm/writer.rz" in order
-assert "src/backend/wasm/cfg.rz" in order
-assert "src/backend/wasm/codegen.rz" in order
+assert "src/raz_codegen_wasm/src/wasm/writer.rz" in order
+assert "src/raz_codegen_wasm/src/wasm/cfg.rz" in order
+assert "src/raz_codegen_wasm/src/wasm/codegen.rz" in order
 
 for needle in [
     "fn wasm_function_block_count(",
@@ -60,15 +60,15 @@ for value in [66, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 13
 print("wasm-backend: PASS (direct Raz-owned wasm backend with structured MIR CFG dispatch)")
 
 # Phase 2 linear-memory qualification.
-memory = (root / 'compiler/src/backend/wasm/memory.rz').read_text()
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
-assert 'src/backend/wasm/memory.rz' in order, 'wasm memory module absent from production compiler source graph'
+memory = (root / 'compiler/src/raz_codegen_wasm/src/wasm/memory.rz').read_text()
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
+assert 'src/raz_codegen_wasm/src/wasm/memory.rz' in order, 'wasm memory module absent from production compiler source graph'
 assert 'wasm_memory_emit_allocate' in memory, 'missing wasm aggregate allocator'
 assert 'wasm_memory_emit_load' in memory and 'wasm_memory_emit_store' in memory, 'missing wasm aggregate memory operations'
 assert 'wasm_emit_memory_section' in memory, 'missing wasm memory section'
-globals_src = (root / 'compiler/src/backend/wasm/globals.rz').read_text()
+globals_src = (root / 'compiler/src/raz_codegen_wasm/src/wasm/globals.rz').read_text()
 assert 'wasm_emit_global_section' in globals_src, 'missing generalized wasm global section'
-codegen2 = (root / 'compiler/src/backend/wasm/codegen.rz').read_text()
+codegen2 = (root / 'compiler/src/raz_codegen_wasm/src/wasm/codegen.rz').read_text()
 for opcode in [
     'opcode == 26',
     'opcode == 27',
@@ -99,7 +99,7 @@ assert 'wasm_signature_supported' in codegen2
 assert 'parameter_array_extents' not in codegen2.split('fn wasm_signature_supported', 1)[1].split('fn wasm_opcode_supported', 1)[0]
 print('wasm-memory: PASS (growable aggregates + references + static strings + aggregate ABI signatures)')
 
-assert 'src/backend/wasm/globals.rz' in order
+assert 'src/raz_codegen_wasm/src/wasm/globals.rz' in order
 for opcode in ['opcode == 43', 'opcode == 44', 'opcode == 47', 'opcode == 48', 'opcode == 49']:
     assert opcode in codegen2, f'missing wasm callable/global lowering {opcode}'
 for primitive in ['wasm_emit_table_section', 'wasm_emit_element_section']:
@@ -109,8 +109,8 @@ for primitive in ['wasm_globals_emit_get', 'wasm_globals_emit_set', 'wasm_global
 assert 'call_indirect' in codegen2
 print('wasm-callables-globals: PASS (module globals + function tables + indirect calls)')
 
-closures_src = (root / 'compiler/src/backend/wasm/closures.rz').read_text()
-assert 'src/backend/wasm/closures.rz' in order
+closures_src = (root / 'compiler/src/raz_codegen_wasm/src/wasm/closures.rz').read_text()
+assert 'src/raz_codegen_wasm/src/wasm/closures.rz' in order
 for opcode in ['opcode == 50', 'opcode == 51']:
     assert opcode in codegen2, f'missing wasm closure MIR lowering {opcode}'
 for primitive in [

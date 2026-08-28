@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "forge/runtime/bindings.hpp"
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/data_layout.hpp"
 
 #include <algorithm>
 #include <unordered_map>

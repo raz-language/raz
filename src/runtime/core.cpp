@@ -24,7 +24,7 @@ constexpr auto raz_crc32_ieee_table = raz_make_crc32_ieee_table();
 // Stage-1 aggregate storage for the LLVM backend. Aggregates lower to a handle
 // into a flat array of i64 cells, and the backend inttoptr's that handle and
 // dereferences it directly ("the arena handle is the payload address" --
-// compiler/src/backend/llvm/codegen.rz), so the handle must BE the address of
+// compiler/src/backend/src/llvm/codegen.rz), so the handle must BE the address of
 // the cells. The 24-byte header therefore sits behind the handle and matches
 // the compiler's own arena ABI: magic at -24, cell count at -16.
 constexpr std::int64_t raz_stage1_arena_magic = 4923358263036431937LL;
@@ -69,6 +69,21 @@ std::int64_t raz_rt_cstr_len(const char* value) {
 std::uintptr_t raz_rt_cstr_ptr(const char* value) {
   return reinterpret_cast<std::uintptr_t>(value);
 }
+
+// Browser-only ABI stubs keep native web page generation linkable. Browser
+// execution maps these symbols to WebAssembly imports instead.
+std::int64_t raz_web_dom_set_text(const char*, const char*) { return 0; }
+std::int64_t raz_web_dom_set_text_i64(const char*, std::int64_t) { return 0; }
+std::int64_t raz_web_dom_toggle_class(const char*, const char*) { return 0; }
+std::int64_t raz_web_dom_set_text_ptr(std::uintptr_t, const char*) { return 0; }
+std::int64_t raz_web_dom_set_text_i64_ptr(std::uintptr_t, std::int64_t) { return 0; }
+std::int64_t raz_web_dom_toggle_class_ptr(std::uintptr_t, const char*) { return 0; }
+std::int64_t raz_web_event_value_length() { return 0; }
+std::int64_t raz_web_event_value_write(std::uintptr_t, std::int64_t) { return 0; }
+std::int64_t raz_web_event_key_length() { return 0; }
+std::int64_t raz_web_event_key_write(std::uintptr_t, std::int64_t) { return 0; }
+std::int64_t raz_web_event_checked() { return 0; }
+std::int64_t raz_web_event_prevent_default() { return 0; }
 
 std::int64_t raz_rt_cstr_equal(const char* left, std::int64_t left_length, const char* right) {
   if (left_length < 0 || right == nullptr) return 0;

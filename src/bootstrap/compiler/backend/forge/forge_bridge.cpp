@@ -275,35 +275,7 @@ bool regular_file(const std::filesystem::path& path) {
     return std::filesystem::is_regular_file(path, error) && !error;
 }
 
-std::vector<std::filesystem::path> read_runtime_link_manifest(const std::filesystem::path& manifest) {
-    std::vector<std::filesystem::path> result;
-    std::ifstream input(manifest, std::ios::binary);
-    if (!input) return result;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const auto first = line.find_first_not_of(" \t");
-        if (first == std::string::npos || line[first] == '#') continue;
-        const auto last = line.find_last_not_of(" \t");
-        std::filesystem::path dependency(line.substr(first, last - first + 1));
-        if (dependency.is_relative()) dependency = manifest.parent_path() / dependency;
-        if (!regular_file(dependency)) continue;
-        bool duplicate = false;
-        for (const auto& existing : result) {
-            std::error_code error;
-            if (std::filesystem::equivalent(existing, dependency, error) && !error) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) result.push_back(std::move(dependency));
-    }
-    return result;
-}
-
 std::vector<std::filesystem::path> runtime_link_dependencies() {
-    // Explicit override is primarily useful for toolchain development. The
-    // installed manifest below is the normal relocatable path.
     if (const std::string configured = environment_value("RAZ_RUNTIME_LINK_DEPS"); !configured.empty()) {
         std::vector<std::filesystem::path> result;
         std::size_t start = 0;
@@ -317,23 +289,28 @@ std::vector<std::filesystem::path> runtime_link_dependencies() {
         return result;
     }
 
+    std::vector<std::filesystem::path> result;
     const auto executable = current_executable_path();
     if (!executable.empty()) {
-        const auto installed_manifest = executable.parent_path().parent_path() / "lib" / "raz-runtime-link-deps.txt";
-        if (std::filesystem::is_regular_file(installed_manifest))
-            return read_runtime_link_manifest(installed_manifest);
-    }
-#ifdef RAZ_RUNTIME_LINK_DEPS_MANIFEST_PATH
-    {
-        const std::filesystem::path build_manifest(RAZ_RUNTIME_LINK_DEPS_MANIFEST_PATH);
-        if (std::filesystem::is_regular_file(build_manifest))
-            return read_runtime_link_manifest(build_manifest);
-    }
+        const auto lib = executable.parent_path().parent_path() / "lib";
+#if defined(_WIN32)
+        const std::filesystem::path candidates[] = {
+            lib / "raz_runtime_ssl.lib", lib / "raz_runtime_crypto.lib",
+            lib / "raz_runtime_ssl.a", lib / "raz_runtime_crypto.a",
+        };
+#else
+        const std::filesystem::path candidates[] = {
+            lib / "libraz_runtime_ssl.so", lib / "libraz_runtime_crypto.so",
+            lib / "libraz_runtime_ssl.a", lib / "libraz_runtime_crypto.a",
+        };
 #endif
+        for (const auto& candidate : candidates)
+            if (regular_file(candidate)) result.push_back(candidate);
+        if (!result.empty()) return result;
+    }
 
-    // Compatibility fallback for source-tree builds made before the manifest
-    // became part of the compiler/runtime ABI boundary.
-    std::vector<std::filesystem::path> result;
+    // Host-build fallback. These are compile-time paths used only before a
+    // self-host compiler has been staged into the relocatable release layout.
 #ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
     if (regular_file(RAZ_OPENSSL_SSL_LIBRARY_PATH)) result.emplace_back(RAZ_OPENSSL_SSL_LIBRARY_PATH);
 #endif
@@ -661,9 +638,9 @@ extern "C" std::int64_t raz_compiler_runtime_library_path_i64(
     return write_i64_ascii(runtime.string(), output_handle, output_capacity);
 }
 
-// Native output backends need the exact transitive linker inputs associated with
-// the selected runtime. Keep this dynamic/relocatable: installed toolchains read
-// lib/raz-runtime-link-deps.txt instead of embedding build-machine paths.
+// Native output backends need the optional third-party linker inputs associated
+// with the selected runtime. Installed toolchains discover those libraries
+// directly beside raz_runtime under release/lib; no metadata manifest is used.
 extern "C" std::int64_t raz_compiler_runtime_link_args_i64(
     std::int64_t output_handle, std::int64_t output_capacity) {
     if (output_handle == 0 || output_capacity <= 0) return -1;

@@ -37,7 +37,7 @@ def _stage_compiler(source_root: Path, work: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("compiler", help="production raz-compiler executable to measure")
+    parser.add_argument("compiler", help="production raz executable to measure")
     parser.add_argument("source_root", help="compiler project root (normally ./compiler)")
     parser.add_argument("workdir", help="disposable profiling workspace")
     parser.add_argument("--output", default="stage-profile.o")

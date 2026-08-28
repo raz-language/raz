@@ -84,7 +84,6 @@ Performance claims should be measured on representative release builds for the t
 The repository's `raz-stdlib-performance-audit` protects structural hot-path guarantees, while runtime fixtures exercise the optimized collection, codec, networking, polling, and channel behavior. Those tests prevent architectural regressions; application benchmarks remain the source of workload-specific performance numbers.
 
 
-
 ## Filesystem, processes, CLI, and random workloads
 
 Directory iteration reuses caller-owned filename storage. Once the buffer has reached the longest filename seen so far, `ReadDir::next` fills it directly and consumes the directory entry in one native transition. An oversized entry returns the required length without consuming it; Raz grows the buffer geometrically and retries only for that new high-water mark. Reuse one `String` while walking large trees.
@@ -95,29 +94,32 @@ Directory iteration reuses caller-owned filename storage. Once the buffer has re
 
 The deterministic `std::random::Rng` is for simulations, schedulers, randomized algorithms, tests, and benchmarks; operating-system entropy remains the source for security-sensitive randomness. `rng_fill_u64` emits directly into contiguous caller storage, and `rng_shuffle_raw` performs Fisher-Yates swaps with one caller-owned scratch slot instead of allocating during the shuffle.
 
-## DNS, HTTP reuse, and logging
+## DNS and HTTP connection reuse
 
 `std::net::resolve::DnsCache` is a bounded four-host hot cache intended for RPC, HTTP, and service clients whose active origin set is small. Cache hits compare retained host bytes, check monotonic TTL expiry, and return the retained first address without allocating or entering the OS resolver. Miss replacement is round-robin to keep the steady-state path branch-light and allocation-bounded.
 
 `std::net::http::client::HttpClientPool` retains four complete HTTP clients rather than one mutable origin. Each slot owns its TCP/TLS stream and reusable request/receive buffers, so alternating between a few services does not force repeated connection teardown and handshakes. Origin selection is a fixed direct scan and miss replacement is round-robin; the pool has no hash-table metadata or per-request pool allocation.
 
-HTTP server workers should retain their `ServerConnection`. Accept now clears and reuses the existing receive allocation, growing only when the configured server buffer exceeds the connection's previous high-water capacity. This removes allocator traffic from the normal accept/process/close/accept cycle.
+HTTP server workers should retain their `ServerConnection`. Accept clears and reuses the existing receive allocation, growing only when the configured server buffer exceeds the connection's high-water capacity. The normal accept/process/close/accept cycle therefore avoids repeated receive-buffer allocation.
 
-For request-heavy servers, `read_request_view` exposes method, target, header, and fixed-length body slices directly from the retained connection input buffer. The worker processes those borrowed views and then calls `release_request`, which advances the buffer in O(1) without copying request fields. `buffered_request_ready` performs a socket-free completeness check so a readiness loop can drain HTTP pipelining already resident in memory before returning to `PollSet`. Chunked bodies retain the same API but point at the connection-owned reusable decode scratch after framing removal. The older owning `read_request` convenience API is implemented on top of this borrowed path.
+For request-heavy servers, `read_request_view` exposes method, target, header, and fixed-length body slices directly from the retained connection input buffer. The worker processes those borrowed views and then calls `release_request`, which advances the buffer in O(1) without copying request fields. `buffered_request_ready` performs a socket-free completeness check so a readiness loop can drain HTTP pipelining already resident in memory before returning to `PollSet`. Chunked bodies retain the same API but point at the connection-owned reusable decode scratch after framing removal. The owning `read_request` convenience API is implemented on top of this borrowed path for callers that prefer owned request data.
+
+## Structured logging
 
 `std::log::LogBuffer` builds compact structured lines in one retained `String`. Message bytes and key/value fields append directly into that storage; integer formatting writes into the same buffer. Reuse one logger per worker/thread and send its borrowed final byte view to the selected output sink in one write.
+
 ## TLS session resumption and compression
 
-TLS clients share the process-wide OpenSSL client context and now retain a bounded eight-host cache of opaque `SSL_SESSION` objects. A reconnect to a recently used host offers the cached session before the handshake; completed sessions are refreshed both when the handshake finishes and again at stream teardown so TLS 1.3 tickets received after the initial handshake are retained. The cache is synchronized only around cache lookup/update and does not add a new Raz/native ABI call.
+TLS clients share the process-wide OpenSSL client context and retain a bounded eight-host cache of opaque `SSL_SESSION` objects. A reconnect to a recently used host offers the cached session before the handshake; completed sessions are refreshed both when the handshake finishes and again at stream teardown so TLS 1.3 tickets received after the initial handshake are retained. The cache is synchronized only around cache lookup/update and does not add a new Raz/native ABI call.
 
 `std::compress::lz4` is an allocation-reusing LZ4 block codec implemented in Raz. `Encoder` owns one 4,096-slot hash table, clears it in one bulk fill between blocks, and writes compressed bytes directly to caller-owned output memory. Decompression also writes directly to caller-owned memory and supports overlapping LZ4 match copies without temporary buffers. This keeps compression state worker-local and makes repeated message/block compression allocator-free after encoder construction.
 
-HTTP `ServerConnection` now retains chunk-decoding scratch in addition to its receive and response buffers. Keep-alive workers therefore avoid the previous hidden 4 KiB allocation on every `read_request` call, including chunked requests. Each connection also retains a two-slice `IoVector`; normal responses send the completed header block and caller-owned body with scatter/gather I/O, avoiding an O(body-size) copy into the response `String` and its associated capacity growth. Partial vectored sends fall back to exact `send_all` completion.
+HTTP `ServerConnection` retains chunk-decoding scratch alongside its receive and response buffers. Keep-alive workers therefore avoid a per-request 4 KiB scratch allocation, including for chunked requests. Each connection also retains a two-slice `IoVector`; normal responses send the completed header block and caller-owned body with scatter/gather I/O, avoiding an O(body-size) copy into the response `String` and its associated capacity growth. Partial vectored sends fall back to exact `send_all` completion.
 
 
 ## Filesystem tree operations
 
-Recursive tree removal retains one mutable full-path buffer for the complete traversal. Each directory level records the current path length, appends the child component, descends, and truncates back to the saved length. This removes the previous per-entry joined-path allocation while preserving symlink safety and deterministic handle cleanup.
+Recursive tree removal retains one mutable full-path buffer for the complete traversal. Each directory level records the current path length, appends the child component, descends, and truncates back to the saved length. The traversal therefore avoids per-entry joined-path allocation while preserving symlink safety and deterministic handle cleanup.
 
 ## Batched readiness reactor
 
@@ -125,8 +127,4 @@ Recursive tree removal retains one mutable full-path buffer for the complete tra
 
 The reactor also owns a retained min-heap of monotonic timers. Scheduling and expiry are O(log n), the timer allocation grows geometrically, and `batch_wait` automatically clamps its OS poll timeout to the nearest deadline. Keep-alive expiry, retries, idle connection timeouts, and similar timers can therefore share the socket event loop rather than occupying sleeping worker tasks. Expired timer tokens are drained with `batch_pop_expired`.
 
-Readiness interests are mutable in place with `batch_set_interests`, which lets a connection switch between readable and writable states when applying backpressure without rebuilding the watch set. `batch_remove_swap` removes a closed connection in O(1) by moving the final poll record into the vacated slot. The older executor-backed one-watch API remains useful when a blocking watch must be adapted into a task, but high-throughput servers should use the batched reactor.
-
-## Structured log emission
-
-`std::log::LogBuffer` retains its record storage and now supports integer, unsigned-integer, boolean, and byte fields plus direct standard-stream emission. Finishing and writing a record does not construct a second formatting string, so worker-local log buffers can remain allocation-stable after reaching their high-water capacity.
+Readiness interests are mutable in place with `batch_set_interests`, which lets a connection switch between readable and writable states when applying backpressure without rebuilding the watch set. `batch_remove_swap` removes a closed connection in O(1) by moving the final poll record into the vacated slot. The executor-backed one-watch API remains useful when a blocking watch must be adapted into a task; high-throughput servers should prefer the batched reactor.

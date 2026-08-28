@@ -1,6 +1,6 @@
 # Roadmap
 
-Forge 1.0 focuses on a stable frontend SDK and production x86-64 scalar/pointer compiler core.
+Forge focuses on a stable frontend SDK and a production x86-64 compiler core, while expanding the AArch64 backend and debugging/tooling support.
 
 Potential future work includes:
 

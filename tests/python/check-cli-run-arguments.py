@@ -7,8 +7,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MAIN = (ROOT / "compiler/src/main.rz").read_text(encoding="utf-8")
-CLI = (ROOT / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
+MAIN = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
+CLI = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
 
 checks = {
     "production driver finds exact argument separator": "fn cli_argument_separator_index(i64 argc) -> i64" in CLI,
@@ -20,7 +20,7 @@ checks = {
     "forwarded argv count is preserved": "argument_count," in CLI,
     "program arguments bypass Raz 32-argument bound": "return *out_cli_argc <= 32;" in CLI,
     "incremental-cache run forwards program argv": "first_program_argument," in MAIN.split("cache_restore_kind != 0", 1)[1].split("cli_release_compilation_arenas", 1)[0],
-    "normal native run forwards program argv": "first_program_argument," in MAIN.split("i64 exit_status = cli_maybe_run_artifact", 1)[1],
+    "normal native run forwards program argv": "first_program_argument," in MAIN.split("else if (!web_build)", 1)[1],
     "direct-source interpreter does not leak compiler argv": "run_after_build && direct_source && first_program_argument < process_argc" in MAIN,
 }
 

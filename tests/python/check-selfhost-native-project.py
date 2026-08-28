@@ -60,11 +60,15 @@ def main() -> int:
         for profile, extra in (("debug", []), ("release", ["--release"])):
             run([str(compiler), "build", *extra], cwd=project, env=env)
             artifact = project / "target" / profile / "bin" / f"smoke{suffix}"
-            obj = project / "target" / profile / "obj" / f"smoke{obj_suffix}"
+            package_units = project / "target" / profile / "packages"
+            module_objects = sorted(package_units.glob(f"*/*{obj_suffix}"))
             if not artifact.is_file():
                 raise RuntimeError(f"missing canonical native artifact: {artifact}")
-            if not obj.is_file():
-                raise RuntimeError(f"missing canonical native object: {obj}")
+            if not module_objects:
+                raise RuntimeError(f"missing canonical module object(s) under: {package_units}")
+            legacy_obj = project / "target" / profile / "obj" / f"smoke{obj_suffix}"
+            if legacy_obj.exists():
+                raise RuntimeError(f"legacy whole-project native object was produced: {legacy_obj}")
             legacy = project / "target" / profile / f"smoke{suffix}"
             if legacy.exists():
                 raise RuntimeError(f"legacy flat-profile artifact was produced: {legacy}")
@@ -78,7 +82,7 @@ def main() -> int:
         # and no special cwd/install-relative assumptions are permitted here.
         shutil.rmtree(root / "raz-home", ignore_errors=True)
 
-    print("selfhost-native-project: PASS (debug/release obj+bin layout and execution)")
+    print("selfhost-native-project: PASS (debug/release module-object+bin layout and execution)")
     return 0
 
 

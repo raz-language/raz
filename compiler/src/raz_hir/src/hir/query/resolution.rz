@@ -1,0 +1,62 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::query::resolution;
+
+public import raz_hir::query::fingerprints;
+
+// Query-backed semantic name resolution. Exact interned SymbolId values and
+// canonical TypeId receivers define method-query identity, so both positive
+// and negative results are collision-safe and source-offset independent.
+fn hir_find_inherent_method(HirBuilder&mut builder, i64 structure, i64 offset, i64 length) -> i64 {
+    i64 symbol = hir_query_intern_symbol(builder, offset, length);
+    i64 receiver = hir_query_intern_value_type(builder, structure, 12);
+
+    if (symbol < 0 || receiver < 0) {
+        return -1;
+    }
+
+    i64 result = -1;
+    i64 unused = 0;
+    i64 epoch = builder.module.inherent_method_count;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_method(),
+            receiver,
+            symbol,
+            0,
+            epoch,
+            0,
+            &mut result,
+            &mut unused,
+        )
+    ) {
+        builder.resolution_cache_hits += 1;
+        return result;
+    }
+    builder.resolution_cache_misses += 1;
+
+    i64 method = 0;
+
+    while (method < builder.module.inherent_method_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.inherent_method_structures, method) == structure &&
+            hir_query_symbol_same(
+                builder,
+                symbol,
+                raz_compiler_rt_arena_get(builder.module.inherent_method_name_offsets, method),
+                raz_compiler_rt_arena_get(builder.module.inherent_method_name_lengths, method),
+            )
+        ) {
+            result = method;
+            break;
+        }
+        method += 1;
+    }
+    if (hir_query_begin(builder, hir_query_kind_method(), receiver, symbol, 0)) {
+        hir_query_end(builder, hir_query_kind_method(), receiver, symbol, 0, epoch, 0, result, 0, true);
+    }
+    return result;
+}

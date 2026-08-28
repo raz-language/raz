@@ -1,0 +1,203 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::dce;
+
+public import mir::analysis::liveness;
+public import raz_mir_opt::transform::scalar;
+
+// Only instructions whose evaluation is known to be side-effect-free are DCE
+// candidates. Everything else is retained conservatively until its effect
+// model is explicit in MIR.
+fn mir_opcode_is_dce_candidate(i64 opcode) -> bool {
+    return (
+        (opcode >= 1 && opcode <= 7) ||
+        (opcode >= 11 && opcode <= 20) ||
+        opcode == 24 ||
+        opcode == 25 ||
+        opcode == 26 ||
+        opcode == 28 ||
+        (opcode >= 34 && opcode <= 40) ||
+        opcode == 43 ||
+        opcode == 45 ||
+        opcode == 47 ||
+        opcode == 49
+    );
+}
+
+fn eliminate_mir_dead_values(MirModule&mut mir) -> bool {
+    if (mir.instruction_count == 0) {
+        return true;
+    }
+
+    MirUseInfo uses;
+
+    if (!build_mir_use_info(mir, &mut uses)) {
+        return false;
+    }
+    // Bits 0 and 1 carry the only per-instruction booleans DCE needs:
+    // keep and pinned. Packing them avoids a second full instruction-sized arena.
+
+    i64 state = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+    i64 queue = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+
+    if (state == 0 || queue == 0) {
+        if (state != 0) {
+            raz_compiler_rt_arena_destroy(state);
+        }
+        if (queue != 0) {
+            raz_compiler_rt_arena_destroy(queue);
+        }
+        destroy_mir_use_info(&mut uses);
+        return false;
+    }
+
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        raz_compiler_rt_arena_set_unchecked(state, ip, 1);
+        ip += 1;
+    }
+    // Branch destinations are control-flow identities, not ordinary register
+    // uses. Keep their label instructions alive even when the label carries no
+    // merge value; deleting one would leave a branch targeting a compacted-away
+    // instruction.
+    ip = 0;
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 22) {
+            i64 target = raz_compiler_rt_arena_get(mir.op_b, ip);
+
+            if (target >= 0 && target < mir.instruction_count) {
+                raz_compiler_rt_arena_set_unchecked(
+                    state,
+                    target,
+                    raz_compiler_rt_arena_get_unchecked(state, target) | 2
+                );
+            }
+        } else if (opcode == 23) {
+            i64 false_target = raz_compiler_rt_arena_get(mir.op_b, ip);
+            i64 true_target = raz_compiler_rt_arena_get(mir.op_c, ip);
+
+            if (false_target >= 0 && false_target < mir.instruction_count) {
+                raz_compiler_rt_arena_set(
+                    state,
+                    false_target,
+                    raz_compiler_rt_arena_get_unchecked(state, false_target) | 2
+                );
+            }
+            if (true_target >= 0 && true_target < mir.instruction_count) {
+                raz_compiler_rt_arena_set(
+                    state,
+                    true_target,
+                    raz_compiler_rt_arena_get_unchecked(state, true_target) | 2
+                );
+            }
+        }
+        ip += 1;
+    }
+    // Ownership metadata identifies semantic program points. Build this pin map
+    // once instead of rescanning every ownership event for every instruction.
+
+    i64 event = 0;
+
+    while (event < mir.ownership.ownership_event_count) {
+        i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+
+        if (instruction >= 0 && instruction < mir.instruction_count) {
+            raz_compiler_rt_arena_set_unchecked(
+                state,
+                instruction,
+                raz_compiler_rt_arena_get_unchecked(state, instruction) | 2
+            );
+        }
+        event += 1;
+    }
+
+    i64 queue_head = 0;
+    i64 queue_tail = 0;
+
+    ip = 0;
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (
+            mir_opcode_is_dce_candidate(opcode) &&
+            (raz_compiler_rt_arena_get_unchecked(state, ip) & 2) == 0 &&
+            raz_compiler_rt_arena_get_unchecked(uses.use_counts, ip) == 0
+        ) {
+            raz_compiler_rt_arena_set_unchecked(queue, queue_tail, ip);
+            queue_tail += 1;
+        }
+        ip += 1;
+    }
+
+    bool changed = false;
+
+    while (queue_head < queue_tail) {
+        i64 dead = raz_compiler_rt_arena_get_unchecked(queue, queue_head);
+
+        queue_head += 1;
+        if (
+            dead < 0 ||
+            dead >= mir.instruction_count ||
+            (raz_compiler_rt_arena_get_unchecked(state, dead) & 1) == 0
+        ) {
+            continue;
+        }
+        if (
+            !mir_opcode_is_dce_candidate(raz_compiler_rt_arena_get(mir.opcodes, dead)) ||
+            (raz_compiler_rt_arena_get_unchecked(state, dead) & 2) != 0 ||
+            raz_compiler_rt_arena_get_unchecked(uses.use_counts, dead) != 0
+        ) {
+            continue;
+        }
+        raz_compiler_rt_arena_set_unchecked(
+            state,
+            dead,
+            raz_compiler_rt_arena_get_unchecked(state, dead) & - 2
+        );
+        changed = true;
+        // Removing a dead pure instruction removes its inline register uses.
+        // Newly unused producers enter the same worklist, collapsing complete
+        // dead expression chains in one pass instead of one compaction per link.
+
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, dead);
+        i64 register_mask = mir_register_operand_mask(opcode);
+        i64 operand = 0;
+
+        while (operand < 4) {
+            if ((register_mask&(1 << operand)) != 0) {
+                i64 value = mir_get_operand(mir, dead, operand);
+
+                if (value >= 0 && value < mir.instruction_count) {
+                    i64 count = raz_compiler_rt_arena_get_unchecked(uses.use_counts, value);
+
+                    if (count > 0) {
+                        count -= 1;
+                        raz_compiler_rt_arena_set_unchecked(uses.use_counts, value, count);
+                        if (
+                            count == 0 &&
+                            (raz_compiler_rt_arena_get_unchecked(state, value) & 1) != 0 &&
+                            (raz_compiler_rt_arena_get_unchecked(state, value) & 2) == 0 &&
+                            mir_opcode_is_dce_candidate(raz_compiler_rt_arena_get(mir.opcodes, value))
+                        ) {
+                            raz_compiler_rt_arena_set_unchecked(queue, queue_tail, value);
+                            queue_tail += 1;
+                        }
+                    }
+                }
+            }
+            operand += 1;
+        }
+    }
+    destroy_mir_use_info(&mut uses);
+    raz_compiler_rt_arena_destroy(queue);
+    if (changed && !compact_mir_instructions(mir, state)) {
+        raz_compiler_rt_arena_destroy(state);
+        return false;
+    }
+    raz_compiler_rt_arena_destroy(state);
+    return true;
+}

@@ -3,9 +3,9 @@
 
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-hir = (root/'compiler/src/hir/semantic/declarations.rz').read_text()
-llvm = (root/'compiler/src/backend/llvm/globals_codegen.rz').read_text()
-forge = (root/'compiler/src/backend/forge/globals_codegen.rz').read_text()
+hir = (root/'compiler/src/raz_hir/src/hir/semantic/declarations.rz').read_text()
+llvm = (root/'compiler/src/raz_codegen_llvm/src/llvm/globals_codegen.rz').read_text()
+forge = (root/'compiler/src/raz_codegen_forge/src/forge/globals_codegen.rz').read_text()
 example = (root/'tests/examples/backends/drop_global.rz').read_text()
 checks = {
     'drop globals admitted as static images': 'Drop-bearing structs are still static module images' in hir,

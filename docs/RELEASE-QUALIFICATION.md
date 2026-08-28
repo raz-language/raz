@@ -1,6 +1,6 @@
 # Release Qualification
 
-Raz release qualification has three explicit tiers. The distinction keeps pull-request feedback fast without allowing release artifacts to rely only on structural source checks.
+Raz release qualification has three tiers. The lighter tiers are useful while developing a change; the full tier is the one that matters for a release artifact.
 
 ## Source tier
 
@@ -8,7 +8,7 @@ Raz release qualification has three explicit tiers. The distinction keeps pull-r
 python tests/python/release-gate.py --tier source
 ```
 
-The source tier runs the lightweight repository qualification and the RXE semantic/reference contracts. It requires no prebuilt compiler and is appropriate for every pull request on Windows and Linux.
+The source tier runs repository structure checks and the RXE semantic/reference contracts. It needs no prebuilt compiler, so it is the quickest way to catch source-tree and specification mistakes on Windows or Linux.
 
 ## Runtime tier
 

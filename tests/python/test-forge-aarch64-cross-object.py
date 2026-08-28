@@ -50,8 +50,9 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    fir_text = run([args.razc, "--forge-ir", str(source)], stdout_path=fir)
-    require("func @main" in fir_text and "add i64" in fir_text,
+    run([args.razc, "forge", str(source), str(fir)])
+    fir_text = fir.read_text(encoding="utf-8")
+    require("func @__raz_main" in fir_text and "add i64" in fir_text,
             "Raz frontend did not produce the expected structured Forge IR")
 
     elf_a = work / "cross-a.elf.o"

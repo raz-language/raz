@@ -4,7 +4,6 @@
 
 ### A systems programming language for native software that has to be fast, safe, and predictable.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/raz-language/raz/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/raz-language/raz/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/language-1.0-111827?style=flat-square)](docs/LANGUAGE-STABILITY.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-111827?style=flat-square)](LICENSE)
 [![Packages](https://img.shields.io/badge/packages-registry-111827?style=flat-square)](https://github.com/raz-language/packages)
@@ -18,9 +17,9 @@
 
 ---
 
-Raz is a statically typed language for command-line tools, network services, runtimes, databases, compilers, storage engines, and infrastructure — software where the cost model has to be visible in the source. It pairs ownership and borrowing with low-level memory access, generics, traits, pattern matching, deterministic destruction, and structured concurrency, and it ships as a complete platform rather than a compiler alone.
+Raz is a statically typed systems language for software where runtime cost and memory behavior matter: command-line tools, network services, runtimes, databases, compilers, storage engines, and infrastructure. It combines ownership and borrowing with low-level memory access, generics, traits, pattern matching, deterministic destruction, and structured concurrency.
 
-**Raz 1.0 is stable.** The documented language contract does not break within the 1.x line.
+**Raz 1.0 is stable.** Programs that stay within the documented 1.x language contract should not need source changes for later 1.x releases.
 
 ## Why Raz
 
@@ -54,9 +53,19 @@ Raz uses type-first declarations and semicolon-terminated statements. The [langu
 
 ## Install and start
 
-Releases provide an MSI installer and a portable archive for Windows, with `razup` for toolchain management. Confirm the environment with `raz --version` and `raz doctor`, then create a project with `raz new` and run it with `raz run`.
+Raz 1.0.0 ships as an MSI and portable ZIP for Windows x86-64, and as a portable `tar.gz` for Linux x86-64. `razup` can install and switch between published toolchains. See [Installation](docs/INSTALLATION.md) for platform-specific instructions.
 
-See [Getting Started](docs/GETTING-STARTED.md) for the first project walkthrough.
+Once `raz` is on `PATH`:
+
+```text
+raz --version
+raz doctor
+raz new hello
+cd hello
+raz run
+```
+
+[Getting Started](docs/GETTING-STARTED.md) continues from there with a guided tour of the language and toolchain.
 
 ## Toolchain
 
@@ -187,7 +196,7 @@ Platform-specific standard-library facilities are documented per module and do n
 
 ## Packages and workspaces
 
-The official registry is hosted at [`raz-language/packages`](https://github.com/raz-language/packages) — a GitHub-backed static registry of immutable, deterministic archives. Published packages cover serialization/data formats, security, web protocols, databases, testing, archives/compression, and exact numeric types. The current catalog includes `json`, `yaml`, `toml`, `csv`, `xml`, `cbor`, `msgpack`, `protobuf`, `serde`, `encoding`, `crypto`, `jwt`, `uuid`, `regex`, `semver`, `datetime`, `websocket`, `http-router`, `multipart`, `sqlite`, `postgres`, `archive`, `compression`, `testing`, `decimal`, and `bigint`. See [Official packages](docs/OFFICIAL-PACKAGES.md).
+The official registry lives at [`raz-language/packages`](https://github.com/raz-language/packages). It is a GitHub-backed static registry of immutable, deterministic archives covering data formats, security, networking, databases, systems utilities, observability, testing, and exact numeric types. See the [official package catalog](docs/OFFICIAL-PACKAGES.md) for the maintained list instead of duplicating it here.
 
 Dependencies are declared as semantic-version constraints and pinned exactly in `raz.lock`. Archives are integrity-checked and stored in a shared content-addressed cache, so `build`, `check`, `run`, and `test` hydrate missing locked packages automatically — a clean checkout needs no separate install step. Offline builds, vendoring, Git dependencies, private registries, and mirrors are supported, and a root manifest can coordinate many member packages against one lockfile.
 
@@ -254,5 +263,3 @@ Please do not report security vulnerabilities through public issues. See [SECURI
 ## License
 
 Raz is licensed under the [Apache License 2.0](LICENSE). Forge retains its nested Apache-2.0 license for independent redistribution. See [NOTICE](NOTICE) and [Licensing](docs/LICENSING.md) for attribution and redistribution details.
-
-

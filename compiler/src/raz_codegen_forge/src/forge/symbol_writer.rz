@@ -1,0 +1,70 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_forge::symbol_writer;
+
+public import raz_codegen_forge::writer;
+
+// Shared Forge symbol naming helpers. This module follows forge_writer.rz so
+// writer primitives are declared before these helpers and precedes all backends.
+// Module-global names are shared by textual and structured Forge lowering.
+public fn writer_module_global_needs_identity_suffix(Source& source, HirModule& hir, i64 global_index) -> bool {
+    i64 cached = raz_compiler_rt_arena_get(hir.global_identity_suffix_cache, global_index);
+    if (cached != 0) {
+        return cached == 2;
+    }
+
+    bool needs_suffix = false;
+    if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
+        i64 offset = raz_compiler_rt_arena_get(hir.global_name_offsets, global_index);
+        i64 length = raz_compiler_rt_arena_get(hir.global_name_lengths, global_index);
+        i64 index = 0;
+        while (!needs_suffix && index < hir.global_count) {
+            if (
+                index != global_index &&
+                raz_compiler_rt_arena_get(hir.global_extern_flags, index) == 0 &&
+                token_same(
+                    source,
+                    offset,
+                    length,
+                    raz_compiler_rt_arena_get(hir.global_name_offsets, index),
+                    raz_compiler_rt_arena_get(hir.global_name_lengths, index),
+                )
+            ) {
+                needs_suffix = true;
+            }
+            index += 1;
+        }
+    }
+
+    if (needs_suffix) {
+        raz_compiler_rt_arena_set(hir.global_identity_suffix_cache, global_index, 2);
+    } else {
+        raz_compiler_rt_arena_set(hir.global_identity_suffix_cache, global_index, 1);
+    }
+    return needs_suffix;
+}
+
+fn writer_module_global_name(ForgeWriter&mut out, Source& source, HirModule& hir, i64 global_index) {
+    writer_put(out, 64);
+    if (raz_compiler_rt_arena_get(hir.global_extern_flags, global_index) == 0) {
+        string prefix = "__raz_global_";
+        i64 index = 0;
+
+        while (index < 13) {
+            writer_put(out, compiler_literal_byte(prefix, index));
+            index += 1;
+        }
+    }
+    writer_text(
+        out,
+        source,
+        raz_compiler_rt_arena_get(hir.global_name_offsets, global_index),
+        raz_compiler_rt_arena_get(hir.global_name_lengths, global_index),
+    );
+    if (writer_module_global_needs_identity_suffix(source, hir, global_index)) {
+        writer_put(out, 95);
+        writer_put(out, 103);
+        writer_decimal(out, global_index);
+    }
+}

@@ -25,6 +25,7 @@ CHECKS = (
     "check-stage0-boundary.py",
     "check-stage0-cache.py",
     "check-bootstrap-fixed-point.py",
+    "check-bootstrap-oblink-staging.py",
     "check-native-boundary.py",
     "check-compiler-runtime-declarations.py",
     "check-forge-backend-integrity.py",

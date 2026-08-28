@@ -1,0 +1,613 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::generics::const_generics;
+
+public import raz_hir::generics::instantiate;
+import raz_hir::semantic::comptime;
+
+// Compile-time const-generic expression evaluation and substitution.
+// Kept separate from hir_types.rz so type parsing stays below the module-size gate.
+fn hir_lookup_const_generic_constant(HirBuilder&mut builder, i64 offset, i64 length, i64&mut out) -> bool {
+    i64 constant = builder.module.constant_count - 1;
+
+    while (constant >= 0) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.constant_function_indices, constant) < 0 &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.constant_name_offsets, constant),
+                raz_compiler_rt_arena_get(builder.module.constant_name_lengths, constant),
+                offset,
+                length,
+            )
+        ) {
+            i64 steps = raz_compiler_rt_arena_create(1);
+
+            if (steps == 0) {
+                return false;
+            }
+            raz_compiler_rt_arena_set(steps, 0, 0);
+            bool ok = hir_eval_constexpr_node(
+                builder.module,
+                raz_compiler_rt_arena_get(builder.module.constant_nodes, constant),
+                0,
+                0,
+                steps,
+                0,
+                out,
+            );
+            raz_compiler_rt_arena_destroy(steps);
+            return ok;
+        }
+        constant -= 1;
+    }
+    return false;
+}
+
+fn hir_parse_const_generic_primary(HirBuilder&mut builder, i64&mut out) -> bool {
+    if (builder.current.kind == TokenKind::Integer) {
+        *out = parse_integer_value(&builder.scan.input, &builder.current);
+        hir_advance(builder);
+        return true;
+    }
+    if (builder.current.kind == TokenKind::Identifier) {
+        if (
+            builder.generic_active != 0 &&
+            hir_find_generic_const_substitution(builder, builder.current.offset, builder.current.length, out)
+        ) {
+            hir_advance(builder);
+            return true;
+        }
+        if (hir_lookup_const_generic_constant(builder, builder.current.offset, builder.current.length, out)) {
+            hir_advance(builder);
+            return true;
+        }
+    }
+    if (builder.current.kind == TokenKind::LeftParen) {
+        hir_advance(builder);
+        if (!hir_parse_const_generic_expression(builder, out)) {
+            return false;
+        }
+        return hir_expect(builder, TokenKind::RightParen);
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_parse_const_generic_unary(HirBuilder&mut builder, i64&mut out) -> bool {
+    if (builder.current.kind == TokenKind::Minus) {
+        hir_advance(builder);
+        if (!hir_parse_const_generic_unary(builder, out)) {
+            return false;
+        }
+        *out = 0 - *out;
+        return true;
+    }
+    return hir_parse_const_generic_primary(builder, out);
+}
+
+fn hir_parse_const_generic_term(HirBuilder&mut builder, i64&mut out) -> bool {
+    if (!hir_parse_const_generic_unary(builder, out)) {
+        return false;
+    }
+    while (
+        builder.current.kind == TokenKind::Star ||
+        builder.current.kind == TokenKind::Slash ||
+        builder.current.kind == TokenKind::Percent
+    ) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = 0;
+
+        if (!hir_parse_const_generic_unary(builder, &mut right)) {
+            return false;
+        }
+        if (operation == TokenKind::Star) {
+            *out = *out * right;
+        } else if (operation == TokenKind::Slash) {
+            if (right == 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            *out = *out / right;
+        } else {
+            if (right == 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            *out = *out % right;
+        }
+    }
+    return true;
+}
+
+fn hir_parse_const_generic_expression(HirBuilder&mut builder, i64&mut out) -> bool {
+    if (!hir_parse_const_generic_term(builder, out)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::Plus || builder.current.kind == TokenKind::Minus) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = 0;
+
+        if (!hir_parse_const_generic_term(builder, &mut right)) {
+            return false;
+        }
+        if (operation == TokenKind::Plus) {
+            *out = *out + right;
+        } else {
+            *out = *out - right;
+        }
+    }
+    return true;
+}
+
+fn hir_generic_scanned_const_primary(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out,
+) -> bool {
+    if (current.kind == TokenKind::Integer) {
+        *out = parse_integer_value(&builder.scan.input, current);
+        next_token(scan, current);
+        return true;
+    }
+    if (current.kind == TokenKind::Identifier) {
+        i64 parameter = hir_generic_parameter_index(
+            builder,
+            owner_kind,
+            owner_index,
+            current.offset,
+            current.length,
+        );
+        if (
+            parameter >= 0 &&
+            parameter < argument_count &&
+            raz_compiler_rt_arena_get(argument_structures, parameter) == -2
+        ) {
+            *out = raz_compiler_rt_arena_get(argument_types, parameter);
+            next_token(scan, current);
+            return true;
+        }
+        if (hir_lookup_const_generic_constant(builder, current.offset, current.length, out)) {
+            next_token(scan, current);
+            return true;
+        }
+    }
+    if (current.kind == TokenKind::LeftParen) {
+        next_token(scan, current);
+        if (
+            !hir_generic_scanned_const_expression(
+                builder,
+                scan,
+                current,
+                owner_kind,
+                owner_index,
+                argument_count,
+                argument_structures,
+                argument_types,
+                out,
+            )
+        ) {
+            return false;
+        }
+        if (current.kind != TokenKind::RightParen) {
+            return false;
+        }
+        next_token(scan, current);
+        return true;
+    }
+    return false;
+}
+
+fn hir_generic_scanned_const_unary(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out,
+) -> bool {
+    if (current.kind == TokenKind::Minus) {
+        next_token(scan, current);
+        if (
+            !hir_generic_scanned_const_unary(
+                builder,
+                scan,
+                current,
+                owner_kind,
+                owner_index,
+                argument_count,
+                argument_structures,
+                argument_types,
+                out,
+            )
+        ) {
+            return false;
+        }
+        *out = 0 - *out;
+        return true;
+    }
+    return hir_generic_scanned_const_primary(
+        builder,
+        scan,
+        current,
+        owner_kind,
+        owner_index,
+        argument_count,
+        argument_structures,
+        argument_types,
+        out,
+    );
+}
+
+fn hir_generic_scanned_const_term(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out,
+) -> bool {
+    if (
+        !hir_generic_scanned_const_unary(
+            builder,
+            scan,
+            current,
+            owner_kind,
+            owner_index,
+            argument_count,
+            argument_structures,
+            argument_types,
+            out,
+        )
+    ) {
+        return false;
+    }
+    while (
+        current.kind == TokenKind::Star ||
+        current.kind == TokenKind::Slash ||
+        current.kind == TokenKind::Percent
+    ) {
+        TokenKind operation = current.kind;
+
+        next_token(scan, current);
+
+        i64 right = 0;
+
+        if (
+            !hir_generic_scanned_const_unary(
+                builder,
+                scan,
+                current,
+                owner_kind,
+                owner_index,
+                argument_count,
+                argument_structures,
+                argument_types,
+                &mut right,
+            )
+        ) {
+            return false;
+        }
+        if (operation == TokenKind::Star) {
+            *out = *out * right;
+        } else if (operation == TokenKind::Slash) {
+            if (right == 0) {
+                return false;
+            }
+            *out = *out / right;
+        } else {
+            if (right == 0) {
+                return false;
+            }
+            *out = *out % right;
+        }
+    }
+    return true;
+}
+
+fn hir_generic_scanned_const_expression(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out,
+) -> bool {
+    if (
+        !hir_generic_scanned_const_term(
+            builder,
+            scan,
+            current,
+            owner_kind,
+            owner_index,
+            argument_count,
+            argument_structures,
+            argument_types,
+            out,
+        )
+    ) {
+        return false;
+    }
+    while (current.kind == TokenKind::Plus || current.kind == TokenKind::Minus) {
+        TokenKind operation = current.kind;
+
+        next_token(scan, current);
+
+        i64 right = 0;
+
+        if (
+            !hir_generic_scanned_const_term(
+                builder,
+                scan,
+                current,
+                owner_kind,
+                owner_index,
+                argument_count,
+                argument_structures,
+                argument_types,
+                &mut right,
+            )
+        ) {
+            return false;
+        }
+        if (operation == TokenKind::Plus) {
+            *out = *out + right;
+        } else {
+            *out = *out - right;
+        }
+    }
+    return true;
+}
+
+// Resolve an associated const declared by a generic trait impl against the
+// concrete generic substitutions active while reparsing one of that impl's
+// methods. This keeps associated constants scoped to the applicable impl and
+// avoids materializing them as module globals (which would collide across
+// different instantiations such as Buffer<i64, 4> and Buffer<i64, 8>).
+fn hir_scanned_substitution_const_primary(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64&mut out,
+) -> bool {
+    if (current.kind == TokenKind::Integer) {
+        *out = parse_integer_value(&builder.scan.input, current);
+        next_token(scan, current);
+        return true;
+    }
+    if (current.kind == TokenKind::Identifier) {
+        if (
+            builder.generic_active != 0 &&
+            hir_find_generic_const_substitution(builder, current.offset, current.length, out)
+        ) {
+            next_token(scan, current);
+            return true;
+        }
+        if (hir_lookup_const_generic_constant(builder, current.offset, current.length, out)) {
+            next_token(scan, current);
+            return true;
+        }
+    }
+    if (current.kind == TokenKind::LeftParen) {
+        next_token(scan, current);
+        if (!hir_scanned_substitution_const_expression(builder, scan, current, out)) {
+            return false;
+        }
+        if (current.kind != TokenKind::RightParen) {
+            return false;
+        }
+        next_token(scan, current);
+        return true;
+    }
+    return false;
+}
+
+fn hir_scanned_substitution_const_unary(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64&mut out,
+) -> bool {
+    if (current.kind == TokenKind::Minus) {
+        next_token(scan, current);
+        if (!hir_scanned_substitution_const_unary(builder, scan, current, out)) {
+            return false;
+        }
+        *out = 0 - *out;
+        return true;
+    }
+    return hir_scanned_substitution_const_primary(builder, scan, current, out);
+}
+
+fn hir_scanned_substitution_const_term(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64&mut out,
+) -> bool {
+    if (!hir_scanned_substitution_const_unary(builder, scan, current, out)) {
+        return false;
+    }
+    while (
+        current.kind == TokenKind::Star ||
+        current.kind == TokenKind::Slash ||
+        current.kind == TokenKind::Percent
+    ) {
+        TokenKind operation = current.kind;
+
+        next_token(scan, current);
+
+        i64 right = 0;
+
+        if (!hir_scanned_substitution_const_unary(builder, scan, current, &mut right)) {
+            return false;
+        }
+        if (operation == TokenKind::Star) {
+            *out = *out * right;
+        } else if (operation == TokenKind::Slash) {
+            if (right == 0) {
+                return false;
+            }
+            *out = *out / right;
+        } else {
+            if (right == 0) {
+                return false;
+            }
+            *out = *out % right;
+        }
+    }
+    return true;
+}
+
+fn hir_scanned_substitution_const_expression(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64&mut out,
+) -> bool {
+    if (!hir_scanned_substitution_const_term(builder, scan, current, out)) {
+        return false;
+    }
+    while (current.kind == TokenKind::Plus || current.kind == TokenKind::Minus) {
+        TokenKind operation = current.kind;
+
+        next_token(scan, current);
+
+        i64 right = 0;
+
+        if (!hir_scanned_substitution_const_term(builder, scan, current, &mut right)) {
+            return false;
+        }
+        if (operation == TokenKind::Plus) {
+            *out = *out + right;
+        } else {
+            *out = *out - right;
+        }
+    }
+    return true;
+}
+
+fn hir_find_generic_trait_associated_const_value(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64&mut out,
+) -> bool {
+    if (builder.current_function < 0) {
+        return false;
+    }
+    i64 structure = raz_compiler_rt_arena_get(
+        builder.module.function_inherent_structs,
+        builder.current_function,
+    );
+    if (structure < 0) {
+        return false;
+    }
+
+    i64 candidate = 0;
+
+    while (candidate < builder.module.generic_trait_impl_count) {
+        i64 primary_structure = -1;
+        i64 primary_type = 0;
+
+        if (
+            hir_generic_trait_impl_applies(
+                builder,
+                candidate,
+                structure,
+                &mut primary_structure,
+                &mut primary_type,
+            )
+        ) {
+            Lexer scan;
+
+            scan.input = builder.scan.input;
+            scan.offset = raz_compiler_rt_arena_get(builder.module.generic_trait_source_offsets, candidate);
+            clear_diagnostic(&mut scan.last_error);
+
+            Token current;
+
+            next_token(&mut scan, &mut current);
+
+            i64 depth = 0;
+
+            while (current.kind != TokenKind::End) {
+                if (current.kind == TokenKind::LeftBrace) {
+                    depth += 1;
+                    next_token(&mut scan, &mut current);
+                    continue;
+                }
+                if (current.kind == TokenKind::RightBrace) {
+                    depth -= 1;
+                    next_token(&mut scan, &mut current);
+                    continue;
+                }
+                if (
+                    depth == 1 &&
+                    current.kind == TokenKind::Identifier &&
+                    token_is_const(&builder.scan.input, &current)
+                ) {
+                    next_token(&mut scan, &mut current);
+                    // Associated const syntax is: const NAME: Type = expression;
+                    if (
+                        current.kind == TokenKind::Identifier &&
+                        token_same(
+                            &builder.scan.input,
+                            current.offset,
+                            current.length,
+                            name_offset,
+                            name_length,
+                        )
+                    ) {
+                        next_token(&mut scan, &mut current);
+                        if (current.kind != TokenKind::Colon) {
+                            return false;
+                        }
+                        next_token(&mut scan, &mut current);
+                        // Skip the declared scalar type. Trait associated consts
+                        // currently use scalar/integer values in the HIR ABI.
+                        if (current.kind != TokenKind::Identifier) {
+                            return false;
+                        }
+                        next_token(&mut scan, &mut current);
+                        if (current.kind != TokenKind::Equal) {
+                            return false;
+                        }
+                        next_token(&mut scan, &mut current);
+                        if (
+                            !hir_scanned_substitution_const_expression(builder, &mut scan, &mut current, out)
+                        ) {
+                            return false;
+                        }
+                        return current.kind == TokenKind::Semicolon;
+                    }
+                }
+                next_token(&mut scan, &mut current);
+            }
+        }
+        candidate += 1;
+    }
+    return false;
+}

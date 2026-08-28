@@ -6,9 +6,9 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-inc = (root / 'compiler/src/driver/incremental.rz').read_text()
-model = (root / 'compiler/src/hir/core/model.rz').read_text()
-main = (root / 'compiler/src/main.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
+model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
 
 checks = {
     'HIR module fingerprints are first-class cache identity':
@@ -40,6 +40,31 @@ checks = {
         'raz_compiler_rt_arena_destroy(out.incremental_module_hir_fingerprints);' in model and
         'raz_compiler_rt_arena_destroy(out.incremental_module_cached_mir_fingerprints);' in model and
         'raz_compiler_rt_arena_destroy(out.incremental_module_cache_kinds);' in model,
+    'artifact cache persists semantic source and backend option fingerprints':
+        '/artifact.semantic.key' in inc and '/artifact.options.key' in inc and
+        'fn incremental_semantic_source_hash(' in inc and
+        'fn incremental_artifact_options_key(' in inc,
+    'cached native artifact has independent size/content integrity':
+        '/artifact.integrity' in inc and 'fn incremental_artifact_integrity_matches(' in inc and
+        'incremental_input_content_hash(artifact_path, artifact_length, expected_size)' in inc,
+    'semantic fast path preserves quoted literals and skips comments only outside them':
+        'Quoted literals are copied byte-for-byte' in inc and
+        'line_comment' in inc and 'block_comment' in inc and 'pending_separator' in inc,
+    'frontend semantic artifact has a dedicated cache file':
+        '/frontend.state' in inc and
+        'incremental_cache_path(manifest_path, manifest_length, 10, state_path, 8192)' in inc,
+    'incremental check restores frontend artifact before legacy debug state':
+        'Pass 60 gives frontend semantic state its own durable artifact' in inc and
+        inc.index('incremental_cache_path(manifest_path, manifest_length, 10, state_path, 8192)') <
+        inc.index('state_length = incremental_cache_path(manifest_path, manifest_length, 2, state_path, 8192)', inc.index('fn incremental_load_check_hints(')),
+    'executable MIR units have a dedicated cache artifact':
+        '/mir.units' in inc and 'fn incremental_persist_mir_units(' in inc and
+        'incremental_persist_mir_units(' in main,
+    'MIR unit image records executable lanes and ownership identity':
+        'RAZMIRUNITS 2\\n' in inc and
+        all(token in inc for token in ['mir.function_count', 'mir.instruction_count', 'mir.global_count',
+                                       'mir.call_argument_count', 'mir.function_module_ids', 'mir.opcodes',
+                                       'mir.op_types', 'mir.op_a', 'mir.op_b', 'mir.op_c', 'mir.op_d']),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

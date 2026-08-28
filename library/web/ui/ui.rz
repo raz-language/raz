@@ -1,0 +1,3709 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+public import alloc::string;
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+extern fn raz_rt_load_u8(usize address) -> i64;
+
+public enum Tag {
+    // Wrapper-free composition node. Fragment renders only its children and
+    // never appears in the emitted HTML or structural stream.
+    Fragment,
+    Div,
+    Main,
+    Section,
+    Header,
+    Footer,
+    Nav,
+    Article,
+    Aside,
+    Figure,
+    Figcaption,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    P,
+    Span,
+    Small,
+    Strong,
+    Em,
+    Code,
+    Pre,
+    Blockquote,
+    Br,
+    Hr,
+    Button,
+    A,
+    Ul,
+    Ol,
+    Li,
+    Dl,
+    Dt,
+    Dd,
+    Form,
+    Label,
+    Input,
+    Textarea,
+    Select,
+    Option,
+    Details,
+    Summary,
+    Table,
+    Thead,
+    Tbody,
+    Tr,
+    Th,
+    Td,
+    Img,
+    Video,
+    Audio,
+    Source,
+}
+
+public enum InputType {
+    Text,
+    Email,
+    Password,
+    Number,
+    Search,
+    Url,
+    Tel,
+    Date,
+    Checkbox,
+    Radio,
+    File,
+    Hidden,
+    Submit,
+    Button,
+    Reset,
+    Color,
+    Range,
+    Month,
+    Week,
+    Time,
+    DateTimeLocal,
+}
+
+struct Buffer {
+    usize data;
+    i64 length;
+    i64 capacity;
+}
+
+public struct StateI64 {
+    i64 slot;
+}
+
+public struct StateBool {
+    i64 slot;
+}
+
+public struct StateString {
+    i64 slot;
+}
+
+// Derived scalar values are lightweight dependency records. They do not own
+// application state: each record points at source StateI64 slots and can be
+// recomputed by the browser directly through the Wasm ABI when all sources are
+// bound-only. A structural get() promotes the source states conservatively.
+public struct DerivedI64 {
+    i64 id;
+}
+
+public struct DerivedBool {
+    i64 id;
+}
+
+public struct HttpRequest {
+    i64 slot;
+}
+
+public struct JsonString {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+public struct JsonI64 {
+    i64 value;
+    bool found;
+}
+
+public struct JsonBool {
+    bool value;
+    bool found;
+}
+
+public struct JsonF64 {
+    f64 value;
+    bool found;
+}
+
+public struct JsonNull {
+    bool found;
+}
+
+public struct JsonObject {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+public struct JsonArray {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+// User-defined response models implement JsonDecode and can then be wrapped in
+// Resource<T>. The resource tracks the underlying HTTP response generation and
+// decodes at most once per completed response, keeping browser transport and
+// application models fully on the Raz side of the Wasm boundary.
+public trait JsonDecode {
+    fn decode(Self&mut self, HttpRequest& request) -> bool;
+}
+
+public struct Resource<T> {
+    i64 request_slot;
+    T value;
+    i64 decoded_version;
+    bool decoded;
+    bool failed;
+}
+
+struct JsonSlice {
+    usize data;
+    i64 length;
+    i64 kind;
+    bool found;
+}
+
+public struct Element {
+    Tag tag;
+    // Zero is the page scope. Positive values identify keyed component
+    // rerender boundaries and are copied into descendant event bindings.
+    i64 component_scope;
+    Buffer attributes;
+    Buffer children;
+    // A parallel structural representation masks values from explicitly bound
+    // state. If this exact byte sequence is unchanged across renders, the
+    // browser can update those bindings directly without parsing/morphing HTML.
+    Buffer shape_attributes;
+    Buffer shape_children;
+}
+
+public struct StyleSheet {
+    Buffer css;
+}
+
+public struct Component {
+    Element root;
+    StyleSheet styles;
+    Buffer scripts;
+    i64 component_scope;
+    bool failed;
+}
+
+// Browser-visible document buffers. The generated web host reads these through
+// stable exports after _start and again after an event dispatcher rerenders.
+global mut usize web_html_data = 0;
+global mut i64 web_html_length = 0;
+global mut usize web_css_data = 0;
+global mut i64 web_css_length = 0;
+global mut usize web_title_data = 0;
+global mut i64 web_title_length = 0;
+global mut usize web_js_data = 0;
+global mut i64 web_js_length = 0;
+global mut i64 web_revision = 0;
+global mut usize web_shape_data = 0;
+global mut i64 web_shape_length = 0;
+global mut i64 web_structure_revision = 0;
+// Component-local render output. A positive component scope can publish only
+// its keyed subtree here, letting the browser patch that boundary without
+// rerunning or replacing the page-level document.
+global mut usize web_component_html_data = 0;
+global mut i64 web_component_html_length = 0;
+global mut usize web_component_css_data = 0;
+global mut i64 web_component_css_length = 0;
+global mut i64 web_component_scope = 0;
+global mut i64 web_component_revision = 0;
+
+// Small browser-resident reactive store. State is keyed by the developer's
+// stable string name instead of render order, so moving a state declaration in
+// a component does not silently retarget another value. Records are four i64s:
+// key hash, kind, value, and per-state version. Event records are three i64s:
+// action kind, state slot, and action argument. The tables live for the Wasm
+// instance lifetime and are reclaimed when the page unloads with the instance.
+const i64 WEB_STATE_CAPACITY = 512;
+const i64 WEB_STATE_RECORD_BYTES = 64;
+const i64 WEB_EVENT_CAPACITY = 1024;
+const i64 WEB_EVENT_RECORD_BYTES = 32;
+const i64 WEB_STATE_I64 = 1;
+const i64 WEB_STATE_BOOL = 2;
+const i64 WEB_ACTION_ADD_I64 = 1;
+const i64 WEB_ACTION_SET_I64 = 2;
+const i64 WEB_ACTION_TOGGLE_BOOL = 3;
+const i64 WEB_ACTION_SET_BOOL = 4;
+const i64 WEB_ACTION_SET_STRING = 5;
+const i64 WEB_ACTION_SUBMIT_STRING = 6;
+const i64 WEB_ACTION_SUBMIT_STRING_MIN = 7;
+const i64 WEB_ACTION_SET_BOOL_INPUT = 8;
+const i64 WEB_ACTION_SET_I64_INPUT = 9;
+const i64 WEB_STATE_STRING = 3;
+const i64 WEB_STATE_DEP_BOUND = 1;
+const i64 WEB_STATE_DEP_STRUCTURAL = 2;
+
+const i64 WEB_DERIVED_CAPACITY = 128;
+const i64 WEB_DERIVED_RECORD_BYTES = 32;
+const i64 WEB_DERIVED_ADD = 1;
+const i64 WEB_DERIVED_SUB = 2;
+const i64 WEB_DERIVED_MUL_CONST = 3;
+const i64 WEB_DERIVED_EQ = 4;
+const i64 WEB_DERIVED_NE = 5;
+const i64 WEB_DERIVED_LT = 6;
+const i64 WEB_DERIVED_LTE = 7;
+const i64 WEB_DERIVED_GT = 8;
+const i64 WEB_DERIVED_GTE = 9;
+const i64 WEB_DERIVED_EQ_CONST = 10;
+const i64 WEB_DERIVED_NE_CONST = 11;
+const i64 WEB_DERIVED_LT_CONST = 12;
+const i64 WEB_DERIVED_LTE_CONST = 13;
+const i64 WEB_DERIVED_GT_CONST = 14;
+const i64 WEB_DERIVED_GTE_CONST = 15;
+const i64 WEB_DERIVED_ADD_CONST = 16;
+const i64 WEB_DERIVED_SUB_CONST = 17;
+
+const i64 WEB_EFFECT_CAPACITY = 512;
+const i64 WEB_EFFECT_RECORD_BYTES = 32;
+const i64 WEB_EFFECT_STATE = 1;
+const i64 WEB_EFFECT_HTTP = 2;
+const i64 WEB_EFFECT_RENDER = 3;
+
+const i64 WEB_HTTP_CAPACITY = 32;
+const i64 WEB_HTTP_RECORD_BYTES = 104;
+// Retained component props are compiler-managed snapshots used only for local
+// rerenders. The first ABI supports flat Copy structs whose fields occupy one
+// Wasm aggregate slot each. Records are scope, data pointer, and slot count.
+const i64 WEB_COMPONENT_PROPS_CAPACITY = 64;
+const i64 WEB_COMPONENT_PROPS_RECORD_BYTES = 24;
+const i64 WEB_HTTP_IDLE = 0;
+const i64 WEB_HTTP_PENDING = 1;
+const i64 WEB_HTTP_INFLIGHT = 2;
+const i64 WEB_HTTP_COMPLETE = 3;
+const i64 WEB_HTTP_FAILED = 4;
+const i64 WEB_HTTP_GET = 1;
+const i64 WEB_HTTP_POST = 2;
+const i64 WEB_HTTP_PUT = 3;
+const i64 WEB_HTTP_PATCH = 4;
+const i64 WEB_HTTP_DELETE = 5;
+
+global mut usize web_state_records = 0;
+global mut usize web_event_records = 0;
+global mut i64 web_event_count = 0;
+global mut usize web_derived_records = 0;
+global mut i64 web_derived_count = 0;
+
+global mut usize web_effect_records = 0;
+global mut i64 web_render_generation = 0;
+
+// Browser route and fetch state are owned by the Wasm instance. JavaScript is
+// only the transport bridge to History/fetch and never owns application state.
+global mut usize web_route_data = 0;
+global mut i64 web_route_length = 0;
+// Structural route reads use the same owner marker convention as state: 0 =
+// unobserved, scope+1 = one owner, -1 = mixed owners.
+global mut i64 web_route_structural_owner = 0;
+global mut usize web_http_records = 0;
+global mut usize web_component_props_records = 0;
+fn buffer_new() -> Buffer {
+    return Buffer { data: 0, length: 0, capacity: 0 };
+}
+
+fn raw_i64_get(usize base, i64 offset) -> i64 {
+    unsafe { return *((base + offset)as i64*const); }
+}
+
+fn raw_i64_set(usize base, i64 offset, i64 value) {
+    unsafe { *((base + offset)as i64*mut) = value; }
+}
+
+fn zero_bytes(usize base, i64 length) {
+    i64 index = 0;
+    while (index < length) {
+        unsafe { *((base + index)as u8*mut) = 0; }
+        index += 1;
+    }
+}
+
+fn ensure_state_records() -> bool {
+    if (web_state_records != 0) { return true; }
+    i64 bytes = WEB_STATE_CAPACITY * WEB_STATE_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_state_records = next;
+    return true;
+}
+
+fn ensure_event_records() -> bool {
+    if (web_event_records != 0) { return true; }
+    i64 bytes = WEB_EVENT_CAPACITY * WEB_EVENT_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_event_records = next;
+    return true;
+}
+
+fn ensure_derived_records() -> bool {
+    if (web_derived_records != 0) { return true; }
+    i64 bytes = WEB_DERIVED_CAPACITY * WEB_DERIVED_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_derived_records = next;
+    return true;
+}
+
+fn derived_record(i64 id) -> usize {
+    return web_derived_records + (id - 1) * WEB_DERIVED_RECORD_BYTES;
+}
+
+fn ensure_effect_records() -> bool {
+    if (web_effect_records != 0) { return true; }
+    i64 bytes = WEB_EFFECT_CAPACITY * WEB_EFFECT_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_effect_records = next;
+    return true;
+}
+
+fn effect_record(i64 slot) -> usize {
+    return web_effect_records + slot * WEB_EFFECT_RECORD_BYTES;
+}
+
+// Returns true on first observation and whenever the observed version changes.
+// Records are keyed by component scope + effect kind + source identity, so
+// ordinary Raz conditional code can implement effects without closures or a
+// second scheduler.
+fn effect_changed(i64 scope, i64 kind, i64 source, i64 version) -> bool {
+    if (scope < 0 || source < 0 || !ensure_effect_records()) { return false; }
+    i64 slot = 0;
+    i64 empty = -1;
+    while (slot < WEB_EFFECT_CAPACITY) {
+        usize record = effect_record(slot);
+        i64 stored_kind = raw_i64_get(record, 0);
+        if (stored_kind == 0) { if (empty < 0) { empty = slot; } }
+        else if (stored_kind == kind && raw_i64_get(record, 8) == scope && raw_i64_get(record, 16) == source) {
+            i64 previous = raw_i64_get(record, 24);
+            if (previous == version) { return false; }
+            raw_i64_set(record, 24, version);
+            return true;
+        }
+        slot += 1;
+    }
+    if (empty < 0) { return false; }
+    usize record = effect_record(empty);
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, scope);
+    raw_i64_set(record, 16, source);
+    raw_i64_set(record, 24, version);
+    return true;
+}
+
+fn ensure_component_props_records() -> bool {
+    if (web_component_props_records != 0) { return true; }
+    i64 bytes = WEB_COMPONENT_PROPS_CAPACITY * WEB_COMPONENT_PROPS_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_component_props_records = next;
+    return true;
+}
+
+fn component_props_record(i64 slot) -> usize {
+    return web_component_props_records + slot * WEB_COMPONENT_PROPS_RECORD_BYTES;
+}
+
+// Compiler-reserved retention ABI. Normal applications never call these
+// directly: Wasm direct-call lowering snapshots props before invoking an
+// annotated component, and the synthesized local dispatcher replays the last
+// snapshot when that component rerenders independently of its parent.
+public fn raz_web_component_props_retain(i64 scope, usize source, i64 slots) -> i64 {
+    if (scope <= 0 || source == 0 || slots <= 0 || !ensure_component_props_records()) { return -1; }
+    i64 slot = 0;
+    i64 empty = -1;
+    while (slot < WEB_COMPONENT_PROPS_CAPACITY) {
+        usize record = component_props_record(slot);
+        i64 stored_scope = raw_i64_get(record, 0);
+        if (stored_scope == scope) {
+            usize data = (raw_i64_get(record, 8))as usize;
+            i64 stored_slots = raw_i64_get(record, 16);
+            i64 bytes = slots * 8;
+            if (data == 0 || stored_slots != slots) {
+                usize next = raz_rt_alloc(bytes);
+                if (next == 0) { return -1; }
+                if (data != 0) { raz_rt_dealloc(data); }
+                data = next;
+                raw_i64_set(record, 8, (data)as i64);
+                raw_i64_set(record, 16, slots);
+            }
+            raz_rt_copy(data, source, bytes);
+            return 1;
+        }
+        if (stored_scope == 0 && empty < 0) { empty = slot; }
+        slot += 1;
+    }
+    if (empty < 0) { return -1; }
+    usize record = component_props_record(empty);
+    i64 bytes = slots * 8;
+    usize data = raz_rt_alloc(bytes);
+    if (data == 0) { return -1; }
+    raz_rt_copy(data, source, bytes);
+    raw_i64_set(record, 0, scope);
+    raw_i64_set(record, 8, (data)as i64);
+    raw_i64_set(record, 16, slots);
+    return 1;
+}
+
+public fn raz_web_component_props_ptr(i64 scope) -> usize {
+    if (scope <= 0 || web_component_props_records == 0) { return 0; }
+    i64 slot = 0;
+    while (slot < WEB_COMPONENT_PROPS_CAPACITY) {
+        usize record = component_props_record(slot);
+        i64 stored_scope = raw_i64_get(record, 0);
+        if (stored_scope == scope) { return (raw_i64_get(record, 8))as usize; }
+        if (stored_scope == 0) { return 0; }
+        slot += 1;
+    }
+    return 0;
+}
+
+
+fn register_derived_id(i64 kind, i64 left_slot, i64 right_slot, i64 argument) -> i64 {
+    if (left_slot < 0 || left_slot >= WEB_STATE_CAPACITY || web_derived_count >= WEB_DERIVED_CAPACITY) { return -1; }
+    bool needs_right = kind == WEB_DERIVED_ADD || kind == WEB_DERIVED_SUB || kind == WEB_DERIVED_EQ || kind == WEB_DERIVED_NE || kind == WEB_DERIVED_LT || kind == WEB_DERIVED_LTE || kind == WEB_DERIVED_GT || kind == WEB_DERIVED_GTE;
+    bool uses_constant = kind == WEB_DERIVED_MUL_CONST || kind == WEB_DERIVED_EQ_CONST || kind == WEB_DERIVED_NE_CONST || kind == WEB_DERIVED_LT_CONST || kind == WEB_DERIVED_LTE_CONST || kind == WEB_DERIVED_GT_CONST || kind == WEB_DERIVED_GTE_CONST || kind == WEB_DERIVED_ADD_CONST || kind == WEB_DERIVED_SUB_CONST;
+    if (needs_right && (right_slot < 0 || right_slot >= WEB_STATE_CAPACITY)) { return -1; }
+    if (uses_constant && right_slot != -1) { return -1; }
+    if (!ensure_derived_records()) { return -1; }
+    i64 id = web_derived_count + 1;
+    usize record = derived_record(id);
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, left_slot);
+    raw_i64_set(record, 16, right_slot);
+    raw_i64_set(record, 24, argument);
+    web_derived_count += 1;
+    return id;
+}
+
+fn register_derived_i64(i64 kind, i64 left_slot, i64 right_slot, i64 argument) -> DerivedI64 {
+    return DerivedI64 { id: register_derived_id(kind, left_slot, right_slot, argument) };
+}
+
+fn register_derived_bool(i64 kind, i64 left_slot, i64 right_slot) -> DerivedBool {
+    return DerivedBool { id: register_derived_id(kind, left_slot, right_slot, 0) };
+}
+
+fn state_key_hash(string key) -> i64 {
+    i64 length = raz_rt_cstr_len(key);
+    i64 hash = 17;
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = 0;
+        unsafe { byte = (*((raz_rt_cstr_ptr(key) + index)as u8*const))as i64; }
+        hash = (hash * 131 + byte + 1) % 281474976710597;
+        index += 1;
+    }
+    if (hash == 0) { return 1; }
+    return hash;
+}
+
+// Component keys are the public stable identity. The compiler uses this exact
+// hash for @web_component("key"), removing hand-assigned numeric scopes.
+public fn web_component_scope_for_key(string key) -> i64 { return state_key_hash(key); }
+
+fn state_record(i64 slot) -> usize {
+    return web_state_records + slot * WEB_STATE_RECORD_BYTES;
+}
+
+fn state_scoped_hash(i64 scope, string key) -> i64 {
+    i64 hash = state_key_hash(key);
+    if (scope <= 0) { return hash; }
+    // Scope is already a stable component-key hash. Mix it with the local key
+    // using a separate domain so reusable component instances may use natural
+    // local names such as "count" without sharing browser state.
+    i64 mixed = (hash * 65537 + scope * 257 + 193) % 281474976710597;
+    if (mixed == 0) { return 1; }
+    return mixed;
+}
+
+fn state_find_or_create_hash(i64 hash, i64 kind, i64 initial) -> i64 {
+    if (!ensure_state_records() || hash <= 0) { return -1; }
+    i64 start = hash % WEB_STATE_CAPACITY;
+    i64 probe = 0;
+    while (probe < WEB_STATE_CAPACITY) {
+        i64 slot = (start + probe) % WEB_STATE_CAPACITY;
+        usize record = state_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == 0) {
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, kind);
+            raw_i64_set(record, 16, initial);
+            raw_i64_set(record, 24, 0);
+            return slot;
+        }
+        if (stored_hash == hash && raw_i64_get(record, 8) == kind) { return slot; }
+        probe += 1;
+    }
+    return -1;
+}
+
+fn state_find_or_create(string key, i64 kind, i64 initial) -> i64 {
+    return state_find_or_create_hash(state_key_hash(key), kind, initial);
+}
+
+fn state_string_find_or_create_hash(i64 hash, string initial) -> i64 {
+    if (!ensure_state_records() || hash <= 0) { return -1; }
+    i64 start = hash % WEB_STATE_CAPACITY;
+    i64 probe = 0;
+    while (probe < WEB_STATE_CAPACITY) {
+        i64 slot = (start + probe) % WEB_STATE_CAPACITY;
+        usize record = state_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == 0) {
+            i64 length = raz_rt_cstr_len(initial);
+            usize data = 0;
+            if (length > 0) {
+                data = raz_rt_alloc(length);
+                if (data == 0) { return -1; }
+                raz_rt_copy(data, raz_rt_cstr_ptr(initial), length);
+            }
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, WEB_STATE_STRING);
+            raw_i64_set(record, 16, 0);
+            raw_i64_set(record, 24, 0);
+            raw_i64_set(record, 32, (data)as i64);
+            raw_i64_set(record, 40, length);
+            return slot;
+        }
+        if (stored_hash == hash && raw_i64_get(record, 8) == WEB_STATE_STRING) { return slot; }
+        probe += 1;
+    }
+    return -1;
+}
+
+fn state_string_find_or_create(string key, string initial) -> i64 {
+    return state_string_find_or_create_hash(state_key_hash(key), initial);
+}
+
+fn state_string_data(i64 slot) -> usize {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 32)as usize;
+}
+
+fn state_string_length(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 40);
+}
+
+fn state_replace_string(i64 slot, usize data, i64 length) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0 || length < 0) { return false; }
+    if (length > 0 && data == 0) { return false; }
+    usize next = 0;
+    if (length > 0) {
+        next = raz_rt_alloc(length);
+        if (next == 0) { return false; }
+        raz_rt_copy(next, data, length);
+    }
+    usize record = state_record(slot);
+    usize old = raw_i64_get(record, 32)as usize;
+    if (old != 0) { raz_rt_dealloc(old); }
+    raw_i64_set(record, 32, (next)as i64);
+    raw_i64_set(record, 40, length);
+    // String record value slot is reserved for form-validation state:
+    // 0 = untouched/validity unknown, 1 = last submission valid, -1 = invalid.
+    raw_i64_set(record, 16, 0);
+    raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    return true;
+}
+
+fn state_value(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 16);
+}
+
+fn state_version(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 24);
+}
+
+fn state_dependency_flags(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return WEB_STATE_DEP_STRUCTURAL; }
+    return raw_i64_get(state_record(slot), 48);
+}
+
+fn state_mark_dependency(i64 slot, i64 flag) {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return; }
+    usize record = state_record(slot);
+    i64 flags = raw_i64_get(record, 48);
+    raw_i64_set(record, 48, flags | flag);
+}
+
+fn state_mark_bound(i64 slot) { state_mark_dependency(slot, WEB_STATE_DEP_BOUND); }
+
+// Offset 56 tracks the unique owner of structural reads. 0 means no owner
+// has been recorded, scope+1 identifies one owner (page scope is therefore 1),
+// and -1 means the state is structurally consumed by multiple scopes.
+fn state_mark_structural_scope(i64 slot, i64 scope) {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0 || scope < 0) { return; }
+    state_mark_dependency(slot, WEB_STATE_DEP_STRUCTURAL);
+    usize record = state_record(slot);
+    i64 marker = scope + 1;
+    i64 current = raw_i64_get(record, 56);
+    if (current == 0) { raw_i64_set(record, 56, marker); }
+    else if (current != marker) { raw_i64_set(record, 56, -1); }
+}
+
+fn state_mark_structural(i64 slot) { state_mark_structural_scope(slot, 0); }
+
+fn state_requires_render(i64 slot) -> bool {
+    i64 flags = state_dependency_flags(slot);
+    return (flags & WEB_STATE_DEP_STRUCTURAL) != 0;
+}
+
+fn state_structural_scope(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return -1; }
+    i64 marker = raw_i64_get(state_record(slot), 56);
+    if (marker <= 0) { return -1; }
+    return marker - 1;
+}
+
+fn clear_state_dependencies() {
+    if (web_state_records == 0) { return; }
+    i64 slot = 0;
+    while (slot < WEB_STATE_CAPACITY) {
+        usize record = state_record(slot);
+        if (raw_i64_get(record, 0) != 0) {
+            raw_i64_set(record, 48, 0);
+            raw_i64_set(record, 56, 0);
+        }
+        slot += 1;
+    }
+}
+
+fn state_replace(i64 slot, i64 value) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = state_record(slot);
+    if (raw_i64_get(record, 16) != value) {
+        raw_i64_set(record, 16, value);
+        raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    }
+    return true;
+}
+
+fn state_add(i64 slot, i64 delta) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = state_record(slot);
+    raw_i64_set(record, 16, raw_i64_get(record, 16) + delta);
+    raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    return true;
+}
+
+fn register_state_action_scoped(i64 kind, i64 slot, i64 argument, i64 scope) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || scope < 0) { return -1; }
+    if (!ensure_event_records()) { return -1; }
+    // Event IDs must remain stable when a single component rerenders. Reuse an
+    // existing action record before allocating a new ID.
+    i64 index = 0;
+    while (index < web_event_count) {
+        usize existing = web_event_records + index * WEB_EVENT_RECORD_BYTES;
+        if (raw_i64_get(existing, 0) == kind && raw_i64_get(existing, 8) == slot && raw_i64_get(existing, 16) == argument && raw_i64_get(existing, 24) == scope) {
+            return index + 1;
+        }
+        index += 1;
+    }
+    if (web_event_count >= WEB_EVENT_CAPACITY) { return -1; }
+    usize record = web_event_records + web_event_count * WEB_EVENT_RECORD_BYTES;
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, slot);
+    raw_i64_set(record, 16, argument);
+    raw_i64_set(record, 24, scope);
+    web_event_count += 1;
+    return web_event_count;
+}
+
+fn register_state_action(i64 kind, i64 slot, i64 argument) -> i64 {
+    return register_state_action_scoped(kind, slot, argument, 0);
+}
+
+// Start a new render pass. State survives; only ephemeral DOM event bindings
+// are rebuilt. Event IDs therefore stay compact and can be delegated by the JS
+// host without retaining JavaScript closures for each DOM node.
+public fn begin_render() {
+    web_render_generation += 1;
+    // State action IDs are lifetime-stable so component-local rerenders cannot
+    // invalidate sibling DOM bindings. Derived records remain per full render.
+    web_derived_count = 0;
+    clear_state_dependencies();
+    web_route_structural_owner = 0;
+    if (web_http_records != 0) {
+        i64 request_slot = 0;
+        while (request_slot < WEB_HTTP_CAPACITY) {
+            usize request_record = web_http_records + request_slot * WEB_HTTP_RECORD_BYTES;
+            if (raw_i64_get(request_record, 0) != 0) { raw_i64_set(request_record, 96, 0); }
+            request_slot += 1;
+        }
+    }
+}
+
+public fn state_i64(string key, i64 initial) -> StateI64 {
+    return StateI64 { slot: state_find_or_create(key, WEB_STATE_I64, initial) };
+}
+
+public fn state_bool(string key, bool initial) -> StateBool {
+    i64 value = 0;
+    if (initial) { value = 1; }
+    return StateBool { slot: state_find_or_create(key, WEB_STATE_BOOL, value) };
+}
+
+public fn state_string(string key, string initial) -> StateString {
+    return StateString { slot: state_string_find_or_create(key, initial) };
+}
+
+/// Creates state in a stable component namespace. Scope zero intentionally
+/// falls back to page/global state so the same helpers work on unscoped roots.
+public fn state_i64_scoped(i64 scope, string key, i64 initial) -> StateI64 {
+    return StateI64 { slot: state_find_or_create_hash(state_scoped_hash(scope, key), WEB_STATE_I64, initial) };
+}
+
+public fn state_bool_scoped(i64 scope, string key, bool initial) -> StateBool {
+    i64 value = 0;
+    if (initial) { value = 1; }
+    return StateBool { slot: state_find_or_create_hash(state_scoped_hash(scope, key), WEB_STATE_BOOL, value) };
+}
+
+public fn state_string_scoped(i64 scope, string key, string initial) -> StateString {
+    return StateString { slot: state_string_find_or_create_hash(state_scoped_hash(scope, key), initial) };
+}
+
+public fn derived_add(StateI64& left, StateI64& right) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_ADD, left.slot, right.slot, 0);
+}
+
+public fn derived_sub(StateI64& left, StateI64& right) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_SUB, left.slot, right.slot, 0);
+}
+
+public fn derived_mul(StateI64& source, i64 factor) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_MUL_CONST, source.slot, -1, factor);
+}
+public fn derived_add_const(StateI64& source, i64 value) -> DerivedI64 { return register_derived_i64(WEB_DERIVED_ADD_CONST, source.slot, -1, value); }
+public fn derived_sub_const(StateI64& source, i64 value) -> DerivedI64 { return register_derived_i64(WEB_DERIVED_SUB_CONST, source.slot, -1, value); }
+
+public fn derived_eq(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_EQ, left.slot, right.slot); }
+public fn derived_ne(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_NE, left.slot, right.slot); }
+public fn derived_lt(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_LT, left.slot, right.slot); }
+public fn derived_lte(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_LTE, left.slot, right.slot); }
+public fn derived_gt(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_GT, left.slot, right.slot); }
+public fn derived_gte(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_GTE, left.slot, right.slot); }
+
+public fn derived_eq_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_EQ_CONST, source.slot, -1, value) }; }
+public fn derived_ne_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_NE_CONST, source.slot, -1, value) }; }
+public fn derived_lt_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_LT_CONST, source.slot, -1, value) }; }
+public fn derived_lte_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_LTE_CONST, source.slot, -1, value) }; }
+public fn derived_gt_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_GT_CONST, source.slot, -1, value) }; }
+public fn derived_gte_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_GTE_CONST, source.slot, -1, value) }; }
+
+fn buffer_reserve(Buffer&mut value, i64 required) -> bool {
+    if (required < 0) { return false; }
+    if (required <= value.capacity) { return true; }
+    i64 next = value.capacity;
+    if (next < 64) { next = 64; }
+    while (next < required) {
+        if (next > 2305843009213693951) {
+            next = required;
+            break;
+        }
+        next *= 2;
+    }
+    usize pointer = raz_rt_alloc(next);
+    if (pointer == 0) { return false; }
+    if (value.data != 0 && value.length > 0) {
+        raz_rt_copy(pointer, value.data, value.length);
+    }
+    if (value.data != 0) { raz_rt_dealloc(value.data); }
+    value.data = pointer;
+    value.capacity = next;
+    return true;
+}
+fn buffer_push_byte(Buffer&mut value, i64 byte) -> bool {
+    if (!buffer_reserve(value, value.length + 1)) { return false; }
+    unsafe {
+        *((value.data + value.length)as u8*mut) = (byte & 255)as u8;
+    }
+    value.length += 1;
+    return true;
+}
+
+fn buffer_append_bytes(Buffer&mut value, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    if (length == 0) { return true; }
+    if (value.length > 9223372036854775807 - length) { return false; }
+    if (!buffer_reserve(value, value.length + length)) { return false; }
+    raz_rt_copy(value.data + value.length, data, length);
+    value.length += length;
+    return true;
+}
+
+fn buffer_append_literal(Buffer&mut value, string text) -> bool {
+    return buffer_append_bytes(value, raz_rt_cstr_ptr(text), raz_rt_cstr_len(text));
+}
+
+fn buffer_append_buffer(Buffer&mut value, Buffer& other) -> bool {
+    return buffer_append_bytes(value, other.data, other.length);
+}
+
+fn buffer_append_to_string(Buffer& value, String&mut output) -> bool {
+    i64 index = 0;
+    while (index < value.length) {
+        i64 byte = 0;
+        unsafe { byte = (*((value.data + index)as u8*const))as i64; }
+        if (!output.push(byte)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn buffer_contains_literal(Buffer& value, string text) -> bool {
+    return buffer_contains_bytes(value, raz_rt_cstr_ptr(text), raz_rt_cstr_len(text));
+}
+
+fn buffer_contains_bytes(Buffer& value, usize needle, i64 needle_length) -> bool {
+    if (needle_length <= 0) { return true; }
+    if (value.data == 0 || needle == 0 || needle_length > value.length) { return false; }
+    i64 start = 0;
+    while (start + needle_length <= value.length) {
+        i64 index = 0;
+        bool same = true;
+        while (index < needle_length) {
+            i64 left = 0;
+            i64 right = 0;
+            unsafe {
+                left = (*((value.data + start + index)as u8*const))as i64;
+                right = (*((needle + index)as u8*const))as i64;
+            }
+            if (left != right) { same = false; break; }
+            index += 1;
+        }
+        if (same) { return true; }
+        start += 1;
+    }
+    return false;
+}
+
+fn buffer_append_unique_buffer(Buffer&mut value, Buffer& other) -> bool {
+    if (other.length <= 0) { return true; }
+    if (buffer_contains_bytes(value, other.data, other.length)) { return true; }
+    return buffer_append_buffer(value, other);
+}
+
+fn literal_byte(string value, i64 index) -> i64 {
+    unsafe {
+        return (*((raz_rt_cstr_ptr(value) + index)as u8*const))as i64;
+    }
+}
+
+fn append_escaped(Buffer&mut output, string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = literal_byte(value, index);
+        if (byte == 38) {
+            if (!buffer_append_literal(output, "&amp;")) { return false; }
+        } else if (byte == 60) {
+            if (!buffer_append_literal(output, "&lt;")) { return false; }
+        } else if (byte == 62) {
+            if (!buffer_append_literal(output, "&gt;")) { return false; }
+        } else if (byte == 34) {
+            if (!buffer_append_literal(output, "&quot;")) { return false; }
+        } else if (byte == 39) {
+            if (!buffer_append_literal(output, "&#39;")) { return false; }
+        } else if (!buffer_push_byte(output, byte)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+fn append_escaped_bytes(Buffer&mut output, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = 0;
+        unsafe { byte = (*((data + index)as u8*const))as i64; }
+        if (byte == 38) { if (!buffer_append_literal(output, "&amp;")) { return false; } }
+        else if (byte == 60) { if (!buffer_append_literal(output, "&lt;")) { return false; } }
+        else if (byte == 62) { if (!buffer_append_literal(output, "&gt;")) { return false; } }
+        else if (byte == 34) { if (!buffer_append_literal(output, "&quot;")) { return false; } }
+        else if (byte == 39) { if (!buffer_append_literal(output, "&#39;")) { return false; } }
+        else if (!buffer_push_byte(output, byte)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn append_html_byte(Buffer&mut output, i64 byte) -> bool {
+    if (byte == 38) { return buffer_append_literal(output, "&amp;"); }
+    if (byte == 60) { return buffer_append_literal(output, "&lt;"); }
+    if (byte == 62) { return buffer_append_literal(output, "&gt;"); }
+    if (byte == 34) { return buffer_append_literal(output, "&quot;"); }
+    if (byte == 39) { return buffer_append_literal(output, "&#39;"); }
+    return buffer_push_byte(output, byte);
+}
+
+fn json_hex(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) { return byte - 48; }
+    if (byte >= 65 && byte <= 70) { return byte - 55; }
+    if (byte >= 97 && byte <= 102) { return byte - 87; }
+    return -1;
+}
+
+fn append_utf8_scalar(Buffer&mut output, i64 scalar) -> bool {
+    if (scalar < 0 || scalar > 1114111 || (scalar >= 55296 && scalar <= 57343)) { return false; }
+    if (scalar <= 127) { return append_html_byte(output, scalar); }
+    if (scalar <= 2047) {
+        if (!buffer_push_byte(output, 192 | (scalar / 64))) { return false; }
+        return buffer_push_byte(output, 128 | (scalar % 64));
+    }
+    if (scalar <= 65535) {
+        if (!buffer_push_byte(output, 224 | (scalar / 4096))) { return false; }
+        if (!buffer_push_byte(output, 128 | ((scalar / 64) % 64))) { return false; }
+        return buffer_push_byte(output, 128 | (scalar % 64));
+    }
+    if (!buffer_push_byte(output, 240 | (scalar / 262144))) { return false; }
+    if (!buffer_push_byte(output, 128 | ((scalar / 4096) % 64))) { return false; }
+    if (!buffer_push_byte(output, 128 | ((scalar / 64) % 64))) { return false; }
+    return buffer_push_byte(output, 128 | (scalar % 64));
+}
+
+fn json_u16(usize data, i64 length, i64 index) -> i64 {
+    if (index < 0 || index + 4 > length) { return -1; }
+    i64 value = 0;
+    i64 offset = 0;
+    while (offset < 4) {
+        i64 digit = json_hex(json_byte(data, index + offset));
+        if (digit < 0) { return -1; }
+        value = value * 16 + digit;
+        offset += 1;
+    }
+    return value;
+}
+
+// Decode a JSON string slice directly into HTML output. The slice excludes the
+// surrounding quotes but may contain all standard JSON escapes, including
+// UTF-16 surrogate pairs. Response models remain zero-copy views over the HTTP
+// bytes while rendering still receives decoded UTF-8.
+fn append_json_simple_escape(Buffer&mut output, i64 escaped) -> i64 {
+    i64 value = -1;
+    if (escaped == 34 || escaped == 92 || escaped == 47) { value = escaped; }
+    else if (escaped == 98) { value = 8; }
+    else if (escaped == 102) { value = 12; }
+    else if (escaped == 110) { value = 10; }
+    else if (escaped == 114) { value = 13; }
+    else if (escaped == 116) { value = 9; }
+    if (value < 0) { return 0; }
+    if (!append_html_byte(output, value)) { return -1; }
+    return 1;
+}
+
+fn append_json_unicode_escape(Buffer&mut output, usize data, i64 length, i64&mut index) -> bool {
+    i64 high = json_u16(data, length, *index + 1);
+    if (high < 0) { return false; }
+    *index += 5;
+    i64 scalar = high;
+    if (high >= 55296 && high <= 56319) {
+        if (*index + 6 > length) { return false; }
+        if (json_byte(data, *index) != 92 || json_byte(data, *index + 1) != 117) { return false; }
+        i64 low = json_u16(data, length, *index + 2);
+        if (low < 56320 || low > 57343) { return false; }
+        scalar = 65536 + (high - 55296) * 1024 + (low - 56320);
+        *index += 6;
+    } else if (high >= 56320 && high <= 57343) {
+        return false;
+    }
+    return append_utf8_scalar(output, scalar);
+}
+
+fn append_json_string_html(Buffer&mut output, usize data, i64 length) -> bool {
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = json_byte(data, index);
+        if (byte != 92) {
+            if (byte < 32 || !append_html_byte(output, byte)) { return false; }
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if (index >= length) { return false; }
+        i64 escaped = json_byte(data, index);
+        i64 simple = append_json_simple_escape(output, escaped);
+        if (simple < 0) { return false; }
+        if (simple > 0) { index += 1; continue; }
+        if (escaped != 117) { return false; }
+        if (!append_json_unicode_escape(output, data, length, &mut index)) { return false; }
+    }
+    return true;
+}
+
+fn append_i64(Buffer&mut output, i64 value) -> bool {
+    if (value == 0) { return buffer_push_byte(output, 48); }
+    i64 digits[20];
+    i64 count = 0;
+    i64 current = value;
+    while (current != 0) {
+        i64 remainder = current % 10;
+        if (remainder < 0) { remainder = -remainder; }
+        digits[count] = 48 + remainder;
+        count += 1;
+        current /= 10;
+    }
+    if (value < 0 && !buffer_push_byte(output, 45)) { return false; }
+    while (count > 0) {
+        count -= 1;
+        if (!buffer_push_byte(output, digits[count])) { return false; }
+    }
+    return true;
+}
+
+fn tag_name(Tag tag) -> string {
+    match tag {
+        Tag::Fragment => { return ""; }
+        Tag::Div => { return "div"; }
+        Tag::Main => { return "main"; }
+        Tag::Section => { return "section"; }
+        Tag::Header => { return "header"; }
+        Tag::Footer => { return "footer"; }
+        Tag::Nav => { return "nav"; }
+        Tag::Article => { return "article"; }
+        Tag::Aside => { return "aside"; }
+        Tag::Figure => { return "figure"; }
+        Tag::Figcaption => { return "figcaption"; }
+        Tag::H1 => { return "h1"; }
+        Tag::H2 => { return "h2"; }
+        Tag::H3 => { return "h3"; }
+        Tag::H4 => { return "h4"; }
+        Tag::H5 => { return "h5"; }
+        Tag::H6 => { return "h6"; }
+        Tag::P => { return "p"; }
+        Tag::Span => { return "span"; }
+        Tag::Small => { return "small"; }
+        Tag::Strong => { return "strong"; }
+        Tag::Em => { return "em"; }
+        Tag::Code => { return "code"; }
+        Tag::Pre => { return "pre"; }
+        Tag::Blockquote => { return "blockquote"; }
+        Tag::Br => { return "br"; }
+        Tag::Hr => { return "hr"; }
+        Tag::Button => { return "button"; }
+        Tag::A => { return "a"; }
+        Tag::Ul => { return "ul"; }
+        Tag::Ol => { return "ol"; }
+        Tag::Li => { return "li"; }
+        Tag::Dl => { return "dl"; }
+        Tag::Dt => { return "dt"; }
+        Tag::Dd => { return "dd"; }
+        Tag::Form => { return "form"; }
+        Tag::Label => { return "label"; }
+        Tag::Input => { return "input"; }
+        Tag::Textarea => { return "textarea"; }
+        Tag::Select => { return "select"; }
+        Tag::Option => { return "option"; }
+        Tag::Details => { return "details"; }
+        Tag::Summary => { return "summary"; }
+        Tag::Table => { return "table"; }
+        Tag::Thead => { return "thead"; }
+        Tag::Tbody => { return "tbody"; }
+        Tag::Tr => { return "tr"; }
+        Tag::Th => { return "th"; }
+        Tag::Td => { return "td"; }
+        Tag::Img => { return "img"; }
+        Tag::Video => { return "video"; }
+        Tag::Audio => { return "audio"; }
+        Tag::Source => { return "source"; }
+    }
+}
+
+fn tag_is_void(Tag tag) -> bool {
+    match tag {
+        Tag::Input => { return true; }
+        Tag::Img => { return true; }
+        Tag::Br => { return true; }
+        Tag::Hr => { return true; }
+        Tag::Source => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn input_type_name(InputType value) -> string {
+    match value {
+        InputType::Text => { return "text"; }
+        InputType::Email => { return "email"; }
+        InputType::Password => { return "password"; }
+        InputType::Number => { return "number"; }
+        InputType::Search => { return "search"; }
+        InputType::Url => { return "url"; }
+        InputType::Tel => { return "tel"; }
+        InputType::Date => { return "date"; }
+        InputType::Checkbox => { return "checkbox"; }
+        InputType::Radio => { return "radio"; }
+        InputType::File => { return "file"; }
+        InputType::Hidden => { return "hidden"; }
+        InputType::Submit => { return "submit"; }
+        InputType::Button => { return "button"; }
+        InputType::Reset => { return "reset"; }
+        InputType::Color => { return "color"; }
+        InputType::Range => { return "range"; }
+        InputType::Month => { return "month"; }
+        InputType::Week => { return "week"; }
+        InputType::Time => { return "time"; }
+        InputType::DateTimeLocal => { return "datetime-local"; }
+    }
+}
+
+fn html_name_byte_allowed(i64 byte) -> bool {
+    if (byte >= 48 && byte <= 57) { return true; }
+    if (byte >= 65 && byte <= 90) { return true; }
+    if (byte >= 97 && byte <= 122) { return true; }
+    return byte == 45 || byte == 95 || byte == 58;
+}
+
+fn html_name_valid(string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    if (length <= 0) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        if (!html_name_byte_allowed(literal_byte(value, index))) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn append_attribute_to(Buffer&mut output, string name, string value) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_literal(output, "=\"")) { return false; }
+    if (!append_escaped(output, value)) { return false; }
+    return buffer_push_byte(output, 34);
+}
+
+fn append_attribute_i64_to(Buffer&mut output, string name, i64 value) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_literal(output, "=\"")) { return false; }
+    if (!append_i64(output, value)) { return false; }
+    return buffer_push_byte(output, 34);
+}
+
+fn append_boolean_attribute_to(Buffer&mut output, string name) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    return buffer_append_literal(output, name);
+}
+
+fn append_attribute(Element&mut element, string name, string value) -> bool {
+    if (!append_attribute_to(&mut element.attributes, name, value)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, value);
+}
+
+fn append_attribute_i64(Element&mut element, string name, i64 value) -> bool {
+    if (!append_attribute_i64_to(&mut element.attributes, name, value)) { return false; }
+    return append_attribute_i64_to(&mut element.shape_attributes, name, value);
+}
+
+fn append_boolean_attribute(Element&mut element, string name) -> bool {
+    if (!append_boolean_attribute_to(&mut element.attributes, name)) { return false; }
+    return append_boolean_attribute_to(&mut element.shape_attributes, name);
+}
+
+// Dynamic attributes carry the real value in HTML but a fixed marker in the
+// structural stream. Callers must also emit a data-raz-state-* binding that the
+// browser host knows how to patch when the structural revision is unchanged.
+fn append_dynamic_attribute_bytes(Element&mut element, string name, usize data, i64 length) -> bool {
+    if (!buffer_push_byte(&mut element.attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, name)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, "=\"")) { return false; }
+    if (!append_escaped_bytes(&mut element.attributes, data, length)) { return false; }
+    if (!buffer_push_byte(&mut element.attributes, 34)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, "__raz_state_bytes__");
+}
+
+fn append_dynamic_attribute_i64(Element&mut element, string name, i64 value) -> bool {
+    if (!buffer_push_byte(&mut element.attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, name)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, "=\"")) { return false; }
+    if (!append_i64(&mut element.attributes, value)) { return false; }
+    if (!buffer_push_byte(&mut element.attributes, 34)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, "__raz_state_i64__");
+}
+
+fn append_dynamic_boolean_attribute(Element&mut element, string name, bool present) -> bool {
+    if (present && !append_boolean_attribute_to(&mut element.attributes, name)) { return false; }
+    // Always contribute the same marker regardless of the live boolean value.
+    if (!buffer_push_byte(&mut element.shape_attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.shape_attributes, "__raz_state_bool_")) { return false; }
+    if (!buffer_append_literal(&mut element.shape_attributes, name)) { return false; }
+    return buffer_append_literal(&mut element.shape_attributes, "__");
+}
+
+fn append_event_attribute(Element&mut element, string name, i64 event_id) -> bool {
+    if (event_id < 0) { return false; }
+    if (!append_attribute_i64_to(&mut element.attributes, name, event_id)) { return false; }
+    return append_attribute_i64_to(&mut element.shape_attributes, name, event_id);
+}
+
+fn render_buffers(Tag tag, Buffer& attributes, Buffer& children, Buffer&mut output) -> bool {
+    // Fragments are a compile/render-time composition primitive, not a DOM
+    // element. Attributes are intentionally invalid on a fragment; callers
+    // get wrapper-free children in both the HTML and structural streams.
+    if (tag == Tag::Fragment) {
+        if (attributes.length != 0) { return false; }
+        return buffer_append_buffer(output, children);
+    }
+    string name = tag_name(tag);
+    if (!buffer_push_byte(output, 60)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_buffer(output, attributes)) { return false; }
+    if (tag_is_void(tag)) { return buffer_append_literal(output, " />"); }
+    if (!buffer_push_byte(output, 62)) { return false; }
+    if (!buffer_append_buffer(output, children)) { return false; }
+    if (!buffer_append_literal(output, "</")) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    return buffer_push_byte(output, 62);
+}
+
+fn render_into(Element& element, Buffer&mut output) -> bool {
+    return render_buffers(element.tag, &element.attributes, &element.children, output);
+}
+
+fn render_shape_into(Element& element, Buffer&mut output) -> bool {
+    return render_buffers(element.tag, &element.shape_attributes, &element.shape_children, output);
+}
+
+fn bytes_equal(usize left, i64 left_length, usize right, i64 right_length) -> bool {
+    if (left_length != right_length) { return false; }
+    i64 index = 0;
+    while (index < left_length) {
+        i64 a = 0;
+        i64 b = 0;
+        unsafe {
+            a = (*((left + index)as u8*const))as i64;
+            b = (*((right + index)as u8*const))as i64;
+        }
+        if (a != b) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn replace_buffer(usize data, i64 length, usize&mut destination, i64&mut destination_length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    usize next = 0;
+    if (length > 0) {
+        next = raz_rt_alloc(length);
+        if (next == 0) { return false; }
+        raz_rt_copy(next, data, length);
+    }
+    if (*destination != 0) { raz_rt_dealloc(*destination); }
+    *destination = next;
+    *destination_length = length;
+    return true;
+}
+
+impl Drop for Buffer {
+    fn drop(Buffer&mut self) {
+        if (self.data != 0) { raz_rt_dealloc(self.data); }
+        self.data = 0;
+        self.length = 0;
+        self.capacity = 0;
+    }
+}
+public fn element(Tag tag) -> Element {
+    return Element {
+        tag: tag,
+        component_scope: 0,
+        attributes: buffer_new(),
+        children: buffer_new(),
+        shape_attributes: buffer_new(),
+        shape_children: buffer_new(),
+    };
+}
+
+public fn div() -> Element { return element(Tag::Div); }
+public fn main_element() -> Element { return element(Tag::Main); }
+public fn section() -> Element { return element(Tag::Section); }
+public fn header() -> Element { return element(Tag::Header); }
+public fn footer() -> Element { return element(Tag::Footer); }
+public fn nav() -> Element { return element(Tag::Nav); }
+public fn h1() -> Element { return element(Tag::H1); }
+public fn h2() -> Element { return element(Tag::H2); }
+public fn h3() -> Element { return element(Tag::H3); }
+public fn h4() -> Element { return element(Tag::H4); }
+public fn h5() -> Element { return element(Tag::H5); }
+public fn h6() -> Element { return element(Tag::H6); }
+public fn paragraph() -> Element { return element(Tag::P); }
+public fn span() -> Element { return element(Tag::Span); }
+public fn button() -> Element { return element(Tag::Button); }
+public fn link() -> Element { return element(Tag::A); }
+public fn unordered_list() -> Element { return element(Tag::Ul); }
+public fn list_item() -> Element { return element(Tag::Li); }
+public fn form() -> Element { return element(Tag::Form); }
+public fn label() -> Element { return element(Tag::Label); }
+public fn input() -> Element { return element(Tag::Input); }
+public fn image() -> Element { return element(Tag::Img); }
+public fn article() -> Element { return element(Tag::Article); }
+public fn aside() -> Element { return element(Tag::Aside); }
+public fn figure() -> Element { return element(Tag::Figure); }
+public fn figcaption() -> Element { return element(Tag::Figcaption); }
+public fn small() -> Element { return element(Tag::Small); }
+public fn strong() -> Element { return element(Tag::Strong); }
+public fn em() -> Element { return element(Tag::Em); }
+public fn code() -> Element { return element(Tag::Code); }
+public fn pre() -> Element { return element(Tag::Pre); }
+public fn blockquote() -> Element { return element(Tag::Blockquote); }
+public fn br() -> Element { return element(Tag::Br); }
+public fn hr() -> Element { return element(Tag::Hr); }
+public fn ol() -> Element { return element(Tag::Ol); }
+public fn dl() -> Element { return element(Tag::Dl); }
+public fn dt() -> Element { return element(Tag::Dt); }
+public fn dd() -> Element { return element(Tag::Dd); }
+public fn textarea() -> Element { return element(Tag::Textarea); }
+public fn select() -> Element { return element(Tag::Select); }
+public fn option() -> Element { return element(Tag::Option); }
+public fn details() -> Element { return element(Tag::Details); }
+public fn summary() -> Element { return element(Tag::Summary); }
+public fn table() -> Element { return element(Tag::Table); }
+public fn thead() -> Element { return element(Tag::Thead); }
+public fn tbody() -> Element { return element(Tag::Tbody); }
+public fn tr() -> Element { return element(Tag::Tr); }
+public fn th() -> Element { return element(Tag::Th); }
+public fn td() -> Element { return element(Tag::Td); }
+public fn video() -> Element { return element(Tag::Video); }
+public fn audio() -> Element { return element(Tag::Audio); }
+public fn source() -> Element { return element(Tag::Source); }
+// Short aliases keep ordinary HTML pleasant to write while the explicit names
+// above remain available for codebases that prefer semantic constructors.
+public fn main_view() -> Element { return element(Tag::Main); }
+public fn p() -> Element { return element(Tag::P); }
+public fn a() -> Element { return element(Tag::A); }
+public fn ul() -> Element { return element(Tag::Ul); }
+public fn li() -> Element { return element(Tag::Li); }
+public fn img() -> Element { return element(Tag::Img); }
+
+// Typed form constructors set the HTML input type at creation time, avoiding
+// repeated manual `input_type(...)` calls while still returning an ordinary
+// Element that can be further configured with name/id/ARIA attributes.
+fn typed_input(InputType kind) -> Element {
+    Element value = input();
+    value.input_type(kind);
+    return move value;
+}
+public fn text_input() -> Element { return typed_input(InputType::Text); }
+public fn email_input() -> Element { return typed_input(InputType::Email); }
+public fn password_input() -> Element { return typed_input(InputType::Password); }
+public fn number_input() -> Element { return typed_input(InputType::Number); }
+public fn search_input() -> Element { return typed_input(InputType::Search); }
+public fn url_input() -> Element { return typed_input(InputType::Url); }
+public fn tel_input() -> Element { return typed_input(InputType::Tel); }
+public fn date_input() -> Element { return typed_input(InputType::Date); }
+public fn checkbox_input() -> Element { return typed_input(InputType::Checkbox); }
+public fn radio_input() -> Element { return typed_input(InputType::Radio); }
+public fn file_input() -> Element { return typed_input(InputType::File); }
+public fn hidden_input() -> Element { return typed_input(InputType::Hidden); }
+public fn submit_input() -> Element { return typed_input(InputType::Submit); }
+
+/// Creates an accessible label connected to a control id.
+public fn label_for(string control_id, string text) -> Element {
+    Element value = label();
+    value.for_id(control_id);
+    value.text(text);
+    return move value;
+}
+
+/// Creates an option with escaped value/text. Selection remains explicit.
+public fn option_value(string option_value, string text) -> Element {
+    Element value = option();
+    value.value(option_value);
+    value.text(text);
+    return move value;
+}
+
+/// Creates a layout boundary as an ordinary div carrying a stable data marker.
+/// Layouts remain part of Raz's normal component tree and add no special host
+/// runtime or JavaScript behavior.
+public fn layout(string name) -> Element {
+    Element value = div();
+    value.attr("data-raz-layout", name);
+    return move value;
+}
+
+impl StateI64 {
+    fn valid(StateI64& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn get(StateI64& self) -> i64 { state_mark_structural(self.slot); return state_value(self.slot); }
+    fn set(StateI64&mut self, i64 value) -> bool { return state_replace(self.slot, value); }
+    fn add(StateI64&mut self, i64 delta) -> bool { return state_add(self.slot, delta); }
+    fn sub(StateI64&mut self, i64 delta) -> bool { return state_add(self.slot, -delta); }
+    fn increment(StateI64&mut self) -> bool { return state_add(self.slot, 1); }
+    fn decrement(StateI64&mut self) -> bool { return state_add(self.slot, -1); }
+    fn version(StateI64& self) -> i64 { return state_version(self.slot); }
+}
+
+impl StateBool {
+    fn valid(StateBool& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn get(StateBool& self) -> bool { state_mark_structural(self.slot); return state_value(self.slot) != 0; }
+    fn set(StateBool&mut self, bool value) -> bool {
+        if (value) { return state_replace(self.slot, 1); }
+        return state_replace(self.slot, 0);
+    }
+    fn toggle(StateBool&mut self) -> bool {
+        if (self.get()) { return state_replace(self.slot, 0); }
+        return state_replace(self.slot, 1);
+    }
+    fn version(StateBool& self) -> i64 { return state_version(self.slot); }
+}
+
+impl StateString {
+    fn valid(StateString& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn length(StateString& self) -> i64 { state_mark_structural(self.slot); return state_string_length(self.slot); }
+    fn data(StateString& self) -> usize { state_mark_structural(self.slot); return state_string_data(self.slot); }
+    fn set(StateString&mut self, string value) -> bool {
+        return state_replace_string(self.slot, raz_rt_cstr_ptr(value), raz_rt_cstr_len(value));
+    }
+    fn version(StateString& self) -> i64 { return state_version(self.slot); }
+    fn validation_failed(StateString& self) -> bool {
+        state_mark_structural(self.slot);
+        if (!self.valid() || web_state_records == 0) { return false; }
+        return raw_i64_get(state_record(self.slot), 16) < 0;
+    }
+    fn validation_ok(StateString& self) -> bool {
+        state_mark_structural(self.slot);
+        if (!self.valid() || web_state_records == 0) { return false; }
+        return raw_i64_get(state_record(self.slot), 16) > 0;
+    }
+}
+
+fn derived_value(i64 id) -> i64 {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return 0; }
+    usize record = derived_record(id);
+    i64 kind = raw_i64_get(record, 0);
+    i64 left_slot = raw_i64_get(record, 8);
+    i64 right_slot = raw_i64_get(record, 16);
+    i64 argument = raw_i64_get(record, 24);
+    i64 left = state_value(left_slot);
+    if (kind == WEB_DERIVED_ADD) { return left + state_value(right_slot); }
+    if (kind == WEB_DERIVED_SUB) { return left - state_value(right_slot); }
+    if (kind == WEB_DERIVED_MUL_CONST) { return left * argument; }
+    if (kind == WEB_DERIVED_ADD_CONST) { return left + argument; }
+    if (kind == WEB_DERIVED_SUB_CONST) { return left - argument; }
+    i64 right = 0;
+    if (right_slot >= 0) { right = state_value(right_slot); }
+    if (kind == WEB_DERIVED_EQ) { if (left == right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_NE) { if (left != right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LT) { if (left < right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LTE) { if (left <= right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GT) { if (left > right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GTE) { if (left >= right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_EQ_CONST) { if (left == argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_NE_CONST) { if (left != argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LT_CONST) { if (left < argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LTE_CONST) { if (left <= argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GT_CONST) { if (left > argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GTE_CONST) { if (left >= argument) { return 1; } return 0; }
+    return 0;
+}
+
+fn derived_mark(i64 id, i64 dependency) {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return; }
+    usize record = derived_record(id);
+    state_mark_dependency(raw_i64_get(record, 8), dependency);
+    i64 right_slot = raw_i64_get(record, 16);
+    if (right_slot >= 0) { state_mark_dependency(right_slot, dependency); }
+}
+
+fn derived_mark_structural_scope(i64 id, i64 scope) {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return; }
+    usize record = derived_record(id);
+    state_mark_structural_scope(raw_i64_get(record, 8), scope);
+    i64 right_slot = raw_i64_get(record, 16);
+    if (right_slot >= 0) { state_mark_structural_scope(right_slot, scope); }
+}
+
+impl DerivedI64 {
+    fn valid(DerivedI64& self) -> bool { return self.id > 0 && self.id <= web_derived_count; }
+    fn get(DerivedI64& self) -> i64 { derived_mark(self.id, WEB_STATE_DEP_STRUCTURAL); return derived_value(self.id); }
+}
+
+impl DerivedBool {
+    fn valid(DerivedBool& self) -> bool { return self.id > 0 && self.id <= web_derived_count; }
+    fn get(DerivedBool& self) -> bool { derived_mark(self.id, WEB_STATE_DEP_STRUCTURAL); return derived_value(self.id) != 0; }
+}
+
+impl Element {
+    fn id(Element&mut self, string value) -> bool { return append_attribute(self, "id", value); }
+    fn class_name(Element&mut self, string value) -> bool { return append_attribute(self, "class", value); }
+    fn attr(Element&mut self, string name, string value) -> bool { return append_attribute(self, name, value); }
+    fn bool_attr(Element&mut self, string name) -> bool { return append_boolean_attribute(self, name); }
+    fn aria(Element&mut self, string name, string value) -> bool {
+        if (!html_name_valid(name)) { return false; }
+        Buffer key = buffer_new();
+        if (!buffer_append_literal(&mut key, "aria-") || !buffer_append_literal(&mut key, name)) { return false; }
+        if (!buffer_push_byte(&mut self.attributes, 32) || !buffer_append_buffer(&mut self.attributes, &key) || !buffer_append_literal(&mut self.attributes, "=\"") || !append_escaped(&mut self.attributes, value) || !buffer_push_byte(&mut self.attributes, 34)) { return false; }
+        if (!buffer_push_byte(&mut self.shape_attributes, 32) || !buffer_append_buffer(&mut self.shape_attributes, &key) || !buffer_append_literal(&mut self.shape_attributes, "=\"") || !append_escaped(&mut self.shape_attributes, value) || !buffer_push_byte(&mut self.shape_attributes, 34)) { return false; }
+        return true;
+    }
+    fn scope(Element&mut self, string value) -> bool { return append_attribute(self, "data-raz-scope", value); }
+    fn key(Element&mut self, string value) -> bool { return append_attribute(self, "data-raz-key", value); }
+    fn key_i64(Element&mut self, i64 value) -> bool { return append_attribute_i64(self, "data-raz-key", value); }
+    fn component_key(Element&mut self, string value) -> bool {
+        if (!append_attribute(self, "data-raz-component", value)) { return false; }
+        return append_attribute(self, "data-raz-key", value);
+    }
+    fn aria_label(Element&mut self, string value) -> bool { return append_attribute(self, "aria-label", value); }
+    fn href(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::A) { return false; }
+        return append_attribute(self, "href", value);
+    }
+    fn navigate(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::A) { return false; }
+        return append_attribute(self, "data-raz-nav", value);
+    }
+    fn src(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::Img && self.tag != Tag::Video && self.tag != Tag::Audio && self.tag != Tag::Source) { return false; }
+        return append_attribute(self, "src", value);
+    }
+    fn alt(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::Img) { return false; }
+        return append_attribute(self, "alt", value);
+    }
+    fn title(Element&mut self, string value) -> bool { return append_attribute(self, "title", value); }
+    fn role(Element&mut self, string value) -> bool { return append_attribute(self, "role", value); }
+    fn name(Element&mut self, string value) -> bool { return append_attribute(self, "name", value); }
+    fn value(Element&mut self, string value) -> bool { return append_attribute(self, "value", value); }
+    fn autocomplete(Element&mut self, string value) -> bool { return append_attribute(self, "autocomplete", value); }
+    fn for_id(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::Label) { return false; }
+        return append_attribute(self, "for", value);
+    }
+    fn aria_describedby(Element&mut self, string value) -> bool { return append_attribute(self, "aria-describedby", value); }
+    fn aria_controls(Element&mut self, string value) -> bool { return append_attribute(self, "aria-controls", value); }
+    fn aria_expanded(Element&mut self, bool value) -> bool {
+        if (value) { return append_attribute(self, "aria-expanded", "true"); }
+        return append_attribute(self, "aria-expanded", "false");
+    }
+    fn aria_hidden(Element&mut self, bool value) -> bool {
+        if (value) { return append_attribute(self, "aria-hidden", "true"); }
+        return append_attribute(self, "aria-hidden", "false");
+    }
+    fn tab_index(Element&mut self, i64 value) -> bool { return append_attribute_i64(self, "tabindex", value); }
+    fn rows(Element&mut self, i64 value) -> bool {
+        if (self.tag != Tag::Textarea || value <= 0) { return false; }
+        return append_attribute_i64(self, "rows", value);
+    }
+    fn cols(Element&mut self, i64 value) -> bool {
+        if (self.tag != Tag::Textarea || value <= 0) { return false; }
+        return append_attribute_i64(self, "cols", value);
+    }
+    fn action(Element&mut self, string value) -> bool { if (self.tag != Tag::Form) { return false; } return append_attribute(self, "action", value); }
+    fn method(Element&mut self, string value) -> bool { if (self.tag != Tag::Form) { return false; } return append_attribute(self, "method", value); }
+    fn enctype(Element&mut self, string value) -> bool { if (self.tag != Tag::Form) { return false; } return append_attribute(self, "enctype", value); }
+    fn accept(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "accept", value); }
+    fn pattern(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "pattern", value); }
+    fn min(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "min", value); }
+    fn max(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "max", value); }
+    fn step(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "step", value); }
+    fn input_mode(Element&mut self, string value) -> bool { if (self.tag != Tag::Input && self.tag != Tag::Textarea) { return false; } return append_attribute(self, "inputmode", value); }
+    fn form_action(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "formaction", value); }
+    fn form_method(Element&mut self, string value) -> bool { if (self.tag != Tag::Input) { return false; } return append_attribute(self, "formmethod", value); }
+    fn no_validate(Element&mut self) -> bool { if (self.tag != Tag::Form) { return false; } return append_boolean_attribute(self, "novalidate"); }
+    fn read_only(Element&mut self) -> bool { if (self.tag != Tag::Input && self.tag != Tag::Textarea) { return false; } return append_boolean_attribute(self, "readonly"); }
+    fn multiple(Element&mut self) -> bool { if (self.tag != Tag::Input && self.tag != Tag::Select) { return false; } return append_boolean_attribute(self, "multiple"); }
+    fn selected(Element&mut self) -> bool { if (self.tag != Tag::Option) { return false; } return append_boolean_attribute(self, "selected"); }
+    fn checked(Element&mut self) -> bool { if (self.tag != Tag::Input) { return false; } return append_boolean_attribute(self, "checked"); }
+    fn disabled(Element&mut self) -> bool { return append_boolean_attribute(self, "disabled"); }
+    fn hidden(Element&mut self) -> bool { return append_boolean_attribute(self, "hidden"); }
+    fn open(Element&mut self) -> bool { if (self.tag != Tag::Details) { return false; } return append_boolean_attribute(self, "open"); }
+    fn data(Element&mut self, string key, string value) -> bool {
+        if (!html_name_valid(key)) { return false; }
+        Buffer name_buffer = buffer_new();
+        if (!buffer_append_literal(&mut name_buffer, "data-")) { return false; }
+        if (!buffer_append_literal(&mut name_buffer, key)) { return false; }
+        // Dynamic attribute names are emitted directly into both render streams.
+        if (!buffer_push_byte(&mut self.attributes, 32) || !buffer_append_buffer(&mut self.attributes, &name_buffer) || !buffer_append_literal(&mut self.attributes, "=\"")) { return false; }
+        if (!append_escaped(&mut self.attributes, value) || !buffer_push_byte(&mut self.attributes, 34)) { return false; }
+        if (!buffer_push_byte(&mut self.shape_attributes, 32) || !buffer_append_buffer(&mut self.shape_attributes, &name_buffer) || !buffer_append_literal(&mut self.shape_attributes, "=\"")) { return false; }
+        if (!append_escaped(&mut self.shape_attributes, value) || !buffer_push_byte(&mut self.shape_attributes, 34)) { return false; }
+        return true;
+    }
+    fn input_type(Element&mut self, InputType value) -> bool {
+        if (self.tag != Tag::Input) { return false; }
+        return append_attribute(self, "type", input_type_name(value));
+    }
+    fn required(Element&mut self) -> bool {
+        if (self.tag != Tag::Input && self.tag != Tag::Textarea && self.tag != Tag::Select) { return false; }
+        return append_boolean_attribute(self, "required");
+    }
+    fn min_length(Element&mut self, i64 value) -> bool {
+        if (self.tag != Tag::Input || value < 0) { return false; }
+        return append_attribute_i64(self, "minlength", value);
+    }
+    fn max_length(Element&mut self, i64 value) -> bool {
+        if (self.tag != Tag::Input || value < 0) { return false; }
+        return append_attribute_i64(self, "maxlength", value);
+    }
+    fn on_click(Element&mut self, i64 event_id) -> bool { return append_event_attribute(self, "data-raz-click", event_id); }
+    fn on_click_add(Element&mut self, StateI64& state, i64 delta) -> bool {
+        i64 event_id = register_state_action_scoped(WEB_ACTION_ADD_I64, state.slot, delta, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-click", event_id);
+    }
+    fn on_click_set_i64(Element&mut self, StateI64& state, i64 value) -> bool {
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SET_I64, state.slot, value, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-click", event_id);
+    }
+    fn on_click_toggle(Element&mut self, StateBool& state) -> bool {
+        i64 event_id = register_state_action_scoped(WEB_ACTION_TOGGLE_BOOL, state.slot, 0, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-click", event_id);
+    }
+    fn on_click_set_bool(Element&mut self, StateBool& state, bool value) -> bool {
+        i64 argument = 0;
+        if (value) { argument = 1; }
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SET_BOOL, state.slot, argument, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-click", event_id);
+    }
+    fn on_input(Element&mut self, i64 event_id) -> bool { return append_event_attribute(self, "data-raz-input", event_id); }
+    fn bind_submit_text(Element&mut self, StateString& state, HttpRequest& request) -> bool {
+        if (self.tag != Tag::Form || !state.valid() || request.slot < 0 || request.slot >= WEB_HTTP_CAPACITY) { return false; }
+        if (web_http_records == 0 || raw_i64_get(web_http_records + request.slot * WEB_HTTP_RECORD_BYTES, 64) != WEB_HTTP_POST) { return false; }
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SUBMIT_STRING, state.slot, request.slot, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-submit", event_id);
+    }
+    fn bind_submit_text_min(Element&mut self, StateString& state, HttpRequest& request, i64 minimum) -> bool {
+        if (self.tag != Tag::Form || !state.valid() || minimum < 0 || request.slot < 0 || request.slot >= WEB_HTTP_CAPACITY) { return false; }
+        if (web_http_records == 0 || raw_i64_get(web_http_records + request.slot * WEB_HTTP_RECORD_BYTES, 64) != WEB_HTTP_POST) { return false; }
+        if (minimum > 288230376151711743) { return false; }
+        i64 encoded = minimum * WEB_HTTP_CAPACITY + request.slot;
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SUBMIT_STRING_MIN, state.slot, encoded, self.component_scope);
+        return event_id > 0 && append_event_attribute(self, "data-raz-submit", event_id);
+    }
+    fn bind_input(Element&mut self, StateString& state) -> bool {
+        if (self.tag != Tag::Input || !state.valid()) { return false; }
+        state_mark_bound(state.slot);
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SET_STRING, state.slot, 0, self.component_scope);
+        if (event_id <= 0 || !append_event_attribute(self, "data-raz-input", event_id)) { return false; }
+        if (!append_attribute_i64(self, "data-raz-state-string", state.slot)) { return false; }
+        return append_dynamic_attribute_bytes(self, "value", state_string_data(state.slot), state_string_length(state.slot));
+    }
+    fn bind_checkbox(Element&mut self, StateBool& state) -> bool {
+        if (self.tag != Tag::Input || !state.valid()) { return false; }
+        state_mark_bound(state.slot);
+        if (!self.input_type(InputType::Checkbox)) { return false; }
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SET_BOOL_INPUT, state.slot, 0, self.component_scope);
+        if (event_id <= 0 || !append_event_attribute(self, "data-raz-check", event_id)) { return false; }
+        if (!append_attribute_i64(self, "data-raz-state-bool", state.slot)) { return false; }
+        return append_dynamic_boolean_attribute(self, "checked", state_value(state.slot) != 0);
+    }
+    fn bind_number(Element&mut self, StateI64& state) -> bool {
+        if (self.tag != Tag::Input || !state.valid()) { return false; }
+        state_mark_bound(state.slot);
+        if (!self.input_type(InputType::Number)) { return false; }
+        i64 event_id = register_state_action_scoped(WEB_ACTION_SET_I64_INPUT, state.slot, 0, self.component_scope);
+        if (event_id <= 0 || !append_event_attribute(self, "data-raz-number", event_id)) { return false; }
+        if (!append_attribute_i64(self, "data-raz-state-i64", state.slot)) { return false; }
+        return append_dynamic_attribute_i64(self, "value", state_value(state.slot));
+    }
+    fn on_change_text(Element&mut self, StateString& state) -> bool { return self.bind_input(state); }
+    fn on_change_number(Element&mut self, StateI64& state) -> bool { return self.bind_number(state); }
+    fn on_change_bool(Element&mut self, StateBool& state) -> bool { return self.bind_checkbox(state); }
+    fn on_submit(Element&mut self, StateString& state, HttpRequest& request) -> bool { return self.bind_submit_text(state, request); }
+    fn placeholder(Element&mut self, string value) -> bool {
+        if (self.tag != Tag::Input && self.tag != Tag::Textarea) { return false; }
+        return append_attribute(self, "placeholder", value);
+    }
+    fn text(Element&mut self, string value) -> bool {
+        if (tag_is_void(self.tag)) { return false; }
+        if (!append_escaped(&mut self.children, value)) { return false; }
+        return append_escaped(&mut self.shape_children, value);
+    }
+    fn text_i64(Element&mut self, i64 value) -> bool {
+        if (tag_is_void(self.tag)) { return false; }
+        if (!append_i64(&mut self.children, value)) { return false; }
+        return append_i64(&mut self.shape_children, value);
+    }
+    fn text_state(Element&mut self, StateString& state) -> bool {
+        if (tag_is_void(self.tag) || !state.valid()) { return false; }
+        state_mark_structural(state.slot);
+        if (!append_escaped_bytes(&mut self.children, state_string_data(state.slot), state_string_length(state.slot))) { return false; }
+        // Direct Element usage is conservatively structural. Component binding
+        // helpers below use the masked variant because they emit patch metadata.
+        return append_escaped_bytes(&mut self.shape_children, state_string_data(state.slot), state_string_length(state.slot));
+    }
+    fn text_state_bound(Element&mut self, StateString& state) -> bool {
+        if (tag_is_void(self.tag) || !state.valid()) { return false; }
+        state_mark_bound(state.slot);
+        if (!append_escaped_bytes(&mut self.children, state_string_data(state.slot), state_string_length(state.slot))) { return false; }
+        return buffer_append_literal(&mut self.shape_children, "__raz_state_string__");
+    }
+    fn text_i64_bound(Element&mut self, StateI64& state) -> bool {
+        if (tag_is_void(self.tag) || !state.valid()) { return false; }
+        state_mark_bound(state.slot);
+        if (!append_i64(&mut self.children, state_value(state.slot))) { return false; }
+        return buffer_append_literal(&mut self.shape_children, "__raz_state_i64__");
+    }
+    fn text_derived_i64_bound(Element&mut self, DerivedI64& value) -> bool {
+        if (tag_is_void(self.tag) || !value.valid()) { return false; }
+        derived_mark(value.id, WEB_STATE_DEP_BOUND);
+        if (!append_i64(&mut self.children, derived_value(value.id))) { return false; }
+        return buffer_append_literal(&mut self.shape_children, "__raz_derived_i64__");
+    }
+    fn child(Element&mut self, Element&mut child) -> bool {
+        if (tag_is_void(self.tag)) { return false; }
+        if (!render_into(child, &mut self.children)) { return false; }
+        return render_shape_into(child, &mut self.shape_children);
+    }
+}
+
+// Concise typed child helpers keep common markup in ordinary Raz without
+// allocating a JavaScript-side VDOM or introducing a second template grammar.
+impl Element {
+    fn child_text(Element&mut self, Tag tag, string value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(value)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_text_i64(Element&mut self, Tag tag, string prefix, i64 value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(prefix)) { return false; }
+        if (!child.text_i64(value)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_button_add(Element&mut self, string class_name, string aria_label, string text, StateI64& state, i64 delta) -> bool {
+        Element child = button();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { return false; }
+        if (raz_rt_cstr_len(aria_label) > 0 && !child.aria_label(aria_label)) { return false; }
+        if (!child.on_click_add(state, delta)) { return false; }
+        if (!child.text(text)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_text_state(Element&mut self, Tag tag, string prefix, StateString& state) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!append_attribute_i64(&mut child, "data-raz-bind-string", state.slot)) { return false; }
+        if (!append_attribute(&mut child, "data-raz-prefix", prefix)) { return false; }
+        if (!child.text(prefix)) { return false; }
+        if (!child.text_state_bound(state)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_text_i64_state(Element&mut self, Tag tag, string prefix, StateI64& state) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!append_attribute_i64(&mut child, "data-raz-bind-i64", state.slot)) { return false; }
+        if (!append_attribute(&mut child, "data-raz-prefix", prefix)) { return false; }
+        if (!child.text(prefix)) { return false; }
+        if (!child.text_i64_bound(state)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_text_derived_i64(Element&mut self, Tag tag, string prefix, DerivedI64& value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!append_attribute_i64(&mut child, "data-raz-bind-derived-i64", value.id)) { return false; }
+        usize dependency_record = derived_record(value.id);
+        if (!append_attribute_i64(&mut child, "data-raz-derived-left", raw_i64_get(dependency_record, 8))) { return false; }
+        if (!append_attribute_i64(&mut child, "data-raz-derived-right", raw_i64_get(dependency_record, 16))) { return false; }
+        if (!append_attribute(&mut child, "data-raz-prefix", prefix)) { return false; }
+        if (!child.text(prefix)) { return false; }
+        if (!child.text_derived_i64_bound(value)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_keyed_text(Element&mut self, Tag tag, string key, string value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.key(key) || !child.text(value)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_keyed_text_i64(Element&mut self, Tag tag, i64 key, string value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.key_i64(key) || !child.text(value)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_input_string(Element&mut self, InputType kind, string class_name, string placeholder, StateString& state, bool is_required, i64 minimum) -> bool {
+        if (kind != InputType::Text && kind != InputType::Email && kind != InputType::Password && kind != InputType::Search && kind != InputType::Url && kind != InputType::Tel && kind != InputType::Date) { return false; }
+        Element child = input();
+        child.component_scope = self.component_scope;
+        if (!child.input_type(kind)) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { return false; }
+        if (raz_rt_cstr_len(placeholder) > 0 && !child.placeholder(placeholder)) { return false; }
+        if (is_required && !child.required()) { return false; }
+        if (minimum > 0 && !child.min_length(minimum)) { return false; }
+        if (!child.bind_input(state)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_input_text(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Text, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_email(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Email, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_password(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Password, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_search(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Search, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_url(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Url, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_tel(Element&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        return self.child_input_string(InputType::Tel, class_name, placeholder, state, false, 0);
+    }
+    fn child_input_date(Element&mut self, string class_name, StateString& state) -> bool {
+        return self.child_input_string(InputType::Date, class_name, "", state, false, 0);
+    }
+    fn child_input_number(Element&mut self, string class_name, StateI64& state) -> bool {
+        Element child = input();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { return false; }
+        if (!child.bind_number(state)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_checkbox(Element&mut self, string class_name, StateBool& state) -> bool {
+        Element child = input();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { return false; }
+        if (!child.bind_checkbox(state)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_form_text_post(Element&mut self, string class_name, string placeholder, string submit_text, StateString& state, HttpRequest& request) -> bool {
+        Element form = element(Tag::Form);
+        form.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !form.class_name(class_name)) { return false; }
+        if (!form.bind_submit_text(state, request)) { return false; }
+        if (!form.child_input_text("", placeholder, state)) { return false; }
+        Element submit = input();
+        submit.component_scope = self.component_scope;
+        if (!submit.input_type(InputType::Submit) || !append_attribute(&mut submit, "value", submit_text)) { return false; }
+        if (!form.child(&mut submit)) { return false; }
+        return self.child(&mut form);
+    }
+    fn child_form_text_post_min(Element&mut self, string class_name, string placeholder, string submit_text, StateString& state, HttpRequest& request, i64 minimum) -> bool {
+        Element form = element(Tag::Form);
+        form.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !form.class_name(class_name)) { return false; }
+        if (!form.bind_submit_text_min(state, request, minimum)) { return false; }
+        if (!form.child_input_string(InputType::Text, "", placeholder, state, minimum > 0, minimum)) { return false; }
+        Element submit = input();
+        submit.component_scope = self.component_scope;
+        if (!submit.input_type(InputType::Submit) || !append_attribute(&mut submit, "value", submit_text)) { return false; }
+        if (!form.child(&mut submit)) { return false; }
+        return self.child(&mut form);
+    }
+    fn child_nav_link(Element&mut self, string href, string text) -> bool {
+        Element child = link();
+        child.component_scope = self.component_scope;
+        if (!child.href(href) || !child.navigate(href) || !child.text(text)) { return false; }
+        return self.child(&mut child);
+    }
+    fn child_button_toggle(Element&mut self, string class_name, string aria_label, string text, StateBool& state) -> bool {
+        Element child = button();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { return false; }
+        if (raz_rt_cstr_len(aria_label) > 0 && !child.aria_label(aria_label)) { return false; }
+        if (!child.on_click_toggle(state)) { return false; }
+        if (!child.text(text)) { return false; }
+        return self.child(&mut child);
+    }
+}
+
+public fn stylesheet() -> StyleSheet { return StyleSheet { css: buffer_new() }; }
+
+// A component owns one typed root element plus the CSS emitted with that root.
+// Components can be nested without a JavaScript-side component object: child
+// markup and styles are flattened into the Raz-rendered document buffers.
+/// Wrapper-free component composition. A fragment may contain text/elements/
+/// components but cannot carry HTML attributes because it emits no DOM node.
+public fn fragment() -> Component { return component(Tag::Fragment); }
+
+/// Semantic component constructors for the most common composition roots.
+public fn div_component() -> Component { return component(Tag::Div); }
+public fn main_component() -> Component { return component(Tag::Main); }
+public fn section_component() -> Component { return component(Tag::Section); }
+public fn article_component() -> Component { return component(Tag::Article); }
+public fn nav_component() -> Component { return component(Tag::Nav); }
+public fn form_component() -> Component { return component(Tag::Form); }
+
+public fn component(Tag root_tag) -> Component {
+    return Component { root: element(root_tag), styles: stylesheet(), scripts: buffer_new(), component_scope: 0, failed: false };
+}
+
+// Positive scopes define keyed rerender boundaries. The numeric scope is a
+// backend-stable identity; the string key remains the DOM identity developers
+// can inspect and use across list/component reconciliation.
+fn component_scoped_with_scope(Tag root_tag, string key, i64 scope) -> Component {
+    Element root = element(root_tag);
+    root.component_scope = scope;
+    bool failed = scope <= 0;
+    if (!failed && !root.component_key(key)) { failed = true; }
+    if (!failed && !append_attribute_i64(&mut root, "data-raz-component-scope", scope)) { failed = true; }
+    return Component { root: move root, styles: stylesheet(), scripts: buffer_new(), component_scope: scope, failed: failed };
+}
+
+// Normal web components use the key alone. The scope hash is deterministic and
+// matches @web_component("key") in the compiler.
+public fn component_scoped(Tag root_tag, string key) -> Component {
+    return component_scoped_with_scope(root_tag, key, web_component_scope_for_key(key));
+}
+
+impl StyleSheet {
+    fn append_unique_rule(StyleSheet&mut self, Buffer&mut rule) -> bool {
+        if (rule.length == 0) { return true; }
+        if (buffer_contains_bytes(&self.css, rule.data, rule.length)) { return true; }
+        return buffer_append_bytes(&mut self.css, rule.data, rule.length);
+    }
+    fn rule(StyleSheet&mut self, string selector, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn scoped_rule(StyleSheet&mut self, string scope, string selector, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, "[data-raz-scope=\"")) { return false; }
+        if (!append_escaped(&mut rule, scope)) { return false; }
+        if (!buffer_append_literal(&mut rule, "\"]")) { return false; }
+        if (raz_rt_cstr_len(selector) > 0) {
+            if (!buffer_push_byte(&mut rule, 32)) { return false; }
+            if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn class_rule(StyleSheet&mut self, string class_name, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_push_byte(&mut rule, 46)) { return false; }
+        if (!buffer_append_literal(&mut rule, class_name)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn id_rule(StyleSheet&mut self, string id_name, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_push_byte(&mut rule, 35)) { return false; }
+        if (!buffer_append_literal(&mut rule, id_name)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn pseudo_rule(StyleSheet&mut self, string selector, string pseudo, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        if (!buffer_push_byte(&mut rule, 58)) { return false; }
+        if (!buffer_append_literal(&mut rule, pseudo)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn pseudo_element_rule(StyleSheet&mut self, string selector, string pseudo, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        if (!buffer_append_literal(&mut rule, "::")) { return false; }
+        if (!buffer_append_literal(&mut rule, pseudo)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn media_rule(StyleSheet&mut self, string query, string selector, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, "@media ")) { return false; }
+        if (!buffer_append_literal(&mut rule, query)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " } }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn container_rule(StyleSheet&mut self, string query, string selector, string declarations) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, "@container ")) { return false; }
+        if (!buffer_append_literal(&mut rule, query)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, selector)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, declarations)) { return false; }
+        if (!buffer_append_literal(&mut rule, " } }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn variable(StyleSheet&mut self, string name, string value) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, ":root { --")) { return false; }
+        if (!buffer_append_literal(&mut rule, name)) { return false; }
+        if (!buffer_append_literal(&mut rule, ": ")) { return false; }
+        if (!buffer_append_literal(&mut rule, value)) { return false; }
+        if (!buffer_append_literal(&mut rule, "; }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn keyframes(StyleSheet&mut self, string name, string frames) -> bool {
+        Buffer rule = buffer_new();
+        if (!buffer_append_literal(&mut rule, "@keyframes ")) { return false; }
+        if (!buffer_append_literal(&mut rule, name)) { return false; }
+        if (!buffer_append_literal(&mut rule, " { ")) { return false; }
+        if (!buffer_append_literal(&mut rule, frames)) { return false; }
+        if (!buffer_append_literal(&mut rule, " }\n")) { return false; }
+        return self.append_unique_rule(&mut rule);
+    }
+    fn raw(StyleSheet&mut self, string css) -> bool {
+        if (!buffer_append_literal(&mut self.css, css)) { return false; }
+        return buffer_push_byte(&mut self.css, 10);
+    }
+
+}
+
+fn mount_document(string title, Element& root, StyleSheet& styles, Buffer& scripts) -> bool {
+    Buffer html = buffer_new();
+    Buffer shape = buffer_new();
+    Buffer title_buffer = buffer_new();
+    if (!render_into(root, &mut html)) { return false; }
+    if (!render_shape_into(root, &mut shape)) { return false; }
+    if (!buffer_append_literal(&mut title_buffer, title)) { return false; }
+    bool same_structure = web_structure_revision > 0 && bytes_equal(shape.data, shape.length, web_shape_data, web_shape_length);
+    if (!replace_buffer(html.data, html.length, &mut web_html_data, &mut web_html_length)) { return false; }
+    if (!replace_buffer(shape.data, shape.length, &mut web_shape_data, &mut web_shape_length)) { return false; }
+    if (!replace_buffer(styles.css.data, styles.css.length, &mut web_css_data, &mut web_css_length)) { return false; }
+    if (!replace_buffer(scripts.data, scripts.length, &mut web_js_data, &mut web_js_length)) { return false; }
+    if (!replace_buffer(title_buffer.data, title_buffer.length, &mut web_title_data, &mut web_title_length)) { return false; }
+    if (!same_structure) { web_structure_revision += 1; }
+    web_revision += 1;
+    return true;
+}
+
+public fn mount(string title, Element& root, StyleSheet& styles) -> bool {
+    Buffer scripts = buffer_new();
+    return mount_document(title, root, styles, &scripts);
+}
+
+
+fn route_mark_structural_scope(i64 scope) {
+    if (scope < 0) { return; }
+    i64 marker = scope + 1;
+    if (web_route_structural_owner == 0) { web_route_structural_owner = marker; }
+    else if (web_route_structural_owner != marker) { web_route_structural_owner = -1; }
+}
+
+fn route_matches(string path) -> bool {
+    i64 length = raz_rt_cstr_len(path);
+    if (length != web_route_length) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        i64 left = 0;
+        i64 right = 0;
+        unsafe {
+            left = (*((web_route_data + index)as u8*const))as i64;
+            right = (*((raz_rt_cstr_ptr(path) + index)as u8*const))as i64;
+        }
+        if (left != right) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn http_mark_structural_scope(i64 slot, i64 scope) {
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0 || scope < 0) { return; }
+    usize record = web_http_records + slot * WEB_HTTP_RECORD_BYTES;
+    i64 marker = scope + 1;
+    i64 current = raw_i64_get(record, 96);
+    if (current == 0) { raw_i64_set(record, 96, marker); }
+    else if (current != marker) { raw_i64_set(record, 96, -1); }
+}
+
+fn http_structural_scope(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return -1; }
+    i64 marker = raw_i64_get(web_http_records + slot * WEB_HTTP_RECORD_BYTES, 96);
+    if (marker == 0) { return 0; }
+    if (marker < 0 || marker == 1) { return -1; }
+    return marker - 1;
+}
+
+impl Component {
+    fn valid(Component& self) -> bool { return !self.failed; }
+    fn invalidate(Component&mut self) -> bool { self.failed = true; return false; }
+    fn id(Component&mut self, string value) -> bool {
+        if (self.failed || !self.root.id(value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn class_name(Component&mut self, string value) -> bool {
+        if (self.failed || !self.root.class_name(value)) { self.failed = true; return false; }
+        return true;
+    }
+    /// Safe escaped attribute on the component root. Fragments reject root
+    /// attributes because they intentionally emit no wrapper element.
+    fn attr(Component&mut self, string name, string value) -> bool {
+        if (self.failed || self.root.tag == Tag::Fragment || !append_attribute(&mut self.root, name, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn aria_label(Component&mut self, string value) -> bool { return self.attr("aria-label", value); }
+    fn aria(Component&mut self, string name, string value) -> bool {
+        if (self.failed || self.root.tag == Tag::Fragment || !self.root.aria(name, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn aria_describedby(Component&mut self, string value) -> bool { return self.attr("aria-describedby", value); }
+    fn aria_controls(Component&mut self, string value) -> bool { return self.attr("aria-controls", value); }
+    fn aria_expanded(Component&mut self, bool value) -> bool {
+        if (value) { return self.attr("aria-expanded", "true"); }
+        return self.attr("aria-expanded", "false");
+    }
+    fn role(Component&mut self, string value) -> bool { return self.attr("role", value); }
+    fn title(Component&mut self, string value) -> bool { return self.attr("title", value); }
+    fn data(Component&mut self, string name, string value) -> bool {
+        if (self.failed || self.root.tag == Tag::Fragment || !self.root.data(name, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn scope(Component&mut self, string value) -> bool {
+        if (self.failed || !self.root.scope(value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn key(Component&mut self, string value) -> bool {
+        if (self.failed || !self.root.component_key(value)) { self.failed = true; return false; }
+        return true;
+    }
+    /// Component-local state is namespaced by this component's stable scope.
+    /// Reusable siblings may therefore use the same local state names safely.
+    fn state_i64(Component& self, string key, i64 initial) -> StateI64 {
+        return state_i64_scoped(self.component_scope, key, initial);
+    }
+    fn state_bool(Component& self, string key, bool initial) -> StateBool {
+        return state_bool_scoped(self.component_scope, key, initial);
+    }
+    fn state_string(Component& self, string key, string initial) -> StateString {
+        return state_string_scoped(self.component_scope, key, initial);
+    }
+    /// True once for this component scope during the lifetime of the Wasm
+    /// instance. This is deliberately a render lifecycle primitive rather than
+    /// a JavaScript mount hook: effect bodies remain ordinary Raz code.
+    fn first_render(Component& self) -> bool {
+        i64 scope = self.component_scope;
+        return effect_changed(scope, WEB_EFFECT_RENDER, 0, 1);
+    }
+    fn render_generation(Component& self) -> i64 { return web_render_generation; }
+    /// Effect observations also register a structural dependency. If the state
+    /// changes, the smallest owning component is rerendered and the guarded Raz
+    /// effect body executes exactly once for the new version.
+    fn effect_i64(Component& self, StateI64& state) -> bool {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return effect_changed(self.component_scope, WEB_EFFECT_STATE, state.slot, state_version(state.slot));
+    }
+    fn effect_bool(Component& self, StateBool& state) -> bool {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return effect_changed(self.component_scope, WEB_EFFECT_STATE, state.slot, state_version(state.slot));
+    }
+    fn effect_string(Component& self, StateString& state) -> bool {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return effect_changed(self.component_scope, WEB_EFFECT_STATE, state.slot, state_version(state.slot));
+    }
+    fn effect_request(Component& self, HttpRequest& request) -> bool {
+        if (request.slot < 0 || request.slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return false; }
+        if (self.component_scope <= 0) { http_mark_structural_scope(request.slot, 0); }
+        else { http_mark_structural_scope(request.slot, self.component_scope); }
+        i64 version = raw_i64_get(web_http_records + request.slot * WEB_HTTP_RECORD_BYTES, 56);
+        return effect_changed(self.component_scope, WEB_EFFECT_HTTP, request.slot, version);
+    }
+    fn read_bool(Component& self, StateBool& state) -> bool {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return state_value(state.slot) != 0;
+    }
+    /// Structural conditional helper. Reading through the component records the
+    /// dependency against this keyed component scope so a state transition can
+    /// rerender only this subtree when possible.
+    fn when(Component& self, StateBool& state) -> bool { return self.read_bool(state); }
+    fn unless(Component& self, StateBool& state) -> bool { return !self.read_bool(state); }
+    fn read_i64(Component& self, StateI64& state) -> i64 {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return state_value(state.slot);
+    }
+    fn read_derived_i64(Component& self, DerivedI64& value) -> i64 {
+        if (self.component_scope <= 0) { derived_mark(value.id, WEB_STATE_DEP_STRUCTURAL); }
+        else { derived_mark_structural_scope(value.id, self.component_scope); }
+        return derived_value(value.id);
+    }
+    fn read_derived_bool(Component& self, DerivedBool& value) -> bool {
+        if (self.component_scope <= 0) { derived_mark(value.id, WEB_STATE_DEP_STRUCTURAL); }
+        else { derived_mark_structural_scope(value.id, self.component_scope); }
+        return derived_value(value.id) != 0;
+    }
+    fn when_derived(Component& self, DerivedBool& value) -> bool { return self.read_derived_bool(value); }
+    fn unless_derived(Component& self, DerivedBool& value) -> bool { return !self.read_derived_bool(value); }
+    fn route_is(Component& self, string path) -> bool {
+        if (self.component_scope <= 0) { route_mark_structural_scope(0); }
+        else { route_mark_structural_scope(self.component_scope); }
+        return route_matches(path);
+    }
+    fn route_prefix(Component& self, string path) -> bool {
+        if (self.component_scope <= 0) { route_mark_structural_scope(0); }
+        else { route_mark_structural_scope(self.component_scope); }
+        i64 length = raz_rt_cstr_len(path);
+        if (length > web_route_length) { return false; }
+        i64 index = 0;
+        while (index < length) {
+            i64 left = 0;
+            i64 right = 0;
+            unsafe {
+                left = (*((web_route_data + index)as u8*const))as i64;
+                right = (*((raz_rt_cstr_ptr(path) + index)as u8*const))as i64;
+            }
+            if (left != right) { return false; }
+            index += 1;
+        }
+        if (length == web_route_length || length == 1) { return true; }
+        i64 boundary = 0;
+        unsafe { boundary = (*((web_route_data + length)as u8*const))as i64; }
+        return boundary == 47;
+    }
+    fn request_done(Component& self, HttpRequest& request) -> bool {
+        if (self.component_scope <= 0) { http_mark_structural_scope(request.slot, 0); }
+        else { http_mark_structural_scope(request.slot, self.component_scope); }
+        if (request.slot < 0 || request.slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return false; }
+        i64 request_state = raw_i64_get(web_http_records + request.slot * WEB_HTTP_RECORD_BYTES, 8);
+        return request_state == WEB_HTTP_COMPLETE || request_state == WEB_HTTP_FAILED;
+    }
+    fn request_loading(Component& self, HttpRequest& request) -> bool {
+        if (self.component_scope <= 0) { http_mark_structural_scope(request.slot, 0); }
+        else { http_mark_structural_scope(request.slot, self.component_scope); }
+        if (request.slot < 0 || request.slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return false; }
+        i64 request_state = raw_i64_get(web_http_records + request.slot * WEB_HTTP_RECORD_BYTES, 8);
+        return request_state == WEB_HTTP_PENDING || request_state == WEB_HTTP_INFLIGHT;
+    }
+    fn read_string_length(Component& self, StateString& state) -> i64 {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        return state_string_length(state.slot);
+    }
+    fn read_string_validation_failed(Component& self, StateString& state) -> bool {
+        if (self.component_scope <= 0) { state_mark_structural(state.slot); }
+        else { state_mark_structural_scope(state.slot, self.component_scope); }
+        if (!state.valid() || web_state_records == 0) { return false; }
+        return raw_i64_get(state_record(state.slot), 16) < 0;
+    }
+    fn text(Component&mut self, Tag tag, string value) -> bool {
+        if (self.failed || !self.root.child_text(tag, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn h1(Component&mut self, string value) -> bool { return self.text(Tag::H1, value); }
+    fn h2(Component&mut self, string value) -> bool { return self.text(Tag::H2, value); }
+    fn h3(Component&mut self, string value) -> bool { return self.text(Tag::H3, value); }
+    fn h4(Component&mut self, string value) -> bool { return self.text(Tag::H4, value); }
+    fn h5(Component&mut self, string value) -> bool { return self.text(Tag::H5, value); }
+    fn h6(Component&mut self, string value) -> bool { return self.text(Tag::H6, value); }
+    fn p(Component&mut self, string value) -> bool { return self.text(Tag::P, value); }
+    fn span(Component&mut self, string value) -> bool { return self.text(Tag::Span, value); }
+    fn small(Component&mut self, string value) -> bool { return self.text(Tag::Small, value); }
+    fn strong(Component&mut self, string value) -> bool { return self.text(Tag::Strong, value); }
+    fn em(Component&mut self, string value) -> bool { return self.text(Tag::Em, value); }
+    fn code(Component&mut self, string value) -> bool { return self.text(Tag::Code, value); }
+    fn pre(Component&mut self, string value) -> bool { return self.text(Tag::Pre, value); }
+    fn blockquote(Component&mut self, string value) -> bool { return self.text(Tag::Blockquote, value); }
+    fn article(Component&mut self, string value) -> bool { return self.text(Tag::Article, value); }
+    fn aside(Component&mut self, string value) -> bool { return self.text(Tag::Aside, value); }
+    fn raw_html(Component&mut self, string html) -> bool {
+        if (self.failed) { return false; }
+        if (!buffer_append_literal(&mut self.root.children, html)) { self.failed = true; return false; }
+        if (!buffer_append_literal(&mut self.root.shape_children, html)) { self.failed = true; return false; }
+        return true;
+    }
+    fn raw_css(Component&mut self, string css) -> bool {
+        if (self.failed || !buffer_append_literal(&mut self.styles.css, css)) { self.failed = true; return false; }
+        if (!buffer_push_byte(&mut self.styles.css, 10)) { self.failed = true; return false; }
+        return true;
+    }
+    fn raw_js(Component&mut self, string javascript) -> bool {
+        if (self.failed || !buffer_append_literal(&mut self.scripts, javascript)) { self.failed = true; return false; }
+        if (!buffer_push_byte(&mut self.scripts, 10)) { self.failed = true; return false; }
+        return true;
+    }
+    fn text_i64(Component&mut self, Tag tag, string prefix, i64 value) -> bool {
+        if (self.failed || !self.root.child_text_i64(tag, prefix, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn text_i64_state(Component&mut self, Tag tag, string prefix, StateI64& state) -> bool {
+        if (self.failed || !self.root.child_text_i64_state(tag, prefix, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn text_derived_i64(Component&mut self, Tag tag, string prefix, DerivedI64& value) -> bool {
+        if (self.failed || !self.root.child_text_derived_i64(tag, prefix, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn keyed_text(Component&mut self, Tag tag, string key, string value) -> bool {
+        if (self.failed || !self.root.child_keyed_text(tag, key, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn keyed_text_i64(Component&mut self, Tag tag, i64 key, string value) -> bool {
+        if (self.failed || !self.root.child_keyed_text_i64(tag, key, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn text_state(Component&mut self, Tag tag, string prefix, StateString& state) -> bool {
+        if (self.failed || !self.root.child_text_state(tag, prefix, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_text(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_text(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_email(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_email(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_password(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_password(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_search(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_search(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_url(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_url(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_tel(Component&mut self, string class_name, string placeholder, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_tel(class_name, placeholder, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_date(Component&mut self, string class_name, StateString& state) -> bool {
+        if (self.failed || !self.root.child_input_date(class_name, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn input_number(Component&mut self, string class_name, StateI64& state) -> bool {
+        if (self.failed || !self.root.child_input_number(class_name, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn checkbox(Component&mut self, string class_name, StateBool& state) -> bool {
+        if (self.failed || !self.root.child_checkbox(class_name, state)) { self.failed = true; return false; }
+        return true;
+    }
+    fn form_text_post(Component&mut self, string class_name, string placeholder, string submit_text, StateString& state, HttpRequest& request) -> bool {
+        if (self.failed || !self.root.child_form_text_post(class_name, placeholder, submit_text, state, request)) { self.failed = true; return false; }
+        return true;
+    }
+    fn form_text_post_min(Component&mut self, string class_name, string placeholder, string submit_text, StateString& state, HttpRequest& request, i64 minimum) -> bool {
+        if (self.failed || !self.root.child_form_text_post_min(class_name, placeholder, submit_text, state, request, minimum)) { self.failed = true; return false; }
+        return true;
+    }
+    fn validation_text(Component&mut self, Tag tag, string message, StateString& state) -> bool {
+        if (!state.validation_failed()) { return true; }
+        return self.text(tag, message);
+    }
+    fn nav_link(Component&mut self, string href, string text) -> bool {
+        if (self.failed || !self.root.child_nav_link(href, text)) { self.failed = true; return false; }
+        return true;
+    }
+    fn button_add(Component&mut self, string class_name, string aria_label, string text, StateI64& state, i64 delta) -> bool {
+        if (self.failed || !self.root.child_button_add(class_name, aria_label, text, state, delta)) {
+            self.failed = true;
+            return false;
+        }
+        return true;
+    }
+    fn button_increment(Component&mut self, string class_name, string aria_label, string text, StateI64& state) -> bool {
+        return self.button_add(class_name, aria_label, text, state, 1);
+    }
+    fn button_decrement(Component&mut self, string class_name, string aria_label, string text, StateI64& state) -> bool {
+        return self.button_add(class_name, aria_label, text, state, -1);
+    }
+    fn button_set_i64(Component&mut self, string class_name, string aria_label, string text, StateI64& state, i64 value) -> bool {
+        Element child = button();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { self.failed = true; return false; }
+        if (raz_rt_cstr_len(aria_label) > 0 && !child.aria_label(aria_label)) { self.failed = true; return false; }
+        if (!child.on_click_set_i64(state, value) || !child.text(text) || !self.root.child(&mut child)) { self.failed = true; return false; }
+        return true;
+    }
+    fn button_set_bool(Component&mut self, string class_name, string aria_label, string text, StateBool& state, bool value) -> bool {
+        Element child = button();
+        child.component_scope = self.component_scope;
+        if (raz_rt_cstr_len(class_name) > 0 && !child.class_name(class_name)) { self.failed = true; return false; }
+        if (raz_rt_cstr_len(aria_label) > 0 && !child.aria_label(aria_label)) { self.failed = true; return false; }
+        if (!child.on_click_set_bool(state, value) || !child.text(text) || !self.root.child(&mut child)) { self.failed = true; return false; }
+        return true;
+    }
+    fn button_toggle(Component&mut self, string class_name, string aria_label, string text, StateBool& state) -> bool {
+        if (self.failed || !self.root.child_button_toggle(class_name, aria_label, text, state)) {
+            self.failed = true;
+            return false;
+        }
+        return true;
+    }
+    fn style(Component&mut self, string selector, string declarations) -> bool {
+        if (self.failed || !self.styles.rule(selector, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn scoped_style(Component&mut self, string scope, string selector, string declarations) -> bool {
+        if (self.failed || !self.styles.scoped_rule(scope, selector, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css(Component&mut self, string selector, string declarations) -> bool { return self.style(selector, declarations); }
+    fn css_class(Component&mut self, string class_name, string declarations) -> bool {
+        if (self.failed || !self.styles.class_rule(class_name, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_id(Component&mut self, string id_name, string declarations) -> bool {
+        if (self.failed || !self.styles.id_rule(id_name, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_pseudo(Component&mut self, string selector, string pseudo, string declarations) -> bool {
+        if (self.failed || !self.styles.pseudo_rule(selector, pseudo, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_pseudo_element(Component&mut self, string selector, string pseudo, string declarations) -> bool {
+        if (self.failed || !self.styles.pseudo_element_rule(selector, pseudo, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_media(Component&mut self, string query, string selector, string declarations) -> bool {
+        if (self.failed || !self.styles.media_rule(query, selector, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_container(Component&mut self, string query, string selector, string declarations) -> bool {
+        if (self.failed || !self.styles.container_rule(query, selector, declarations)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_variable(Component&mut self, string name, string value) -> bool {
+        if (self.failed || !self.styles.variable(name, value)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_keyframes(Component&mut self, string name, string frames) -> bool {
+        if (self.failed || !self.styles.keyframes(name, frames)) { self.failed = true; return false; }
+        return true;
+    }
+    fn css_raw(Component&mut self, string css) -> bool {
+        if (self.failed || !self.styles.raw(css)) { self.failed = true; return false; }
+        return true;
+    }
+    /// Append an ordinary semantic Element to this component. This keeps forms,
+    /// media, tables, and one-off HTML nodes convenient without forcing every
+    /// leaf node to become a standalone Component.
+    fn element(Component&mut self, Element&mut child) -> bool {
+        if (self.failed) { return false; }
+        child.component_scope = self.component_scope;
+        if (!self.root.child(child)) { self.failed = true; return false; }
+        return true;
+    }
+    fn element_keyed(Component&mut self, string key, Element&mut child) -> bool {
+        if (!child.key(key)) { self.failed = true; return false; }
+        return self.element(child);
+    }
+    fn element_keyed_i64(Component&mut self, i64 key, Element&mut child) -> bool {
+        if (!child.key_i64(key)) { self.failed = true; return false; }
+        return self.element(child);
+    }
+    fn child(Component&mut self, Component&mut child) -> bool {
+        if (self.failed || child.failed) { self.failed = true; return false; }
+        if (!self.root.child(&mut child.root)) { self.failed = true; return false; }
+        if (!buffer_append_unique_buffer(&mut self.styles.css, &child.styles.css)) { self.failed = true; return false; }
+        if (!buffer_append_buffer(&mut self.scripts, &child.scripts)) { self.failed = true; return false; }
+        return true;
+    }
+    /// Append a child with an explicit DOM reconciliation key. This is useful
+    /// for dynamic lists whose order may change: the browser moves the existing
+    /// keyed node instead of replacing unrelated siblings.
+    fn child_keyed(Component&mut self, string key, Component&mut child) -> bool {
+        if (child.failed || !child.root.key(key)) { self.failed = true; return false; }
+        return self.child(child);
+    }
+    fn child_keyed_i64(Component&mut self, i64 key, Component&mut child) -> bool {
+        if (child.failed || !child.root.key_i64(key)) { self.failed = true; return false; }
+        return self.child(child);
+    }
+
+    /// Conditionally append a child while registering the condition as a
+    /// structural dependency of this component scope. When the state changes,
+    /// the runtime can therefore rerender this boundary instead of the page.
+    fn child_when(Component&mut self, StateBool& state, Component&mut child) -> bool {
+        if (!self.when(state)) { return true; }
+        return self.child(child);
+    }
+    fn child_unless(Component&mut self, StateBool& state, Component&mut child) -> bool {
+        if (!self.unless(state)) { return true; }
+        return self.child(child);
+    }
+    fn child_when_keyed(Component&mut self, StateBool& state, string key, Component&mut child) -> bool {
+        if (!self.when(state)) { return true; }
+        return self.child_keyed(key, child);
+    }
+    fn child_unless_keyed(Component&mut self, StateBool& state, string key, Component&mut child) -> bool {
+        if (!self.unless(state)) { return true; }
+        return self.child_keyed(key, child);
+    }
+    fn child_when_derived(Component&mut self, DerivedBool& value, Component&mut child) -> bool {
+        if (!self.when_derived(value)) { return true; }
+        return self.child(child);
+    }
+    fn child_unless_derived(Component&mut self, DerivedBool& value, Component&mut child) -> bool {
+        if (!self.unless_derived(value)) { return true; }
+        return self.child(child);
+    }
+    fn child_when_derived_keyed(Component&mut self, DerivedBool& value, string key, Component&mut child) -> bool {
+        if (!self.when_derived(value)) { return true; }
+        return self.child_keyed(key, child);
+    }
+
+    /// Append this component as build-time-only HTML/CSS. This is the static
+    /// component path used by Page: it deliberately rejects browser bindings,
+    /// component rerender scopes, routes, state bindings, and raw client code so
+    /// using reusable Component trees does not silently opt a static site into
+    /// JavaScript or WebAssembly.
+    fn append_static(Component&mut self, String&mut html, String&mut css) -> bool {
+        if (self.failed || self.scripts.length != 0 || self.component_scope != 0) { return false; }
+        Buffer rendered = buffer_new();
+        if (!render_into(&self.root, &mut rendered)) { self.failed = true; return false; }
+        bool browser_bound =
+            buffer_contains_literal(&rendered, "data-raz-bind-") ||
+            buffer_contains_literal(&rendered, "data-raz-click") ||
+            buffer_contains_literal(&rendered, "data-raz-input") ||
+            buffer_contains_literal(&rendered, "data-raz-check") ||
+            buffer_contains_literal(&rendered, "data-raz-number") ||
+            buffer_contains_literal(&rendered, "data-raz-submit") ||
+            buffer_contains_literal(&rendered, "data-raz-nav") ||
+            buffer_contains_literal(&rendered, "data-raz-component");
+        if (browser_bound) { return false; }
+        if (!buffer_append_to_string(&rendered, html)) { self.failed = true; return false; }
+        if (!buffer_append_to_string(&self.styles.css, css)) { self.failed = true; return false; }
+        return true;
+    }
+    fn publish(Component&mut self) -> bool {
+        if (self.failed || self.component_scope <= 0) { return false; }
+        Buffer html = buffer_new();
+        if (!render_into(&self.root, &mut html)) { self.failed = true; return false; }
+        if (!replace_buffer(html.data, html.length, &mut web_component_html_data, &mut web_component_html_length)) { self.failed = true; return false; }
+        if (!replace_buffer(self.styles.css.data, self.styles.css.length, &mut web_component_css_data, &mut web_component_css_length)) { self.failed = true; return false; }
+        web_component_scope = self.component_scope;
+        web_component_revision += 1;
+        return true;
+    }
+    fn mount(Component&mut self, string title) -> bool {
+        if (self.failed) { return false; }
+        if (!mount_document(title, &self.root, &self.styles, &self.scripts)) { self.failed = true; return false; }
+        return true;
+    }
+}
+
+// Reserved compiler/runtime bridge for @web_component functions that return
+// Component directly. The Wasm backend feeds the moved return value into this
+// helper so normal Raz ownership performs publication and destruction.
+public fn raz_web_publish_component_value(Component component) -> i64 {
+    if (!component.valid()) { return -1; }
+    if (!component.publish()) { return -1; }
+    return 1;
+}
+
+// Web application entry bridge. `kind = "web"` projects may return Component
+// directly from ordinary Raz `main`; the browser host calls this function with
+// that Wasm aggregate handle to publish the page without an application-written
+// wrapper. The manifest-provided document title remains authoritative when the
+// component does not explicitly mount a different title.
+public fn raz_web_publish_main(Component component) -> i64 {
+    if (!component.valid()) { return -1; }
+    if (!component.mount("")) { return -1; }
+    return 1;
+}
+
+public fn raz_web_begin_render() { begin_render(); }
+
+
+// Route state is synchronized from the browser History API before the first
+// render and on pushState/popstate navigation. Raz routing remains ordinary
+// conditional logic over this stable state rather than a JavaScript router.
+public fn route_is(string path) -> bool {
+    route_mark_structural_scope(0);
+    return route_matches(path);
+}
+public fn route_prefix(string path) -> bool {
+    route_mark_structural_scope(0);
+    i64 length = raz_rt_cstr_len(path);
+    if (length > web_route_length) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        i64 left = 0;
+        i64 right = 0;
+        unsafe {
+            left = (*((web_route_data + index)as u8*const))as i64;
+            right = (*((raz_rt_cstr_ptr(path) + index)as u8*const))as i64;
+        }
+        if (left != right) { return false; }
+        index += 1;
+    }
+    if (length == web_route_length || length == 1) { return true; }
+    i64 boundary = 0;
+    unsafe { boundary = (*((web_route_data + length)as u8*const))as i64; }
+    return boundary == 47;
+}
+
+
+fn route_pattern_segment_equal(usize pattern_data, i64 pattern_start, i64 pattern_length, usize route_data, i64 route_start, i64 route_length) -> bool {
+    if (pattern_length != route_length) { return false; }
+    i64 i = 0;
+    while (i < pattern_length) {
+        i64 left = 0;
+        i64 right = 0;
+        unsafe {
+            left = (*((pattern_data + pattern_start + i)as u8*const))as i64;
+            right = (*((route_data + route_start + i)as u8*const))as i64;
+        }
+        if (left != right) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Matches route patterns such as `/blog/:slug` and `/docs/*`. Named segments
+/// match exactly one non-empty path segment; `*` is permitted only as the final
+/// segment and matches the remaining suffix.
+fn route_pattern_matches(string pattern) -> bool {
+    i64 pattern_length = raz_rt_cstr_len(pattern);
+    if (pattern_length <= 0 || web_route_length <= 0) { return false; }
+    usize pattern_data = raz_rt_cstr_ptr(pattern);
+    if (raz_rt_load_u8(pattern_data) != 47) { return false; }
+    if (pattern_length == 1) { return web_route_length == 1; }
+    i64 pi = 1;
+    i64 ri = 1;
+    while (pi <= pattern_length) {
+        i64 ps = pi;
+        while (pi < pattern_length && raz_rt_load_u8(pattern_data + pi) != 47) { pi += 1; }
+        i64 pl = pi - ps;
+        // A final `*` or named splat such as `*path` consumes the remaining
+        // route suffix. Named splats can be read through route_param().
+        if (pl >= 1 && raz_rt_load_u8(pattern_data + ps) == 42) { return pi == pattern_length; }
+        i64 rs = ri;
+        while (ri < web_route_length) {
+            i64 ch = 0;
+            unsafe { ch = (*((web_route_data + ri)as u8*const))as i64; }
+            if (ch == 47) { break; }
+            ri += 1;
+        }
+        i64 rl = ri - rs;
+        if (pl <= 0 || rl <= 0) { return false; }
+        if (raz_rt_load_u8(pattern_data + ps) != 58 && !route_pattern_segment_equal(pattern_data, ps, pl, web_route_data, rs, rl)) { return false; }
+        if (pi == pattern_length || ri == web_route_length) { return pi == pattern_length && ri == web_route_length; }
+        pi += 1;
+        ri += 1;
+    }
+    return ri == web_route_length;
+}
+
+public fn route_match(string pattern) -> bool {
+    route_mark_structural_scope(0);
+    return route_pattern_matches(pattern);
+}
+
+fn route_pattern_name_equal(usize pattern_data, i64 start, i64 length, string name) -> bool {
+    i64 name_length = raz_rt_cstr_len(name);
+    if (length != name_length) { return false; }
+    usize name_data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < length) {
+        if (raz_rt_load_u8(pattern_data + start + i) != raz_rt_load_u8(name_data + i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Extracts one named segment from a matching route pattern. A missing name or
+/// non-matching pattern returns an empty String.
+fn route_param_value(string pattern, string name) -> String {
+    if (!route_pattern_matches(pattern)) { return String::new(); }
+    i64 pattern_length = raz_rt_cstr_len(pattern);
+    usize pattern_data = raz_rt_cstr_ptr(pattern);
+    i64 pi = 1;
+    i64 ri = 1;
+    while (pi <= pattern_length) {
+        i64 ps = pi;
+        while (pi < pattern_length && raz_rt_load_u8(pattern_data + pi) != 47) { pi += 1; }
+        i64 pl = pi - ps;
+        i64 rs = ri;
+        while (ri < web_route_length) {
+            i64 ch = 0;
+            unsafe { ch = (*((web_route_data + ri)as u8*const))as i64; }
+            if (ch == 47) { break; }
+            ri += 1;
+        }
+        i64 rl = ri - rs;
+        bool named_segment = pl > 1 && raz_rt_load_u8(pattern_data + ps) == 58 && route_pattern_name_equal(pattern_data, ps + 1, pl - 1, name);
+        bool named_splat = pl > 1 && raz_rt_load_u8(pattern_data + ps) == 42 && route_pattern_name_equal(pattern_data, ps + 1, pl - 1, name);
+        if (named_segment || named_splat) {
+            i64 value_length = rl;
+            if (named_splat) { value_length = web_route_length - rs; }
+            String value = String::with_capacity(value_length);
+            i64 i = 0;
+            while (i < value_length) {
+                i64 ch = 0;
+                unsafe { ch = (*((web_route_data + rs + i)as u8*const))as i64; }
+                if (!value.push(ch)) { return String::new(); }
+                i += 1;
+            }
+            return value;
+        }
+        if (pi == pattern_length || ri == web_route_length) { break; }
+        pi += 1;
+        ri += 1;
+    }
+    return String::new();
+}
+
+public fn route_param(string pattern, string name) -> String {
+    route_mark_structural_scope(0);
+    return route_param_value(pattern, name);
+}
+
+/// Reads the remaining suffix captured by a final named splat such as
+/// `/docs/*path`. This is an ergonomic alias for route_param().
+public fn route_splat(string pattern, string name) -> String {
+    route_mark_structural_scope(0);
+    return route_param_value(pattern, name);
+}
+
+public fn raz_web_route_set(usize data, i64 length) -> i64 {
+    if (!replace_buffer(data, length, &mut web_route_data, &mut web_route_length)) { return -1; }
+    return 1;
+}
+
+fn ensure_http_records() -> bool {
+    if (web_http_records != 0) { return true; }
+    i64 bytes = WEB_HTTP_CAPACITY * WEB_HTTP_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_http_records = next;
+    return true;
+}
+
+fn http_record(i64 slot) -> usize { return web_http_records + slot * WEB_HTTP_RECORD_BYTES; }
+
+fn http_find_or_create(string url, i64 method, i64 initial_state) -> HttpRequest {
+    if (!ensure_http_records()) { return HttpRequest { slot: -1 }; }
+    i64 hash = (state_key_hash(url) * 7 + method) % 281474976710597;
+    if (hash == 0) { hash = method; }
+    i64 slot = 0;
+    while (slot < WEB_HTTP_CAPACITY) {
+        usize record = http_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == hash && raw_i64_get(record, 64) == method) { return HttpRequest { slot: slot }; }
+        if (stored_hash == 0) {
+            i64 length = raz_rt_cstr_len(url);
+            usize data = 0;
+            if (length > 0) {
+                data = raz_rt_alloc(length);
+                if (data == 0) { return HttpRequest { slot: -1 }; }
+                raz_rt_copy(data, raz_rt_cstr_ptr(url), length);
+            }
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, initial_state);
+            raw_i64_set(record, 16, (data)as i64);
+            raw_i64_set(record, 24, length);
+            raw_i64_set(record, 32, 0);
+            raw_i64_set(record, 40, 0);
+            raw_i64_set(record, 48, 0);
+            raw_i64_set(record, 56, 0);
+            raw_i64_set(record, 64, method);
+            raw_i64_set(record, 72, 0);
+            raw_i64_set(record, 80, 0);
+            raw_i64_set(record, 88, 0);
+            raw_i64_set(record, 96, 0);
+            return HttpRequest { slot: slot };
+        }
+        slot += 1;
+    }
+    return HttpRequest { slot: -1 };
+}
+
+public fn http_get(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_GET, WEB_HTTP_PENDING);
+}
+
+// Create a reusable POST resource. It remains idle until a form/action queues
+// a body, so merely rendering a form never performs a network side effect.
+public fn http_post(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_POST, WEB_HTTP_IDLE);
+}
+
+fn http_prepare_text_body(HttpRequest& request, string body) -> bool {
+    if (!request.valid() || web_http_records == 0) { return false; }
+    usize record = http_record(request.slot);
+    i64 method = raw_i64_get(record, 64);
+    if (method == WEB_HTTP_GET) { return false; }
+    i64 length = raz_rt_cstr_len(body);
+    usize data = 0;
+    if (length > 0) {
+        data = raz_rt_alloc(length);
+        if (data == 0) { return false; }
+        raz_rt_copy(data, raz_rt_cstr_ptr(body), length);
+    }
+    usize old_body = raw_i64_get(record, 72)as usize;
+    usize old_response = raw_i64_get(record, 40)as usize;
+    if (old_body != 0) { raz_rt_dealloc(old_body); }
+    if (old_response != 0) { raz_rt_dealloc(old_response); }
+    raw_i64_set(record, 32, 0);
+    raw_i64_set(record, 40, 0);
+    raw_i64_set(record, 48, 0);
+    raw_i64_set(record, 72, (data)as i64);
+    raw_i64_set(record, 80, length);
+    raw_i64_set(record, 8, WEB_HTTP_PENDING);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    return true;
+}
+
+public fn http_post_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_POST, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_put_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_PUT, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_patch_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_PATCH, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_delete(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_DELETE, WEB_HTTP_PENDING);
+}
+
+fn http_prepare_post_string(i64 request_slot, i64 state_slot) -> bool {
+    if (request_slot < 0 || request_slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return false; }
+    if (state_slot < 0 || state_slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = http_record(request_slot);
+    if (raw_i64_get(record, 64) != WEB_HTTP_POST) { return false; }
+    usize source = state_string_data(state_slot);
+    i64 length = state_string_length(state_slot);
+    usize body = 0;
+    if (length > 0) {
+        body = raz_rt_alloc(length);
+        if (body == 0) { return false; }
+        raz_rt_copy(body, source, length);
+    }
+    usize old_body = raw_i64_get(record, 72)as usize;
+    usize old_response = raw_i64_get(record, 40)as usize;
+    if (old_body != 0) { raz_rt_dealloc(old_body); }
+    if (old_response != 0) { raz_rt_dealloc(old_response); }
+    raw_i64_set(record, 32, 0);
+    raw_i64_set(record, 40, 0);
+    raw_i64_set(record, 48, 0);
+    raw_i64_set(record, 72, (body)as i64);
+    raw_i64_set(record, 80, length);
+    raw_i64_set(record, 8, WEB_HTTP_PENDING);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    return true;
+}
+
+fn json_space(i64 byte) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13;
+}
+
+fn json_byte(usize data, i64 index) -> i64 {
+    unsafe { return (*((data + index)as u8*const))as i64; }
+}
+
+fn json_skip_space(usize data, i64 length, i64 index) -> i64 {
+    i64 next = index;
+    while (next < length && json_space(json_byte(data, next))) { next += 1; }
+    return next;
+}
+
+fn json_key_matches(usize data, i64 start, i64 end, string key) -> bool {
+    i64 key_length = raz_rt_cstr_len(key);
+    if (end - start != key_length) { return false; }
+    i64 index = 0;
+    while (index < key_length) {
+        if (json_byte(data, start + index) != literal_byte(key, index)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+// Allocation-free typed JSON views for browser resources. Objects/arrays are
+// retained as slices into the Raz-owned HTTP response, so nested decoding does
+// not build a JavaScript object graph or duplicate response storage.
+fn json_scan_value(usize data, i64 length, i64 start) -> JsonSlice {
+    i64 index = json_skip_space(data, length, start);
+    if (index >= length) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    i64 first = json_byte(data, index);
+    if (first == 34) {
+        i64 value_start = index + 1;
+        i64 cursor = value_start;
+        bool previous_escape = false;
+        while (cursor < length) {
+            i64 byte = json_byte(data, cursor);
+            if (byte < 32) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+            if (byte == 34 && !previous_escape) {
+                return JsonSlice { data: data + value_start, length: cursor - value_start, kind: 1, found: true };
+            }
+            if (previous_escape) {
+                if (!(byte == 34 || byte == 92 || byte == 47 || byte == 98 || byte == 102 || byte == 110 || byte == 114 || byte == 116 || byte == 117)) {
+                    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+                }
+                if (byte == 117) {
+                    if (json_u16(data, length, cursor + 1) < 0) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+                    cursor += 4;
+                }
+                previous_escape = false;
+            } else if (byte == 92) {
+                previous_escape = true;
+            }
+            cursor += 1;
+        }
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    if (first == 123 || first == 91) {
+        i64 open = first;
+        i64 close = 125;
+        i64 kind = 3;
+        if (open == 91) { close = 93; kind = 4; }
+        i64 depth = 0;
+        i64 cursor = index;
+        bool in_string = false;
+        bool escaped = false;
+        while (cursor < length) {
+            i64 byte = json_byte(data, cursor);
+            if (in_string) {
+                if (escaped) { escaped = false; }
+                else if (byte == 92) { escaped = true; }
+                else if (byte == 34) { in_string = false; }
+            } else {
+                if (byte == 34) { in_string = true; }
+                else if (byte == open) { depth += 1; }
+                else if (byte == close) {
+                    depth -= 1;
+                    if (depth == 0) { return JsonSlice { data: data + index, length: cursor - index + 1, kind: kind, found: true }; }
+                }
+            }
+            cursor += 1;
+        }
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    i64 cursor = index;
+    while (cursor < length) {
+        i64 byte = json_byte(data, cursor);
+        if (byte == 44 || byte == 125 || byte == 93 || json_space(byte)) { break; }
+        cursor += 1;
+    }
+    if (cursor <= index) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    return JsonSlice { data: data + index, length: cursor - index, kind: 2, found: true };
+}
+
+fn json_find_in_object(usize data, i64 length, string key) -> JsonSlice {
+    i64 index = json_skip_space(data, length, 0);
+    if (index >= length || json_byte(data, index) != 123) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    index += 1;
+    while (index < length) {
+        index = json_skip_space(data, length, index);
+        if (index < length && json_byte(data, index) == 125) { break; }
+        if (index >= length || json_byte(data, index) != 34) { break; }
+        i64 key_start = index + 1;
+        i64 key_end = key_start;
+        bool key_escape = false;
+        while (key_end < length && json_byte(data, key_end) != 34) {
+            if (json_byte(data, key_end) == 92) { key_escape = true; }
+            key_end += 1;
+        }
+        if (key_end >= length) { break; }
+        bool matches = !key_escape && json_key_matches(data, key_start, key_end, key);
+        index = json_skip_space(data, length, key_end + 1);
+        if (index >= length || json_byte(data, index) != 58) { break; }
+        JsonSlice value = json_scan_value(data, length, index + 1);
+        if (!value.found) { break; }
+        if (matches) { return value; }
+        i64 value_end = (value.data - data)as i64 + value.length;
+        if (value.kind == 1) { value_end += 1; }
+        index = json_skip_space(data, length, value_end);
+        if (index < length && json_byte(data, index) == 44) { index += 1; }
+    }
+    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+}
+
+fn json_find(HttpRequest& request, string key) -> JsonSlice {
+    if (!request.done() || request.data() == 0 || request.length() <= 0) {
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    return json_find_in_object(request.data(), request.length(), key);
+}
+
+fn json_array_item(JsonArray& array, i64 wanted) -> JsonSlice {
+    if (!array.found || wanted < 0 || array.length < 2 || json_byte(array.data, 0) != 91) {
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    i64 index = 1;
+    i64 item = 0;
+    while (index < array.length) {
+        index = json_skip_space(array.data, array.length, index);
+        if (index >= array.length || json_byte(array.data, index) == 93) { break; }
+        JsonSlice value = json_scan_value(array.data, array.length, index);
+        if (!value.found) { break; }
+        if (item == wanted) { return value; }
+        i64 value_end = (value.data - array.data)as i64 + value.length;
+        if (value.kind == 1) { value_end += 1; }
+        index = json_skip_space(array.data, array.length, value_end);
+        if (index < array.length && json_byte(array.data, index) == 44) { index += 1; }
+        item += 1;
+    }
+    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+}
+
+fn json_parse_i64(JsonSlice& slice) -> JsonI64 {
+    if (!slice.found || slice.kind != 2 || slice.length <= 0) { return JsonI64 { value: 0, found: false }; }
+    i64 index = 0;
+    bool negative = false;
+    if (json_byte(slice.data, 0) == 45) { negative = true; index = 1; }
+    if (index >= slice.length) { return JsonI64 { value: 0, found: false }; }
+    i64 value = 0;
+    while (index < slice.length) {
+        i64 byte = json_byte(slice.data, index);
+        if (byte < 48 || byte > 57) { return JsonI64 { value: 0, found: false }; }
+        value = value * 10 + (byte - 48);
+        index += 1;
+    }
+    if (negative) { value = -value; }
+    return JsonI64 { value: value, found: true };
+}
+
+fn json_parse_bool(JsonSlice& slice) -> JsonBool {
+    if (!slice.found || slice.kind != 2) { return JsonBool { value: false, found: false }; }
+    if (slice.length == 4 && json_byte(slice.data, 0) == 116 && json_byte(slice.data, 1) == 114 && json_byte(slice.data, 2) == 117 && json_byte(slice.data, 3) == 101) {
+        return JsonBool { value: true, found: true };
+    }
+    if (slice.length == 5 && json_byte(slice.data, 0) == 102 && json_byte(slice.data, 1) == 97 && json_byte(slice.data, 2) == 108 && json_byte(slice.data, 3) == 115 && json_byte(slice.data, 4) == 101) {
+        return JsonBool { value: false, found: true };
+    }
+    return JsonBool { value: false, found: false };
+}
+
+fn json_parse_f64(JsonSlice& slice) -> JsonF64 {
+    if (!slice.found || slice.kind != 2 || slice.length <= 0) { return JsonF64 { value: 0.0, found: false }; }
+    i64 index = 0;
+    bool negative = false;
+    if (json_byte(slice.data, index) == 45) { negative = true; index += 1; }
+    if (index >= slice.length) { return JsonF64 { value: 0.0, found: false }; }
+    f64 value = 0.0;
+    i64 digits = 0;
+    while (index < slice.length) {
+        i64 byte = json_byte(slice.data, index);
+        if (byte < 48 || byte > 57) { break; }
+        value = value * 10.0 + ((byte - 48)as f64);
+        digits += 1;
+        index += 1;
+    }
+    if (digits == 0) { return JsonF64 { value: 0.0, found: false }; }
+    if (index < slice.length && json_byte(slice.data, index) == 46) {
+        index += 1;
+        i64 fractional_digits = 0;
+        f64 scale = 0.1;
+        while (index < slice.length) {
+            i64 byte = json_byte(slice.data, index);
+            if (byte < 48 || byte > 57) { break; }
+            value = value + ((byte - 48)as f64) * scale;
+            scale = scale * 0.1;
+            fractional_digits += 1;
+            index += 1;
+        }
+        if (fractional_digits == 0) { return JsonF64 { value: 0.0, found: false }; }
+    }
+    if (index < slice.length && (json_byte(slice.data, index) == 101 || json_byte(slice.data, index) == 69)) {
+        index += 1;
+        bool exponent_negative = false;
+        if (index < slice.length && (json_byte(slice.data, index) == 43 || json_byte(slice.data, index) == 45)) {
+            exponent_negative = json_byte(slice.data, index) == 45;
+            index += 1;
+        }
+        i64 exponent = 0;
+        i64 exponent_digits = 0;
+        while (index < slice.length) {
+            i64 byte = json_byte(slice.data, index);
+            if (byte < 48 || byte > 57) { break; }
+            exponent = exponent * 10 + (byte - 48);
+            exponent_digits += 1;
+            index += 1;
+        }
+        if (exponent_digits == 0 || exponent > 308) { return JsonF64 { value: 0.0, found: false }; }
+        while (exponent > 0) {
+            if (exponent_negative) { value = value / 10.0; } else { value = value * 10.0; }
+            exponent -= 1;
+        }
+    }
+    if (index != slice.length) { return JsonF64 { value: 0.0, found: false }; }
+    if (negative) { value = -value; }
+    return JsonF64 { value: value, found: true };
+}
+
+fn json_parse_null(JsonSlice& slice) -> JsonNull {
+    if (!slice.found || slice.kind != 2 || slice.length != 4) { return JsonNull { found: false }; }
+    bool ok = json_byte(slice.data, 0) == 110 && json_byte(slice.data, 1) == 117 && json_byte(slice.data, 2) == 108 && json_byte(slice.data, 3) == 108;
+    return JsonNull { found: ok };
+}
+
+public fn json_string_none() -> JsonString { return JsonString { data: 0, length: 0, found: false }; }
+public fn json_i64_none() -> JsonI64 { return JsonI64 { value: 0, found: false }; }
+public fn json_bool_none() -> JsonBool { return JsonBool { value: false, found: false }; }
+public fn json_f64_none() -> JsonF64 { return JsonF64 { value: 0.0, found: false }; }
+public fn json_null_none() -> JsonNull { return JsonNull { found: false }; }
+public fn json_object_none() -> JsonObject { return JsonObject { data: 0, length: 0, found: false }; }
+public fn json_array_none() -> JsonArray { return JsonArray { data: 0, length: 0, found: false }; }
+
+public fn resource<T>(HttpRequest& request, T initial) -> Resource<T> {
+    return Resource<T> { request_slot: request.slot, value: move initial, decoded_version: -1, decoded: false, failed: false };
+}
+
+impl<T> Resource<T> {
+    fn valid(Resource<T>& self) -> bool { return self.request_slot >= 0 && self.request_slot < WEB_HTTP_CAPACITY; }
+    fn loading(Resource<T>& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.request_slot), 8);
+        return state == WEB_HTTP_PENDING || state == WEB_HTTP_INFLIGHT;
+    }
+    fn ready(Resource<T>& self) -> bool { return self.decoded && !self.failed; }
+    fn failed(Resource<T>& self) -> bool { return self.failed; }
+    fn status(Resource<T>& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.request_slot), 32);
+    }
+    /// Observe this async resource through a component boundary. The HTTP
+    /// request slot is registered as a structural dependency of that scope, so
+    /// completion/failure can rerender the smallest owning component.
+    fn loading_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.request_loading(&request);
+    }
+    fn done_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.request_done(&request);
+    }
+    fn ready_in(Resource<T>& self, Component& owner) -> bool {
+        if (!self.done_in(owner)) { return false; }
+        return self.ready();
+    }
+    fn failed_in(Resource<T>& self, Component& owner) -> bool {
+        if (!self.done_in(owner)) { return false; }
+        return self.failed();
+    }
+    fn changed_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.effect_request(&request);
+    }
+    fn value(Resource<T>& self) -> T& { return & self.value; }
+}
+
+public fn resource_refresh<T: JsonDecode>(Resource<T>&mut resource) -> bool {
+    if (!resource.valid() || web_http_records == 0) { resource.failed = true; return false; }
+    HttpRequest request = HttpRequest { slot: resource.request_slot };
+    if (!request.done()) { return false; }
+    i64 version = raw_i64_get(http_record(resource.request_slot), 56);
+    if (!request.ok()) {
+        resource.failed = true;
+        resource.decoded = false;
+        resource.decoded_version = version;
+        return false;
+    }
+    if (resource.decoded && !resource.failed && resource.decoded_version == version) { return true; }
+    if (!resource.value.decode(&request)) {
+        resource.failed = true;
+        resource.decoded = false;
+        resource.decoded_version = version;
+        return false;
+    }
+    resource.failed = false;
+    resource.decoded = true;
+    resource.decoded_version = version;
+    return true;
+}
+
+impl JsonString {
+    fn valid(JsonString& self) -> bool { return self.found; }
+    fn data(JsonString& self) -> usize { return self.data; }
+    fn length(JsonString& self) -> i64 { return self.length; }
+}
+
+impl JsonI64 {
+    fn valid(JsonI64& self) -> bool { return self.found; }
+    fn get(JsonI64& self) -> i64 { return self.value; }
+}
+
+impl JsonBool {
+    fn valid(JsonBool& self) -> bool { return self.found; }
+    fn get(JsonBool& self) -> bool { return self.value; }
+}
+
+impl JsonF64 {
+    fn valid(JsonF64& self) -> bool { return self.found; }
+    fn get(JsonF64& self) -> f64 { return self.value; }
+}
+
+impl JsonNull {
+    fn valid(JsonNull& self) -> bool { return self.found; }
+}
+
+
+impl JsonObject {
+    fn valid(JsonObject& self) -> bool { return self.found; }
+    fn json_string(JsonObject& self, string key) -> JsonString {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 1) { return json_string_none(); }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_i64(JsonObject& self, string key) -> JsonI64 {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_i64(&slice);
+    }
+    fn json_bool(JsonObject& self, string key) -> JsonBool {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_bool(&slice);
+    }
+    fn json_f64(JsonObject& self, string key) -> JsonF64 {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_f64(&slice);
+    }
+    fn json_null(JsonObject& self, string key) -> JsonNull {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_null(&slice);
+    }
+    fn json_object(JsonObject& self, string key) -> JsonObject {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_array(JsonObject& self, string key) -> JsonArray {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl JsonArray {
+    fn valid(JsonArray& self) -> bool { return self.found; }
+    fn count(JsonArray& self) -> i64 {
+        if (!self.found) { return 0; }
+        i64 count = 0;
+        while (json_array_item(self, count).found) { count += 1; }
+        return count;
+    }
+    fn json_string(JsonArray& self, i64 index) -> JsonString {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 1) { return json_string_none(); }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_i64(JsonArray& self, i64 index) -> JsonI64 {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_i64(&slice);
+    }
+    fn json_bool(JsonArray& self, i64 index) -> JsonBool {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_bool(&slice);
+    }
+    fn json_f64(JsonArray& self, i64 index) -> JsonF64 {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_f64(&slice);
+    }
+    fn json_null(JsonArray& self, i64 index) -> JsonNull {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_null(&slice);
+    }
+    fn json_object(JsonArray& self, i64 index) -> JsonObject {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_array(JsonArray& self, i64 index) -> JsonArray {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl HttpRequest {
+    public fn valid(HttpRequest& self) -> bool { return self.slot >= 0 && self.slot < WEB_HTTP_CAPACITY; }
+    public fn loading(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.slot), 8);
+        return state == WEB_HTTP_PENDING || state == WEB_HTTP_INFLIGHT;
+    }
+    public fn done(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.slot), 8);
+        return state == WEB_HTTP_COMPLETE || state == WEB_HTTP_FAILED;
+    }
+    public fn failed(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return true; }
+        return raw_i64_get(http_record(self.slot), 8) == WEB_HTTP_FAILED;
+    }
+    public fn ok(HttpRequest& self) -> bool {
+        if (!self.done()) { return false; }
+        i64 status = raw_i64_get(http_record(self.slot), 32);
+        return status >= 200 && status < 300;
+    }
+    public fn status(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 32);
+    }
+    public fn informational(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 100 && code < 200; }
+    public fn successful(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 200 && code < 300; }
+    public fn redirected(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 300 && code < 400; }
+    public fn client_error(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 400 && code < 500; }
+    public fn server_error(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 500 && code < 600; }
+    public fn length(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 48);
+    }
+    public fn data(HttpRequest& self) -> usize {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 40)as usize;
+    }
+    public fn method(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 64);
+    }
+    public fn body_data(HttpRequest& self) -> usize {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 72)as usize;
+    }
+    public fn body_length(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 80);
+    }
+    public fn json_string(HttpRequest& self, string key) -> JsonString {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 1) { return JsonString { data: 0, length: 0, found: false }; }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_i64(HttpRequest& self, string key) -> JsonI64 {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_i64(&slice);
+    }
+    public fn json_bool(HttpRequest& self, string key) -> JsonBool {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_bool(&slice);
+    }
+    public fn json_f64(HttpRequest& self, string key) -> JsonF64 {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_f64(&slice);
+    }
+    public fn json_null(HttpRequest& self, string key) -> JsonNull {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_null(&slice);
+    }
+    public fn json_object(HttpRequest& self, string key) -> JsonObject {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_array(HttpRequest& self, string key) -> JsonArray {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_root(HttpRequest& self) -> JsonObject {
+        if (!self.done() || self.data() == 0 || self.length() <= 0) { return json_object_none(); }
+        JsonSlice slice = json_scan_value(self.data(), self.length(), 0);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl Element {
+    fn text_json(Element&mut self, JsonString& value) -> bool {
+        if (tag_is_void(self.tag) || !value.valid()) { return false; }
+        return append_json_string_html(&mut self.children, value.data(), value.length());
+    }
+    fn text_http(Element&mut self, HttpRequest& request) -> bool {
+        if (tag_is_void(self.tag) || !request.valid()) { return false; }
+        return append_escaped_bytes(&mut self.children, request.data(), request.length());
+    }
+}
+
+impl Component {
+    fn json_text(Component&mut self, Tag tag, string prefix, JsonString& value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(prefix) || !child.text_json(value) || !self.root.child(&mut child)) { self.failed = true; return false; }
+        return true;
+    }
+    fn http_text(Component&mut self, Tag tag, string prefix, HttpRequest& request) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(prefix) || !child.text_http(request) || !self.root.child(&mut child)) {
+            self.failed = true;
+            return false;
+        }
+        return true;
+    }
+}
+
+public fn http_request_valid(HttpRequest& request) -> bool { return request.valid(); }
+public fn http_request_loading(HttpRequest& request) -> bool { return request.loading(); }
+public fn http_request_done(HttpRequest& request) -> bool { return request.done(); }
+public fn http_request_failed(HttpRequest& request) -> bool { return request.failed(); }
+public fn http_request_ok(HttpRequest& request) -> bool { return request.ok(); }
+public fn http_request_status(HttpRequest& request) -> i64 { return request.status(); }
+public fn http_request_text(HttpRequest& request) -> String {
+    if (!request.done() || request.data() == 0 || request.length() <= 0) { return String::new(); }
+    String value = String::with_capacity(request.length());
+    if (!alloc::string::resize(&mut value, request.length(), 0)) { return String::new(); }
+    raz_rt_copy(value.as_ptr(), request.data(), request.length());
+    return value;
+}
+
+// Host-side async fetch queue ABI. pending_next marks the returned request as
+// in-flight so repeated browser pumps cannot issue the same request twice.
+public fn raz_web_http_pending_next(i64 after_slot) -> i64 {
+    if (web_http_records == 0) { return 0; }
+    i64 slot = after_slot;
+    if (slot < 0) { slot = 0; }
+    while (slot < WEB_HTTP_CAPACITY) {
+        usize record = http_record(slot);
+        if (raw_i64_get(record, 8) == WEB_HTTP_PENDING) {
+            raw_i64_set(record, 8, WEB_HTTP_INFLIGHT);
+            return slot + 1;
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+public fn raz_web_http_url_ptr(i64 request_id) -> usize {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 16)as usize;
+}
+public fn raz_web_http_url_len(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 24);
+}
+public fn raz_web_http_method(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 64);
+}
+public fn raz_web_http_body_ptr(i64 request_id) -> usize {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 72)as usize;
+}
+public fn raz_web_http_body_len(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 80);
+}
+public fn raz_web_http_complete(i64 request_id, i64 status, usize data, i64 length) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0 || length < 0) { return -1; }
+    usize record = http_record(slot);
+    usize next = 0;
+    if (length > 0) {
+        if (data == 0) { return -1; }
+        next = raz_rt_alloc(length);
+        if (next == 0) { return -1; }
+        raz_rt_copy(next, data, length);
+    }
+    usize old = raw_i64_get(record, 40)as usize;
+    if (old != 0) { raz_rt_dealloc(old); }
+    raw_i64_set(record, 32, status);
+    raw_i64_set(record, 40, (next)as i64);
+    raw_i64_set(record, 48, length);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    if (status >= 200 && status < 600) { raw_i64_set(record, 8, WEB_HTTP_COMPLETE); }
+    else { raw_i64_set(record, 8, WEB_HTTP_FAILED); }
+    return 1;
+}
+
+// Generic host scratch allocation lets the browser copy UTF-8 route, input,
+// and fetch bytes into Wasm without exposing allocator internals to JS.
+public fn raz_web_host_alloc(i64 size) -> usize { return raz_rt_alloc(size); }
+public fn raz_web_host_free(usize pointer) { if (pointer != 0) { raz_rt_dealloc(pointer); } }
+
+// Generic reactive event dispatcher. The browser host invokes this, then calls
+// main() again to render the updated Raz state. Applications only need to bind
+// actions to StateI64/StateBool; they no longer need to hand-write an exported
+// event switch for routine reactive UI.
+public fn raz_web_dispatch(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    i64 slot = raw_i64_get(record, 8);
+    i64 argument = raw_i64_get(record, 16);
+    if (kind == WEB_ACTION_ADD_I64) {
+        if (!state_add(slot, argument)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SET_I64) {
+        if (!state_replace(slot, argument)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_TOGGLE_BOOL) {
+        i64 next = 0;
+        if (state_value(slot) == 0) { next = 1; }
+        if (!state_replace(slot, next)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SET_BOOL) {
+        i64 next = 0;
+        if (argument != 0) { next = 1; }
+        if (!state_replace(slot, next)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SUBMIT_STRING) {
+        if (!http_prepare_post_string(argument, slot)) { return -1; }
+        return 1;
+    }
+    if (kind == WEB_ACTION_SUBMIT_STRING_MIN) {
+        i64 request_slot = argument % WEB_HTTP_CAPACITY;
+        i64 minimum = argument / WEB_HTTP_CAPACITY;
+        if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return -1; }
+        usize state = state_record(slot);
+        if (state_string_length(slot) < minimum) {
+            raw_i64_set(state, 16, -1);
+            raw_i64_set(state, 24, raw_i64_get(state, 24) + 1);
+            return 0;
+        }
+        raw_i64_set(state, 16, 1);
+        if (!http_prepare_post_string(request_slot, slot)) { return -1; }
+        return 1;
+    }
+    return -1;
+}
+
+public fn raz_web_dispatch_text(i64 event_id, usize data, i64 length) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_STRING) { return -1; }
+    if (!state_replace_string(raw_i64_get(record, 8), data, length)) { return -1; }
+    return 1;
+}
+
+public fn raz_web_dispatch_bool(i64 event_id, bool value) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_BOOL_INPUT) { return -1; }
+    i64 next = 0;
+    if (value) { next = 1; }
+    if (!state_replace(raw_i64_get(record, 8), next)) { return -1; }
+    return next;
+}
+
+public fn raz_web_dispatch_i64(i64 event_id, i64 value) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_I64_INPUT) { return -1; }
+    if (!state_replace(raw_i64_get(record, 8), value)) { return -1; }
+    return value;
+}
+
+// The browser can skip main()/HTML reconciliation when an event only changes
+// explicitly bound state and no Raz code read that state structurally during
+// the current render. Non-state actions remain conservative.
+public fn raz_web_event_state_slot(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    return raw_i64_get(record, 8);
+}
+
+public fn raz_web_event_requires_render(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return 1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    if (kind == WEB_ACTION_SUBMIT_STRING || kind == WEB_ACTION_SUBMIT_STRING_MIN) { return 1; }
+    i64 slot = raw_i64_get(record, 8);
+    if (state_requires_render(slot)) { return 1; }
+    return 0;
+}
+
+// Returns a positive keyed component scope when this structural event can be
+// rerendered locally, 0 for direct-bound events, and -1 when the page-level
+// render is required. Local rendering is permitted only for a single matching
+// structural owner; mixed/page dependencies remain conservative.
+public fn raz_web_event_render_scope(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    if (kind == WEB_ACTION_SUBMIT_STRING || kind == WEB_ACTION_SUBMIT_STRING_MIN) { return -1; }
+    i64 slot = raw_i64_get(record, 8);
+    if (!state_requires_render(slot)) { return 0; }
+    i64 event_scope = raw_i64_get(record, 24);
+    if (event_scope <= 0) { return -1; }
+    if (state_structural_scope(slot) != event_scope) { return -1; }
+    return event_scope;
+}
+
+// Route/HTTP host transitions use the same scoped structural ownership model
+// as state events. 0 means nobody currently depends on the value, a positive
+// value is a component-local rerender scope, and -1 requires page main().
+public fn raz_web_route_render_scope() -> i64 {
+    if (web_route_structural_owner == 0) { return 0; }
+    if (web_route_structural_owner < 0 || web_route_structural_owner == 1) { return -1; }
+    return web_route_structural_owner - 1;
+}
+
+public fn raz_web_http_render_scope(i64 request_id) -> i64 {
+    return http_structural_scope(request_id - 1);
+}
+
+// Stable browser ABI consumed by compiler/backend/web/codegen.rz.
+public fn raz_web_revision() -> i64 { return web_revision; }
+public fn raz_web_structure_revision() -> i64 { return web_structure_revision; }
+public fn raz_web_state_i64(i64 slot) -> i64 { return state_value(slot); }
+public fn raz_web_derived_i64(i64 id) -> i64 { return derived_value(id); }
+public fn raz_web_state_bool(i64 slot) -> i64 {
+    if (state_value(slot) != 0) { return 1; }
+    return 0;
+}
+public fn raz_web_state_string_ptr(i64 slot) -> usize { return state_string_data(slot); }
+public fn raz_web_state_string_len(i64 slot) -> i64 { return state_string_length(slot); }
+public fn raz_web_component_revision() -> i64 { return web_component_revision; }
+public fn raz_web_component_scope() -> i64 { return web_component_scope; }
+public fn raz_web_component_html_ptr() -> usize { return web_component_html_data; }
+public fn raz_web_component_html_len() -> i64 { return web_component_html_length; }
+public fn raz_web_component_css_ptr() -> usize { return web_component_css_data; }
+public fn raz_web_component_css_len() -> i64 { return web_component_css_length; }
+public fn raz_web_html_ptr() -> usize { return web_html_data; }
+public fn raz_web_html_len() -> i64 { return web_html_length; }
+public fn raz_web_css_ptr() -> usize { return web_css_data; }
+public fn raz_web_css_len() -> i64 { return web_css_length; }
+public fn raz_web_title_ptr() -> usize { return web_title_data; }
+public fn raz_web_title_len() -> i64 { return web_title_length; }
+public fn raz_web_js_ptr() -> usize { return web_js_data; }
+public fn raz_web_js_len() -> i64 { return web_js_length; }

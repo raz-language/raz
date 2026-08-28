@@ -1,0 +1,1327 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::compiler_main;
+
+public import borrowck::semantics;
+public import mir_opt::transform::pipeline;
+public import raz_driver::razup;
+import raz_driver::web_bundle;
+// Keep the compiler entrypoint boring: load input, run each phase in order, emit
+// backend artifacts, and leave the actual language rules in the subsystem modules above.
+// Web target analysis happens after normal HIR construction. A target=web
+// project whose root `main` returns the web `Component` structure is an
+// application/reactive bundle; otherwise target=web stays static-first and the
+// native page generator decides whether individual routes need Wasm islands.
+// This lets one manifest spelling select the cheapest output automatically.
+fn compiler_web_name_is_literal(Source& source, i64 offset, i64 length, string expected) -> bool {
+    i64 expected_length = compiler_literal_length(expected);
+    if (length != expected_length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (source_byte(source, offset + i) != compiler_literal_byte(expected, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn compiler_web_main_returns_component(Source& source, HirModule& hir) -> bool {
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0 &&
+            raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index) == 0 &&
+            compiler_web_name_is_literal(
+                source,
+                raz_compiler_rt_arena_get(hir.function_name_offsets, function_index),
+                raz_compiler_rt_arena_get(hir.function_name_lengths, function_index),
+                "main"
+            )
+        ) {
+            i64 structure = raz_compiler_rt_arena_get(hir.function_return_type_structs, function_index);
+            if (structure < 0 || structure >= hir.struct_count) { return false; }
+            return compiler_web_name_is_literal(
+                source,
+                raz_compiler_rt_arena_get(hir.struct_name_offsets, structure),
+                raz_compiler_rt_arena_get(hir.struct_name_lengths, structure),
+                "Component"
+            );
+        }
+        function_index += 1;
+    }
+    return false;
+}
+
+fn compiler_web_chunk_name_equals(i64 data, i64 start, i64 length, i64 name, i64 name_length) -> bool {
+    if (data == 0 || name == 0 || length != name_length || length <= 0) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != raz_compiler_rt_arena_get(name, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn compiler_web_chunk_already_processed(i64 processed, i64 processed_length, i64 name, i64 name_length) -> bool {
+    if (processed == 0 || name == 0 || name_length <= 0) { return false; }
+    i64 start = 0;
+    while (start < processed_length) {
+        i64 end = start;
+        while (end < processed_length && raz_compiler_rt_arena_get(processed, end) != 10) { end += 1; }
+        if (compiler_web_chunk_name_equals(processed, start, end - start, name, name_length)) { return true; }
+        start = end + 1;
+    }
+    return false;
+}
+
+fn compiler_emit_web_wasm_chunks(
+    Source& input, HirModule& hir, MirModule& mir,
+    i64 manifest_path, i64 manifest_path_length
+) -> bool {
+    i64 marker_length = 0;
+    i64 marker_path = cli_web_wasm_chunks_marker_path(manifest_path, manifest_path_length, &mut marker_length);
+    if (marker_path == 0 || marker_length <= 0) { return false; }
+    if (raz_compiler_rt_path_exists_ascii(marker_path, marker_length) == 0) {
+        raz_compiler_rt_arena_destroy(marker_path);
+        return true;
+    }
+    i64 data = raz_compiler_rt_arena_create(65536);
+    i64 processed = raz_compiler_rt_arena_create(65536);
+    i64 chunk_name = raz_compiler_rt_arena_create(256);
+    i64 roots = raz_compiler_rt_arena_create(65536);
+    if (data == 0 || processed == 0 || chunk_name == 0 || roots == 0) { return false; }
+    i64 length = raz_compiler_rt_read_ascii(marker_path, marker_length, data, 65536);
+    raz_compiler_rt_remove_path_ascii(marker_path, marker_length);
+    raz_compiler_rt_arena_destroy(marker_path);
+    if (length <= 0) { return false; }
+
+    i64 processed_length = 0;
+    i64 line_start = 0;
+    while (line_start < length) {
+        i64 line_end = line_start;
+        while (line_end < length && raz_compiler_rt_arena_get(data, line_end) != 10) { line_end += 1; }
+        i64 tab = line_start;
+        while (tab < line_end && raz_compiler_rt_arena_get(data, tab) != 9) { tab += 1; }
+        i64 chunk_length = tab - line_start;
+        if (chunk_length <= 0 || chunk_length > 128 || tab + 1 >= line_end) { return false; }
+        i64 i = 0;
+        while (i < chunk_length) {
+            i64 ch = raz_compiler_rt_arena_get(data, line_start + i);
+            if (!((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 45 || ch == 95)) { return false; }
+            raz_compiler_rt_arena_set(chunk_name, i, ch);
+            i += 1;
+        }
+
+        if (!compiler_web_chunk_already_processed(processed, processed_length, chunk_name, chunk_length)) {
+            i64 roots_length = 0;
+            i64 scan_start = 0;
+            while (scan_start < length) {
+                i64 scan_end = scan_start;
+                while (scan_end < length && raz_compiler_rt_arena_get(data, scan_end) != 10) { scan_end += 1; }
+                i64 scan_tab = scan_start;
+                while (scan_tab < scan_end && raz_compiler_rt_arena_get(data, scan_tab) != 9) { scan_tab += 1; }
+                if (scan_tab <= scan_start || scan_tab + 1 >= scan_end) { return false; }
+                if (compiler_web_chunk_name_equals(data, scan_start, scan_tab - scan_start, chunk_name, chunk_length)) {
+                    i64 handler_start = scan_tab + 1;
+                    i64 handler_length = scan_end - handler_start;
+                    if (handler_length <= 0 || roots_length + handler_length + 1 >= 65536) { return false; }
+                    i = 0;
+                    while (i < handler_length) {
+                        raz_compiler_rt_arena_set(roots, roots_length + i, raz_compiler_rt_arena_get(data, handler_start + i));
+                        i += 1;
+                    }
+                    roots_length += handler_length;
+                    raz_compiler_rt_arena_set(roots, roots_length, 10);
+                    roots_length += 1;
+                }
+                scan_start = scan_end + 1;
+            }
+
+            i64 output_length = 0;
+            i64 output_path = cli_web_wasm_chunk_output_path(manifest_path, manifest_path_length, chunk_name, chunk_length, &mut output_length);
+            bool emitted = output_path != 0 && output_length > 0 && roots_length > 0 && emit_web_wasm_module_roots(
+                input, hir, mir, output_path, output_length, roots, roots_length
+            );
+            if (output_path != 0) { raz_compiler_rt_arena_destroy(output_path); }
+            if (!emitted) { return false; }
+            if (processed_length + chunk_length + 1 >= 65536) { return false; }
+            i = 0;
+            while (i < chunk_length) { raz_compiler_rt_arena_set(processed, processed_length + i, raz_compiler_rt_arena_get(chunk_name, i)); i += 1; }
+            processed_length += chunk_length;
+            raz_compiler_rt_arena_set(processed, processed_length, 10);
+            processed_length += 1;
+        }
+        line_start = line_end + 1;
+    }
+
+    raz_compiler_rt_arena_destroy(data);
+    raz_compiler_rt_arena_destroy(processed);
+    raz_compiler_rt_arena_destroy(chunk_name);
+    raz_compiler_rt_arena_destroy(roots);
+    return true;
+}
+
+public fn compiler_driver_main() -> i64 {
+    write_compiler_diagnostic(80, 0, 0);
+    if (bootstrap_qualifications_requested()) {
+        i64 qualification = run_bootstrap_qualifications();
+
+        if (qualification != 0) {
+            return qualification;
+        }
+    }
+    write_compiler_diagnostic(81, 0, 0);
+    i64 process_argc = raz_compiler_rt_process_argc();
+    if (razup_invoked()) {
+        return razup_command(process_argc);
+    }
+    i64 cli_command = cli_detect_command(process_argc);
+    i64 cli_argc = 0;
+    i64 first_program_argument = 0;
+    if (
+        !cli_prepare_argument_partition(process_argc, cli_command, &mut cli_argc, &mut first_program_argument)
+    ) {
+        return 2;
+    }
+    if (
+        cli_command == 0 &&
+        !cli_argument_starts_with_dash_at(cli_argc, 1) &&
+        !cli_argument_looks_like_path(cli_argc, 1)
+    ) {
+        cli_print_unknown_command_at(cli_argc, 1);
+        return 2;
+    }
+    if (cli_command == 1) {
+        if (cli_argc > 3) {
+            cli_print_invalid_arguments();
+            return 2;
+        }
+        i64 topic = cli_help_topic(cli_argc);
+        if (topic > 0) {
+            cli_print_command_help(topic);
+        } else if (cli_argc > 2) {
+            cli_print_unknown_command_at(cli_argc, 2);
+            return 2;
+        } else {
+            cli_print_general_help();
+        }
+        return 0;
+    }
+    if (cli_command == 2) {
+        if (cli_argc != 2) {
+            cli_print_invalid_arguments();
+            return 2;
+        }
+        cli_print_version();
+        return 0;
+    }
+    if (cli_command_help_requested(cli_argc, cli_command)) {
+        cli_print_command_help(cli_command);
+        return 0;
+    }
+    bool auxiliary_handled = false;
+    i64 auxiliary_status = driver_command_dispatch(cli_argc, cli_command, &mut auxiliary_handled);
+    if (auxiliary_handled) {
+        return auxiliary_status;
+    }
+    i64 backend = backend_default();
+    if (cli_command == 5) {
+        backend = 0;
+    }
+    if (cli_command == 6) {
+        backend = 1;
+    }
+    bool forge_native = false;
+    bool forge_structured_only = false;
+    bool profile_queries = cli_command == 11;
+    bool run_after_build = cli_command == 12;
+    bool dev_server = cli_command == 45;
+    bool test_after_build = cli_command == 16;
+    bool bench_after_build = cli_command == 40;
+    i64 bench_iterations = 10;
+    i64 test_filter = raz_compiler_rt_arena_create(4096);
+    i64 test_filter_length = 0;
+    bool check_only = cli_command == 4 || cli_command == 11 || cli_command == 17;
+    i64 requested_features = raz_compiler_rt_arena_create(4096);
+    i64 requested_features_length = 0;
+    i64 dev_host = raz_compiler_rt_arena_create(256);
+    i64 dev_host_length = 9;
+    i64 dev_port = 3000;
+    if (dev_host != 0) {
+        string default_dev_host = "127.0.0.1";
+        i64 dev_host_i = 0;
+        while (dev_host_i < dev_host_length) {
+            raz_compiler_rt_arena_set(dev_host, dev_host_i, compiler_literal_byte(default_dev_host, dev_host_i));
+            dev_host_i += 1;
+        }
+    }
+    bool all_features = false;
+    bool default_features = true;
+    bool release_profile = false;
+    bool force_build = false;
+    bool analyze_web_bundle = false;
+    i64 cli_started_nanos = raz_compiler_rt_monotonic_nanos();
+    if (requested_features == 0 || test_filter == 0 || dev_host == 0) {
+        return 40;
+    }
+    LlvmTargetOptions llvm_options;
+    llvm_target_options_init(&mut llvm_options);
+    i64 argument_base = cli_command_argument_base(cli_command);
+    bool scanning_options = true;
+    while (scanning_options && argument_base < cli_argc) {
+        i64 option_argument = raz_compiler_rt_arena_create(4096);
+
+        if (option_argument == 0) {
+            return 55;
+        }
+
+        i64 option_length = raz_compiler_rt_process_arg(argument_base, option_argument, 4096);
+
+        if (option_length <= 0) {
+            return 55;
+        }
+
+        i64 global_output = cli_global_output_option_consumed(cli_argc, argument_base, option_argument, option_length);
+        if (global_output < 0) {
+            cli_print_invalid_arguments();
+            return 2;
+        }
+        if (global_output > 0) {
+            argument_base += global_output;
+            raz_compiler_rt_arena_destroy(option_argument);
+            continue;
+        }
+        i64 diagnostic_output = cli_diagnostic_format_option_consumed(cli_argc, argument_base, option_argument, option_length);
+        if (diagnostic_output < 0) {
+            cli_print_invalid_arguments();
+            return 2;
+        }
+        if (diagnostic_output > 0) {
+            argument_base += diagnostic_output;
+            raz_compiler_rt_arena_destroy(option_argument);
+            continue;
+        }
+        i64 warning_policy = cli_warning_policy_option_consumed(cli_argc, argument_base, option_argument, option_length);
+        if (warning_policy < 0) {
+            cli_print_invalid_arguments();
+            return 2;
+        }
+        if (warning_policy > 0) {
+            argument_base += warning_policy;
+            raz_compiler_rt_arena_destroy(option_argument);
+            continue;
+        }
+
+        i64 profile_option = cli_profile_option_consumed(cli_argc, argument_base, option_argument, option_length, &mut release_profile);
+        if (profile_option < 0) {
+            if (!cli_arg_equals_literal(option_argument, option_length, "--profile")) { cli_print_invalid_arguments(); }
+            return 2;
+        }
+        if (profile_option > 0) {
+            argument_base += profile_option;
+            raz_compiler_rt_arena_destroy(option_argument);
+            continue;
+        }
+        if (cli_force_option(option_argument, option_length)) {
+            force_build = true;
+            argument_base += 1;
+            raz_compiler_rt_arena_destroy(option_argument);
+            continue;
+        }
+
+        i64 backend_shortcut = cli_backend_shortcut(option_argument, option_length);
+        i64 bench_option = 0;
+        i64 test_filter_option = 0;
+        i64 dev_port_option = 0;
+        i64 dev_host_option = 0;
+
+        if (dev_server) {
+            dev_port_option = cli_dev_port_option(option_argument, option_length);
+            dev_host_option = cli_dev_host_option(option_argument, option_length, dev_host, 256);
+            if (dev_port_option < 0 || dev_host_option < 0) {
+                cli_print_invalid_arguments();
+                return 2;
+            }
+        }
+        if (test_after_build) {
+            test_filter_option = cli_test_filter_option(option_argument, option_length, test_filter, 4096);
+            if (test_filter_option < 0) {
+                cli_print_invalid_arguments();
+                return 2;
+            }
+        }
+        if (bench_after_build) {
+            bench_option = cli_bench_iterations_option(option_argument, option_length);
+            if (bench_option < 0) {
+                cli_print_invalid_arguments();
+                return 2;
+            }
+        }
+        if (dev_port_option > 0) {
+            dev_port = dev_port_option;
+            argument_base += 1;
+        } else if (dev_host_option > 0) {
+            dev_host_length = dev_host_option;
+            argument_base += 1;
+        } else if (test_filter_option > 0) {
+            test_filter_length = test_filter_option;
+            argument_base += 1;
+        } else if (bench_option > 0) {
+            bench_iterations = bench_option;
+            argument_base += 1;
+        } else if (path_is_check_option(option_argument, option_length)) {
+            check_only = true;
+            argument_base += 1;
+        } else if (cli_analyze_option(option_argument, option_length)) {
+            analyze_web_bundle = true;
+            argument_base += 1;
+        } else if (cli_release_option(option_argument, option_length)) {
+            if (dev_server) {
+                cli_print_invalid_arguments();
+                return 2;
+            }
+            release_profile = true;
+            argument_base += 1;
+        } else if (backend_shortcut >= 0) {
+            backend = backend_shortcut;
+            argument_base += 1;
+        } else if (profile_queries_option(option_argument, option_length)) {
+            profile_queries = true;
+            argument_base += 1;
+        } else if (forge_native_option(option_argument, option_length)) {
+            forge_native = true;
+            argument_base += 1;
+        } else if (forge_structured_only_option(option_argument, option_length)) {
+            forge_native = true;
+            forge_structured_only = true;
+            argument_base += 1;
+        } else if (backend_option_present(option_argument, option_length)) {
+            backend = backend_option_kind(option_argument, option_length);
+            if (backend < 0) {
+                cli_print_unknown_option(option_argument, option_length);
+                return 2;
+            }
+            argument_base += 1;
+        } else if (cli_entry_override_option(option_argument, option_length)) {
+            argument_base += 1;
+        } else if (cli_all_features_option(option_argument, option_length)) {
+            all_features = true;
+            argument_base += 1;
+        } else if (cli_no_default_features_option(option_argument, option_length)) {
+            default_features = false;
+            argument_base += 1;
+        } else {
+            i64 feature_option_length = cli_features_option(
+                option_argument,
+                option_length,
+                requested_features,
+                4096,
+            );
+            if (feature_option_length < 0) {
+                cli_print_unknown_option(option_argument, option_length);
+                return 2;
+            }
+            if (feature_option_length > 0) {
+                requested_features_length = feature_option_length;
+                argument_base += 1;
+                raz_compiler_rt_arena_destroy(option_argument);
+                continue;
+            }
+
+            i64 parsed_option = llvm_parse_target_option(&mut llvm_options, option_argument, option_length);
+
+            if (parsed_option < 0) {
+                cli_print_unknown_option(option_argument, option_length);
+                return 2;
+            }
+            if (parsed_option > 0) {
+                argument_base += 1;
+            } else if (cli_arg_starts_with_dash(option_argument, option_length)) {
+                if (cli_known_command_specific_option(option_argument, option_length)) {
+                    cli_print_option_not_valid_for_command(option_argument, option_length, cli_command);
+                } else {
+                    cli_print_unknown_option(option_argument, option_length);
+                }
+                return 2;
+            } else {
+                scanning_options = false;
+                raz_compiler_rt_arena_destroy(option_argument);
+            }
+        }
+    }
+    if (backend != 1 && llvm_target_options_require_llvm(&llvm_options)) {
+        cli_print_invalid_arguments();
+        return 2;
+    }
+    if (backend != 0 && (forge_native || forge_structured_only)) {
+        cli_print_invalid_arguments();
+        return 2;
+    }
+    if (backend == 1 && llvm_cross_target_executable_requires_runtime(&llvm_options)) {
+        cli_print_cross_target_runtime_required();
+        return 2;
+    }
+    i64 positional_indices[2] = [-1, -1];
+    i64 positional_count = 0;
+    i64 scan_index = argument_base;
+    while (scan_index < cli_argc) {
+        i64 arg = raz_compiler_rt_arena_create(4096);
+        if (arg == 0) { return 40; }
+        i64 arg_length = raz_compiler_rt_process_arg(scan_index, arg, 4096);
+        i64 global = cli_global_output_option_consumed(cli_argc, scan_index, arg, arg_length);
+        if (global < 0) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { raz_compiler_rt_arena_destroy(arg); scan_index += global; continue; }
+        i64 diagnostic = cli_diagnostic_format_option_consumed(cli_argc, scan_index, arg, arg_length);
+        if (diagnostic < 0) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        if (diagnostic > 0) { raz_compiler_rt_arena_destroy(arg); scan_index += diagnostic; continue; }
+        i64 warning_policy = cli_warning_policy_option_consumed(cli_argc, scan_index, arg, arg_length);
+        if (warning_policy < 0) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        if (warning_policy > 0) { raz_compiler_rt_arena_destroy(arg); scan_index += warning_policy; continue; }
+        i64 profile = cli_profile_option_consumed(cli_argc, scan_index, arg, arg_length, &mut release_profile);
+        if (profile < 0) { raz_compiler_rt_arena_destroy(arg); return 2; }
+        if (profile > 0) { raz_compiler_rt_arena_destroy(arg); scan_index += profile; continue; }
+        if (cli_force_option(arg, arg_length)) { force_build = true; raz_compiler_rt_arena_destroy(arg); scan_index += 1; continue; }
+        if (cli_arg_starts_with_dash(arg, arg_length)) {
+            if (cli_known_command_specific_option(arg, arg_length)) { cli_print_option_not_valid_for_command(arg, arg_length, cli_command); }
+            else { cli_print_unknown_option(arg, arg_length); }
+            raz_compiler_rt_arena_destroy(arg);
+            return 2;
+        }
+        if (positional_count >= 2) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        positional_indices[positional_count] = scan_index;
+        positional_count += 1;
+        raz_compiler_rt_arena_destroy(arg);
+        scan_index += 1;
+    }
+    i64 remaining_argc = positional_count;
+
+    if (remaining_argc > 2 || (dev_server && remaining_argc > 1)) { cli_print_invalid_arguments(); return 2; }
+    if ((cli_command == 4 || cli_command == 11 || cli_command == 16 || cli_command == 17 || cli_command == 40) && remaining_argc > 1) { cli_print_invalid_arguments(); return 2; }
+    if (cli_command == 10 && remaining_argc != 2) { cli_print_invalid_arguments(); return 2; }
+
+    i64 cli_manifest_path = 0;
+    i64 cli_manifest_length = 0;
+    i64 cli_output_path = 0;
+    i64 cli_output_length = 0;
+    if (positional_count > 0) {
+        cli_manifest_path = raz_compiler_rt_arena_create(4096);
+        if (cli_manifest_path == 0) { return 55; }
+        cli_manifest_length = raz_compiler_rt_process_arg(positional_indices[0], cli_manifest_path, 4096);
+        if (cli_manifest_length <= 0) { return 55; }
+    }
+    if (positional_count > 1) {
+        cli_output_path = raz_compiler_rt_arena_create(4096);
+        if (cli_output_path == 0) { return 55; }
+        cli_output_length = raz_compiler_rt_process_arg(positional_indices[1], cli_output_path, 4096);
+        if (cli_output_length <= 0) { return 55; }
+    }
+    if (cli_manifest_path == 0) {
+        i64 default_manifest = raz_compiler_rt_arena_create(8);
+
+        if (default_manifest == 0) {
+            return 40;
+        }
+
+        string default_manifest_bytes = "raz.toml";
+        i64 default_manifest_index = 0;
+
+        while (default_manifest_index < 8) {
+            raz_compiler_rt_arena_set(
+                default_manifest,
+                default_manifest_index,
+                compiler_literal_byte(default_manifest_bytes, default_manifest_index),
+            );
+            default_manifest_index += 1;
+        }
+        if (raz_compiler_rt_path_exists_ascii(default_manifest, 8) != 0) {
+            cli_manifest_path = default_manifest;
+            cli_manifest_length = 8;
+        } else {
+            raz_compiler_rt_arena_destroy(default_manifest);
+        }
+    }
+    if (cli_manifest_path == 0 || cli_manifest_length <= 0) {
+        cli_print_missing_input();
+        return 2;
+    }
+    if (raz_compiler_rt_path_exists_ascii(cli_manifest_path, cli_manifest_length) == 0) {
+        cli_print_missing_path(cli_manifest_path, cli_manifest_length);
+        return 2;
+    }
+    if (raz_compiler_rt_path_is_dir_ascii(cli_manifest_path, cli_manifest_length) == 1) {
+        string manifest_suffix = "/raz.toml";
+        if (cli_manifest_length + 9 > 4096) { return 55; }
+        i64 suffix_index = 0;
+        while (suffix_index < 9) {
+            raz_compiler_rt_arena_set(cli_manifest_path, cli_manifest_length + suffix_index, compiler_literal_byte(manifest_suffix, suffix_index));
+            suffix_index += 1;
+        }
+        cli_manifest_length += 9;
+        if (raz_compiler_rt_path_exists_ascii(cli_manifest_path, cli_manifest_length) == 0) {
+            cli_print_missing_path(cli_manifest_path, cli_manifest_length);
+            return 2;
+        }
+    }
+
+    bool direct_source = path_has_rz_extension(cli_manifest_path, cli_manifest_length);
+    bool project_manifest = path_has_toml_extension(cli_manifest_path, cli_manifest_length);
+    // One manifest classification drives every web path. Mode 1 is the normal
+    // target=web static-first pipeline; mode 2 preserves legacy kind=web
+    // component applications while both share the same frontend/HIR/MIR.
+    i64 web_mode = 0;
+    if (project_manifest) { web_mode = project_manifest_web_mode(cli_manifest_path, cli_manifest_length); }
+    bool web_target = web_mode == 1;
+    bool web_project = web_mode == 2;
+    bool web_build = web_mode != 0;
+    if (analyze_web_bundle && (!web_build || !release_profile)) {
+        cli_write_literal("error: --analyze requires a target=web release build\n");
+        return 2;
+    }
+    if (dev_server && !web_build) {
+        cli_print_dev_requires_web();
+        return 2;
+    }
+    if (web_project) {
+        backend = 2;
+        forge_native = false;
+        forge_structured_only = false;
+    }
+
+    if (run_after_build && direct_source && first_program_argument < process_argc) {
+        cli_print_invalid_arguments();
+        return 2;
+    }
+
+    ProjectNativeBuild native_build;
+
+    project_native_build_init(&mut native_build);
+    if ((cli_command == 3 || cli_command == 12 || cli_command == 45) && project_manifest && !web_project && cli_output_path == 0) {
+        if (
+            !project_prepare_default_native_build(
+                cli_manifest_path,
+                cli_manifest_length,
+                release_profile,
+                backend,
+                &mut llvm_options.optimization_kind,
+                &mut llvm_options.emit_kind,
+                &mut forge_native,
+                &mut cli_output_path,
+                &mut cli_output_length,
+                &mut native_build,
+            )
+        ) {
+            cli_print_native_path_failure();
+            return 40;
+        }
+    }
+
+    i64 manifest_capacity = 65536;
+    // Source text is byte data. Keep a generous aggregate ceiling without paying
+    // the old 8-byte-cell cost per source byte; the compiler arena ABI records
+    // width so every existing checked get/set/copy path remains valid.
+    i64 source_capacity = 16777216;
+    i64 module_capacity = 4194304;
+    // intentional-byte-array: raw stage1 manifest path for the i64-pointer runtime file ABI.
+    i64 manifest_path[18] = [115, 116, 97, 103, 101, 49, 45, 112, 97, 99, 107, 97, 103, 101, 46, 116, 120, 116];
+    i64 manifest = raz_compiler_rt_arena_create(manifest_capacity);
+
+    if (manifest == 0) {
+        return 40;
+    }
+
+    i64 manifest_length = 0;
+
+    if (!direct_source && !project_manifest) {
+        if (cli_manifest_path != 0) {
+            manifest_length = raz_compiler_rt_read_ascii(
+                cli_manifest_path,
+                cli_manifest_length,
+                manifest,
+                manifest_capacity,
+            );
+        } else {
+            manifest_length = raz_rt_read_ascii_i64(&mut manifest_path[0], 18, manifest, manifest_capacity);
+        }
+        if (manifest_length <= 0 || manifest_length >= manifest_capacity) {
+            return 40;
+        }
+    }
+
+    i64 bytes = raz_compiler_rt_arena_create_width(source_capacity, 1);
+
+    if (bytes == 0) {
+        raz_compiler_rt_arena_destroy(manifest);
+        return 40;
+    }
+
+    i64 length = 0;
+    i64 cursor = 0;
+    i64 module_count = 0;
+
+    if (project_manifest) {
+        // Build/check/run/test hydrate exact locked registry packages automatically.
+        // Users should not need a separate `raz fetch` after cloning a project.
+
+        i64 dependency_status = package_registry_prepare_build(cli_manifest_path, cli_manifest_length);
+
+        if (dependency_status != 0) {
+            return registry_report_status(dependency_status);
+        }
+        write_compiler_diagnostic(82, 0, 0);
+        if (
+            !project_load_sources_incremental(
+                cli_manifest_path,
+                cli_manifest_length,
+                bytes,
+                source_capacity,
+                module_capacity,
+                test_after_build,
+                all_features,
+                default_features,
+                requested_features,
+                requested_features_length,
+                &mut length,
+                &mut module_count,
+            )
+        ) {
+            cli_print_project_source_failure();
+            return 40;
+        }
+    }
+    if (direct_source) {
+        i64 module_bytes = raz_compiler_rt_arena_create_width(module_capacity, 1);
+
+        if (module_bytes == 0) {
+            return 40;
+        }
+        i64 module_length = raz_compiler_rt_read_ascii(
+            cli_manifest_path,
+            cli_manifest_length,
+            module_bytes,
+            module_capacity,
+        );
+        if (module_length <= 0 || module_length >= module_capacity || module_length + 1 >= source_capacity) {
+            return 40;
+        }
+        if (!append_source_origin_marker(bytes, &mut length, source_capacity, cli_manifest_path, cli_manifest_length)) {
+            raz_compiler_rt_arena_destroy(module_bytes);
+            return 40;
+        }
+        if (raz_compiler_rt_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length) {
+            raz_compiler_rt_arena_destroy(module_bytes);
+            return 40;
+        }
+        length += module_length;
+        raz_compiler_rt_arena_set(bytes, length, 10);
+        length += 1;
+        module_count = 1;
+        raz_compiler_rt_arena_destroy(module_bytes);
+    }
+    while (!direct_source && !project_manifest && cursor < manifest_length) {
+        while (
+            cursor < manifest_length &&
+            (
+                raz_compiler_rt_arena_get(manifest, cursor) == 10 ||
+                raz_compiler_rt_arena_get(manifest, cursor) == 13 ||
+                raz_compiler_rt_arena_get(manifest, cursor) == 32 ||
+                raz_compiler_rt_arena_get(manifest, cursor) == 9
+            )
+        ) {
+            cursor += 1;
+        }
+        if (cursor >= manifest_length) {
+            cursor = manifest_length;
+        } else {
+            i64 path[256];
+            i64 path_length = 0;
+
+            while (
+                cursor < manifest_length &&
+                raz_compiler_rt_arena_get(manifest, cursor) != 10 &&
+                raz_compiler_rt_arena_get(manifest, cursor) != 13
+            ) {
+                if (path_length >= 255) {
+                    return 40;
+                }
+                path[path_length] = raz_compiler_rt_arena_get(manifest, cursor);
+                path_length += 1;
+                cursor += 1;
+            }
+            while (path_length > 0 && (path[path_length - 1] == 32 || path[path_length - 1] == 9)) {
+                path_length -= 1;
+            }
+            if (path_length > 0) {
+                i64 module_bytes = raz_compiler_rt_arena_create_width(module_capacity, 1);
+
+                if (module_bytes == 0) {
+                    return 40;
+                }
+                i64 module_length = raz_rt_read_ascii_i64(
+                    &mut path[0],
+                    path_length,
+                    module_bytes,
+                    module_capacity,
+                );
+                if (
+                    module_length <= 0 ||
+                    module_length >= module_capacity ||
+                    length + module_length + 1 >= source_capacity
+                ) {
+                    return 40;
+                }
+                if (
+                    raz_compiler_rt_arena_copy(bytes, length, module_bytes, 0, module_length) != module_length
+                ) {
+                    raz_compiler_rt_arena_destroy(module_bytes);
+                    return 40;
+                }
+                length += module_length;
+                raz_compiler_rt_arena_set(bytes, length, 10);
+                length += 1;
+                module_count += 1;
+                raz_compiler_rt_arena_destroy(module_bytes);
+            }
+        }
+    }
+    if (module_count <= 0) {
+        cli_print_project_source_failure();
+        return 40;
+    }
+    write_compiler_diagnostic(90, module_count, length);
+
+    Source input;
+    input.bytes = bytes;
+    input.length = length;
+    i64 backend_options_key = backend_codegen_cache_key(backend, &llvm_options);
+    if (cli_emit_copy_move_warning(&input)) {
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
+        project_native_build_destroy(&mut native_build);
+        return 43;
+    }
+
+    i64 cache_restore_kind = incremental_restore_kind(
+        check_only,
+        profile_queries,
+        test_after_build,
+        run_after_build,
+        cli_manifest_path,
+        cli_manifest_length,
+        &input,
+        backend,
+        llvm_options.emit_kind,
+        backend_options_key,
+        forge_native,
+        forge_structured_only,
+        release_profile,
+        cli_output_path,
+        cli_output_length,
+    );
+    // target=web first executes its native build-time page generator and then
+    // emits browser WASM only when that generator reports interactive routes.
+    // Until the artifact cache records that interaction bit directly, retain the
+    // frontend cache but run the backend path so an interactive rebuild always
+    // has HIR/MIR available for app.wasm.
+    if (web_build || force_build) { cache_restore_kind = 0; }
+    if (cache_restore_kind != 0) {
+        write_compiler_diagnostic(96, cache_restore_kind, length);
+        if (cache_restore_kind == 1) {
+            cli_print_status(3, cli_manifest_path, cli_manifest_length);
+        }
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+        if (web_target && cache_restore_kind == 1 && !cli_prepare_web_dist(cli_manifest_path, cli_manifest_length)) {
+            return 56;
+        }
+        i64 restored_status = cli_maybe_run_artifact(
+            (run_after_build || web_target) && cache_restore_kind == 1,
+            cli_output_path,
+            cli_output_length,
+            first_program_argument,
+            process_argc,
+        );
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
+        project_native_build_destroy(&mut native_build);
+        return restored_status;
+    }
+    cli_print_dependency_compile_statuses(cli_command, &input, cli_manifest_path, cli_manifest_length);
+    cli_print_compile_status(cli_command, cli_manifest_path, cli_manifest_length);
+    // bytes. Avoid a second full-file lexer pass here: on the production compiler
+    // this source is large and arena-backed, so the redundant preflight scan was
+    // a measurable bootstrap cost with no additional correctness coverage.
+    write_compiler_diagnostic(91, 0, length);
+    // available as a bootstrap/preflight utility, but production compilation no
+    // longer parses the source twice or lets a compact syntax subset reject a
+    // construct before the authoritative frontend sees it.
+    write_compiler_diagnostic(92, 0, 0);
+
+    HirModule hir;
+    HirIncrementalCheckHints check_hints;
+
+    bool package_units_reuse =
+        !check_only &&
+        backend == 0 &&
+        native_build.active &&
+        !web_build &&
+        project_package_units_cache_ready(&native_build, &input, backend_options_key);
+
+    incremental_init_check_hints(&mut check_hints);
+    if (check_only || package_units_reuse) {
+        incremental_load_check_hints(cli_manifest_path, cli_manifest_length, &mut check_hints);
+    }
+    // Dependency native units are emitted one object per package. A partial HIR
+    // therefore has to keep every body in a package whenever any sibling module
+    // in that package is dirty; otherwise refreshing that object would silently
+    // discard symbols owned by clean sibling modules.
+    if (package_units_reuse && check_hints.enabled != 0) {
+        check_hints.package_body_coherent = 1;
+    }
+
+    bool hir_built = false;
+    i64 hir_started_nanos = raz_compiler_rt_monotonic_nanos();
+
+    if ((check_only || package_units_reuse) && check_hints.enabled != 0) {
+        hir_built = build_hir_with_check_hints(input, &mut check_hints, &mut hir);
+    } else {
+        package_units_reuse = false;
+        hir_built = build_hir(input, &mut hir);
+    }
+    compiler_phase_trace("hir", hir_started_nanos);
+    incremental_destroy_check_hints(&mut check_hints);
+    if (!hir_built) {
+        write_compiler_diagnostic(2, diagnostic_code_value(hir.diagnostic_code), hir.diagnostic_offset);
+        cli_render_frontend_diagnostic(&input, hir.diagnostic_code, hir.diagnostic_offset);
+        return 43;
+    }
+    bool web_application = web_project;
+    if (web_target && compiler_web_main_returns_component(&input, &hir)) {
+        web_application = true;
+    }
+
+    i64 hir_post_started_nanos = raz_compiler_rt_monotonic_nanos();
+    incremental_store_check(cli_manifest_path, cli_manifest_length, &input);
+    incremental_classify_module_changes(cli_manifest_path, cli_manifest_length, &mut hir);
+    incremental_load_module_cache_state(cli_manifest_path, cli_manifest_length, &mut hir);
+    incremental_persist_module_fingerprints(cli_manifest_path, cli_manifest_length, &hir);
+    compiler_phase_trace("hir-post", hir_post_started_nanos);
+    if (profile_queries) {
+        write_query_profile(&hir);
+    }
+    if (check_only) {
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+        destroy_hir(&mut hir);
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
+        return 0;
+    }
+    write_compiler_diagnostic(
+        93,
+        raz_compiler_rt_arena_get(hir.function_statement_counts, 0),
+        raz_compiler_rt_arena_get(
+            hir.statement_kinds,
+            raz_compiler_rt_arena_get(hir.function_statement_starts, 0),
+        ),
+    );
+
+    MirModule mir;
+    i64 mir_lower_started_nanos = raz_compiler_rt_monotonic_nanos();
+
+    if (!lower_hir(&hir, &mut mir)) {
+        write_compiler_diagnostic(3, 0, 0);
+        destroy_hir(&mut hir);
+        return 44;
+    }
+    compiler_phase_trace("hir-to-mir", mir_lower_started_nanos);
+    i64 mir_pipeline_started_nanos = raz_compiler_rt_monotonic_nanos();
+    if (!verify_mir_ownership_semantics(&mir)) {
+        write_compiler_diagnostic(3, mir.function_count, mir.instruction_count);
+        destroy_mir(&mut mir);
+        destroy_hir(&mut hir);
+        return 45;
+    }
+    if (!run_mir_pipeline(&mut mir, llvm_options.optimization_kind)) {
+        write_compiler_diagnostic(3, mir.function_count, mir.instruction_count);
+        destroy_mir(&mut mir);
+        destroy_hir(&mut hir);
+        return 45;
+    }
+    if (!verify_mir_ownership_semantics(&mir)) {
+        write_compiler_diagnostic(3, mir.function_count, mir.instruction_count);
+        destroy_mir(&mut mir);
+        destroy_hir(&mut hir);
+        return 45;
+    }
+    compiler_phase_trace("mir-pipeline", mir_pipeline_started_nanos);
+    i64 mir_persist_started_nanos = raz_compiler_rt_monotonic_nanos();
+    incremental_persist_module_mir_state(cli_manifest_path, cli_manifest_length, &hir, &mut mir);
+    incremental_persist_mir_units(cli_manifest_path, cli_manifest_length, &hir, &mut mir);
+    compiler_phase_trace("mir-persist", mir_persist_started_nanos);
+    write_compiler_diagnostic(94, mir.function_count, mir.instruction_count);
+    if (test_after_build || bench_after_build) {
+        cli_print_status(5, cli_manifest_path, cli_manifest_length);
+
+        i64 execution_status = 0;
+
+        if (test_after_build) {
+            execution_status = execute_mir_tests(&input, &hir, &mut mir, test_filter, test_filter_length);
+        } else {
+            execution_status = execute_mir_benches(&input, &hir, &mut mir, bench_iterations);
+        }
+        if (execution_status == 0) {
+            cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+        }
+        destroy_mir(&mut mir);
+        destroy_hir(&mut hir);
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
+        return execution_status;
+    }
+    // A project run links a real executable and launches it, so what `raz run`
+    // reports is what the program actually does. Only a direct-source run, which
+    // produces no artifact to launch, still goes through the MIR interpreter.
+    if (run_after_build && cli_output_path == 0 && !web_application) {
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+        cli_print_status(4, cli_manifest_path, cli_manifest_length);
+
+        i64 run_status = execute_mir_main(&hir, &mut mir);
+
+        destroy_mir(&mut mir);
+        destroy_hir(&mut hir);
+        cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, 0);
+        return run_status;
+    }
+
+    i64 backend_output_path = cli_output_path;
+    i64 backend_output_length = cli_output_length;
+    i64 llvm_sidecar_path = 0;
+
+    project_native_backend_output(
+        &native_build,
+        backend,
+        &mut backend_output_path,
+        &mut backend_output_length
+    );
+    if (backend == 1 && llvm_options.emit_kind != 0) {
+        if (cli_output_path == 0 || cli_output_length <= 0) {
+            return 46;
+        }
+        llvm_sidecar_path = llvm_make_ir_sidecar(cli_output_path, cli_output_length);
+        if (llvm_sidecar_path == 0) {
+            return 46;
+        }
+        backend_output_path = llvm_sidecar_path;
+        backend_output_length = cli_output_length + 3;
+    }
+    i64 backend_started_nanos = raz_compiler_rt_monotonic_nanos();
+    bool package_units_completed = false;
+    i64 web_index_path = 0;
+    i64 web_index_length = 0;
+    i64 web_title = 0;
+    i64 web_title_length = 0;
+    i64 web_custom_index = 0;
+    i64 web_custom_index_length = 0;
+    i64 web_extra_css = 0;
+    i64 web_extra_css_length = 0;
+    i64 web_extra_javascript = 0;
+    i64 web_extra_javascript_length = 0;
+
+    if (web_application) {
+        web_index_path = raz_compiler_rt_arena_create(8192);
+        web_title = raz_compiler_rt_arena_create(4096);
+        web_custom_index = raz_compiler_rt_arena_create(8192);
+        web_extra_css = raz_compiler_rt_arena_create(8192);
+        web_extra_javascript = raz_compiler_rt_arena_create(8192);
+        if (web_index_path == 0 || web_title == 0 || web_custom_index == 0 || web_extra_css == 0 || web_extra_javascript == 0) { return 46; }
+        web_index_length = project_web_output_index(cli_manifest_path, cli_manifest_length, web_index_path, 8192);
+        web_title_length = project_web_title(cli_manifest_path, cli_manifest_length, web_title, 4096);
+        web_custom_index_length = project_web_optional_path(cli_manifest_path, cli_manifest_length, "index", web_custom_index, 8192);
+        web_extra_css_length = project_web_optional_path(cli_manifest_path, cli_manifest_length, "css", web_extra_css, 8192);
+        web_extra_javascript_length = project_web_optional_path(cli_manifest_path, cli_manifest_length, "javascript", web_extra_javascript, 8192);
+        if (
+            web_index_length <= 0 || web_title_length <= 0 || web_custom_index_length < 0 ||
+            web_extra_css_length < 0 || web_extra_javascript_length < 0 ||
+            !project_web_copy_public(cli_manifest_path, cli_manifest_length) ||
+            !emit_web_application(
+                &input, &hir, &mir,
+                web_index_path, web_index_length,
+                web_title, web_title_length,
+                web_custom_index, web_custom_index_length,
+                web_extra_css, web_extra_css_length,
+                web_extra_javascript, web_extra_javascript_length,
+                release_profile,
+            )
+        ) {
+            cli_print_backend_emit_failure();
+            return 46;
+        }
+        package_units_completed = true;
+    }
+
+    bool package_units_attempted = backend == 0 && native_build.active && !web_build;
+
+    if (package_units_attempted) {
+        bool units_emitted = project_emit_package_units(
+            &native_build,
+            &input,
+            &hir,
+            &mir,
+            llvm_options.optimization_kind,
+            package_units_reuse,
+        );
+        if (units_emitted) {
+            cli_print_status(12, cli_manifest_path, cli_manifest_length);
+            package_units_completed = project_link_package_units(
+                &native_build,
+                &input,
+                &hir,
+                cli_output_path,
+                cli_output_length,
+                backend_options_key,
+            );
+        }
+        // A partial HIR intentionally omitted clean package bodies. If its
+        // package-object path cannot complete, whole-program emission would be
+        // incomplete; fail this build and force the next invocation to re-seed
+        // from a full HIR rather than silently generating a stale executable.
+        if (package_units_reuse && !package_units_completed) {
+            cli_print_native_link_failure();
+            return 46;
+        }
+    }
+
+    if (!package_units_completed) {
+        // The modular Forge path does not use target/<profile>/obj at all. Only
+        // create the legacy scratch directory if package-unit emission/linking
+        // could not complete and whole-project fallback is genuinely required.
+        if (!project_native_prepare_backend_output(&native_build, backend)) {
+            cli_print_native_path_failure();
+            return 46;
+        }
+        if (
+            !emit_backend_module(
+                backend,
+                forge_native,
+                forge_structured_only,
+                &llvm_options,
+                &input,
+                &hir,
+                &mir,
+                backend_output_path,
+                backend_output_length,
+            )
+        ) {
+            cli_print_backend_emit_failure();
+            return 46;
+        }
+        if (
+            (backend == 1 && llvm_options.emit_kind != 0) ||
+            (backend == 0 && native_build.active)
+        ) {
+            cli_print_status(12, cli_manifest_path, cli_manifest_length);
+        }
+        if (backend == 1 && llvm_options.emit_kind != 0) {
+            if (
+                !llvm_finalize_native_output(
+                    &llvm_options,
+                    backend_output_path,
+                    backend_output_length,
+                    cli_output_path,
+                    cli_output_length,
+                )
+            ) {
+                return 46;
+            }
+        }
+        if (!project_native_build_finish(&native_build, backend, cli_output_path, cli_output_length)) {
+            cli_print_native_link_failure();
+            return 46;
+        }
+    }
+    compiler_phase_trace("backend-emit", backend_started_nanos);
+    if (!web_application) {
+        incremental_store_artifact(
+        cli_manifest_path,
+        cli_manifest_length,
+        &input,
+        backend,
+        llvm_options.emit_kind,
+        backend_options_key,
+        forge_native,
+        forge_structured_only,
+        release_profile,
+        cli_output_path,
+        cli_output_length,
+        );
+    }
+    write_compiler_diagnostic(95, 0, 0);
+    i64 exit_status = 0;
+
+    // Static-first web projects are build-time Raz programs. Run the generator
+    // before deciding whether a browser module exists: Page writes a private
+    // marker only when at least one route binds browser events. Pure static
+    // sites therefore stop here with ordinary HTML/CSS/assets and pay no WASM
+    // code-generation cost at all.
+    if (web_target && !web_application) {
+        if (!cli_prepare_web_dist(cli_manifest_path, cli_manifest_length)) { return 56; }
+        exit_status = cli_maybe_run_artifact(
+            true,
+            cli_output_path,
+            cli_output_length,
+            first_program_argument,
+            process_argc,
+        );
+        if (exit_status == 0) {
+            i64 marker_length = 0;
+            i64 marker_path = cli_web_wasm_required_marker_path(
+                cli_manifest_path,
+                cli_manifest_length,
+                &mut marker_length,
+            );
+            if (marker_path == 0 || marker_length <= 0) { return 56; }
+            bool requires_wasm = raz_compiler_rt_path_exists_ascii(marker_path, marker_length) != 0;
+            i64 browser_roots = 0;
+            i64 browser_roots_length = 0;
+            if (requires_wasm) {
+                browser_roots = raz_compiler_rt_arena_create(65536);
+                if (browser_roots == 0) {
+                    raz_compiler_rt_remove_path_ascii(marker_path, marker_length);
+                    raz_compiler_rt_arena_destroy(marker_path);
+                    return 56;
+                }
+                browser_roots_length = raz_compiler_rt_read_ascii(
+                    marker_path, marker_length, browser_roots, 65536,
+                );
+            }
+            raz_compiler_rt_remove_path_ascii(marker_path, marker_length);
+            raz_compiler_rt_arena_destroy(marker_path);
+
+            if (requires_wasm) {
+                if (browser_roots_length <= 0) {
+                    raz_compiler_rt_arena_destroy(browser_roots);
+                    return 56;
+                }
+                i64 web_wasm_length = 0;
+                i64 web_wasm_path = cli_web_wasm_output_path(cli_manifest_path, cli_manifest_length, &mut web_wasm_length);
+                if (web_wasm_path == 0 || web_wasm_length <= 0) {
+                    raz_compiler_rt_arena_destroy(browser_roots);
+                    return 56;
+                }
+                if (!emit_web_wasm_module_roots(
+                    &input, &hir, &mir, web_wasm_path, web_wasm_length,
+                    browser_roots, browser_roots_length,
+                )) {
+                    raz_compiler_rt_arena_destroy(web_wasm_path);
+                    raz_compiler_rt_arena_destroy(browser_roots);
+                    cli_print_backend_emit_failure();
+                    return 46;
+                }
+                raz_compiler_rt_arena_destroy(web_wasm_path);
+                raz_compiler_rt_arena_destroy(browser_roots);
+            }
+            if (!compiler_emit_web_wasm_chunks(&input, &hir, &mir, cli_manifest_path, cli_manifest_length)) {
+                cli_print_backend_emit_failure();
+                return 46;
+            }
+        }
+    }
+
+    if (exit_status == 0 && web_build) {
+        i64 web_bundle_root = raz_compiler_rt_arena_create(8192);
+        i64 web_bundle_dist_name = raz_compiler_rt_arena_create(4);
+        i64 web_bundle_dist = raz_compiler_rt_arena_create(8192);
+        if (web_bundle_root == 0 || web_bundle_dist_name == 0 || web_bundle_dist == 0) { return 56; }
+        i64 web_bundle_root_length = path_dirname(cli_manifest_path, cli_manifest_length, web_bundle_root, 8192);
+        string web_bundle_dist_literal = "dist";
+        i64 web_bundle_i = 0;
+        while (web_bundle_i < 4) {
+            raz_compiler_rt_arena_set(web_bundle_dist_name, web_bundle_i, compiler_literal_byte(web_bundle_dist_literal, web_bundle_i));
+            web_bundle_i += 1;
+        }
+        i64 web_bundle_dist_length = path_join(web_bundle_root, web_bundle_root_length, web_bundle_dist_name, 4, web_bundle_dist, 8192);
+        bool web_bundle_ok = web_bundle_dist_length > 0 && web_bundle_finalize_dist(web_bundle_dist, web_bundle_dist_length, release_profile);
+        if (web_bundle_ok && analyze_web_bundle) {
+            web_bundle_ok = web_bundle_analyze_dist(
+                web_bundle_dist,
+                web_bundle_dist_length,
+                cli_manifest_path,
+                cli_manifest_length
+            );
+        }
+        raz_compiler_rt_arena_destroy(web_bundle_root);
+        raz_compiler_rt_arena_destroy(web_bundle_dist_name);
+        raz_compiler_rt_arena_destroy(web_bundle_dist);
+        if (!web_bundle_ok) { return 56; }
+    }
+
+    if (exit_status == 0) {
+        // Package Fresh status tracks the last successfully completed build,
+        // not the most recent semantic check.  Advancing this display state
+        // during `raz check` can make a later build claim that an older native
+        // package object is fresh even when the native-unit fingerprint marker
+        // correctly forces regeneration.
+        incremental_persist_package_state(cli_manifest_path, cli_manifest_length, &input);
+        cli_print_completion_summary(cli_command, release_profile, cli_started_nanos);
+    }
+    if ((dev_server && web_build) || (web_application && run_after_build)) {
+        i64 compiler_path = raz_compiler_rt_arena_create(8192);
+        i64 web_root = raz_compiler_rt_arena_create(8192);
+        i64 web_dist = raz_compiler_rt_arena_create(8192);
+        if (compiler_path == 0 || web_root == 0 || web_dist == 0) {
+            exit_status = -1;
+        } else {
+            i64 compiler_path_length = raz_compiler_rt_process_arg(0, compiler_path, 8192);
+            i64 web_root_length = path_dirname(cli_manifest_path, cli_manifest_length, web_root, 8192);
+            i64 web_dist_length = 0;
+            if (web_application && web_index_path != 0 && web_index_length > 0) {
+                web_dist_length = path_dirname(web_index_path, web_index_length, web_dist, 8192);
+            } else {
+                i64 dist_name = raz_compiler_rt_arena_create(4);
+                if (dist_name != 0) {
+                    string dist_literal = "dist";
+                    i64 dist_i = 0;
+                    while (dist_i < 4) {
+                        raz_compiler_rt_arena_set(dist_name, dist_i, compiler_literal_byte(dist_literal, dist_i));
+                        dist_i += 1;
+                    }
+                    web_dist_length = path_join(web_root, web_root_length, dist_name, 4, web_dist, 8192);
+                    raz_compiler_rt_arena_destroy(dist_name);
+                }
+            }
+            if (compiler_path_length <= 0 || web_root_length <= 0 || web_dist_length <= 0) {
+                exit_status = -1;
+            } else {
+                i64 server_port = 3000;
+                if (dev_server) { server_port = dev_port; }
+                exit_status = raz_compiler_rt_web_dev_server_ascii(
+                    compiler_path, compiler_path_length,
+                    cli_manifest_path, cli_manifest_length,
+                    web_root, web_root_length,
+                    web_dist, web_dist_length,
+                    dev_host, dev_host_length,
+                    server_port,
+                );
+            }
+        }
+        if (web_dist != 0) { raz_compiler_rt_arena_destroy(web_dist); }
+        if (web_root != 0) { raz_compiler_rt_arena_destroy(web_root); }
+        if (compiler_path != 0) { raz_compiler_rt_arena_destroy(compiler_path); }
+    } else if (!web_build) {
+        exit_status = cli_maybe_run_artifact(
+            run_after_build,
+            cli_output_path,
+            cli_output_length,
+            first_program_argument,
+            process_argc,
+        );
+    }
+    destroy_mir(&mut mir);
+    destroy_hir(&mut hir);
+    cli_release_compilation_arenas(bytes, manifest, cli_manifest_path, cli_output_path);
+    if (llvm_sidecar_path != 0) {
+        raz_compiler_rt_arena_destroy(llvm_sidecar_path);
+    }
+    if (web_index_path != 0) { raz_compiler_rt_arena_destroy(web_index_path); }
+    if (web_title != 0) { raz_compiler_rt_arena_destroy(web_title); }
+    if (web_custom_index != 0) { raz_compiler_rt_arena_destroy(web_custom_index); }
+    if (web_extra_css != 0) { raz_compiler_rt_arena_destroy(web_extra_css); }
+    if (web_extra_javascript != 0) { raz_compiler_rt_arena_destroy(web_extra_javascript); }
+    project_native_build_destroy(&mut native_build);
+    if (dev_host != 0) { raz_compiler_rt_arena_destroy(dev_host); }
+    return exit_status;
+}

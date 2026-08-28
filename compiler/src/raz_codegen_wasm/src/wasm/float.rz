@@ -1,0 +1,433 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::float;
+
+public import raz_codegen_wasm::globals;
+
+fn wasm_float_is_f32(i64 type_kind) -> bool {
+    return type_kind == 11;
+}
+
+fn wasm_float_valtype(i64 type_kind) -> i64 {
+    if (type_kind == 11) {
+        return 125;
+    }
+    return 124;
+}
+
+fn wasm_float_emit_bits_to_value(ForgeWriter&mut out, i64 type_kind) {
+    if (type_kind == 11) {
+        wasm_u8(out, 167);
+        // i32.wrap_i64
+        wasm_u8(out, 190);
+        // f32.reinterpret_i32
+    } else {
+        wasm_u8(out, 191);
+        // f64.reinterpret_i64
+    }
+}
+
+fn wasm_float_emit_value_to_bits(ForgeWriter&mut out, i64 type_kind) {
+    if (type_kind == 11) {
+        wasm_u8(out, 188);
+        // i32.reinterpret_f32
+        wasm_u8(out, 173);
+        // i64.extend_i32_u
+    } else {
+        wasm_u8(out, 189);
+        // i64.reinterpret_f64
+    }
+}
+
+fn wasm_float_emit_memory_load(ForgeWriter&mut out, i64 type_kind) {
+    if (type_kind == 11) {
+        wasm_u8(out, 42);
+        // f32.load align=4 offset=0
+        wasm_u32(out, 2);
+        wasm_u32(out, 0);
+    } else {
+        wasm_u8(out, 43);
+        // f64.load align=8 offset=0
+        wasm_u32(out, 3);
+        wasm_u32(out, 0);
+    }
+    wasm_float_emit_value_to_bits(out, type_kind);
+}
+
+fn wasm_float_emit_memory_store(ForgeWriter&mut out, i64 type_kind) {
+    wasm_float_emit_bits_to_value(out, type_kind);
+    if (type_kind == 11) {
+        wasm_u8(out, 56);
+        // f32.store align=4 offset=0
+        wasm_u32(out, 2);
+        wasm_u32(out, 0);
+    } else {
+        wasm_u8(out, 57);
+        // f64.store align=8 offset=0
+        wasm_u32(out, 3);
+        wasm_u32(out, 0);
+    }
+}
+
+fn wasm_float_emit_fixed_bits(ForgeWriter&mut out, i64 bits, i64 bytes) {
+    i64 i = 0;
+    i64 value = bits;
+
+    while (i < bytes) {
+        wasm_u8(out, value & 255);
+        value = value >> 8;
+        i += 1;
+    }
+}
+
+fn wasm_float_pow10(i64 exponent) -> i64 {
+    i64 value = 1;
+    i64 i = 0;
+
+    while (i < exponent) {
+        if (value > 922337203685477580) {
+            return -1;
+        }
+        value *= 10;
+        i += 1;
+    }
+    return value;
+}
+
+fn wasm_float_decimal_bits(Source& source, i64 offset, i64 length, i64 type_kind, i64&mut bits) -> bool {
+    if (length <= 0) {
+        return false;
+    }
+
+    i64 cursor = 0;
+    bool negative = false;
+
+    if (source_byte(source, offset) == 45) {
+        negative = true;
+        cursor = 1;
+    } else if (source_byte(source, offset) == 43) {
+        cursor = 1;
+    }
+
+    i64 digits = 0;
+    i64 fraction_digits = 0;
+    bool decimal = false;
+    bool saw_digit = false;
+
+    while (cursor < length) {
+        i64 byte = source_byte(source, offset + cursor);
+
+        if (byte == 46 && !decimal) {
+            decimal = true;
+            cursor += 1;
+            continue;
+        }
+        if (byte == 101 || byte == 69) {
+            break;
+        }
+        if (byte < 48 || byte > 57) {
+            return false;
+        }
+        saw_digit = true;
+        if (digits <= 922337203685477580) {
+            digits = digits * 10 + byte - 48;
+            if (decimal) {
+                fraction_digits += 1;
+            }
+        } else {
+            return false;
+        }
+        cursor += 1;
+    }
+    if (!saw_digit) {
+        return false;
+    }
+
+    i64 decimal_exponent = -fraction_digits;
+
+    if (cursor < length) {
+        cursor += 1;
+
+        bool exponent_negative = false;
+
+        if (cursor < length && source_byte(source, offset + cursor) == 45) {
+            exponent_negative = true;
+            cursor += 1;
+        } else if (cursor < length && source_byte(source, offset + cursor) == 43) {
+            cursor += 1;
+        }
+
+        i64 exponent = 0;
+        bool exponent_digit = false;
+
+        while (cursor < length) {
+            i64 byte = source_byte(source, offset + cursor);
+
+            if (byte < 48 || byte > 57 || exponent > 1000) {
+                return false;
+            }
+            exponent_digit = true;
+            exponent = exponent * 10 + byte - 48;
+            cursor += 1;
+        }
+        if (!exponent_digit) {
+            return false;
+        }
+        if (exponent_negative) {
+            decimal_exponent -= exponent;
+        } else {
+            decimal_exponent += exponent;
+        }
+    }
+    if (digits == 0) {
+        if (negative) {
+            if (type_kind == 11) {
+                *bits = 2147483648;
+            } else {
+                *bits = -9223372036854775807 - 1;
+            }
+        } else {
+            *bits = 0;
+        }
+        return true;
+    }
+    // The compiler-side encoder intentionally uses an integer rational.  It is
+    // deterministic across hosts and covers the normal source-literal range;
+    // extreme decimal exponents are rejected instead of consulting libc.
+    if (decimal_exponent < -18 || decimal_exponent > 18) {
+        return false;
+    }
+
+    i64 numerator = digits;
+    i64 denominator = 1;
+
+    if (decimal_exponent > 0) {
+        i64 scale = wasm_float_pow10(decimal_exponent);
+
+        if (scale <= 0 || numerator > 9223372036854775807 / scale) {
+            return false;
+        }
+        numerator *= scale;
+    } else if (decimal_exponent < 0) {
+        denominator = wasm_float_pow10(-decimal_exponent);
+        if (denominator <= 0) {
+            return false;
+        }
+    }
+
+    i64 exponent2 = 0;
+    i64 normalized_num = numerator;
+    i64 normalized_den = denominator;
+
+    while (normalized_den <= 4611686018427387903 && normalized_num >= normalized_den * 2) {
+        normalized_den *= 2;
+        exponent2 += 1;
+    }
+    while (normalized_num < normalized_den) {
+        if (normalized_num > 4611686018427387903) {
+            return false;
+        }
+        normalized_num *= 2;
+        exponent2 -= 1;
+    }
+
+    i64 mantissa_bits = 52;
+    i64 bias = 1023;
+
+    if (type_kind == 11) {
+        mantissa_bits = 23;
+        bias = 127;
+    }
+
+    i64 remainder = normalized_num - normalized_den;
+    i64 mantissa = 0;
+    i64 bit = 0;
+
+    while (bit < mantissa_bits) {
+        if (remainder > 4611686018427387903) {
+            return false;
+        }
+        remainder *= 2;
+        mantissa = mantissa << 1;
+        if (remainder >= normalized_den) {
+            mantissa |= 1;
+            remainder -= normalized_den;
+        }
+        bit += 1;
+    }
+    // Round to nearest, ties to even.
+    if (remainder > 4611686018427387903) {
+        return false;
+    }
+
+    i64 twice = remainder * 2;
+
+    if (twice > normalized_den || (twice == normalized_den && (mantissa & 1) != 0)) {
+        mantissa += 1;
+
+        i64 overflow = 1 << mantissa_bits;
+
+        if (mantissa == overflow) {
+            mantissa = 0;
+            exponent2 += 1;
+        }
+    }
+
+    i64 encoded_exponent = exponent2 + bias;
+    i64 max_exponent = 2047;
+
+    if (type_kind == 11) {
+        max_exponent = 255;
+    }
+    if (encoded_exponent <= 0 || encoded_exponent >= max_exponent) {
+        return false;
+    }
+    *bits = (encoded_exponent << mantissa_bits) | mantissa;
+    if (negative) {
+        if (type_kind == 11) {
+            *bits |= 2147483648;
+        } else {
+            *bits |= -9223372036854775807 - 1;
+        }
+    }
+    return true;
+}
+
+fn wasm_float_emit_literal(
+    ForgeWriter&mut out,
+    Source& source,
+    i64 offset,
+    i64 length,
+    i64 type_kind,
+) -> bool {
+    i64 bits = 0;
+
+    if (!wasm_float_decimal_bits(source, offset, length, type_kind, &mut bits)) {
+        return false;
+    }
+    if (type_kind == 11) {
+        wasm_u8(out, 67);
+        // f32.const
+        wasm_float_emit_fixed_bits(out, bits, 4);
+    } else {
+        wasm_u8(out, 68);
+        // f64.const
+        wasm_float_emit_fixed_bits(out, bits, 8);
+    }
+    return true;
+}
+
+fn wasm_float_emit_binary(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    i64 base = 160;
+
+    if (type_kind == 11) {
+        base = 146;
+    }
+    if (opcode == 4) {
+        wasm_u8(out, base);
+    } else if (opcode == 5) {
+        wasm_u8(out, base + 1);
+    } else if (opcode == 6) {
+        wasm_u8(out, base + 2);
+    } else if (opcode == 7) {
+        wasm_u8(out, base + 3);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn wasm_float_emit_compare(ForgeWriter&mut out, i64 opcode, i64 type_kind) -> bool {
+    i64 base = 91;
+
+    if (type_kind != 11) {
+        base = 97;
+    }
+    if (opcode == 11) {
+        wasm_u8(out, base);
+    } else if (opcode == 12) {
+        wasm_u8(out, base + 1);
+    } else if (opcode == 13) {
+        wasm_u8(out, base + 2);
+    } else if (opcode == 15) {
+        wasm_u8(out, base + 3);
+    } else if (opcode == 14) {
+        wasm_u8(out, base + 4);
+    } else if (opcode == 16) {
+        wasm_u8(out, base + 5);
+    } else {
+        return false;
+    }
+    wasm_u8(out, 173);
+    // i64.extend_i32_u
+    return true;
+}
+
+fn wasm_float_emit_numeric_cast(ForgeWriter&mut out, i64 source_type, i64 target_type) -> bool {
+    bool source_float = primitive_type_is_float(source_type);
+    bool target_float = primitive_type_is_float(target_type);
+
+    if (source_type == target_type) {
+        return true;
+    }
+    if (!source_float && !target_float) {
+        // Integer narrowing/widening is already represented canonically in the
+        // uniform i64 MIR frame; no wasm stack conversion is required here.
+        return true;
+    }
+    if (!source_float && target_float) {
+        if (primitive_type_is_unsigned(source_type)) {
+            if (target_type == 11) {
+                wasm_u8(out, 181);
+                // f32.convert_i64_u
+            } else {
+                wasm_u8(out, 186);
+                // f64.convert_i64_u
+            }
+        } else {
+            if (target_type == 11) {
+                wasm_u8(out, 180);
+                // f32.convert_i64_s
+            } else {
+                wasm_u8(out, 185);
+                // f64.convert_i64_s
+            }
+        }
+        wasm_float_emit_value_to_bits(out, target_type);
+        return true;
+    }
+    if (source_float && !target_float) {
+        wasm_float_emit_bits_to_value(out, source_type);
+        if (source_type == 11) {
+            if (primitive_type_is_unsigned(target_type)) {
+                wasm_u8(out, 175);
+                // i64.trunc_f32_u
+            } else {
+                wasm_u8(out, 174);
+                // i64.trunc_f32_s
+            }
+        } else {
+            if (primitive_type_is_unsigned(target_type)) {
+                wasm_u8(out, 177);
+                // i64.trunc_f64_u
+            } else {
+                wasm_u8(out, 176);
+                // i64.trunc_f64_s
+            }
+        }
+        return true;
+    }
+    wasm_float_emit_bits_to_value(out, source_type);
+    if (source_type == 11 && target_type == 1) {
+        wasm_u8(out, 187);
+        // f64.promote_f32
+    } else if (source_type == 1 && target_type == 11) {
+        wasm_u8(out, 182);
+        // f32.demote_f64
+    } else {
+        return false;
+    }
+    wasm_float_emit_value_to_bits(out, target_type);
+    return true;
+}

@@ -1,0 +1,1376 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web;
+
+import alloc::string;
+public import web::std::dom;
+public import web::std::events;
+public import web::std::storage;
+public import web::std::location;
+public import web::std::url;
+public import web::std::fetch;
+public import web::std::encoding;
+public import web::std::history;
+public import web::std::clipboard;
+public import web::std::timers;
+import web::build::fs;
+import web::build::format;
+import web::ui;
+
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+extern fn raz_rt_load_u8(usize address) -> i64;
+
+// Browser host boundary. These symbols are inert during the native build-time
+// page-generation run and become WebAssembly imports in the browser artifact.
+
+/// Static HTML document builder for Raz web projects.
+///
+/// Interactive Raz application behavior executes as WebAssembly. Static pages
+/// emit no JavaScript or WebAssembly; interactive pages emit only the minimal host shim needed to instantiate app.wasm,
+/// bind browser events, and expose DOM primitives to the module.
+public struct Page {
+    String html_open;
+    String head;
+    String body;
+    String css;
+    String client;
+    // Compiler-private list of ordinary Raz functions referenced by browser
+    // event bindings. The native page generator appends these roots to
+    // dist/.raz-wasm-required; no application behavior is encoded here.
+    String browser_roots;
+    // Compiler-private lazy WASM chunk manifest. Each line is chunk-name<TAB>handler.
+    String browser_chunks;
+    i64 open_depth;
+}
+
+fn append_escaped_to(String&mut output, string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    usize data = raz_rt_cstr_ptr(value);
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 38) {
+            if (!output.push_str("&amp;")) { return false; }
+        } else if (ch == 60) {
+            if (!output.push_str("&lt;")) { return false; }
+        } else if (ch == 62) {
+            if (!output.push_str("&gt;")) { return false; }
+        } else if (ch == 34) {
+            if (!output.push_str("&quot;")) { return false; }
+        } else if (ch == 39) {
+            if (!output.push_str("&#39;")) { return false; }
+        } else {
+            if (!output.push(ch)) { return false; }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn html_name_byte_allowed(i64 ch) -> bool {
+    if (ch >= 48 && ch <= 57) { return true; }
+    if (ch >= 65 && ch <= 90) { return true; }
+    if (ch >= 97 && ch <= 122) { return true; }
+    return ch == 45 || ch == 95 || ch == 58;
+}
+
+fn html_name_valid(string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(value);
+    i64 i = 0;
+    while (i < length) {
+        if (!html_name_byte_allowed(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn append_html_name_to(String&mut output, string value) -> bool {
+    if (!html_name_valid(value)) { return false; }
+    i64 length = raz_rt_cstr_len(value);
+    usize data = raz_rt_cstr_ptr(value);
+    i64 i = 0;
+    while (i < length) {
+        if (!output.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn append_attribute_to(String&mut output, string name, string value) -> bool {
+    if (!output.push_str(" ") || !append_html_name_to(output, name) || !output.push_str("=\"")) { return false; }
+    if (!append_escaped_to(output, value)) { return false; }
+    return output.push_str("\"");
+}
+
+fn append_boolean_attribute_to(String&mut output, string name) -> bool {
+    return output.push_str(" ") && append_html_name_to(output, name);
+}
+
+fn append_js_string_to(String&mut output, string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    usize data = raz_rt_cstr_ptr(value);
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 92) {
+            if (!output.push_str("\\\\")) { return false; }
+        } else if (ch == 39) {
+            if (!output.push_str("\\'")) { return false; }
+        } else if (ch == 10) {
+            if (!output.push_str("\\n")) { return false; }
+        } else if (ch == 13) {
+            if (!output.push_str("\\r")) { return false; }
+        } else if (ch == 9) {
+            if (!output.push_str("\\t")) { return false; }
+        } else {
+            if (!output.push(ch)) { return false; }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn body_tag_text(Page&mut page, string tag, string class_name, string value) -> bool {
+    if (!page.body.push_str("<") || !append_html_name_to(&mut page.body, tag)) { return false; }
+    if (raz_rt_cstr_len(class_name) > 0) {
+        if (!page.body.push_str(" class=\"") || !append_escaped_to(&mut page.body, class_name) || !page.body.push_str("\"")) { return false; }
+    }
+    if (!page.body.push_str(">") || !append_escaped_to(&mut page.body, value)) { return false; }
+    return page.body.push_str("</") && append_html_name_to(&mut page.body, tag) && page.body.push_str(">\n");
+}
+
+fn body_tag_id_text(Page&mut page, string tag, string id, string class_name, string value) -> bool {
+    if (!page.body.push_str("<") || !append_html_name_to(&mut page.body, tag)) { return false; }
+    if (raz_rt_cstr_len(id) > 0) {
+        if (!page.body.push_str(" id=\"") || !append_escaped_to(&mut page.body, id) || !page.body.push_str("\"")) { return false; }
+    }
+    if (raz_rt_cstr_len(class_name) > 0) {
+        if (!page.body.push_str(" class=\"") || !append_escaped_to(&mut page.body, class_name) || !page.body.push_str("\"")) { return false; }
+    }
+    if (!page.body.push_str(">") || !append_escaped_to(&mut page.body, value)) { return false; }
+    return page.body.push_str("</") && append_html_name_to(&mut page.body, tag) && page.body.push_str(">\n");
+}
+
+fn client_element_lookup(String&mut output, string local_name, string id) -> bool {
+    if (!output.push_str("const ") || !output.push_str(local_name) || !output.push_str(" = document.getElementById('") || !append_js_string_to(output, id)) { return false; }
+    return output.push_str("');\n");
+}
+
+fn write_client_for_path(Page&mut page, String& html_path) -> bool {
+    usize data = html_path.as_ptr();
+    i64 length = html_path.len();
+    i64 slash = -1;
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 47 || ch == 92) { slash = i; }
+        i += 1;
+    }
+
+    String script_path = String::with_capacity(length + 16);
+    i = 0;
+    while (i <= slash) {
+        if (!script_path.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    if (!script_path.push_str("app.js")) { return false; }
+    if (page.client.len() == 0) {
+        return web::build::fs::remove_file_if_present(&script_path);
+    }
+
+    // Client-only module loading is deliberately independent from the Raz WASM
+    // host. A page that only lazy-loads an ES module must not pay for app.wasm.
+    if (page.browser_roots.len() == 0 && page.browser_chunks.len() == 0) {
+        String client_only = String::with_capacity(page.client.len() + 256);
+        if (!client_only.push_str("// Generated Raz Web lazy-module loader.\n") ||
+            !client_only.push_string(&page.client)) { return false; }
+        return web::build::fs::write_string(&script_path, &client_only);
+    }
+
+    String script = String::with_capacity(page.client.len() + 6144);
+    if (!script.push_str("// Generated Raz Web host shim. Application logic lives in app.wasm.\n")) { return false; }
+    if (!script.push_str("let rzMemory = null;\nlet rzCurrentEvent = null;\nlet rz = null;\nconst rzDecoder = new TextDecoder();\nconst rzEncoder = new TextEncoder();\nconst rzUse = (exports) => { rz = exports; rzMemory = exports.memory; return exports; };\n")) { return false; }
+    if (!script.push_str("const rzCstr = (ptr) => { const bytes = new Uint8Array(rzMemory.buffer); const start = Number(ptr); let end = start; while (end < bytes.length && bytes[end] !== 0) end++; return rzDecoder.decode(bytes.subarray(start, end)); };\n")) { return false; }
+    if (!script.push_str("const rzWasi = new Proxy({}, { get: (_target, name) => name === 'proc_exit' ? ((code) => { throw new Error('Raz WASM exited with code ' + code); }) : (() => 0) });\n")) { return false; }
+    if (!script.push_str("const rzImports = { wasi_snapshot_preview1: rzWasi, raz_web: {\n")) { return false; }
+    if (!script.push_str("dom_set_text: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_set_text_i64: (idPtr, value) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = value.toString(); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_toggle_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.toggle(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_set_text_ptr: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_set_text_i64_ptr: (idPtr, value) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = value.toString(); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_toggle_class_ptr: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.toggle(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("event_value_length: () => { const value = rzCurrentEvent && rzCurrentEvent.target && 'value' in rzCurrentEvent.target ? String(rzCurrentEvent.target.value) : ''; return BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("event_value_write: (outPtr, capacity) => { const value = rzCurrentEvent && rzCurrentEvent.target && 'value' in rzCurrentEvent.target ? String(rzCurrentEvent.target.value) : ''; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("event_key_length: () => { const key = rzCurrentEvent && typeof rzCurrentEvent.key === 'string' ? rzCurrentEvent.key : ''; return BigInt(rzEncoder.encode(key).length); },\n")) { return false; }
+    if (!script.push_str("event_key_write: (outPtr, capacity) => { const key = rzCurrentEvent && typeof rzCurrentEvent.key === 'string' ? rzCurrentEvent.key : ''; const bytes = rzEncoder.encode(key); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("event_checked: () => rzCurrentEvent && rzCurrentEvent.target && !!rzCurrentEvent.target.checked ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("event_prevent_default: () => { if (!rzCurrentEvent) return 0n; rzCurrentEvent.preventDefault(); return 1n; },\n")) { return false; }
+    if (!script.push_str("event_code_length: () => { const value = rzCurrentEvent && typeof rzCurrentEvent.code === 'string' ? rzCurrentEvent.code : ''; return BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("event_code_write: (outPtr, capacity) => { const value = rzCurrentEvent && typeof rzCurrentEvent.code === 'string' ? rzCurrentEvent.code : ''; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("event_repeat: () => rzCurrentEvent && rzCurrentEvent.repeat ? 1n : 0n, event_alt_key: () => rzCurrentEvent && rzCurrentEvent.altKey ? 1n : 0n, event_ctrl_key: () => rzCurrentEvent && rzCurrentEvent.ctrlKey ? 1n : 0n, event_shift_key: () => rzCurrentEvent && rzCurrentEvent.shiftKey ? 1n : 0n, event_meta_key: () => rzCurrentEvent && rzCurrentEvent.metaKey ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("event_button: () => BigInt(rzCurrentEvent && Number.isInteger(rzCurrentEvent.button) ? rzCurrentEvent.button : -1), event_client_x: () => BigInt(Math.trunc(rzCurrentEvent && Number.isFinite(rzCurrentEvent.clientX) ? rzCurrentEvent.clientX : 0)), event_client_y: () => BigInt(Math.trunc(rzCurrentEvent && Number.isFinite(rzCurrentEvent.clientY) ? rzCurrentEvent.clientY : 0)),\n")) { return false; }
+    if (!script.push_str("event_stop_propagation: () => { if (!rzCurrentEvent) return 0n; rzCurrentEvent.stopPropagation(); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_set_attribute: (idPtr, namePtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.setAttribute(rzCstr(namePtr), rzCstr(valuePtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_remove_attribute: (idPtr, namePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.removeAttribute(rzCstr(namePtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_add_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.add(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_remove_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.remove(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_focus: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.focus(); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_set_value: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !('value' in el)) return 0n; el.value = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("dom_blur: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || typeof el.blur !== 'function') return 0n; el.blur(); return 1n; }, dom_click: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || typeof el.click !== 'function') return 0n; el.click(); return 1n; }, dom_exists: (idPtr) => document.getElementById(rzCstr(idPtr)) ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("dom_value_length: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !(\'value\' in el)) return -1n; return BigInt(rzEncoder.encode(String(el.value)).length); }, dom_value_write: (idPtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !(\'value\' in el)) return -1n; const b = rzEncoder.encode(String(el.value)); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("dom_text_length: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; return BigInt(rzEncoder.encode(el.textContent || \'\').length); }, dom_text_write: (idPtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const b = rzEncoder.encode(el.textContent || \'\'); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("dom_attribute_length: (idPtr, namePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const v = el.getAttribute(rzCstr(namePtr)); return v === null ? -1n : BigInt(rzEncoder.encode(v).length); }, dom_attribute_write: (idPtr, namePtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const v = el.getAttribute(rzCstr(namePtr)); if (v === null) return -1n; const b = rzEncoder.encode(v); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("timer_set_timeout: (handlerPtr, delay) => { const name = rzCstr(handlerPtr); const owner = rz; const id = setTimeout(() => { const fn = owner && owner[name]; if (typeof fn === 'function') { rzUse(owner); fn(); } }, Math.max(0, Number(delay))); return BigInt(id); }, timer_clear_timeout: (id) => { clearTimeout(Number(id)); return 1n; }, timer_set_interval: (handlerPtr, delay) => { const name = rzCstr(handlerPtr); const owner = rz; const id = setInterval(() => { const fn = owner && owner[name]; if (typeof fn === 'function') { rzUse(owner); fn(); } }, Math.max(1, Number(delay))); return BigInt(id); }, timer_clear_interval: (id) => { clearInterval(Number(id)); return 1n; },\n")) { return false; }
+    if (!script.push_str("storage_set: (keyPtr, valuePtr) => { try { localStorage.setItem(rzCstr(keyPtr), rzCstr(valuePtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("storage_remove: (keyPtr) => { try { localStorage.removeItem(rzCstr(keyPtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("storage_clear: () => { try { localStorage.clear(); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("storage_value_length: (keyPtr) => { const value = localStorage.getItem(rzCstr(keyPtr)); return value === null ? -1n : BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("storage_value_write: (keyPtr, outPtr, capacity) => { const value = localStorage.getItem(rzCstr(keyPtr)); if (value === null) return -1n; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("session_storage_set: (keyPtr, valuePtr) => { try { sessionStorage.setItem(rzCstr(keyPtr), rzCstr(valuePtr)); return 1n; } catch (_) { return 0n; } }, session_storage_remove: (keyPtr) => { try { sessionStorage.removeItem(rzCstr(keyPtr)); return 1n; } catch (_) { return 0n; } }, session_storage_clear: () => { try { sessionStorage.clear(); return 1n; } catch (_) { return 0n; } }, session_storage_value_length: (keyPtr) => { const value = sessionStorage.getItem(rzCstr(keyPtr)); return value === null ? -1n : BigInt(rzEncoder.encode(value).length); }, session_storage_value_write: (keyPtr, outPtr, capacity) => { const value = sessionStorage.getItem(rzCstr(keyPtr)); if (value === null) return -1n; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("location_href_length: () => BigInt(rzEncoder.encode(location.href).length),\n")) { return false; }
+    if (!script.push_str("location_href_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.href); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("location_origin_length: () => BigInt(rzEncoder.encode(location.origin).length), location_origin_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.origin); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); }, location_pathname_length: () => BigInt(rzEncoder.encode(location.pathname).length), location_pathname_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.pathname); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); }, location_search_length: () => BigInt(rzEncoder.encode(location.search).length), location_search_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.search); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); }, location_hash_length: () => BigInt(rzEncoder.encode(location.hash).length), location_hash_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.hash); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("location_assign: (urlPtr) => { location.assign(rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("location_replace: (urlPtr) => { location.replace(rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("location_reload: () => { location.reload(); return 1n; },\n")) { return false; }
+    if (!script.push_str("url_query_value_length: (namePtr) => { const p = new URLSearchParams(location.search); const key = rzCstr(namePtr); if (!p.has(key)) return -1n; return BigInt(rzEncoder.encode(p.get(key) || '').length); }, url_query_value_write: (namePtr, outPtr, capacity) => { const p = new URLSearchParams(location.search); const key = rzCstr(namePtr); if (!p.has(key)) return -1n; const bytes = rzEncoder.encode(p.get(key) || ''); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); }, url_query_has: (namePtr) => new URLSearchParams(location.search).has(rzCstr(namePtr)) ? 1n : 0n, url_encode_length: (valuePtr) => BigInt(rzEncoder.encode(encodeURIComponent(rzCstr(valuePtr))).length), url_encode_write: (valuePtr, outPtr, capacity) => { const bytes = rzEncoder.encode(encodeURIComponent(rzCstr(valuePtr))); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); }, url_decode_length: (valuePtr) => { try { return BigInt(rzEncoder.encode(decodeURIComponent(rzCstr(valuePtr))).length); } catch (_) { return -1n; } }, url_decode_write: (valuePtr, outPtr, capacity) => { try { const bytes = rzEncoder.encode(decodeURIComponent(rzCstr(valuePtr))); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); } catch (_) { return -1n; } },\n")) { return false; }
+    if (!script.push_str("history_push: (urlPtr) => { history.pushState(null, '', rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("history_replace: (urlPtr) => { history.replaceState(null, '', rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("history_back: () => { history.back(); return 1n; },\n")) { return false; }
+    if (!script.push_str("history_forward: () => { history.forward(); return 1n; },\n")) { return false; }
+    if (!script.push_str("clipboard_write: (valuePtr) => { if (!navigator.clipboard) return 0n; void navigator.clipboard.writeText(rzCstr(valuePtr)); return 1n; }\n")) { return false; }
+    if (!script.push_str("} };\nconst rzLoadWasm = async (url) => { const response = await fetch(url); const bytes = await response.arrayBuffer(); const { instance } = await WebAssembly.instantiate(bytes, rzImports); return instance.exports; };\n")) { return false; }
+    if (page.browser_roots.len() > 0) {
+        if (!script.push_str("const rzMain = await rzLoadWasm('/app.wasm');\nrzUse(rzMain);\n")) { return false; }
+    }
+    if (!script.push_string(&page.client)) { return false; }
+    if (!web::build::fs::write_string(&script_path, &script)) { return false; }
+
+    // The native/static generator is authoritative about whether browser code
+    // exists. The compiler consumes this private marker after generation and
+    // emits app.wasm only when at least one route actually bound an event.
+    bool ok = true;
+    if (page.browser_roots.len() > 0) {
+        String marker_path = String::from("dist/.raz-wasm-required");
+        ok = web::build::fs::append_string(&marker_path, &page.browser_roots);
+    }
+    if (ok && page.browser_chunks.len() > 0) {
+        String chunks_path = String::from("dist/.raz-wasm-chunks");
+        ok = web::build::fs::append_string(&chunks_path, &page.browser_chunks);
+    }
+    return ok;
+}
+
+fn string_contains(String& haystack, String& needle) -> bool {
+    i64 haystack_length = haystack.len();
+    i64 needle_length = needle.len();
+    if (needle_length == 0) { return true; }
+    if (needle_length > haystack_length) { return false; }
+    usize haystack_data = haystack.as_ptr();
+    usize needle_data = needle.as_ptr();
+    i64 start = 0;
+    while (start + needle_length <= haystack_length) {
+        i64 i = 0;
+        bool same = true;
+        while (i < needle_length) {
+            if (raz_rt_load_u8(haystack_data + start + i) != raz_rt_load_u8(needle_data + i)) {
+                same = false;
+                break;
+            }
+            i += 1;
+        }
+        if (same) { return true; }
+        start += 1;
+    }
+    return false;
+}
+
+fn append_css_rule(Page&mut page, string prefix, string name, string selector, string declarations) -> bool {
+    String rule = String::with_capacity(raz_rt_cstr_len(prefix) + raz_rt_cstr_len(name) + raz_rt_cstr_len(selector) + raz_rt_cstr_len(declarations) + 24);
+    if (!rule.push_str(prefix)) { return false; }
+    if (raz_rt_cstr_len(name) > 0 && !rule.push_str(name)) { return false; }
+    if (raz_rt_cstr_len(selector) > 0 && !rule.push_str(selector)) { return false; }
+    if (!rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" }\n")) { return false; }
+    if (string_contains(&page.css, &rule)) { return true; }
+    return page.css.push_string(&rule);
+}
+
+fn write_css_for_path(Page&mut page, String& html_path) -> bool {
+    usize data = html_path.as_ptr();
+    i64 length = html_path.len();
+    i64 slash = -1;
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 47 || ch == 92) { slash = i; }
+        i += 1;
+    }
+
+    String css_path = String::with_capacity(length + 16);
+    i = 0;
+    while (i <= slash) {
+        if (!css_path.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    if (!css_path.push_str("app.css")) { return false; }
+    if (page.css.len() == 0) {
+        return web::build::fs::remove_file_if_present(&css_path);
+    }
+    return web::build::fs::write_string(&css_path, &page.css);
+}
+
+fn write_page_to(Page&mut page, String& path) -> bool {
+    String document = String::with_capacity(page.head.len() + page.body.len() + 256);
+    if (!document.push_str("<!doctype html>\n") ||
+        !document.push_string(&page.html_open) ||
+        !document.push_str("<head>\n") ||
+        !document.push_string(&page.head)) {
+        return false;
+    }
+    if (page.css.len() > 0) {
+        if (!document.push_str("<link rel=\"stylesheet\" href=\"./app.css\">\n")) { return false; }
+    }
+    if (!document.push_str("</head>\n<body>\n") ||
+        !document.push_string(&page.body)) {
+        return false;
+    }
+    if (page.client.len() > 0) {
+        if (!document.push_str("<script type=\"module\" src=\"./app.js\"></script>\n")) { return false; }
+    }
+    if (!document.push_str("</body>\n</html>\n")) { return false; }
+
+    if (!web::build::fs::write_string(path, &document)) { return false; }
+    if (!write_css_for_path(page, path)) { return false; }
+    return write_client_for_path(page, path);
+}
+
+
+fn static_route_segment_forbidden(usize data, i64 start, i64 length) -> bool {
+    if (length == 1 && raz_rt_load_u8(data + start) == 46) { return true; }
+    if (length == 2 && raz_rt_load_u8(data + start) == 46 && raz_rt_load_u8(data + start + 1) == 46) { return true; }
+    return false;
+}
+
+fn static_route_valid(string route) -> bool {
+    i64 length = raz_rt_cstr_len(route);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(route);
+    if (raz_rt_load_u8(data) != 47) { return false; }
+    if (length == 1) { return true; }
+    i64 segment_start = 1;
+    i64 i = 1;
+    while (i <= length) {
+        i64 ch = 47;
+        if (i < length) { ch = raz_rt_load_u8(data + i); }
+        if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+        if (ch == 47) {
+            i64 segment_length = i - segment_start;
+            if (segment_length <= 0 || static_route_segment_forbidden(data, segment_start, segment_length)) { return false; }
+            segment_start = i + 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_output(string route, String&mut output) -> bool {
+    if (!static_route_valid(route)) { return false; }
+    if (!output.push_str("dist")) { return false; }
+    i64 length = raz_rt_cstr_len(route);
+    if (length > 1 && !output.push_str(route)) { return false; }
+    if (!web::build::fs::create_dir_all(output.as_ptr(), output.len())) { return false; }
+    return output.push_str("/index.html");
+}
+
+fn route_name_byte(i64 ch) -> bool {
+    if (ch >= 48 && ch <= 57) { return true; }
+    if (ch >= 65 && ch <= 90) { return true; }
+    if (ch >= 97 && ch <= 122) { return true; }
+    return ch == 45 || ch == 95;
+}
+
+fn route_name_valid(string name) -> bool {
+    i64 length = raz_rt_cstr_len(name);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < length) {
+        if (!route_name_byte(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_value_valid(string value, bool splat) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(value);
+    i64 start = 0;
+    i64 i = 0;
+    while (i <= length) {
+        bool boundary = i == length;
+        i64 ch = 0;
+        if (!boundary) {
+            ch = raz_rt_load_u8(data + i);
+            if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+            boundary = ch == 47;
+        }
+        if (!boundary) { i += 1; continue; }
+        if (!splat && i != length) { return false; }
+        i64 segment_length = i - start;
+        if (segment_length <= 0 || static_route_segment_forbidden(data, start, segment_length)) { return false; }
+        start = i + 1;
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_marker_matches(usize data, i64 start, i64 length, i64 marker, string name) -> bool {
+    if (length <= 1 || raz_rt_load_u8(data + start) != marker) { return false; }
+    i64 name_length = raz_rt_cstr_len(name);
+    if (length - 1 != name_length) { return false; }
+    usize name_data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < name_length) {
+        if (raz_rt_load_u8(data + start + 1 + i) != raz_rt_load_u8(name_data + i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Copies a route pattern into an owned build-time path. Dynamic `:name` and
+/// final `*name` segments can then be bound with route_bind/route_bind_splat.
+public fn route_path(string pattern) -> String {
+    return String::from(pattern);
+}
+
+fn route_bind_value(String&mut path, string name, string value, bool splat) -> bool {
+    if (!route_name_valid(name) || !static_route_value_valid(value, splat)) { return false; }
+    i64 length = path.len();
+    usize data = path.as_ptr();
+    String next = String::with_capacity(length + raz_rt_cstr_len(value) + 8);
+    i64 i = 0;
+    bool replaced = false;
+    while (i < length) {
+        if (raz_rt_load_u8(data + i) == 47) {
+            i64 start = i + 1;
+            i64 end = start;
+            while (end < length && raz_rt_load_u8(data + end) != 47) { end += 1; }
+            i64 marker = 58;
+            if (splat) { marker = 42; }
+            if (!replaced && static_route_marker_matches(data, start, end - start, marker, name)) {
+                if (!next.push(47) || !next.push_str(value)) { return false; }
+                replaced = true;
+                i = end;
+                continue;
+            }
+        }
+        if (!next.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    if (!replaced) { return false; }
+    *path = move next;
+    return true;
+}
+
+public fn route_bind(String&mut path, string name, string value) -> bool {
+    return route_bind_value(path, name, value, false);
+}
+
+public fn route_bind_splat(String&mut path, string name, string value) -> bool {
+    return route_bind_value(path, name, value, true);
+}
+
+fn static_route_string_valid(String& route) -> bool {
+    i64 length = route.len();
+    if (length <= 0) { return false; }
+    usize data = route.as_ptr();
+    if (raz_rt_load_u8(data) != 47) { return false; }
+    if (length == 1) { return true; }
+    i64 segment_start = 1;
+    i64 i = 1;
+    while (i <= length) {
+        i64 ch = 47;
+        if (i < length) { ch = raz_rt_load_u8(data + i); }
+        if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+        if (ch == 47) {
+            i64 segment_length = i - segment_start;
+            if (segment_length <= 0 || static_route_segment_forbidden(data, segment_start, segment_length)) { return false; }
+            i64 first = raz_rt_load_u8(data + segment_start);
+            if (first == 58 || first == 42) { return false; }
+            segment_start = i + 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_output_string(String& route, String&mut output) -> bool {
+    if (!static_route_string_valid(route)) { return false; }
+    if (!output.push_str("dist")) { return false; }
+    if (route.len() > 1 && !output.push_string(route)) { return false; }
+    if (!web::build::fs::create_dir_all(output.as_ptr(), output.len())) { return false; }
+    return output.push_str("/index.html");
+}
+
+/// Emits a host-independent redirect page at a static route. The generated
+/// document uses a standards-based meta refresh plus a normal fallback link;
+/// it intentionally requires no JavaScript or WebAssembly.
+public fn write_redirect(string route, string target) -> bool {
+    String path = String::new();
+    if (!static_route_output(route, &mut path)) { return false; }
+    String document = String::with_capacity(512 + raz_rt_cstr_len(target) * 2);
+    if (!document.push_str("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0;url=")) { return false; }
+    if (!append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\">\n<link rel=\"canonical\" href=\"")) { return false; }
+    if (!append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\"></head><body><p>Redirecting to <a href=\"")) { return false; }
+    if (!append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\">")) { return false; }
+    if (!append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("</a>.</p></body></html>\n")) { return false; }
+    return web::build::fs::write_string(&path, &document);
+}
+
+public impl Page {
+    public fn new(string title) -> Page {
+        Page page = Page {
+            html_open: String::with_capacity(64),
+            head: String::with_capacity(512),
+            body: String::with_capacity(2048),
+            css: String::with_capacity(1024),
+            client: String::with_capacity(1024),
+            browser_roots: String::with_capacity(256),
+            browser_chunks: String::with_capacity(256),
+            open_depth: 0,
+        };
+        page.html_open.push_str("<html lang=\"en\">\n");
+        page.head.push_str("<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>");
+        append_escaped_to(&mut page.head, title);
+        page.head.push_str("</title>\n");
+        return page;
+    }
+
+    public fn new_lang(string title, string language) -> Page {
+        Page page = Page {
+            html_open: String::with_capacity(64),
+            head: String::with_capacity(512),
+            body: String::with_capacity(2048),
+            css: String::with_capacity(1024),
+            client: String::with_capacity(1024),
+            browser_roots: String::with_capacity(256),
+            browser_chunks: String::with_capacity(256),
+            open_depth: 0,
+        };
+        page.html_open.push_str("<html lang=\"");
+        append_escaped_to(&mut page.html_open, language);
+        page.html_open.push_str("\">\n");
+        page.head.push_str("<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>");
+        append_escaped_to(&mut page.head, title);
+        page.head.push_str("</title>\n");
+        return page;
+    }
+
+    // ---- head metadata / assets -------------------------------------------------
+    public fn description(Page&mut self, string value) -> bool {
+        if (!self.head.push_str("<meta name=\"description\" content=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, value)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn author(Page&mut self, string value) -> bool {
+        if (!self.head.push_str("<meta name=\"author\" content=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, value)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn theme_color(Page&mut self, string value) -> bool {
+        if (!self.head.push_str("<meta name=\"theme-color\" content=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, value)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn canonical(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<link rel=\"canonical\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn meta(Page&mut self, string name, string content) -> bool {
+        if (!self.head.push_str("<meta name=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, name) || !self.head.push_str("\" content=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, content)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    /// Metadata whose key uses the HTML `property` attribute, such as Open Graph.
+    public fn meta_property(Page&mut self, string property_name, string content) -> bool {
+        if (!self.head.push_str("<meta property=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, property_name) || !self.head.push_str("\" content=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, content)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn keywords(Page&mut self, string value) -> bool { return self.meta("keywords", value); }
+    public fn robots(Page&mut self, string value) -> bool { return self.meta("robots", value); }
+
+    public fn base(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<base href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn manifest(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<link rel=\"manifest\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn alternate(Page&mut self, string href, string language) -> bool {
+        if (!self.head.push_str("<link rel=\"alternate\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href) || !self.head.push_str("\" hreflang=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, language)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn preload(Page&mut self, string href, string resource_type) -> bool {
+        if (!self.head.push_str("<link rel=\"preload\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href) || !self.head.push_str("\" as=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, resource_type)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn stylesheet(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<link rel=\"stylesheet\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    /// Add a static CSS rule. Raz extracts these rules to app.css beside the
+    /// generated HTML. Identical rules are emitted once per page.
+    public fn style(Page&mut self, string selector, string declarations) -> bool {
+        return append_css_rule(self, "", "", selector, declarations);
+    }
+
+    public fn css(Page&mut self, string selector, string declarations) -> bool {
+        return self.style(selector, declarations);
+    }
+
+    public fn css_class(Page&mut self, string class_name, string declarations) -> bool {
+        if (!html_name_valid(class_name)) { return false; }
+        return append_css_rule(self, ".", class_name, "", declarations);
+    }
+
+    public fn css_id(Page&mut self, string id_name, string declarations) -> bool {
+        if (!html_name_valid(id_name)) { return false; }
+        return append_css_rule(self, "#", id_name, "", declarations);
+    }
+    public fn css_pseudo(Page&mut self, string selector, string pseudo, string declarations) -> bool {
+        if (!html_name_valid(pseudo)) { return false; }
+        String rule = String::with_capacity(raz_rt_cstr_len(selector) + raz_rt_cstr_len(pseudo) + raz_rt_cstr_len(declarations) + 16);
+        if (!rule.push_str(selector) || !rule.push_str(":") || !rule.push_str(pseudo) || !rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+    public fn css_pseudo_element(Page&mut self, string selector, string pseudo, string declarations) -> bool {
+        if (!html_name_valid(pseudo)) { return false; }
+        String rule = String::with_capacity(raz_rt_cstr_len(selector) + raz_rt_cstr_len(pseudo) + raz_rt_cstr_len(declarations) + 17);
+        if (!rule.push_str(selector) || !rule.push_str("::") || !rule.push_str(pseudo) || !rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    public fn css_media(Page&mut self, string query, string selector, string declarations) -> bool {
+        String rule = String::with_capacity(raz_rt_cstr_len(query) + raz_rt_cstr_len(selector) + raz_rt_cstr_len(declarations) + 32);
+        if (!rule.push_str("@media ") || !rule.push_str(query) || !rule.push_str(" { ") || !rule.push_str(selector) || !rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" } }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    public fn css_container(Page&mut self, string query, string selector, string declarations) -> bool {
+        String rule = String::with_capacity(raz_rt_cstr_len(query) + raz_rt_cstr_len(selector) + raz_rt_cstr_len(declarations) + 36);
+        if (!rule.push_str("@container ") || !rule.push_str(query) || !rule.push_str(" { ") || !rule.push_str(selector) || !rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" } }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    public fn css_variable(Page&mut self, string name, string value) -> bool {
+        if (!html_name_valid(name)) { return false; }
+        String rule = String::with_capacity(raz_rt_cstr_len(name) + raz_rt_cstr_len(value) + 24);
+        if (!rule.push_str(":root { --") || !rule.push_str(name) || !rule.push_str(": ") || !rule.push_str(value) || !rule.push_str("; }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    public fn css_keyframes(Page&mut self, string name, string frames) -> bool {
+        if (!html_name_valid(name)) { return false; }
+        String rule = String::with_capacity(raz_rt_cstr_len(name) + raz_rt_cstr_len(frames) + 24);
+        if (!rule.push_str("@keyframes ") || !rule.push_str(name) || !rule.push_str(" { ") || !rule.push_str(frames) || !rule.push_str(" }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    /// Scope a static rule to an element carrying data-raz-scope="scope".
+    /// Scope names use the same conservative HTML-name grammar as IDs/classes.
+    public fn scoped_style(Page&mut self, string scope, string selector, string declarations) -> bool {
+        if (!html_name_valid(scope)) { return false; }
+        String rule = String::with_capacity(raz_rt_cstr_len(scope) + raz_rt_cstr_len(selector) + raz_rt_cstr_len(declarations) + 48);
+        if (!rule.push_str("[data-raz-scope=\"") || !rule.push_str(scope) || !rule.push_str("\"]")) { return false; }
+        if (raz_rt_cstr_len(selector) > 0) {
+            if (!rule.push_str(" ") || !rule.push_str(selector)) { return false; }
+        }
+        if (!rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" }\n")) { return false; }
+        if (string_contains(&self.css, &rule)) { return true; }
+        return self.css.push_string(&rule);
+    }
+
+    /// Deliberate raw-CSS escape hatch. Unlike structured rules, raw blocks are
+    /// preserved verbatim and are not deduplicated.
+    public fn raw_css(Page&mut self, string css) -> bool {
+        if (!self.css.push_str(css)) { return false; }
+        return self.css.push_str("\n");
+    }
+
+    public fn icon(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<link rel=\"icon\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    public fn script(Page&mut self, string src) -> bool {
+        if (!self.body.push_str("<script src=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, src)) { return false; }
+        return self.body.push_str("\"></script>\n");
+    }
+
+    /// Hint that an ES module chunk will be needed soon. Release asset
+    /// fingerprinting rewrites the href just like other public/assets URLs.
+    public fn module_preload(Page&mut self, string href) -> bool {
+        if (!self.head.push_str("<link rel=\"modulepreload\" href=\"")) { return false; }
+        if (!append_escaped_to(&mut self.head, href)) { return false; }
+        return self.head.push_str("\">\n");
+    }
+
+    /// Load a standards-based ES module immediately without involving app.wasm.
+    public fn module_script(Page&mut self, string src) -> bool {
+        if (!self.body.push_str("<script type=\"module\" src=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, src)) { return false; }
+        return self.body.push_str("\"></script>\n");
+    }
+
+    // ---- text elements ----------------------------------------------------------
+    public fn h1(Page&mut self, string value) -> bool { return body_tag_text(self, "h1", "", value); }
+    public fn h2(Page&mut self, string value) -> bool { return body_tag_text(self, "h2", "", value); }
+    public fn h3(Page&mut self, string value) -> bool { return body_tag_text(self, "h3", "", value); }
+    public fn h4(Page&mut self, string value) -> bool { return body_tag_text(self, "h4", "", value); }
+    public fn h5(Page&mut self, string value) -> bool { return body_tag_text(self, "h5", "", value); }
+    public fn h6(Page&mut self, string value) -> bool { return body_tag_text(self, "h6", "", value); }
+    public fn p(Page&mut self, string value) -> bool { return body_tag_text(self, "p", "", value); }
+    public fn strong(Page&mut self, string value) -> bool { return body_tag_text(self, "strong", "", value); }
+    public fn em(Page&mut self, string value) -> bool { return body_tag_text(self, "em", "", value); }
+    public fn small(Page&mut self, string value) -> bool { return body_tag_text(self, "small", "", value); }
+    public fn pre(Page&mut self, string value) -> bool { return body_tag_text(self, "pre", "", value); }
+    public fn label(Page&mut self, string value) -> bool { return body_tag_text(self, "label", "", value); }
+    public fn code(Page&mut self, string value) -> bool { return body_tag_text(self, "code", "", value); }
+    public fn li(Page&mut self, string value) -> bool { return body_tag_text(self, "li", "", value); }
+    public fn blockquote(Page&mut self, string value) -> bool { return body_tag_text(self, "blockquote", "", value); }
+    public fn span(Page&mut self, string value) -> bool { return body_tag_text(self, "span", "", value); }
+    public fn mark(Page&mut self, string value) -> bool { return body_tag_text(self, "mark", "", value); }
+    public fn del(Page&mut self, string value) -> bool { return body_tag_text(self, "del", "", value); }
+    public fn ins(Page&mut self, string value) -> bool { return body_tag_text(self, "ins", "", value); }
+    public fn sub(Page&mut self, string value) -> bool { return body_tag_text(self, "sub", "", value); }
+    public fn sup(Page&mut self, string value) -> bool { return body_tag_text(self, "sup", "", value); }
+    public fn kbd(Page&mut self, string value) -> bool { return body_tag_text(self, "kbd", "", value); }
+    public fn samp(Page&mut self, string value) -> bool { return body_tag_text(self, "samp", "", value); }
+    public fn cite(Page&mut self, string value) -> bool { return body_tag_text(self, "cite", "", value); }
+    public fn address(Page&mut self, string value) -> bool { return body_tag_text(self, "address", "", value); }
+    public fn dt(Page&mut self, string value) -> bool { return body_tag_text(self, "dt", "", value); }
+    public fn dd(Page&mut self, string value) -> bool { return body_tag_text(self, "dd", "", value); }
+    public fn caption(Page&mut self, string value) -> bool { return body_tag_text(self, "caption", "", value); }
+    public fn legend(Page&mut self, string value) -> bool { return body_tag_text(self, "legend", "", value); }
+    public fn time(Page&mut self, string datetime, string value) -> bool {
+        if (!self.body.push_str("<time datetime=\"") || !append_escaped_to(&mut self.body, datetime) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</time>\n");
+    }
+    public fn abbr(Page&mut self, string title, string value) -> bool {
+        if (!self.body.push_str("<abbr title=\"") || !append_escaped_to(&mut self.body, title) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</abbr>\n");
+    }
+    public fn q(Page&mut self, string cite_url, string value) -> bool {
+        if (!self.body.push_str("<q cite=\"") || !append_escaped_to(&mut self.body, cite_url) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</q>\n");
+    }
+
+    public fn br(Page&mut self) -> bool { return self.body.push_str("<br>\n"); }
+    public fn hr(Page&mut self) -> bool { return self.body.push_str("<hr>\n"); }
+
+    public fn h1_class(Page&mut self, string class_name, string value) -> bool { return body_tag_text(self, "h1", class_name, value); }
+    public fn p_class(Page&mut self, string class_name, string value) -> bool { return body_tag_text(self, "p", class_name, value); }
+    public fn h1_id(Page&mut self, string id, string value) -> bool { return body_tag_id_text(self, "h1", id, "", value); }
+    public fn p_id(Page&mut self, string id, string value) -> bool { return body_tag_id_text(self, "p", id, "", value); }
+    public fn span_id(Page&mut self, string id, string value) -> bool { return body_tag_id_text(self, "span", id, "", value); }
+
+    // Any HTML/custom element is available immediately; dedicated helpers above
+    // are only conveniences for common tags.
+    public fn element(Page&mut self, string tag, string value) -> bool { return body_tag_text(self, tag, "", value); }
+    public fn element_class(Page&mut self, string tag, string class_name, string value) -> bool { return body_tag_text(self, tag, class_name, value); }
+    public fn element_id(Page&mut self, string tag, string id, string class_name, string value) -> bool { return body_tag_id_text(self, tag, id, class_name, value); }
+
+    /// Emit a text element with one escaped attribute. Attribute and tag names
+    /// are restricted to normal HTML name characters; values are always escaped.
+    public fn element_attr(Page&mut self, string tag, string name, string attribute_value, string value) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name, attribute_value) || !self.body.push_str(">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</") && append_html_name_to(&mut self.body, tag) && self.body.push_str(">\n");
+    }
+
+    /// Safe multi-attribute variants for ordinary HTML without dropping to raw().
+    public fn element_attr2(Page&mut self, string tag, string name1, string value1, string name2, string value2, string value) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name1, value1) || !append_attribute_to(&mut self.body, name2, value2) || !self.body.push_str(">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</") && append_html_name_to(&mut self.body, tag) && self.body.push_str(">\n");
+    }
+
+    public fn element_attr3(Page&mut self, string tag, string name1, string value1, string name2, string value2, string name3, string value3, string value) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name1, value1) || !append_attribute_to(&mut self.body, name2, value2) || !append_attribute_to(&mut self.body, name3, value3) || !self.body.push_str(">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</") && append_html_name_to(&mut self.body, tag) && self.body.push_str(">\n");
+    }
+
+    public fn void_element(Page&mut self, string tag) -> bool {
+        return self.body.push_str("<") && append_html_name_to(&mut self.body, tag) && self.body.push_str(">\n");
+    }
+
+    public fn void_attr(Page&mut self, string tag, string name, string value) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        return append_attribute_to(&mut self.body, name, value) && self.body.push_str(">\n");
+    }
+
+    public fn void_attr2(Page&mut self, string tag, string name1, string value1, string name2, string value2) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        return append_attribute_to(&mut self.body, name1, value1) && append_attribute_to(&mut self.body, name2, value2) && self.body.push_str(">\n");
+    }
+
+    public fn void_attr3(Page&mut self, string tag, string name1, string value1, string name2, string value2, string name3, string value3) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        return append_attribute_to(&mut self.body, name1, value1) && append_attribute_to(&mut self.body, name2, value2) && append_attribute_to(&mut self.body, name3, value3) && self.body.push_str(">\n");
+    }
+
+
+    // ---- links/media/forms ------------------------------------------------------
+    public fn a(Page&mut self, string href, string label) -> bool {
+        if (!self.body.push_str("<a href=\"") || !append_escaped_to(&mut self.body, href) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</a>\n");
+    }
+    public fn link(Page&mut self, string href, string label) -> bool { return self.a(href, label); }
+    public fn a_class(Page&mut self, string href, string class_name, string label) -> bool {
+        if (!self.body.push_str("<a href=\"") || !append_escaped_to(&mut self.body, href) || !self.body.push_str("\" class=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</a>\n");
+    }
+
+    public fn a_external(Page&mut self, string href, string label) -> bool {
+        if (!self.body.push_str("<a href=\"") || !append_escaped_to(&mut self.body, href)) { return false; }
+        if (!self.body.push_str("\" target=\"_blank\" rel=\"noopener noreferrer\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</a>\n");
+    }
+
+    public fn image(Page&mut self, string src, string alt) -> bool {
+        if (!self.body.push_str("<img src=\"") || !append_escaped_to(&mut self.body, src) || !self.body.push_str("\" alt=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, alt)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    public fn image_lazy(Page&mut self, string src, string alt) -> bool {
+        if (!self.body.push_str("<img src=\"") || !append_escaped_to(&mut self.body, src) || !self.body.push_str("\" alt=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, alt)) { return false; }
+        return self.body.push_str("\" loading=\"lazy\" decoding=\"async\">\n");
+    }
+
+    public fn image_size(Page&mut self, string src, string alt, string width, string height) -> bool {
+        if (!self.body.push_str("<img src=\"") || !append_escaped_to(&mut self.body, src) || !self.body.push_str("\" alt=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, alt) || !self.body.push_str("\" width=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, width) || !self.body.push_str("\" height=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, height)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    public fn source(Page&mut self, string src, string media_type) -> bool {
+        return self.void_attr2("source", "src", src, "type", media_type);
+    }
+
+    public fn source_media(Page&mut self, string srcset, string media) -> bool {
+        return self.void_attr2("source", "srcset", srcset, "media", media);
+    }
+
+    public fn track(Page&mut self, string src, string kind, string language) -> bool {
+        return self.void_attr3("track", "src", src, "kind", kind, "srclang", language);
+    }
+
+    public fn iframe(Page&mut self, string src, string title) -> bool {
+        if (!self.body.push_str("<iframe src=\"") || !append_escaped_to(&mut self.body, src) || !self.body.push_str("\" title=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, title)) { return false; }
+        return self.body.push_str("\"></iframe>\n");
+    }
+
+    public fn button(Page&mut self, string label) -> bool { return body_tag_text(self, "button", "", label); }
+    public fn button_id(Page&mut self, string id, string label) -> bool { return body_tag_id_text(self, "button", id, "", label); }
+
+    public fn input(Page&mut self, string input_type, string name, string placeholder) -> bool {
+        if (!self.body.push_str("<input type=\"") || !append_escaped_to(&mut self.body, input_type) || !self.body.push_str("\" name=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, name) || !self.body.push_str("\" placeholder=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, placeholder)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    public fn input_id(Page&mut self, string id, string input_type, string name, string placeholder) -> bool {
+        if (!self.body.push_str("<input id=\"") || !append_escaped_to(&mut self.body, id) || !self.body.push_str("\" type=\"") || !append_escaped_to(&mut self.body, input_type) || !self.body.push_str("\" name=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, name) || !self.body.push_str("\" placeholder=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, placeholder)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    public fn label_for(Page&mut self, string target_id, string label) -> bool {
+        if (!self.body.push_str("<label for=\"") || !append_escaped_to(&mut self.body, target_id) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</label>\n");
+    }
+
+    public fn input_text(Page&mut self, string name, string placeholder) -> bool { return self.input("text", name, placeholder); }
+    public fn input_email(Page&mut self, string name, string placeholder) -> bool { return self.input("email", name, placeholder); }
+    public fn input_password(Page&mut self, string name, string placeholder) -> bool { return self.input("password", name, placeholder); }
+    public fn input_search(Page&mut self, string name, string placeholder) -> bool { return self.input("search", name, placeholder); }
+    public fn input_number(Page&mut self, string name, string placeholder) -> bool { return self.input("number", name, placeholder); }
+    public fn input_url(Page&mut self, string name, string placeholder) -> bool { return self.input("url", name, placeholder); }
+    public fn input_tel(Page&mut self, string name, string placeholder) -> bool { return self.input("tel", name, placeholder); }
+    public fn input_date(Page&mut self, string name) -> bool { return self.input("date", name, ""); }
+    public fn input_month(Page&mut self, string name) -> bool { return self.input("month", name, ""); }
+    public fn input_week(Page&mut self, string name) -> bool { return self.input("week", name, ""); }
+    public fn input_time(Page&mut self, string name) -> bool { return self.input("time", name, ""); }
+    public fn input_datetime_local(Page&mut self, string name) -> bool { return self.input("datetime-local", name, ""); }
+    public fn input_color(Page&mut self, string name) -> bool { return self.input("color", name, ""); }
+
+    /// Range input with native browser validation and no client runtime requirement.
+    public fn input_range(Page&mut self, string name, string minimum, string maximum, string step) -> bool {
+        if (!self.body.push_str("<input type=\"range\" name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\" min=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, minimum) || !self.body.push_str("\" max=\"") || !append_escaped_to(&mut self.body, maximum) || !self.body.push_str("\" step=\"") || !append_escaped_to(&mut self.body, step)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    /// Hidden form value. This remains ordinary HTML and does not require the browser runtime.
+    public fn input_hidden(Page&mut self, string name, string value) -> bool {
+        if (!self.body.push_str("<input type=\"hidden\" name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\" value=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    /// Progressive-enhancement checkbox. `checked` only controls initial HTML state.
+    public fn input_checkbox(Page&mut self, string name, string value, bool checked) -> bool {
+        if (!self.body.push_str("<input type=\"checkbox\" name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\" value=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, value) || !self.body.push_str("\"")) { return false; }
+        if (checked && !self.body.push_str(" checked")) { return false; }
+        return self.body.push_str(">\n");
+    }
+
+    public fn input_radio(Page&mut self, string name, string value, bool checked) -> bool {
+        if (!self.body.push_str("<input type=\"radio\" name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\" value=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, value) || !self.body.push_str("\"")) { return false; }
+        if (checked && !self.body.push_str(" checked")) { return false; }
+        return self.body.push_str(">\n");
+    }
+
+    public fn input_file(Page&mut self, string name, string accept) -> bool {
+        if (!self.body.push_str("<input type=\"file\" name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\"")) { return false; }
+        if (raz_rt_cstr_len(accept) > 0) {
+            if (!self.body.push_str(" accept=\"") || !append_escaped_to(&mut self.body, accept) || !self.body.push_str("\"")) { return false; }
+        }
+        return self.body.push_str(">\n");
+    }
+
+    public fn input_submit(Page&mut self, string value) -> bool {
+        if (!self.body.push_str("<input type=\"submit\" value=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("\">\n");
+    }
+
+    public fn form(Page&mut self, string action, string method, string class_name) -> bool {
+        if (!self.body.push_str("<form action=\"") || !append_escaped_to(&mut self.body, action) || !self.body.push_str("\" method=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, method) || !self.body.push_str("\"")) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn form_get(Page&mut self, string action, string class_name) -> bool { return self.form(action, "get", class_name); }
+    public fn form_post(Page&mut self, string action, string class_name) -> bool { return self.form(action, "post", class_name); }
+
+    /// POST form suitable for file uploads on ordinary static/server-backed sites.
+    public fn form_multipart(Page&mut self, string action, string class_name) -> bool {
+        if (!self.body.push_str("<form action=\"") || !append_escaped_to(&mut self.body, action) || !self.body.push_str("\" method=\"post\" enctype=\"multipart/form-data\"")) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    // ---- containers -------------------------------------------------------------
+    public fn open(Page&mut self, string tag, string class_name) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn open_id(Page&mut self, string tag, string id, string class_name) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (raz_rt_cstr_len(id) > 0) {
+            if (!self.body.push_str(" id=\"") || !append_escaped_to(&mut self.body, id) || !self.body.push_str("\"")) { return false; }
+        }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn open_attr(Page&mut self, string tag, string name, string value) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name, value) || !self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn open_attr2(Page&mut self, string tag, string name1, string value1, string name2, string value2) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name1, value1) || !append_attribute_to(&mut self.body, name2, value2) || !self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn open_attr3(Page&mut self, string tag, string name1, string value1, string name2, string value2, string name3, string value3) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_attribute_to(&mut self.body, name1, value1) || !append_attribute_to(&mut self.body, name2, value2) || !append_attribute_to(&mut self.body, name3, value3) || !self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn open_bool_attr(Page&mut self, string tag, string name) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (!append_boolean_attribute_to(&mut self.body, name) || !self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn begin(Page&mut self, string tag, string class_name) -> bool { return self.open(tag, class_name); }
+    public fn begin_id(Page&mut self, string tag, string id, string class_name) -> bool { return self.open_id(tag, id, class_name); }
+
+    public fn close(Page&mut self, string tag) -> bool {
+        if (self.open_depth > 0) { self.open_depth -= 1; }
+        return self.body.push_str("</") && append_html_name_to(&mut self.body, tag) && self.body.push_str(">\n");
+    }
+
+    public fn end(Page&mut self, string tag) -> bool { return self.close(tag); }
+
+    public fn main(Page&mut self, string class_name) -> bool { return self.open("main", class_name); }
+    public fn section(Page&mut self, string class_name) -> bool { return self.open("section", class_name); }
+    public fn div(Page&mut self, string class_name) -> bool { return self.open("div", class_name); }
+    public fn div_id(Page&mut self, string id, string class_name) -> bool { return self.open_id("div", id, class_name); }
+
+    /// Opens a reusable layout boundary. Layouts are ordinary HTML and carry
+    /// only a data marker for styling/testing; they introduce no browser runtime.
+    public fn layout(Page&mut self, string name, string class_name) -> bool {
+        if (!html_name_valid(name)) { return false; }
+        if (!self.body.push_str("<div data-raz-layout=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\"")) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+    public fn nav(Page&mut self, string class_name) -> bool { return self.open("nav", class_name); }
+    public fn header(Page&mut self, string class_name) -> bool { return self.open("header", class_name); }
+    public fn footer(Page&mut self, string class_name) -> bool { return self.open("footer", class_name); }
+    public fn ul(Page&mut self, string class_name) -> bool { return self.open("ul", class_name); }
+    public fn ol(Page&mut self, string class_name) -> bool { return self.open("ol", class_name); }
+    public fn article(Page&mut self, string class_name) -> bool { return self.open("article", class_name); }
+    public fn aside(Page&mut self, string class_name) -> bool { return self.open("aside", class_name); }
+    public fn figure(Page&mut self, string class_name) -> bool { return self.open("figure", class_name); }
+    public fn details(Page&mut self, string class_name) -> bool { return self.open("details", class_name); }
+    public fn table(Page&mut self, string class_name) -> bool { return self.open("table", class_name); }
+    public fn thead(Page&mut self, string class_name) -> bool { return self.open("thead", class_name); }
+    public fn tbody(Page&mut self, string class_name) -> bool { return self.open("tbody", class_name); }
+    public fn tfoot(Page&mut self, string class_name) -> bool { return self.open("tfoot", class_name); }
+    public fn tr(Page&mut self, string class_name) -> bool { return self.open("tr", class_name); }
+    public fn dl(Page&mut self, string class_name) -> bool { return self.open("dl", class_name); }
+    public fn menu(Page&mut self, string class_name) -> bool { return self.open("menu", class_name); }
+    public fn search(Page&mut self, string class_name) -> bool { return self.open("search", class_name); }
+    public fn fieldset(Page&mut self, string class_name) -> bool { return self.open("fieldset", class_name); }
+    public fn picture(Page&mut self, string class_name) -> bool { return self.open("picture", class_name); }
+    public fn audio(Page&mut self, string class_name) -> bool { return self.open("audio", class_name); }
+    public fn video(Page&mut self, string class_name) -> bool { return self.open("video", class_name); }
+    public fn canvas(Page&mut self, string class_name) -> bool { return self.open("canvas", class_name); }
+    public fn select(Page&mut self, string class_name) -> bool { return self.open("select", class_name); }
+
+    /// Accessible container carrying id, class, role, and aria-label in one call.
+    public fn landmark(Page&mut self, string tag, string id, string class_name, string role, string label) -> bool {
+        if (!self.body.push_str("<") || !append_html_name_to(&mut self.body, tag)) { return false; }
+        if (raz_rt_cstr_len(id) > 0 && !append_attribute_to(&mut self.body, "id", id)) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0 && !append_attribute_to(&mut self.body, "class", class_name)) { return false; }
+        if (raz_rt_cstr_len(role) > 0 && !append_attribute_to(&mut self.body, "role", role)) { return false; }
+        if (raz_rt_cstr_len(label) > 0 && !append_attribute_to(&mut self.body, "aria-label", label)) { return false; }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    /// Begin a normal SVG fragment. Child SVG elements use the same safe open/
+    /// element/void helpers because SVG tag and attribute names share the name grammar.
+    public fn svg(Page&mut self, string view_box, string class_name) -> bool {
+        if (!self.body.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"") || !append_escaped_to(&mut self.body, view_box) || !self.body.push_str("\"")) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn svg_path(Page&mut self, string d) -> bool { return self.element_attr("path", "d", d, ""); }
+    public fn svg_use(Page&mut self, string href) -> bool { return self.element_attr("use", "href", href, ""); }
+    public fn select_name(Page&mut self, string name, string class_name) -> bool {
+        if (!self.body.push_str("<select name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\"")) { return false; }
+        if (raz_rt_cstr_len(class_name) > 0) {
+            if (!self.body.push_str(" class=\"") || !append_escaped_to(&mut self.body, class_name) || !self.body.push_str("\"")) { return false; }
+        }
+        if (!self.body.push_str(">\n")) { return false; }
+        self.open_depth += 1;
+        return true;
+    }
+
+    public fn end_main(Page&mut self) -> bool { return self.close("main"); }
+    public fn end_section(Page&mut self) -> bool { return self.close("section"); }
+    public fn end_div(Page&mut self) -> bool { return self.close("div"); }
+    public fn end_layout(Page&mut self) -> bool { return self.close("div"); }
+    public fn end_nav(Page&mut self) -> bool { return self.close("nav"); }
+    public fn end_header(Page&mut self) -> bool { return self.close("header"); }
+    public fn end_footer(Page&mut self) -> bool { return self.close("footer"); }
+    public fn end_ul(Page&mut self) -> bool { return self.close("ul"); }
+    public fn end_ol(Page&mut self) -> bool { return self.close("ol"); }
+    public fn end_article(Page&mut self) -> bool { return self.close("article"); }
+    public fn end_aside(Page&mut self) -> bool { return self.close("aside"); }
+    public fn end_figure(Page&mut self) -> bool { return self.close("figure"); }
+    public fn end_details(Page&mut self) -> bool { return self.close("details"); }
+    public fn end_table(Page&mut self) -> bool { return self.close("table"); }
+    public fn end_thead(Page&mut self) -> bool { return self.close("thead"); }
+    public fn end_tbody(Page&mut self) -> bool { return self.close("tbody"); }
+    public fn end_tfoot(Page&mut self) -> bool { return self.close("tfoot"); }
+    public fn end_tr(Page&mut self) -> bool { return self.close("tr"); }
+    public fn end_dl(Page&mut self) -> bool { return self.close("dl"); }
+    public fn end_menu(Page&mut self) -> bool { return self.close("menu"); }
+    public fn end_search(Page&mut self) -> bool { return self.close("search"); }
+    public fn end_fieldset(Page&mut self) -> bool { return self.close("fieldset"); }
+    public fn end_picture(Page&mut self) -> bool { return self.close("picture"); }
+    public fn end_audio(Page&mut self) -> bool { return self.close("audio"); }
+    public fn end_video(Page&mut self) -> bool { return self.close("video"); }
+    public fn end_canvas(Page&mut self) -> bool { return self.close("canvas"); }
+    public fn end_svg(Page&mut self) -> bool { return self.close("svg"); }
+    public fn end_select(Page&mut self) -> bool { return self.close("select"); }
+    public fn end_form(Page&mut self) -> bool { return self.close("form"); }
+
+    public fn th(Page&mut self, string value) -> bool { return body_tag_text(self, "th", "", value); }
+    public fn td(Page&mut self, string value) -> bool { return body_tag_text(self, "td", "", value); }
+    public fn summary(Page&mut self, string value) -> bool { return body_tag_text(self, "summary", "", value); }
+    public fn figcaption(Page&mut self, string value) -> bool { return body_tag_text(self, "figcaption", "", value); }
+
+    public fn textarea(Page&mut self, string name, string placeholder, string value) -> bool {
+        if (!self.body.push_str("<textarea name=\"") || !append_escaped_to(&mut self.body, name) || !self.body.push_str("\" placeholder=\"")) { return false; }
+        if (!append_escaped_to(&mut self.body, placeholder) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, value)) { return false; }
+        return self.body.push_str("</textarea>\n");
+    }
+
+    public fn option(Page&mut self, string value, string label) -> bool {
+        if (!self.body.push_str("<option value=\"") || !append_escaped_to(&mut self.body, value) || !self.body.push_str("\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</option>\n");
+    }
+
+    public fn option_selected(Page&mut self, string value, string label) -> bool {
+        if (!self.body.push_str("<option value=\"") || !append_escaped_to(&mut self.body, value) || !self.body.push_str("\" selected>")) { return false; }
+        if (!append_escaped_to(&mut self.body, label)) { return false; }
+        return self.body.push_str("</option>\n");
+    }
+
+    /// Accessible validation/status message for progressively-enhanced forms.
+    public fn field_error(Page&mut self, string id, string message) -> bool {
+        if (!self.body.push_str("<p id=\"") || !append_escaped_to(&mut self.body, id) || !self.body.push_str("\" role=\"alert\" aria-live=\"polite\">")) { return false; }
+        if (!append_escaped_to(&mut self.body, message)) { return false; }
+        return self.body.push_str("</p>\n");
+    }
+
+    // ---- browser interactivity --------------------------------------------------
+    /// Lazily load an ES-module chunk the first time an element receives the
+    /// selected event. This is a client-only enhancement: using it does not root
+    /// any Raz function and therefore does not cause app.wasm to be emitted.
+    public fn lazy_module_on(Page&mut self, string element_id, EventKind kind, string src) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); if (el) el.addEventListener('") || !append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', () => { void import('") || !append_js_string_to(&mut self.client, src)) { return false; }
+        return self.client.push_str("'); }, { once: true }); }\n");
+    }
+
+    public fn lazy_module_on_click(Page&mut self, string element_id, string src) -> bool {
+        return self.lazy_module_on(element_id, EventKind::Click, src);
+    }
+
+    /// Lazily instantiate a Raz-WASM chunk the first time the selected event fires.
+    /// The chunk contains only `handler` and the functions reachable from it; it is
+    /// not included in the main app.wasm root set unless bound separately with `on`.
+    public fn lazy_wasm_on(Page&mut self, string element_id, EventKind kind, string chunk, string handler) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); let module = null; if (el) el.addEventListener('") || !append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', async (event) => { if (!module) module = await rzLoadWasm('/assets/chunks/") || !append_js_string_to(&mut self.client, chunk)) { return false; }
+        if (!self.client.push_str(".wasm'); const fn = module['") || !append_js_string_to(&mut self.client, handler)) { return false; }
+        if (!self.client.push_str("']; if (typeof fn !== 'function') return; rzUse(module); rzCurrentEvent = event; try { fn(); } finally { rzCurrentEvent = null; } }); }\n")) { return false; }
+        return self.browser_chunks.push_str(chunk) && self.browser_chunks.push_str("\t") && self.browser_chunks.push_str(handler) && self.browser_chunks.push_str("\n");
+    }
+
+    public fn lazy_wasm_on_click(Page&mut self, string element_id, string chunk, string handler) -> bool {
+        return self.lazy_wasm_on(element_id, EventKind::Click, chunk, handler);
+    }
+
+    // Event bindings contain no application behavior. They only dispatch a DOM
+    // event to an exported ordinary Raz function in app.wasm.
+    /// Roots an exported Raz function for browser APIs that invoke callbacks by name
+    /// (for example `web::std::timers::set_timeout`). This emits no JavaScript by
+    /// itself; it only keeps the named function available in app.wasm.
+    public fn browser_export(Page&mut self, string handler) -> bool {
+        return self.browser_roots.push_str(handler) && self.browser_roots.push_str("\n");
+    }
+
+    public fn on(Page&mut self, string element_id, EventKind kind, string handler) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); const owner = rzMain; const fn = rz['") || !append_js_string_to(&mut self.client, handler)) { return false; }
+        if (!self.client.push_str("']; if (el && typeof fn === 'function') el.addEventListener('") || !append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', (event) => { rzUse(owner); rzCurrentEvent = event; try { fn(); } finally { rzCurrentEvent = null; } }); }\n")) { return false; }
+        // Keep browser codegen rooted in the functions the page actually binds.
+        // One handler name per line makes the marker deterministic and trivial
+        // for the compiler to consume after the native generation pass.
+        return self.browser_roots.push_str(handler) && self.browser_roots.push_str("\n");
+    }
+
+    public fn on_click(Page&mut self, string element_id, string handler) -> bool {
+        return self.on(element_id, EventKind::Click, handler);
+    }
+
+    public fn on_input(Page&mut self, string element_id, string handler) -> bool {
+        return self.on(element_id, EventKind::Input, handler);
+    }
+
+    /// Append a reusable Component tree to this page as build-time-only HTML/CSS.
+    /// Browser-bound components are rejected instead of silently adding a runtime.
+    public fn component(Page&mut self, web::ui::Component&mut value) -> bool {
+        return value.append_static(&mut self.body, &mut self.css);
+    }
+
+    /// Escape and append plain text without wrapping it in an element.
+    public fn text(Page&mut self, string value) -> bool { return append_escaped_to(&mut self.body, value); }
+
+    /// Escape hatch for deliberately-authored HTML. Normal text APIs escape by default.
+    public fn raw(Page&mut self, string html) -> bool { return self.body.push_str(html); }
+
+    /// Writes an explicit static file path. Interactive pages emit only the
+    /// app.js WebAssembly host shim beside the HTML file.
+    public fn write(Page&mut self, string path) -> bool {
+        String owned = String::from(path);
+        return write_page_to(self, &owned);
+    }
+
+    /// Writes a host-friendly static route. `/` becomes `dist/index.html` and
+    /// `/about` becomes `dist/about/index.html`. Route traversal, query/hash
+    /// suffixes, backslashes, and empty path segments are rejected so a build
+    /// can never escape its dist directory.
+    public fn write_route(Page&mut self, string route) -> bool {
+        String path = String::new();
+        if (!static_route_output(route, &mut path)) { return false; }
+        return write_page_to(self, &path);
+    }
+
+    /// Writes an owned prerendered route path created by route_path(). Any
+    /// unresolved dynamic segment or unsafe traversal is rejected.
+    public fn write_route_path(Page&mut self, String& route) -> bool {
+        String output = String::new();
+        if (!static_route_output_string(route, &mut output)) { return false; }
+        return write_page_to(self, &output);
+    }
+
+    /// Writes the conventional static-host 404 document.
+    public fn write_not_found(Page&mut self) -> bool {
+        String path = String::from("dist/404.html");
+        return write_page_to(self, &path);
+    }
+}
+
+/// Browser DOM primitives callable from ordinary Raz event functions. Their
+/// implementations are WebAssembly imports supplied by generated host glue.
+public fn set_text(string id, string value) -> bool { return web::std::dom::set_text(id, value); }
+public fn set_text_i64(string id, i64 value) -> bool { return web::std::dom::set_text_i64(id, value); }
+public fn toggle_class(string id, string class_name) -> bool { return web::std::dom::toggle_class(id, class_name); }
+public fn element(string id) -> web::std::dom::Element { return web::std::dom::element(id); }
+public fn event() -> Event { return web::std::events::current(); }
+
+/// Creates the canonical static output root used by Raz web projects.
+public fn prepare_dist() -> bool {
+    string dist = "dist";
+    return web::build::fs::create_dir_all(raz_rt_cstr_ptr(dist), 4);
+}
+
+/// Emit one host-friendly static route from a reusable Component tree.
+/// This is the concise static-site path: ordinary Component authoring, no
+/// application runtime, and no manual prepare_dist/Page/write_route boilerplate.
+public fn write_component_route(string route, string title, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new(title);
+    if (!page.component(component)) { return false; }
+    return page.write_route(route);
+}
+
+public fn write_component_route_path(String& route, string title, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new(title);
+    if (!page.component(component)) { return false; }
+    return page.write_route_path(route);
+}
+
+public fn write_component_route_lang(string route, string title, string language, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new_lang(title, language);
+    if (!page.component(component)) { return false; }
+    return page.write_route(route);
+}

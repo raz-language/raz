@@ -26,9 +26,15 @@ checks = {
     "seed build streams compiler diagnostics": 'f"Stage-0 compiler -> Raz seed (O{args.seed_opt})"' in bootstrap and "seed_command[1:]" in bootstrap,
     "seed artifact follows bin layout": 'compiler_project / "target" / seed_profile / "bin" / f"raz-compiler{EXE}"' in bootstrap,
     "all bootstrap generations use canonical profile layout": 'PROFILE_OUTPUT_DIRECTORIES = ("bin", "lib", "obj", "ir", "modules", "packages")' in bootstrap and 'stage_layout["obj"] / f"raz-compiler{OBJ}"' in bootstrap and 'stage_layout["bin"] / f"raz-compiler{EXE}"' in bootstrap and 'verify_layout["obj"] / f"raz-compiler{OBJ}"' in bootstrap and 'verify_layout["bin"] / f"raz-compiler{EXE}"' in bootstrap,
+    "self-host generations use release profile": 'generation_args = [\n            "build",\n            "--release",' in bootstrap and 'verify_args = [\n                "build", "--release",' in bootstrap,
+    "normal bootstrap does not force compiler phase tracing": 'RAZ_COMPILER_PHASE_TRACE' not in bootstrap,
+    "self-host stages relocatable Forge support": "shutil.copy2(bridge, lib_dir / bridge.name)" in bootstrap and "shutil.copy2(forge, lib_dir / forge.name)" in bootstrap,
     "legacy bootstrap scratch is migrated away": 'BOOTSTRAP_LEGACY_SCRATCH_NAMES = {"host-source-order.txt", "stage1-diagnostic.txt"}' in bootstrap and 'remove_legacy_bootstrap_scratch(build_dir)' in bootstrap,
-    "release helper uses repro-1": "repro-1" in release and "repro-2" not in release,
-    "Windows docs use repro-1 as normal final compiler": "repro-1" in windows,
+    "release helper uses retained production compiler": "qualification / 'release' / 'bin'" in release and "repro-1" not in release,
+    "retained compiler uses public raz name": 'retain_user_facing_compiler(staged_profile)' in bootstrap and 'final_compiler = qualification / "release" / "bin" / f"raz{EXE}"' in bootstrap,
+    "retained profile prunes empty artifact directories": 'prune_empty_directories(staged_profile)' in bootstrap,
+    "build summary is relocatable and names object digest precisely": 'retained_relative = Path("release") / "bin" / f"raz{EXE}"' in bootstrap and 'f"Production compiler: {retained_relative.as_posix()}\\n"' in bootstrap and 'Self-host object SHA-256' in bootstrap,
+    "Windows docs use retained release compiler": "target/bootstrap/release/bin/raz.exe" in windows,
     "release docs describe optional verification": "verify-reproducibility" in qualification,
 }
 

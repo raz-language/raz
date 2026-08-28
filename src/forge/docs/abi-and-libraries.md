@@ -1,13 +1,13 @@
 # Native ABI classification and libraries
 
-Forge 1.2 provides frontend-visible ABI classification and native library workflows for x86-64 targets.
+Forge exposes frontend-visible ABI classification and native library workflows for x86-64 targets.
 
 ## Aggregate classification
 
 Include:
 
 ```cpp
-#include <forge/target/abi.hpp>
+#include <forge/platform/abi.hpp>
 ```
 
 Classify a named aggregate:

@@ -1,0 +1,365 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::async;
+
+public import raz_codegen_wasm::wasi;
+
+// Cooperative Raz async ABI for wasm32. Async function handles are frame
+// addresses in linear memory. The frame is self-describing enough for await to
+// drive a nested future without a host callback or JavaScript trampoline.
+//
+//   +0   resume MIR instruction (relative to function start)
+//   +8   result bits
+//   +16  poll function-table index (-1 for an externally completed future)
+//   +24  spill-slot count
+//   +32  terminal status: 0 pending, 1 complete, -1 cancelled
+//   +40  reserved awaited future
+//   +48  reserved awaited result
+//   +56  reserved awaited status
+//   +64  spill slots (i64 bit-pattern ABI)
+fn wasm_async_frame_header_size() -> i64 {
+    return 64;
+}
+
+fn wasm_async_frame_state_offset() -> i64 {
+    return 0;
+}
+
+fn wasm_async_frame_result_offset() -> i64 {
+    return 8;
+}
+
+fn wasm_async_frame_poll_offset() -> i64 {
+    return 16;
+}
+
+fn wasm_async_frame_slot_count_offset() -> i64 {
+    return 24;
+}
+
+fn wasm_async_frame_status_offset() -> i64 {
+    return 32;
+}
+
+fn wasm_async_frame_slot_offset(i64 slot) -> i64 {
+    return wasm_async_frame_header_size() + slot * 8;
+}
+
+fn wasm_async_count(HirModule& hir) -> i64 {
+    i64 count = 0;
+    i64 function_index = 0;
+
+    while (function_index < hir.function_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_async, function_index) != 0 &&
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0
+        ) {
+            count += 1;
+        }
+        function_index += 1;
+    }
+    return count;
+}
+
+fn wasm_async_ordinal(HirModule& hir, i64 function_index) -> i64 {
+    i64 ordinal = 0;
+    i64 current = 0;
+
+    while (current < function_index) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_async, current) != 0 &&
+            raz_compiler_rt_arena_get(hir.function_is_extern, current) == 0
+        ) {
+            ordinal += 1;
+        }
+        current += 1;
+    }
+    return ordinal;
+}
+
+fn wasm_async_poll_type_index(HirModule& hir) -> i64 {
+    // HIR functions + callable types + closure-adapter types + 12 WASI types,
+    // followed by the two Raz Web host signatures in browser mode.
+    i64 browser_types = 0;
+    if (wasm_browser_mode()) { browser_types = 2; }
+    return hir.function_count + hir.function_type_count * 2 + 12 + browser_types;
+}
+
+fn wasm_async_poll_defined_index(HirModule& hir, i64 closure_count, i64 function_index) -> i64 {
+    return hir.function_count + closure_count + wasm_async_ordinal(hir, function_index);
+}
+
+fn wasm_async_poll_table_index(HirModule& hir, i64 closure_count, i64 function_index) -> i64 {
+    return wasm_async_poll_defined_index(hir, closure_count, function_index);
+}
+
+fn wasm_async_current_frame_global(MirModule& mir) -> i64 {
+    // global 0 is the memory frontier, global 1 is WASI errno, and module
+    // globals occupy 2..N+1.
+    return mir.global_count + 2;
+}
+
+fn wasm_async_spill_slot_count(HirModule& hir, MirModule& mir, i64 function_index) -> i64 {
+    return (raz_compiler_rt_arena_get(hir.function_local_counts, function_index) + raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index) + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index));
+}
+
+fn wasm_async_register_slot(HirModule& hir, MirModule& mir, i64 function_index, i64 ip) -> i64 {
+    return (raz_compiler_rt_arena_get(hir.function_local_counts, function_index) + raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index) + (ip - raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index)));
+}
+
+fn wasm_async_parameter_slot(HirModule& hir, i64 function_index, i64 parameter) -> i64 {
+    return raz_compiler_rt_arena_get(hir.function_local_counts, function_index) + parameter;
+}
+
+fn wasm_async_local_slot(i64 local) -> i64 {
+    return local;
+}
+
+fn wasm_async_i64_load(ForgeWriter&mut out, i64 frame_local, i64 offset) {
+    wasm_local_get(out, frame_local);
+    wasm_u8(out, 167);
+    // i32.wrap_i64
+    wasm_u8(out, 41);
+    // i64.load
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_async_i64_store_local(ForgeWriter&mut out, i64 frame_local, i64 offset, i64 value_local) {
+    wasm_local_get(out, frame_local);
+    wasm_u8(out, 167);
+    wasm_local_get(out, value_local);
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_async_i64_store_const(ForgeWriter&mut out, i64 frame_local, i64 offset, i64 value) {
+    wasm_local_get(out, frame_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 66);
+    wasm_i64(out, value);
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_async_store_frame_state(ForgeWriter&mut out, i64 frame_local, i64 state) {
+    wasm_async_i64_store_const(out, frame_local, wasm_async_frame_state_offset(), state);
+}
+
+fn wasm_async_store_frame_status(ForgeWriter&mut out, i64 frame_local, i64 status) {
+    wasm_async_i64_store_const(out, frame_local, wasm_async_frame_status_offset(), status);
+}
+
+fn wasm_async_load_frame_status(ForgeWriter&mut out, i64 frame_local) {
+    wasm_async_i64_load(out, frame_local, wasm_async_frame_status_offset());
+}
+
+fn wasm_async_load_frame_result(ForgeWriter&mut out, i64 frame_local) {
+    wasm_async_i64_load(out, frame_local, wasm_async_frame_result_offset());
+}
+
+fn wasm_async_load_frame_poll(ForgeWriter&mut out, i64 frame_local) {
+    wasm_async_i64_load(out, frame_local, wasm_async_frame_poll_offset());
+}
+
+fn wasm_async_store_spill_local(ForgeWriter&mut out, i64 frame_local, i64 slot, i64 value_local) {
+    wasm_async_i64_store_local(out, frame_local, wasm_async_frame_slot_offset(slot), value_local);
+}
+
+fn wasm_async_load_spill(ForgeWriter&mut out, i64 frame_local, i64 slot) {
+    wasm_async_i64_load(out, frame_local, wasm_async_frame_slot_offset(slot));
+}
+
+fn wasm_async_emit_global(ForgeWriter&mut section) {
+    // Mutable i64 current-frame register. Nested polls save/restore it around
+    // calls, so re-entrant async chains do not corrupt the parent continuation.
+    wasm_u8(section, 126);
+    wasm_u8(section, 1);
+    wasm_u8(section, 66);
+    wasm_i64(section, 0);
+    wasm_u8(section, 11);
+}
+
+fn wasm_async_emit_wrapper_body(
+    ForgeWriter&mut section,
+    HirModule& hir,
+    MirModule& mir,
+    i64 function_index,
+    i64 closure_count,
+) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+
+    i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+    i64 frame_local = parameter_count;
+    i64 saved_frame_local = parameter_count + 1;
+    i64 slot_count = wasm_async_spill_slot_count(hir, mir, function_index);
+    i64 frame_size = wasm_async_frame_header_size() + slot_count * 8;
+
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 126);
+    // frame = zero-extended old heap frontier.
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 173);
+    wasm_local_set(&mut body, frame_local);
+    // Advance frontier and grow memory as required.
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, frame_size);
+    wasm_u8(&mut body, 106);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, 0);
+    wasm_memory_emit_ensure_capacity(&mut body);
+    // Explicitly clear the complete frame so future ABI fields are deterministic.
+    wasm_local_get(&mut body, frame_local);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, frame_size);
+    wasm_u8(&mut body, 252);
+    wasm_u32(&mut body, 11);
+    wasm_u32(&mut body, 0);
+    wasm_async_i64_store_const(
+        &mut body,
+        frame_local,
+        wasm_async_frame_poll_offset(),
+        wasm_async_poll_table_index(hir, closure_count, function_index),
+    );
+    wasm_async_i64_store_const(&mut body, frame_local, wasm_async_frame_slot_count_offset(), slot_count);
+
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 parameter = 0;
+
+    while (parameter < parameter_count) {
+        wasm_local_get(&mut body, parameter);
+
+        i64 parameter_type = raz_compiler_rt_arena_get(hir.parameter_types, parameter_start + parameter);
+
+        if (primitive_type_is_float(parameter_type)) {
+            wasm_float_emit_value_to_bits(&mut body, parameter_type);
+        }
+        wasm_local_set(&mut body, saved_frame_local);
+        wasm_async_i64_store_local(
+            &mut body,
+            frame_local,
+            wasm_async_frame_slot_offset(wasm_async_parameter_slot(hir, function_index, parameter)),
+            saved_frame_local,
+        );
+        parameter += 1;
+    }
+    // Save parent current-frame, run one eager poll, then restore the parent.
+    wasm_u8(&mut body, 35);
+    wasm_u32(&mut body, wasm_async_current_frame_global(mir));
+    wasm_local_set(&mut body, saved_frame_local);
+    wasm_local_get(&mut body, frame_local);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, wasm_async_current_frame_global(mir));
+    wasm_u8(&mut body, 16);
+    wasm_u32(
+        &mut body,
+        wasm_wasi_defined_function(wasm_async_poll_defined_index(hir, closure_count, function_index)),
+    );
+    wasm_u8(&mut body, 26);
+    // drop poll status
+    wasm_local_get(&mut body, saved_frame_local);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, wasm_async_current_frame_global(mir));
+    wasm_local_get(&mut body, frame_local);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_async_emit_wasi_start_body(
+    ForgeWriter&mut section,
+    HirModule& hir,
+    MirModule& mir,
+    i64 main_function,
+    i64 closure_count,
+) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    // local 0 = main future frame; local 1 = observed terminal status.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 2);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, wasm_wasi_defined_function(main_function));
+    wasm_local_set(&mut body, 0);
+    // Cooperative command executor. poll_oneoff provides a host yield between
+    // pending polls so async main never degrades into a CPU-burning busy loop.
+    wasm_u8(&mut body, 3);
+    wasm_u8(&mut body, 64);
+    wasm_async_load_frame_status(&mut body, 0);
+    wasm_local_set(&mut body, 1);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 81);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    if (raz_compiler_rt_arena_get(hir.function_returns_value, main_function) != 0) {
+        wasm_async_load_frame_result(&mut body, 0);
+        wasm_u8(&mut body, 167);
+    } else {
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 8);
+    wasm_u8(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 83);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 8);
+    wasm_u8(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_wasi_emit_poll_delay(&mut body, 1);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 36);
+    wasm_u32(&mut body, wasm_async_current_frame_global(mir));
+    wasm_u8(&mut body, 16);
+    wasm_u32(
+        &mut body,
+        wasm_wasi_defined_function(wasm_async_poll_defined_index(hir, closure_count, main_function)),
+    );
+    wasm_u8(&mut body, 26);
+    wasm_u8(&mut body, 12);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}

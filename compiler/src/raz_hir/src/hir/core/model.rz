@@ -1,0 +1,2428 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::core::model;
+
+public import frontend::parser;
+public import querydb::query::context;
+
+// Core HIR storage and metadata. These tables are shared by semantic analysis,
+// ownership checking, MIR lowering, and compile-time evaluation.
+public struct HirModule {
+    i64 function_count;
+    i64 diagnostic_offset;
+    DiagnosticCode diagnostic_code;
+    i64 parameter_count;
+    i64 local_count;
+    i64 node_count;
+    i64 statement_count;
+    i64 argument_count;
+    i64 block_count;
+    i64 struct_count;
+    i64 drop_impl_count;
+    i64 clone_impl_count;
+    i64 generic_function_count;
+    i64 generic_struct_count;
+
+    // Generic templates own a packed list of type parameters. The legacy
+    // single-parameter fields below remain as mirrors of parameter 0 while
+    // older lowering helpers are migrated to the packed representation.
+
+    i64 generic_parameter_count;
+    i64 generic_parameter_name_offsets;
+    i64 generic_parameter_name_lengths;
+
+    // 0 = type parameter, 1 = named lifetime, 2 = const value parameter.
+
+    i64 generic_parameter_kinds;
+    i64 generic_parameter_const_types;
+    i64 generic_parameter_bound_starts;
+    i64 generic_parameter_bound_counts;
+    i64 generic_parameter_bound_count;
+    i64 generic_parameter_bounds;
+    i64 generic_function_parameter_starts;
+    i64 generic_function_parameter_counts;
+    i64 generic_struct_parameter_starts;
+    i64 generic_struct_parameter_counts;
+
+    // Interned function-pointer signatures. Function values keep pointer ABI
+    // representation while semantic compatibility uses these records.
+
+    i64 function_type_count;
+    i64 function_type_parameter_count;
+    i64 function_type_parameter_starts;
+    i64 function_type_parameter_counts;
+    i64 function_type_parameter_type_structs;
+    i64 function_type_parameter_types;
+    i64 function_type_parameter_references;
+    i64 function_type_parameter_slices;
+    i64 function_type_parameter_slice_mutable;
+    i64 function_type_parameter_function_types;
+    i64 function_type_return_type_structs;
+    i64 function_type_return_types;
+    i64 function_type_return_references;
+    i64 function_type_return_slices;
+    i64 function_type_return_slice_mutable;
+    i64 function_type_return_function_types;
+    i64 generic_drop_impl_count;
+    i64 generic_clone_impl_count;
+    i64 generic_inherent_impl_count;
+    i64 inherent_method_count;
+    i64 trait_count;
+    i64 trait_name_offsets;
+    i64 trait_name_lengths;
+
+    // Object-safety is computed from the declared trait surface. dyn Trait
+    // parsing rejects traits that require associated types or object-unsafe methods.
+
+    i64 trait_object_safe_flags;
+
+    // Distinguish `trait Alias = A + B;` from ordinary marker traits with supertraits.
+
+    i64 trait_alias_flags;
+
+    // Object-safe trait methods retain declaration order and names so a dyn
+    // object can use stable vtable slots without reparsing the trait later.
+
+    i64 trait_method_count;
+    i64 trait_method_starts;
+    i64 trait_method_counts;
+    i64 trait_method_trait_indices;
+    i64 trait_method_name_offsets;
+    i64 trait_method_name_lengths;
+    i64 trait_method_source_offsets;
+
+    // Whether the trait declaration supplied a default body for this method.
+
+    i64 trait_method_default_flags;
+
+    // Effect contracts retained on trait declarations (bit 0 pure, 1 no_panic, 2 no_alloc, 3 deterministic).
+
+    i64 trait_method_effect_flags;
+    i64 trait_associated_type_count;
+    i64 trait_associated_const_count;
+    i64 trait_associated_type_starts;
+    i64 trait_associated_type_counts;
+    i64 trait_associated_const_starts;
+    i64 trait_associated_const_counts;
+    i64 trait_associated_type_name_offsets;
+    i64 trait_associated_type_name_lengths;
+    i64 trait_associated_const_name_offsets;
+    i64 trait_associated_const_name_lengths;
+    i64 trait_associated_const_type_offsets;
+    i64 trait_associated_const_type_lengths;
+
+    // Supertraits are packed per trait. Built-in trait IDs use the same
+    // negative encoding as generic bounds (-2 Clone, -3 Drop, -4 Copy).
+
+    i64 trait_supertrait_count;
+    i64 trait_supertrait_starts;
+    i64 trait_supertrait_counts;
+    i64 trait_supertraits;
+    i64 trait_impl_count;
+    i64 trait_impl_traits;
+    i64 trait_impl_structures;
+
+    // Source provenance retained for implementation reflection. A generic index
+    // of -1 denotes a concrete/non-template implementation.
+
+    i64 trait_impl_source_offsets;
+    i64 trait_impl_generic_indices;
+    i64 generic_trait_impl_count;
+    i64 generic_trait_source_offsets;
+    i64 generic_trait_traits;
+    i64 generic_trait_struct_templates;
+    i64 generic_trait_type_name_offsets;
+    i64 generic_trait_type_name_lengths;
+    i64 generic_trait_bound_counts;
+    i64 generic_trait_bounds;
+    i64 struct_field_count;
+    i64 enum_count;
+    i64 enum_member_count;
+    i64 generic_enum_count;
+    i64 generic_enum_name_offsets;
+    i64 generic_enum_name_lengths;
+    i64 generic_enum_source_offsets;
+    i64 generic_enum_parameter_starts;
+    i64 generic_enum_parameter_counts;
+    i64 generic_enum_derive_copy_flags;
+    i64 generic_enum_derive_clone_flags;
+    i64 constant_count;
+
+    // Backend-neutral module storage. Globals/statics are real addressable
+    // storage visible to MIR and every backend; TLS and external declarations
+    // are properties of the declaration, not LLVM-only escape hatches.
+
+    i64 global_count;
+    i64 global_name_offsets;
+    i64 global_name_lengths;
+    // Owning source module for modular native global definition/declaration emission.
+    i64 global_module_ids;
+    // Lazy Forge symbol-collision decision: 0 unknown, 1 no suffix, 2 suffix.
+    i64 global_identity_suffix_cache;
+    i64 global_type_structs;
+    i64 global_types;
+    i64 global_array_extents;
+    i64 global_function_types;
+    i64 global_mutable_flags;
+    i64 global_extern_flags;
+    i64 global_tls_flags;
+    i64 global_internal_flags;
+    i64 global_public_flags;
+    i64 global_initializer_nodes;
+    i64 constant_name_offsets;
+    i64 constant_name_lengths;
+    i64 constant_nodes;
+    i64 constant_types;
+    i64 constant_function_indices;
+    i64 constant_block_indices;
+    i64 constant_source_offsets;
+    i64 struct_name_offsets;
+    i64 struct_name_lengths;
+    // 0 = unknown, 1 = no identity suffix, 2 = identity suffix required.
+    // Forge names the same concrete structures repeatedly; cache the collision
+    // decision so symbol emission does not rescan the whole structure table.
+    i64 struct_identity_suffix_cache;
+    i64 struct_field_starts;
+    i64 struct_field_counts;
+    i64 struct_tuple_flags;
+
+    // Retained source layout attributes for reflection and ABI-stable layout.
+
+    i64 struct_packed_flags;
+    i64 struct_repr_c_flags;
+    i64 struct_explicit_alignments;
+    i64 struct_attribute_counts;
+    i64 struct_drop_functions;
+    i64 struct_clone_functions;
+
+    // Structural Clone derives that do not require a handwritten clone function.
+
+    i64 struct_derived_clone_flags;
+    i64 struct_copy_flags;
+    i64 struct_generic_template_indices;
+    i64 struct_generic_type_structs;
+    i64 struct_generic_types;
+    i64 struct_generic_argument_starts;
+    i64 struct_generic_argument_counts;
+    i64 struct_generic_argument_count;
+    i64 struct_generic_argument_type_structs;
+    i64 struct_generic_argument_types;
+    i64 generic_struct_name_offsets;
+    i64 generic_struct_name_lengths;
+    i64 generic_struct_source_offsets;
+    i64 generic_struct_type_name_offsets;
+    i64 generic_struct_type_name_lengths;
+    i64 generic_struct_derive_copy_flags;
+    i64 generic_struct_derive_clone_flags;
+    i64 generic_drop_source_offsets;
+    i64 generic_drop_struct_templates;
+    i64 generic_drop_type_name_offsets;
+    i64 generic_drop_type_name_lengths;
+    i64 generic_drop_requires_drop;
+    i64 generic_clone_source_offsets;
+    i64 generic_clone_struct_templates;
+    i64 generic_clone_type_name_offsets;
+    i64 generic_clone_type_name_lengths;
+    i64 generic_clone_requires_clone;
+    i64 generic_inherent_source_offsets;
+    i64 generic_inherent_struct_templates;
+    i64 generic_inherent_type_name_offsets;
+    i64 generic_inherent_type_name_lengths;
+    // Bounded inherent impls keep the impl parameter spelling and each bound's
+    // parameter index. This lets method reservation and body materialization
+    // enforce `impl<T: Trait> Type<T>` without widening the API to every T.
+    i64 generic_inherent_parameter_counts;
+    i64 generic_inherent_parameter_name_offsets;
+    i64 generic_inherent_parameter_name_lengths;
+    i64 generic_inherent_parameter_kinds;
+    i64 generic_inherent_bound_counts;
+    i64 generic_inherent_bound_parameter_indices;
+    i64 generic_inherent_bounds;
+    i64 inherent_method_structures;
+    i64 inherent_method_name_offsets;
+    i64 inherent_method_name_lengths;
+    i64 inherent_method_functions;
+    i64 inherent_method_receivers;
+    i64 function_inherent_structs;
+    i64 function_inherent_source_offsets;
+    i64 function_inherent_body_parsed;
+
+    // 0 for ordinary functions; trait method index + 1 for a concrete
+    // materialization of a trait-provided default method.
+
+    i64 function_trait_default_methods;
+    i64 struct_field_name_offsets;
+    i64 struct_field_name_lengths;
+    i64 struct_field_type_offsets;
+    i64 struct_field_type_lengths;
+    i64 struct_field_type_structs;
+    i64 struct_field_types;
+    i64 struct_field_references;
+    i64 struct_field_slices;
+    i64 struct_field_slice_mutable;
+
+    // -1 = scalar/non-array field; non-negative values are fixed-array extents.
+
+    i64 struct_field_array_extents;
+    i64 struct_field_function_types;
+    i64 enum_name_offsets;
+    i64 enum_name_lengths;
+    i64 enum_member_starts;
+    i64 enum_member_counts;
+    i64 enum_member_name_offsets;
+    i64 enum_member_name_lengths;
+    i64 enum_member_values;
+    i64 enum_member_payload_starts;
+    i64 enum_member_payload_counts;
+    i64 enum_has_payload;
+
+    // Built-in value-trait derivation retained per concrete enum. Payload enums
+    // are not scalar merely because their HIR type identity is numeric.
+
+    i64 enum_copy_flags;
+    i64 enum_derived_clone_flags;
+
+    // User marker traits derived directly on concrete enums.
+
+    i64 enum_marker_trait_count;
+    i64 enum_marker_trait_starts;
+    i64 enum_marker_trait_counts;
+    i64 enum_marker_traits;
+    i64 enum_payload_count;
+    i64 enum_generic_template_indices;
+    i64 enum_generic_argument_starts;
+    i64 enum_generic_argument_counts;
+    i64 enum_generic_argument_count;
+    i64 enum_generic_argument_type_structs;
+    i64 enum_generic_argument_types;
+    i64 enum_payload_types;
+    // Preserve source enum identity even for fieldless/C-style enums whose
+    // runtime HIR type remains the historical integer ABI kind.
+    i64 enum_payload_enum_indices;
+    i64 enum_payload_type_structs;
+    i64 enum_payload_array_extents;
+    i64 match_arm_count;
+    i64 match_binding_count;
+    i64 match_arm_values;
+    i64 match_arm_blocks;
+    i64 match_arm_guards;
+    i64 match_arm_wildcards;
+    i64 match_arm_enum_indices;
+    i64 match_arm_member_indices;
+    i64 match_arm_binding_starts;
+    i64 match_arm_binding_counts;
+    i64 match_arm_nested_test_starts;
+    i64 match_arm_nested_test_counts;
+    i64 match_nested_test_count;
+    i64 match_nested_test_outer_indices;
+    i64 match_nested_test_path_indices;
+    i64 match_nested_test_values;
+    i64 match_binding_local_slots;
+    i64 match_binding_outer_indices;
+    i64 match_binding_inner_indices;
+    i64 match_binding_path_indices;
+    i64 match_binding_payload_indices;
+    i64 match_binding_modes;
+    i64 match_path_count;
+    i64 match_path_parents;
+    i64 match_path_payload_indices;
+    i64 function_name_offsets;
+    i64 function_name_lengths;
+    // Lazy Forge symbol-collision decision: 0 unknown, 1 no suffix, 2 suffix.
+    i64 function_identity_suffix_cache;
+    i64 function_declaration_offsets;
+    i64 function_parameter_starts;
+    i64 function_parameter_counts;
+    i64 function_local_starts;
+    i64 function_local_counts;
+    i64 function_last_locals;
+    i64 function_statement_starts;
+    i64 function_statement_counts;
+    i64 function_is_extern;
+    i64 function_is_const;
+    i64 function_is_async;
+    i64 function_is_unsafe;
+    i64 function_root_statement_counts;
+    i64 function_extern_kinds;
+    i64 function_return_types;
+    i64 function_returns_value;
+    i64 function_return_references;
+    i64 function_return_reference_mutable;
+    i64 function_return_type_structs;
+    i64 function_return_slices;
+    i64 function_return_slice_mutable;
+    i64 function_return_lifetimes;
+    i64 function_return_function_types;
+    i64 function_pointer_signatures;
+    i64 function_lifetime_parameter_starts;
+    i64 function_lifetime_parameter_counts;
+    i64 lifetime_parameter_count;
+    i64 lifetime_name_offsets;
+    i64 lifetime_name_lengths;
+
+    // Function declaration attributes retained for ABI/backend lowering.
+
+    i64 function_abi_kinds;
+    i64 function_link_name_offsets;
+    i64 function_link_name_lengths;
+    i64 function_target_feature_offsets;
+    i64 function_target_feature_lengths;
+
+    // Source-level effect contracts: pure/no_panic/no_alloc/deterministic.
+
+    i64 function_effect_flags;
+    i64 function_drop_structs;
+    i64 function_clone_structs;
+    i64 function_closure_ids;
+    i64 function_closure_kinds;
+    i64 function_closure_body_starts;
+    i64 function_closure_body_ends;
+    i64 function_closure_root_blocks;
+    i64 function_closure_body_parsed;
+    i64 function_closure_parent_functions;
+    i64 function_closure_parent_blocks;
+    i64 function_closure_explicit_parameter_counts;
+    i64 function_closure_capture_starts;
+    i64 function_closure_capture_counts;
+    i64 closure_count;
+    i64 closure_capture_count;
+    i64 comptime_block_count;
+    i64 comptime_blocks;
+    i64 closure_capture_root_kinds;
+    i64 closure_capture_root_indices;
+    i64 function_generic_template_indices;
+    i64 function_generic_type_structs;
+    i64 function_generic_types;
+    i64 function_generic_argument_starts;
+    i64 function_generic_argument_counts;
+    i64 function_generic_argument_count;
+    i64 function_generic_argument_type_structs;
+    i64 function_generic_argument_types;
+    i64 function_generic_body_parsed;
+    i64 generic_function_name_offsets;
+    i64 generic_function_name_lengths;
+    i64 generic_function_source_offsets;
+    i64 generic_function_type_name_offsets;
+    i64 generic_function_type_name_lengths;
+    i64 generic_function_bound_counts;
+    i64 generic_function_bounds;
+    i64 function_defer_starts;
+    i64 function_defer_counts;
+    i64 parameter_name_offsets;
+    i64 parameter_name_lengths;
+    i64 parameter_function_indices;
+    i64 parameter_type_structs;
+    i64 parameter_types;
+    i64 parameter_references;
+    i64 parameter_reference_mutable;
+    i64 parameter_lifetimes;
+    i64 parameter_slices;
+    i64 parameter_slice_mutable;
+
+    // Fixed-array parameters preserve their compile-time extent separately from slices.
+
+    i64 parameter_array_extents;
+    i64 parameter_mutated;
+    i64 parameter_function_types;
+    i64 local_name_offsets;
+    i64 local_name_lengths;
+    // Source position where each local becomes lexically live. This is distinct
+    // from name offsets because compiler-generated locals have no source name.
+    i64 local_declaration_offsets;
+    i64 local_slots;
+    i64 local_previous_function_locals;
+    i64 local_function_indices;
+    i64 local_block_indices;
+    i64 local_type_structs;
+    i64 local_types;
+    i64 local_references;
+    i64 local_reference_mutable;
+    i64 local_lifetimes;
+    i64 local_slices;
+    i64 local_slice_mutable;
+    i64 local_array_extents;
+    i64 local_array_element_starts;
+    i64 local_array_element_counts;
+    i64 local_final_moved;
+    i64 local_callable_functions;
+    i64 local_callable_kinds;
+    i64 local_callable_capture_starts;
+    i64 local_callable_capture_counts;
+    i64 local_callable_consumed;
+    i64 local_function_types;
+    i64 callable_capture_local_count;
+    i64 callable_capture_locals;
+    i64 parameter_final_moved;
+    i64 final_moved_path_count;
+    i64 final_moved_path_root_kinds;
+    i64 final_moved_path_root_indices;
+    i64 final_moved_paths;
+    i64 array_element_count;
+    i64 array_elements;
+    i64 node_kinds;
+    i64 node_a;
+    i64 node_b;
+    i64 node_c;
+    i64 node_values;
+    i64 node_type_structs;
+    i64 node_types;
+    i64 node_references;
+    i64 node_reference_mutable;
+    i64 node_lifetimes;
+    i64 node_slices;
+    i64 node_slice_mutable;
+    i64 node_array_extents;
+    i64 node_function_types;
+    i64 arguments;
+    i64 block_starts;
+    i64 block_ends;
+    i64 block_statement_starts;
+    i64 block_statement_counts;
+    i64 block_function_indices;
+    i64 block_parent_indices;
+    i64 block_loop_depths;
+    i64 block_unsafe_depths;
+
+    // Deferred blocks are parsed after their surrounding generic materializer
+    // may have restored its caller context. Preserve the complete generic
+    // environment at capture time so nested match/if/loop bodies keep T/U/etc.
+
+    i64 block_generic_active;
+    i64 block_generic_template_indices;
+    i64 block_generic_type_name_offsets;
+    i64 block_generic_type_name_lengths;
+    i64 block_generic_type_structures;
+    i64 block_generic_type_kinds;
+    i64 block_generic_signature_only;
+    i64 block_generic_reparse_function_indices;
+    i64 block_generic_substitution_counts;
+    i64 block_generic_substitution_name_offsets;
+    i64 block_generic_substitution_name_lengths;
+    i64 block_generic_substitution_type_structures;
+    i64 block_generic_substitution_types;
+    i64 block_defer_starts;
+    i64 block_defer_counts;
+    i64 block_defer_contexts;
+    i64 defer_count;
+    i64 defer_blocks;
+    i64 statement_kinds;
+    i64 statement_block_indices;
+    i64 statement_function_indices;
+    // Source position immediately after the statement. Deferred blocks are
+    // parsed out of order, so cleanup must use lexical source order rather than
+    // HIR allocation order when deciding which locals are live on an exit edge.
+    i64 statement_source_offsets;
+    i64 statement_a;
+    i64 statement_b;
+    i64 statement_c;
+    i64 statement_predrop_structures;
+    i64 statement_predrop_root_kinds;
+    i64 statement_predrop_root_indices;
+    i64 statement_predrop_paths;
+    i64 statement_predrop_moved_starts;
+    i64 statement_predrop_moved_counts;
+    i64 predrop_moved_path_count;
+    i64 predrop_moved_paths;
+
+    // Pass Z: persisted semantic-query counters. These are copied from the
+    // transient HirBuilder before it is destroyed so --profile-queries can
+    // report optimization effectiveness without keeping frontend scratch state.
+
+    i64 profile_generic_cache_hits;
+    i64 profile_generic_cache_misses;
+    i64 profile_trait_query_cache_hits;
+    i64 profile_trait_query_cache_misses;
+    i64 profile_resolution_cache_hits;
+    i64 profile_resolution_cache_misses;
+    i64 profile_symbol_cache_hits;
+    i64 profile_symbol_cache_misses;
+    i64 profile_layout_cache_hits;
+    i64 profile_layout_cache_misses;
+    i64 profile_scope_cache_hits;
+    i64 profile_scope_cache_misses;
+
+    // Persistent incremental-build fingerprints exported from the semantic
+    // builder. These survive builder destruction so the driver can persist
+    // module implementation/interface state across compiler processes.
+
+    i64 incremental_module_fingerprint_count;
+    i64 incremental_module_ids;
+    i64 incremental_module_source_fingerprints;
+    i64 incremental_module_interface_fingerprints;
+    i64 incremental_module_package_hashes;
+    i64 incremental_module_namespace_hashes;
+    i64 incremental_function_module_ids;
+    i64 incremental_module_function_starts;
+    i64 incremental_module_function_counts;
+    i64 incremental_module_function_indices;
+    i64 incremental_module_dependency_count;
+    i64 incremental_module_dependency_owners;
+    i64 incremental_module_dependency_targets;
+    i64 incremental_module_dirty_kinds;
+    i64 incremental_module_hir_fingerprints;
+    i64 incremental_module_cached_mir_fingerprints;
+    i64 incremental_module_cache_kinds;
+    i64 incremental_module_cache_hit_count;
+    i64 incremental_dirty_module_count;
+    i64 incremental_interface_dirty_module_count;
+    i64 incremental_affected_module_count;
+}
+
+public struct HirIncrementalCheckHints {
+    i64 enabled;
+    i64 module_count;
+    i64 old_sources;
+    i64 old_interfaces;
+    i64 old_present;
+    i64 affected_modules;
+    // Native dependency package objects are package-coherent: if any module in
+    // one package changes, the partial HIR must retain every body in that package.
+    i64 package_body_coherent;
+    i64 edge_owners;
+    i64 edge_targets;
+    i64 edge_count;
+}
+
+
+public struct HirBuilder {
+    Lexer scan;
+    Token current;
+    Diagnostic last_error;
+    HirModule&mut module;
+    HirQueryContext queries;
+    i64 current_function;
+    i64 current_block;
+    i64 loop_depth;
+    i64 parameter_moved;
+    i64 local_moved;
+    i64 local_borrow_kinds;
+    i64 local_borrow_source_kinds;
+    i64 local_borrow_source_indices;
+    i64 local_borrow_source_paths;
+    i64 local_reference_last_uses;
+    i64 moved_path_count;
+    i64 moved_path_root_kinds;
+    i64 moved_path_root_indices;
+    i64 moved_paths;
+    i64 allow_moved_name;
+    i64 comptime_mode;
+    i64 generic_active;
+    i64 generic_template_index;
+    i64 generic_type_name_offset;
+    i64 generic_type_name_length;
+    i64 generic_type_structure;
+    i64 generic_type_kind;
+
+    // Active generic substitutions used while reparsing a concrete template.
+    // Keeping these in arenas lets one parser context represent T, U, ...
+    // without hard-coding a fixed number of fields into HirBuilder.
+
+    i64 generic_substitution_count;
+    i64 generic_substitution_name_offsets;
+    i64 generic_substitution_name_lengths;
+    i64 generic_substitution_type_structs;
+    i64 generic_substitution_types;
+    i64 generic_signature_only;
+    i64 generic_reparse_function_index;
+
+    // Impl methods live in type/trait method namespaces and may reuse names
+    // such as clone/drop across unrelated receiver types.
+
+    i64 allow_function_name_reuse;
+    // Receiver target temporarily attached while an inherent method body is parsed.
+    // This prevents the method currently being defined from masquerading as a free function.
+    i64 pending_inherent_target;
+    i64 unsafe_depth;
+    i64 last_type_lifetime;
+    i64 last_type_reference_mutable;
+    i64 last_type_function_signature;
+
+    // -1 for ordinary types, otherwise the trait index for a parsed dyn Trait.
+
+    i64 last_type_trait_object;
+    i64 pending_abi_kind;
+    i64 pending_link_name_offset;
+    i64 pending_link_name_length;
+    i64 pending_target_feature_offset;
+    i64 pending_target_feature_length;
+    i64 pending_effect_flags;
+
+    // Pending derive list for the next aggregate declaration. Copy and Clone
+    // are tracked explicitly; user marker traits are stored as trait IDs.
+
+    i64 pending_derive_copy;
+    i64 pending_derive_clone;
+    i64 pending_derive_trait_count;
+    i64 pending_struct_packed;
+    i64 pending_struct_repr_c;
+    i64 pending_struct_alignment;
+    i64 pending_struct_attribute_count;
+    i64 pending_derive_traits;
+
+    // Frontend-only module provenance. Source declarations keep their compact
+    // HIR layout and recover module ownership from source offsets.
+
+    i64 namespace_segment_count;
+    i64 namespace_segment_offsets;
+    i64 namespace_segment_hashes;
+    i64 current_namespace_hash;
+
+    // Project composition preserves package provenance independently from a
+    // module's source namespace so default visibility survives namespace changes.
+
+    i64 package_segment_count;
+    i64 package_segment_offsets;
+    i64 package_segment_hashes;
+    i64 current_package_hash;
+
+    // Physical module provenance is separate from source namespaces.
+
+    i64 module_segment_count;
+    i64 module_segment_offsets;
+    i64 module_segment_ids;
+    i64 current_module_id;
+
+    // Manifest dependency aliases map a package-local prefix to a target package.
+
+    i64 package_dependency_count;
+    i64 package_dependency_owner_packages;
+    i64 package_dependency_aliases;
+    i64 package_dependency_targets;
+
+    // One visibility segment is recorded for every top-level declaration.
+    // 0 = package, 1 = public, 2 = private.
+
+    i64 declaration_visibility_count;
+    i64 declaration_visibility_offsets;
+    i64 declaration_visibility_values;
+    i64 namespace_import_count;
+    i64 namespace_import_owner_packages;
+    i64 namespace_import_owners;
+    i64 namespace_import_target_packages;
+    i64 namespace_import_targets;
+    i64 namespace_import_aliases;
+
+    // Bit 0: qualified-only alias import. Bit 1: public re-export.
+
+    i64 namespace_import_flags;
+
+    // Owner-indexed import chains. Bucket heads and next links store index + 1
+    // so zero remains the empty sentinel.
+
+    i64 namespace_import_bucket_heads;
+    i64 namespace_import_next;
+
+    // Direct-mapped memoization for transitive public re-export reachability.
+    // The import count is the epoch because imports are append-only while HIR is built.
+
+    i64 namespace_reexport_cache_owner_packages;
+    i64 namespace_reexport_cache_owners;
+    i64 namespace_reexport_cache_target_packages;
+    i64 namespace_reexport_cache_targets;
+    i64 namespace_reexport_cache_epochs;
+    i64 namespace_reexport_cache_results;
+    i64 namespace_scope_count;
+    i64 namespace_scope_hashes;
+
+    // -1 means ordinary local/import lookup. A non-negative value constrains
+    // name lookup to an explicitly qualified namespace.
+
+    i64 namespace_lookup_target_hash;
+    i64 namespace_lookup_target_package_hash;
+
+    // Pass AC: epoch-aware cache for ordinary top-level symbol resolution.
+
+    i64 symbol_cache_kinds;
+    i64 symbol_cache_packages;
+    i64 symbol_cache_namespaces;
+    i64 symbol_cache_modules;
+    i64 symbol_cache_name_offsets;
+    i64 symbol_cache_name_lengths;
+    i64 symbol_cache_epochs;
+    i64 symbol_cache_results;
+    i64 symbol_cache_hits;
+    i64 symbol_cache_misses;
+
+
+    // Name-hash buckets narrow ordinary function resolution to exact-name
+    // candidates before namespace/import/accessibility checks run.
+    i64 function_lookup_bucket_heads;
+    i64 function_lookup_next;
+
+    i64 top_level_name_used;
+    i64 top_level_name_packages;
+    i64 top_level_name_namespaces;
+    i64 top_level_name_hashes;
+    i64 top_level_name_offsets;
+    i64 top_level_name_lengths;
+
+    // Pass AG: direct-mapped caches for lexical name and struct-field lookup.
+    // Lexical entries are keyed by function, block, exact name bytes, and the
+    // current parameter/local counts so a later declaration invalidates stale
+    // hits or misses without requiring explicit cache clearing.
+
+    i64 lexical_cache_functions;
+    i64 lexical_cache_blocks;
+    i64 lexical_cache_name_offsets;
+    i64 lexical_cache_name_lengths;
+    i64 lexical_cache_parameter_epochs;
+    i64 lexical_cache_local_epochs;
+    i64 lexical_cache_kinds;
+    i64 lexical_cache_slots;
+
+    // Pass AH: closure/name lookups and slot-to-local resolution caches.
+
+    i64 function_name_cache_functions;
+    i64 function_name_cache_blocks;
+    i64 function_name_cache_before_offsets;
+    i64 function_name_cache_name_offsets;
+    i64 function_name_cache_name_lengths;
+    i64 function_name_cache_parameter_epochs;
+    i64 function_name_cache_local_epochs;
+    i64 function_name_cache_kinds;
+    i64 function_name_cache_indices;
+    i64 slot_local_cache_functions;
+    i64 slot_local_cache_slots;
+    i64 slot_local_cache_local_epochs;
+    i64 slot_local_cache_results;
+    i64 field_name_cache_structures;
+    i64 field_name_cache_name_offsets;
+    i64 field_name_cache_name_lengths;
+    i64 field_name_cache_field_epochs;
+    i64 field_name_cache_results;
+    i64 scope_cache_hits;
+    i64 scope_cache_misses;
+
+    // Phase 3: generic monomorphization now uses the unified semantic query runtime.
+    // Profile counters are retained for compiler telemetry.
+
+    i64 generic_cache_hits;
+    i64 generic_cache_misses;
+
+    // Phase 3: unified semantic query runtime. Every semantic subsystem uses
+    // the same key/cache/epoch/cycle/dependency machinery instead of growing
+    // a new direct-mapped cache and recursion guard for each feature.
+
+
+    // Semantic-input fingerprints drive targeted invalidation. Cache entries
+    // remain valid across unrelated database mutations; invalidation walks
+    // reverse query dependencies from the affected semantic roots.
+
+
+    // Canonical semantic identities for monomorphization requests. These are
+    // not result caches: they intern the exact template/entity/argument tuple
+    // so query keys and cycle detection never depend on a fingerprint alone.
+
+
+    // Canonical semantic symbols. IDs are interned from exact source bytes, so
+    // query identity never depends on a source offset or a hash alone.
+
+
+    // Canonical semantic type identities. A type ID captures the complete HIR
+    // type shape used by semantic queries rather than packing ad-hoc pieces
+    // directly into each query key.
+
+
+    // Per-module fingerprints separate implementation changes from exported
+    // semantic-interface changes. They are compiler-local identities used by
+    // incremental project compilation and cache invalidation.
+
+
+    // Compatibility profile counters retained while trait queries migrate onto
+    // the unified engine. They now mirror trait traffic through that engine.
+
+    i64 trait_query_cache_hits;
+    i64 trait_query_cache_misses;
+
+    // Resolution query profile counters remain stable across query-engine migration.
+
+    i64 resolution_cache_hits;
+    i64 resolution_cache_misses;
+
+    // Query-engine layout profile counters. Layout and field-offset results now
+    // share the semantic query cache and dependency graph.
+
+    i64 layout_cache_hits;
+    i64 layout_cache_misses;
+}
+
+// Canonical hash for a monomorphization request. The hash is deliberately
+// independent of source offsets: two syntactically separate uses of Vec<i64>
+// produce the same key. Exact packed arguments are still compared on hits.
+fn hir_generic_argument_hash(
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    i64 hash = (generic + 17) % 281474976710597;
+
+    hash = (hash * 131 + argument_count + 1) % 281474976710597;
+
+    i64 index = 0;
+
+    while (index < argument_count) {
+        i64 structure = raz_compiler_rt_arena_get(argument_structures, index);
+        i64 type_kind = raz_compiler_rt_arena_get(argument_types, index);
+
+        hash = (hash * 131 + structure + 2) % 281474976710597;
+        hash = (hash * 131 + type_kind + 2) % 281474976710597;
+        index += 1;
+    }
+    if (hash < 0) {
+        hash = 0 - hash;
+    }
+    return hash;
+}
+
+fn init_hir(HirModule&mut out) -> bool {
+    out.function_count = 0;
+    out.diagnostic_offset = 0;
+    out.diagnostic_code = DiagnosticCode::None;
+    out.parameter_count = 0;
+    out.local_count = 0;
+    out.node_count = 0;
+    out.statement_count = 0;
+    out.argument_count = 0;
+    out.block_count = 0;
+    out.struct_count = 0;
+    out.drop_impl_count = 0;
+    out.clone_impl_count = 0;
+    out.closure_count = 0;
+    out.closure_capture_count = 0;
+    out.comptime_block_count = 0;
+    out.callable_capture_local_count = 0;
+    out.generic_function_count = 0;
+    out.generic_struct_count = 0;
+    out.generic_parameter_count = 0;
+    out.function_type_count = 0;
+    out.function_type_parameter_count = 0;
+    out.generic_parameter_bound_count = 0;
+    out.lifetime_parameter_count = 0;
+    out.function_generic_argument_count = 0;
+    out.struct_generic_argument_count = 0;
+    out.generic_drop_impl_count = 0;
+    out.generic_clone_impl_count = 0;
+    out.generic_inherent_impl_count = 0;
+    out.inherent_method_count = 0;
+    out.trait_count = 0;
+    out.trait_associated_type_count = 0;
+    out.trait_associated_const_count = 0;
+    out.trait_impl_count = 0;
+    out.generic_trait_impl_count = 0;
+    out.struct_field_count = 0;
+    out.enum_count = 0;
+    out.enum_member_count = 0;
+    out.enum_marker_trait_count = 0;
+    out.enum_payload_count = 0;
+    out.generic_enum_count = 0;
+    out.enum_generic_argument_count = 0;
+    out.constant_count = 0;
+    out.global_count = 0;
+    out.match_arm_count = 0;
+    out.match_binding_count = 0;
+    out.defer_count = 0;
+    out.array_element_count = 0;
+    out.predrop_moved_path_count = 0;
+    out.profile_generic_cache_hits = 0;
+    out.profile_generic_cache_misses = 0;
+    out.profile_trait_query_cache_hits = 0;
+    out.profile_trait_query_cache_misses = 0;
+    out.profile_resolution_cache_hits = 0;
+    out.profile_resolution_cache_misses = 0;
+    out.profile_symbol_cache_hits = 0;
+    out.profile_symbol_cache_misses = 0;
+    out.profile_layout_cache_hits = 0;
+    out.profile_layout_cache_misses = 0;
+    out.profile_scope_cache_hits = 0;
+    out.profile_scope_cache_misses = 0;
+    out.incremental_module_fingerprint_count = 0;
+    out.incremental_module_ids = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_source_fingerprints = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_interface_fingerprints = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_package_hashes = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_namespace_hashes = raz_compiler_rt_arena_create(4096);
+    out.incremental_function_module_ids = raz_compiler_rt_arena_create(16384);
+    out.incremental_module_function_starts = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_function_counts = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_function_indices = raz_compiler_rt_arena_create(16384);
+    out.incremental_module_dependency_count = 0;
+    out.incremental_module_dependency_owners = raz_compiler_rt_arena_create(16384);
+    out.incremental_module_dependency_targets = raz_compiler_rt_arena_create(16384);
+    out.incremental_module_dirty_kinds = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_hir_fingerprints = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_cached_mir_fingerprints = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_cache_kinds = raz_compiler_rt_arena_create(4096);
+    out.incremental_module_cache_hit_count = 0;
+    out.incremental_dirty_module_count = 0;
+    out.incremental_interface_dirty_module_count = 0;
+    out.incremental_affected_module_count = 0;
+    out.struct_name_offsets = raz_compiler_rt_arena_create(256);
+    out.struct_name_lengths = raz_compiler_rt_arena_create(256);
+    out.struct_identity_suffix_cache = raz_compiler_rt_arena_create(256);
+    out.struct_field_starts = raz_compiler_rt_arena_create(256);
+    out.struct_field_counts = raz_compiler_rt_arena_create(256);
+    out.struct_tuple_flags = raz_compiler_rt_arena_create(256);
+    out.struct_packed_flags = raz_compiler_rt_arena_create(256);
+    out.struct_repr_c_flags = raz_compiler_rt_arena_create(256);
+    out.struct_explicit_alignments = raz_compiler_rt_arena_create(256);
+    out.struct_attribute_counts = raz_compiler_rt_arena_create(256);
+    out.struct_drop_functions = raz_compiler_rt_arena_create(256);
+    out.struct_clone_functions = raz_compiler_rt_arena_create(256);
+    out.struct_derived_clone_flags = raz_compiler_rt_arena_create(256);
+    out.struct_copy_flags = raz_compiler_rt_arena_create(256);
+    out.struct_generic_template_indices = raz_compiler_rt_arena_create(256);
+    out.struct_generic_argument_starts = raz_compiler_rt_arena_create(256);
+    out.struct_generic_argument_counts = raz_compiler_rt_arena_create(256);
+    out.struct_generic_argument_type_structs = raz_compiler_rt_arena_create(4096);
+    out.struct_generic_argument_types = raz_compiler_rt_arena_create(4096);
+    out.struct_generic_type_structs = raz_compiler_rt_arena_create(256);
+    out.struct_generic_types = raz_compiler_rt_arena_create(256);
+    out.generic_struct_name_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_struct_name_lengths = raz_compiler_rt_arena_create(256);
+    out.generic_struct_source_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_struct_type_name_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_struct_type_name_lengths = raz_compiler_rt_arena_create(256);
+    out.generic_struct_derive_copy_flags = raz_compiler_rt_arena_create(256);
+    out.generic_struct_derive_clone_flags = raz_compiler_rt_arena_create(256);
+    out.generic_drop_source_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_drop_struct_templates = raz_compiler_rt_arena_create(256);
+    out.generic_drop_type_name_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_drop_type_name_lengths = raz_compiler_rt_arena_create(256);
+    out.generic_drop_requires_drop = raz_compiler_rt_arena_create(256);
+    out.generic_clone_source_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_clone_struct_templates = raz_compiler_rt_arena_create(256);
+    out.generic_clone_type_name_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_clone_type_name_lengths = raz_compiler_rt_arena_create(256);
+    out.generic_clone_requires_clone = raz_compiler_rt_arena_create(256);
+    out.generic_inherent_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_struct_templates = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_type_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_type_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_parameter_counts = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_parameter_name_offsets = raz_compiler_rt_arena_create(32768);
+    out.generic_inherent_parameter_name_lengths = raz_compiler_rt_arena_create(32768);
+    out.generic_inherent_parameter_kinds = raz_compiler_rt_arena_create(32768);
+    out.generic_inherent_bound_counts = raz_compiler_rt_arena_create(4096);
+    out.generic_inherent_bound_parameter_indices = raz_compiler_rt_arena_create(32768);
+    out.generic_inherent_bounds = raz_compiler_rt_arena_create(32768);
+    out.inherent_method_structures = raz_compiler_rt_arena_create(8192);
+    out.inherent_method_name_offsets = raz_compiler_rt_arena_create(8192);
+    out.inherent_method_name_lengths = raz_compiler_rt_arena_create(8192);
+    out.inherent_method_functions = raz_compiler_rt_arena_create(8192);
+    out.inherent_method_receivers = raz_compiler_rt_arena_create(8192);
+    out.function_inherent_structs = raz_compiler_rt_arena_create(16384);
+    out.function_inherent_source_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_inherent_body_parsed = raz_compiler_rt_arena_create(16384);
+    out.function_trait_default_methods = raz_compiler_rt_arena_create(16384);
+    out.trait_name_offsets = raz_compiler_rt_arena_create(256);
+    out.trait_name_lengths = raz_compiler_rt_arena_create(256);
+    out.trait_object_safe_flags = raz_compiler_rt_arena_create(256);
+    out.trait_alias_flags = raz_compiler_rt_arena_create(256);
+    out.trait_method_count = 0;
+    out.trait_method_starts = raz_compiler_rt_arena_create(256);
+    out.trait_method_counts = raz_compiler_rt_arena_create(256);
+    out.trait_method_trait_indices = raz_compiler_rt_arena_create(4096);
+    out.trait_method_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_method_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.trait_method_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_method_default_flags = raz_compiler_rt_arena_create(4096);
+    out.trait_method_effect_flags = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_type_starts = raz_compiler_rt_arena_create(256);
+    out.trait_associated_type_counts = raz_compiler_rt_arena_create(256);
+    out.trait_associated_const_starts = raz_compiler_rt_arena_create(256);
+    out.trait_associated_const_counts = raz_compiler_rt_arena_create(256);
+    out.trait_associated_type_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_type_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_const_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_const_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_const_type_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_associated_const_type_lengths = raz_compiler_rt_arena_create(4096);
+    out.trait_supertrait_count = 0;
+    out.trait_supertrait_starts = raz_compiler_rt_arena_create(256);
+    out.trait_supertrait_counts = raz_compiler_rt_arena_create(256);
+    out.trait_supertraits = raz_compiler_rt_arena_create(4096);
+    out.trait_impl_traits = raz_compiler_rt_arena_create(4096);
+    out.trait_impl_structures = raz_compiler_rt_arena_create(4096);
+    out.trait_impl_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.trait_impl_generic_indices = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_traits = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_struct_templates = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_type_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_type_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_bound_counts = raz_compiler_rt_arena_create(4096);
+    out.generic_trait_bounds = raz_compiler_rt_arena_create(32768);
+    out.struct_field_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.struct_field_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.struct_field_type_offsets = raz_compiler_rt_arena_create(4096);
+    out.struct_field_type_lengths = raz_compiler_rt_arena_create(4096);
+    out.struct_field_type_structs = raz_compiler_rt_arena_create(4096);
+    out.struct_field_types = raz_compiler_rt_arena_create(4096);
+    out.struct_field_references = raz_compiler_rt_arena_create(4096);
+    out.struct_field_slices = raz_compiler_rt_arena_create(4096);
+    out.struct_field_slice_mutable = raz_compiler_rt_arena_create(4096);
+    out.struct_field_array_extents = raz_compiler_rt_arena_create(4096);
+    out.struct_field_function_types = raz_compiler_rt_arena_create(4096);
+    out.enum_name_offsets = raz_compiler_rt_arena_create(256);
+    out.enum_name_lengths = raz_compiler_rt_arena_create(256);
+    out.enum_member_starts = raz_compiler_rt_arena_create(256);
+    out.enum_member_counts = raz_compiler_rt_arena_create(256);
+    out.enum_member_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.enum_member_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.enum_member_values = raz_compiler_rt_arena_create(4096);
+    out.enum_member_payload_starts = raz_compiler_rt_arena_create(4096);
+    out.enum_member_payload_counts = raz_compiler_rt_arena_create(4096);
+    out.enum_has_payload = raz_compiler_rt_arena_create(256);
+    out.enum_copy_flags = raz_compiler_rt_arena_create(256);
+    out.enum_derived_clone_flags = raz_compiler_rt_arena_create(256);
+    out.enum_marker_trait_starts = raz_compiler_rt_arena_create(256);
+    out.enum_marker_trait_counts = raz_compiler_rt_arena_create(256);
+    out.enum_marker_traits = raz_compiler_rt_arena_create(8192);
+    out.enum_payload_types = raz_compiler_rt_arena_create(8192);
+    out.enum_payload_enum_indices = raz_compiler_rt_arena_create(8192);
+    out.enum_payload_type_structs = raz_compiler_rt_arena_create(8192);
+    out.enum_payload_array_extents = raz_compiler_rt_arena_create(8192);
+    out.enum_generic_template_indices = raz_compiler_rt_arena_create(256);
+    out.enum_generic_argument_starts = raz_compiler_rt_arena_create(256);
+    out.enum_generic_argument_counts = raz_compiler_rt_arena_create(256);
+    out.enum_generic_argument_type_structs = raz_compiler_rt_arena_create(4096);
+    out.enum_generic_argument_types = raz_compiler_rt_arena_create(4096);
+    out.generic_enum_name_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_enum_name_lengths = raz_compiler_rt_arena_create(256);
+    out.generic_enum_source_offsets = raz_compiler_rt_arena_create(256);
+    out.generic_enum_parameter_starts = raz_compiler_rt_arena_create(256);
+    out.generic_enum_parameter_counts = raz_compiler_rt_arena_create(256);
+    out.generic_enum_derive_copy_flags = raz_compiler_rt_arena_create(256);
+    out.generic_enum_derive_clone_flags = raz_compiler_rt_arena_create(256);
+    out.global_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.global_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.global_module_ids = raz_compiler_rt_arena_create(4096);
+    out.global_identity_suffix_cache = raz_compiler_rt_arena_create(4096);
+    out.global_type_structs = raz_compiler_rt_arena_create(4096);
+    out.global_types = raz_compiler_rt_arena_create(4096);
+    out.global_array_extents = raz_compiler_rt_arena_create(4096);
+    out.global_function_types = raz_compiler_rt_arena_create(4096);
+    out.global_mutable_flags = raz_compiler_rt_arena_create(4096);
+    out.global_extern_flags = raz_compiler_rt_arena_create(4096);
+    out.global_tls_flags = raz_compiler_rt_arena_create(4096);
+    out.global_internal_flags = raz_compiler_rt_arena_create(4096);
+    out.global_public_flags = raz_compiler_rt_arena_create(4096);
+    out.global_initializer_nodes = raz_compiler_rt_arena_create(4096);
+    out.constant_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.constant_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.constant_nodes = raz_compiler_rt_arena_create(4096);
+    out.constant_types = raz_compiler_rt_arena_create(4096);
+    out.constant_function_indices = raz_compiler_rt_arena_create(4096);
+    out.constant_block_indices = raz_compiler_rt_arena_create(4096);
+    out.constant_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.match_arm_values = raz_compiler_rt_arena_create(8192);
+    out.match_arm_blocks = raz_compiler_rt_arena_create(8192);
+    out.match_arm_guards = raz_compiler_rt_arena_create(8192);
+    out.match_arm_wildcards = raz_compiler_rt_arena_create(8192);
+    out.match_arm_enum_indices = raz_compiler_rt_arena_create(8192);
+    out.match_arm_member_indices = raz_compiler_rt_arena_create(8192);
+    out.match_arm_binding_starts = raz_compiler_rt_arena_create(8192);
+    out.match_arm_binding_counts = raz_compiler_rt_arena_create(8192);
+    out.match_arm_nested_test_starts = raz_compiler_rt_arena_create(8192);
+    out.match_arm_nested_test_counts = raz_compiler_rt_arena_create(8192);
+    out.match_nested_test_count = 0;
+    out.match_nested_test_outer_indices = raz_compiler_rt_arena_create(16384);
+    out.match_nested_test_path_indices = raz_compiler_rt_arena_create(16384);
+    out.match_nested_test_values = raz_compiler_rt_arena_create(16384);
+    out.match_binding_local_slots = raz_compiler_rt_arena_create(16384);
+    out.match_binding_outer_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_inner_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_path_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_payload_indices = raz_compiler_rt_arena_create(16384);
+    out.match_binding_modes = raz_compiler_rt_arena_create(16384);
+    out.match_path_count = 0;
+    out.match_path_parents = raz_compiler_rt_arena_create(16384);
+    out.match_path_payload_indices = raz_compiler_rt_arena_create(16384);
+    out.function_name_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_name_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_identity_suffix_cache = raz_compiler_rt_arena_create(16384);
+    out.function_declaration_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_parameter_starts = raz_compiler_rt_arena_create(16384);
+    out.function_parameter_counts = raz_compiler_rt_arena_create(16384);
+    out.function_local_starts = raz_compiler_rt_arena_create(16384);
+    out.function_local_counts = raz_compiler_rt_arena_create(16384);
+    out.function_last_locals = raz_compiler_rt_arena_create(16384);
+    out.function_statement_starts = raz_compiler_rt_arena_create(16384);
+    out.function_statement_counts = raz_compiler_rt_arena_create(16384);
+    out.function_is_extern = raz_compiler_rt_arena_create(16384);
+    out.function_is_const = raz_compiler_rt_arena_create(16384);
+    out.function_is_async = raz_compiler_rt_arena_create(16384);
+    out.function_is_unsafe = raz_compiler_rt_arena_create(16384);
+    out.function_root_statement_counts = raz_compiler_rt_arena_create(16384);
+    out.function_extern_kinds = raz_compiler_rt_arena_create(16384);
+    out.function_return_types = raz_compiler_rt_arena_create(16384);
+    out.function_returns_value = raz_compiler_rt_arena_create(16384);
+    out.function_return_references = raz_compiler_rt_arena_create(16384);
+    out.function_return_reference_mutable = raz_compiler_rt_arena_create(16384);
+    out.function_return_type_structs = raz_compiler_rt_arena_create(16384);
+    out.function_return_slices = raz_compiler_rt_arena_create(16384);
+    out.function_return_slice_mutable = raz_compiler_rt_arena_create(16384);
+    out.function_return_lifetimes = raz_compiler_rt_arena_create(16384);
+    out.function_return_function_types = raz_compiler_rt_arena_create(16384);
+    out.function_pointer_signatures = raz_compiler_rt_arena_create(16384);
+    out.function_lifetime_parameter_starts = raz_compiler_rt_arena_create(16384);
+    out.function_lifetime_parameter_counts = raz_compiler_rt_arena_create(16384);
+    out.lifetime_name_offsets = raz_compiler_rt_arena_create(8192);
+    out.lifetime_name_lengths = raz_compiler_rt_arena_create(8192);
+    out.function_abi_kinds = raz_compiler_rt_arena_create(16384);
+    out.function_link_name_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_link_name_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_target_feature_offsets = raz_compiler_rt_arena_create(16384);
+    out.function_target_feature_lengths = raz_compiler_rt_arena_create(16384);
+    out.function_effect_flags = raz_compiler_rt_arena_create(16384);
+    out.function_drop_structs = raz_compiler_rt_arena_create(16384);
+    out.function_clone_structs = raz_compiler_rt_arena_create(16384);
+    out.function_closure_ids = raz_compiler_rt_arena_create(16384);
+    out.function_closure_kinds = raz_compiler_rt_arena_create(16384);
+    out.function_closure_body_starts = raz_compiler_rt_arena_create(16384);
+    out.function_closure_body_ends = raz_compiler_rt_arena_create(16384);
+    out.function_closure_root_blocks = raz_compiler_rt_arena_create(16384);
+    out.function_closure_body_parsed = raz_compiler_rt_arena_create(16384);
+    out.function_closure_parent_functions = raz_compiler_rt_arena_create(16384);
+    out.function_closure_parent_blocks = raz_compiler_rt_arena_create(16384);
+    out.function_closure_explicit_parameter_counts = raz_compiler_rt_arena_create(16384);
+    out.function_closure_capture_starts = raz_compiler_rt_arena_create(16384);
+    out.function_closure_capture_counts = raz_compiler_rt_arena_create(16384);
+    out.closure_capture_root_kinds = raz_compiler_rt_arena_create(262144);
+    out.closure_capture_root_indices = raz_compiler_rt_arena_create(262144);
+    out.comptime_blocks = raz_compiler_rt_arena_create(256);
+    out.function_generic_template_indices = raz_compiler_rt_arena_create(16384);
+    out.function_generic_argument_starts = raz_compiler_rt_arena_create(16384);
+    out.function_generic_argument_counts = raz_compiler_rt_arena_create(16384);
+    out.function_generic_argument_type_structs = raz_compiler_rt_arena_create(262144);
+    out.function_generic_argument_types = raz_compiler_rt_arena_create(262144);
+    out.function_generic_type_structs = raz_compiler_rt_arena_create(16384);
+    out.function_generic_types = raz_compiler_rt_arena_create(16384);
+    out.function_generic_body_parsed = raz_compiler_rt_arena_create(16384);
+    out.generic_parameter_name_offsets = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_name_lengths = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_kinds = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_const_types = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_bound_starts = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_bound_counts = raz_compiler_rt_arena_create(8192);
+    out.generic_parameter_bounds = raz_compiler_rt_arena_create(32768);
+    out.generic_function_parameter_starts = raz_compiler_rt_arena_create(4096);
+    out.generic_function_parameter_counts = raz_compiler_rt_arena_create(4096);
+    out.generic_struct_parameter_starts = raz_compiler_rt_arena_create(256);
+    out.generic_struct_parameter_counts = raz_compiler_rt_arena_create(256);
+    out.function_type_parameter_starts = raz_compiler_rt_arena_create(4096);
+    out.function_type_parameter_counts = raz_compiler_rt_arena_create(4096);
+    out.function_type_parameter_type_structs = raz_compiler_rt_arena_create(16384);
+    out.function_type_parameter_types = raz_compiler_rt_arena_create(16384);
+    out.function_type_parameter_references = raz_compiler_rt_arena_create(16384);
+    out.function_type_parameter_slices = raz_compiler_rt_arena_create(16384);
+    out.function_type_parameter_slice_mutable = raz_compiler_rt_arena_create(16384);
+    out.function_type_parameter_function_types = raz_compiler_rt_arena_create(16384);
+    out.function_type_return_type_structs = raz_compiler_rt_arena_create(4096);
+    out.function_type_return_types = raz_compiler_rt_arena_create(4096);
+    out.function_type_return_references = raz_compiler_rt_arena_create(4096);
+    out.function_type_return_slices = raz_compiler_rt_arena_create(4096);
+    out.function_type_return_slice_mutable = raz_compiler_rt_arena_create(4096);
+    out.function_type_return_function_types = raz_compiler_rt_arena_create(4096);
+    out.generic_function_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_function_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.generic_function_source_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_function_type_name_offsets = raz_compiler_rt_arena_create(4096);
+    out.generic_function_type_name_lengths = raz_compiler_rt_arena_create(4096);
+    out.generic_function_bound_counts = raz_compiler_rt_arena_create(4096);
+    out.generic_function_bounds = raz_compiler_rt_arena_create(32768);
+    out.function_defer_starts = raz_compiler_rt_arena_create(16384);
+    out.function_defer_counts = raz_compiler_rt_arena_create(16384);
+    out.parameter_name_offsets = raz_compiler_rt_arena_create(32768);
+    out.parameter_name_lengths = raz_compiler_rt_arena_create(32768);
+    out.parameter_function_indices = raz_compiler_rt_arena_create(32768);
+    out.parameter_type_structs = raz_compiler_rt_arena_create(32768);
+    out.parameter_types = raz_compiler_rt_arena_create(32768);
+    out.parameter_references = raz_compiler_rt_arena_create(32768);
+    out.parameter_reference_mutable = raz_compiler_rt_arena_create(32768);
+    out.parameter_lifetimes = raz_compiler_rt_arena_create(32768);
+    out.parameter_slices = raz_compiler_rt_arena_create(32768);
+    out.parameter_slice_mutable = raz_compiler_rt_arena_create(32768);
+    out.parameter_array_extents = raz_compiler_rt_arena_create(32768);
+    out.parameter_mutated = raz_compiler_rt_arena_create(32768);
+    out.parameter_function_types = raz_compiler_rt_arena_create(32768);
+    out.local_name_offsets = raz_compiler_rt_arena_create(32768);
+    out.local_name_lengths = raz_compiler_rt_arena_create(32768);
+    out.local_declaration_offsets = raz_compiler_rt_arena_create(32768);
+    out.local_slots = raz_compiler_rt_arena_create(32768);
+    out.local_previous_function_locals = raz_compiler_rt_arena_create(32768);
+    out.local_function_indices = raz_compiler_rt_arena_create(32768);
+    out.local_block_indices = raz_compiler_rt_arena_create(32768);
+    out.local_type_structs = raz_compiler_rt_arena_create(32768);
+    out.local_types = raz_compiler_rt_arena_create(32768);
+    out.local_references = raz_compiler_rt_arena_create(32768);
+    out.local_reference_mutable = raz_compiler_rt_arena_create(32768);
+    out.local_lifetimes = raz_compiler_rt_arena_create(32768);
+    out.local_slices = raz_compiler_rt_arena_create(32768);
+    out.local_slice_mutable = raz_compiler_rt_arena_create(32768);
+    out.local_array_extents = raz_compiler_rt_arena_create(32768);
+    out.local_array_element_starts = raz_compiler_rt_arena_create(32768);
+    out.local_array_element_counts = raz_compiler_rt_arena_create(32768);
+    out.local_final_moved = raz_compiler_rt_arena_create(32768);
+    out.local_callable_functions = raz_compiler_rt_arena_create(32768);
+    out.local_callable_kinds = raz_compiler_rt_arena_create(32768);
+    out.local_callable_capture_starts = raz_compiler_rt_arena_create(32768);
+    out.local_callable_capture_counts = raz_compiler_rt_arena_create(32768);
+    out.local_callable_consumed = raz_compiler_rt_arena_create(32768);
+    out.local_function_types = raz_compiler_rt_arena_create(32768);
+    out.callable_capture_locals = raz_compiler_rt_arena_create(262144);
+    out.parameter_final_moved = raz_compiler_rt_arena_create(32768);
+    out.final_moved_path_count = 0;
+    out.final_moved_path_root_kinds = raz_compiler_rt_arena_create(16384);
+    out.final_moved_path_root_indices = raz_compiler_rt_arena_create(16384);
+    out.final_moved_paths = raz_compiler_rt_arena_create(16384);
+    out.array_elements = raz_compiler_rt_arena_create(262144);
+    out.node_kinds = raz_compiler_rt_arena_create(1048576);
+    out.node_a = raz_compiler_rt_arena_create(1048576);
+    out.node_b = raz_compiler_rt_arena_create(1048576);
+    out.node_c = raz_compiler_rt_arena_create(1048576);
+    out.node_values = raz_compiler_rt_arena_create(1048576);
+    out.node_type_structs = raz_compiler_rt_arena_create(1048576);
+    out.node_types = raz_compiler_rt_arena_create(1048576);
+    out.node_references = raz_compiler_rt_arena_create(1048576);
+    out.node_reference_mutable = raz_compiler_rt_arena_create(1048576);
+    out.node_lifetimes = raz_compiler_rt_arena_create(1048576);
+    out.node_slices = raz_compiler_rt_arena_create(1048576);
+    out.node_slice_mutable = raz_compiler_rt_arena_create(1048576);
+    out.node_array_extents = raz_compiler_rt_arena_create(1048576);
+    out.node_function_types = raz_compiler_rt_arena_create(1048576);
+    out.arguments = raz_compiler_rt_arena_create(262144);
+    out.block_starts = raz_compiler_rt_arena_create(131072);
+    out.block_ends = raz_compiler_rt_arena_create(131072);
+    out.block_statement_starts = raz_compiler_rt_arena_create(131072);
+    out.block_statement_counts = raz_compiler_rt_arena_create(131072);
+    out.block_function_indices = raz_compiler_rt_arena_create(131072);
+    out.block_parent_indices = raz_compiler_rt_arena_create(131072);
+    out.block_loop_depths = raz_compiler_rt_arena_create(131072);
+    out.block_unsafe_depths = raz_compiler_rt_arena_create(131072);
+    out.block_generic_active = raz_compiler_rt_arena_create(131072);
+    out.block_generic_template_indices = raz_compiler_rt_arena_create(131072);
+    out.block_generic_type_name_offsets = raz_compiler_rt_arena_create(131072);
+    out.block_generic_type_name_lengths = raz_compiler_rt_arena_create(131072);
+    out.block_generic_type_structures = raz_compiler_rt_arena_create(131072);
+    out.block_generic_type_kinds = raz_compiler_rt_arena_create(131072);
+    out.block_generic_signature_only = raz_compiler_rt_arena_create(131072);
+    out.block_generic_reparse_function_indices = raz_compiler_rt_arena_create(131072);
+    out.block_generic_substitution_counts = raz_compiler_rt_arena_create(131072);
+    out.block_generic_substitution_name_offsets = raz_compiler_rt_arena_create(2097152);
+    out.block_generic_substitution_name_lengths = raz_compiler_rt_arena_create(2097152);
+    out.block_generic_substitution_type_structures = raz_compiler_rt_arena_create(2097152);
+    out.block_generic_substitution_types = raz_compiler_rt_arena_create(2097152);
+    out.block_defer_starts = raz_compiler_rt_arena_create(131072);
+    out.block_defer_counts = raz_compiler_rt_arena_create(131072);
+    out.block_defer_contexts = raz_compiler_rt_arena_create(131072);
+    out.defer_blocks = raz_compiler_rt_arena_create(16384);
+    out.statement_kinds = raz_compiler_rt_arena_create(131072);
+    out.statement_block_indices = raz_compiler_rt_arena_create(131072);
+    out.statement_function_indices = raz_compiler_rt_arena_create(131072);
+    out.statement_source_offsets = raz_compiler_rt_arena_create(131072);
+    out.statement_a = raz_compiler_rt_arena_create(131072);
+    out.statement_b = raz_compiler_rt_arena_create(131072);
+    out.statement_c = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_structures = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_root_kinds = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_root_indices = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_paths = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_moved_starts = raz_compiler_rt_arena_create(131072);
+    out.statement_predrop_moved_counts = raz_compiler_rt_arena_create(131072);
+    out.predrop_moved_paths = raz_compiler_rt_arena_create(262144);
+    if (out.struct_name_offsets == 0) {
+        return false;
+    }
+    if (out.struct_name_lengths == 0 || out.struct_identity_suffix_cache == 0) {
+        return false;
+    }
+    if (out.struct_field_starts == 0) {
+        return false;
+    }
+    if (
+        out.struct_field_counts == 0 ||
+        out.struct_packed_flags == 0 ||
+        out.struct_repr_c_flags == 0 ||
+        out.struct_explicit_alignments == 0 ||
+        out.struct_attribute_counts == 0
+    ) {
+        return false;
+    }
+    if (out.struct_drop_functions == 0) {
+        return false;
+    }
+    if (out.struct_clone_functions == 0 || out.struct_derived_clone_flags == 0) {
+        return false;
+    }
+    if (out.struct_copy_flags == 0) {
+        return false;
+    }
+    if (
+        out.struct_generic_template_indices == 0 ||
+        out.struct_generic_type_structs == 0 ||
+        out.struct_generic_types == 0 ||
+        out.struct_generic_argument_starts == 0 ||
+        out.struct_generic_argument_counts == 0 ||
+        out.struct_generic_argument_type_structs == 0 ||
+        out.struct_generic_argument_types == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_struct_name_offsets == 0 ||
+        out.generic_struct_name_lengths == 0 ||
+        out.generic_struct_source_offsets == 0 ||
+        out.generic_struct_type_name_offsets == 0 ||
+        out.generic_struct_type_name_lengths == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_drop_source_offsets == 0 ||
+        out.generic_drop_struct_templates == 0 ||
+        out.generic_drop_type_name_offsets == 0 ||
+        out.generic_drop_type_name_lengths == 0 ||
+        out.generic_drop_requires_drop == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_clone_source_offsets == 0 ||
+        out.generic_clone_struct_templates == 0 ||
+        out.generic_clone_type_name_offsets == 0 ||
+        out.generic_clone_type_name_lengths == 0 ||
+        out.generic_clone_requires_clone == 0 ||
+        out.generic_struct_derive_copy_flags == 0 ||
+        out.generic_struct_derive_clone_flags == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_inherent_source_offsets == 0 ||
+        out.generic_inherent_struct_templates == 0 ||
+        out.generic_inherent_type_name_offsets == 0 ||
+        out.generic_inherent_type_name_lengths == 0 ||
+        out.generic_inherent_parameter_counts == 0 ||
+        out.generic_inherent_parameter_name_offsets == 0 ||
+        out.generic_inherent_parameter_name_lengths == 0 ||
+        out.generic_inherent_parameter_kinds == 0 ||
+        out.generic_inherent_bound_counts == 0 ||
+        out.generic_inherent_bound_parameter_indices == 0 ||
+        out.generic_inherent_bounds == 0
+    ) {
+        return false;
+    }
+    if (
+        out.inherent_method_structures == 0 ||
+        out.inherent_method_name_offsets == 0 ||
+        out.inherent_method_name_lengths == 0 ||
+        out.inherent_method_functions == 0 ||
+        out.inherent_method_receivers == 0
+    ) {
+        return false;
+    }
+    if (
+        out.function_inherent_structs == 0 ||
+        out.function_inherent_source_offsets == 0 ||
+        out.function_inherent_body_parsed == 0 ||
+        out.function_trait_default_methods == 0
+    ) {
+        return false;
+    }
+    if (
+        out.function_clone_structs == 0 ||
+        out.function_closure_ids == 0 ||
+        out.function_closure_kinds == 0 ||
+        out.function_closure_body_starts == 0 ||
+        out.function_closure_body_ends == 0 ||
+        out.function_closure_root_blocks == 0 ||
+        out.function_closure_body_parsed == 0 ||
+        out.function_closure_parent_functions == 0 ||
+        out.function_closure_parent_blocks == 0 ||
+        out.function_closure_explicit_parameter_counts == 0 ||
+        out.function_closure_capture_starts == 0 ||
+        out.function_closure_capture_counts == 0 ||
+        out.closure_capture_root_kinds == 0 ||
+        out.closure_capture_root_indices == 0
+    ) {
+        return false;
+    }
+    if (out.comptime_blocks == 0) {
+        return false;
+    }
+    if (
+        out.trait_name_offsets == 0 ||
+        out.trait_name_lengths == 0 ||
+        out.trait_object_safe_flags == 0 ||
+        out.trait_alias_flags == 0 ||
+        out.trait_method_starts == 0 ||
+        out.trait_method_counts == 0 ||
+        out.trait_method_trait_indices == 0 ||
+        out.trait_method_name_offsets == 0 ||
+        out.trait_method_name_lengths == 0 ||
+        out.trait_method_source_offsets == 0 ||
+        out.trait_method_default_flags == 0 ||
+        out.trait_method_effect_flags == 0 ||
+        out.trait_associated_type_starts == 0 ||
+        out.trait_associated_type_counts == 0 ||
+        out.trait_associated_const_starts == 0 ||
+        out.trait_associated_const_counts == 0 ||
+        out.trait_associated_type_name_offsets == 0 ||
+        out.trait_associated_type_name_lengths == 0 ||
+        out.trait_associated_const_name_offsets == 0 ||
+        out.trait_associated_const_name_lengths == 0 ||
+        out.trait_associated_const_type_offsets == 0 ||
+        out.trait_associated_const_type_lengths == 0 ||
+        out.trait_supertrait_starts == 0 ||
+        out.trait_supertrait_counts == 0 ||
+        out.trait_supertraits == 0 ||
+        out.trait_impl_traits == 0 ||
+        out.trait_impl_structures == 0 ||
+        out.trait_impl_source_offsets == 0 ||
+        out.trait_impl_generic_indices == 0 ||
+        out.generic_trait_source_offsets == 0 ||
+        out.generic_trait_traits == 0 ||
+        out.generic_trait_struct_templates == 0 ||
+        out.generic_trait_type_name_offsets == 0 ||
+        out.generic_trait_type_name_lengths == 0 ||
+        out.generic_trait_bound_counts == 0 ||
+        out.generic_trait_bounds == 0
+    ) {
+        return false;
+    }
+    if (out.struct_field_name_offsets == 0) {
+        return false;
+    }
+    if (out.struct_field_name_lengths == 0) {
+        return false;
+    }
+    if (out.struct_field_type_offsets == 0) {
+        return false;
+    }
+    if (out.struct_field_type_lengths == 0) {
+        return false;
+    }
+    if (out.struct_field_type_structs == 0) {
+        return false;
+    }
+    if (out.struct_field_types == 0) {
+        return false;
+    }
+    if (out.struct_field_references == 0) {
+        return false;
+    }
+    if (out.struct_field_slices == 0) {
+        return false;
+    }
+    if (out.struct_field_slice_mutable == 0 || out.struct_field_array_extents == 0) {
+        return false;
+    }
+    if (out.enum_name_offsets == 0) {
+        return false;
+    }
+    if (out.enum_name_lengths == 0) {
+        return false;
+    }
+    if (out.enum_member_starts == 0) {
+        return false;
+    }
+    if (out.enum_member_counts == 0) {
+        return false;
+    }
+    if (out.enum_member_name_offsets == 0) {
+        return false;
+    }
+    if (out.enum_member_name_lengths == 0) {
+        return false;
+    }
+    if (out.enum_member_values == 0) {
+        return false;
+    }
+    if (out.enum_member_payload_starts == 0) {
+        return false;
+    }
+    if (out.enum_member_payload_counts == 0) {
+        return false;
+    }
+    if (out.enum_has_payload == 0 || out.enum_copy_flags == 0 || out.enum_derived_clone_flags == 0) {
+        return false;
+    }
+    if (
+        out.enum_marker_trait_starts == 0 ||
+        out.enum_marker_trait_counts == 0 ||
+        out.enum_marker_traits == 0
+    ) {
+        return false;
+    }
+    if (out.enum_payload_types == 0 || out.enum_payload_enum_indices == 0) {
+        return false;
+    }
+    if (out.enum_payload_type_structs == 0 || out.enum_payload_array_extents == 0) {
+        return false;
+    }
+    if (
+        out.enum_generic_template_indices == 0 ||
+        out.enum_generic_argument_starts == 0 ||
+        out.enum_generic_argument_counts == 0 ||
+        out.enum_generic_argument_type_structs == 0 ||
+        out.enum_generic_argument_types == 0 ||
+        out.generic_enum_name_offsets == 0 ||
+        out.generic_enum_name_lengths == 0 ||
+        out.generic_enum_source_offsets == 0 ||
+        out.generic_enum_parameter_starts == 0 ||
+        out.generic_enum_parameter_counts == 0 ||
+        out.generic_enum_derive_copy_flags == 0 ||
+        out.generic_enum_derive_clone_flags == 0
+    ) {
+        return false;
+    }
+    if (out.constant_name_offsets == 0) {
+        return false;
+    }
+    if (out.constant_name_lengths == 0) {
+        return false;
+    }
+    if (out.constant_nodes == 0) {
+        return false;
+    }
+    if (out.constant_types == 0) {
+        return false;
+    }
+    if (out.constant_function_indices == 0) {
+        return false;
+    }
+    if (out.constant_block_indices == 0) {
+        return false;
+    }
+    if (out.constant_source_offsets == 0) {
+        return false;
+    }
+    if (out.match_arm_values == 0) {
+        return false;
+    }
+    if (out.match_arm_blocks == 0) {
+        return false;
+    }
+    if (out.match_arm_guards == 0) {
+        return false;
+    }
+    if (out.match_arm_wildcards == 0) {
+        return false;
+    }
+    if (out.match_arm_enum_indices == 0) {
+        return false;
+    }
+    if (out.match_arm_member_indices == 0) {
+        return false;
+    }
+    if (out.match_arm_binding_starts == 0) {
+        return false;
+    }
+    if (out.match_arm_binding_counts == 0) {
+        return false;
+    }
+    if (out.match_arm_nested_test_starts == 0 || out.match_arm_nested_test_counts == 0) {
+        return false;
+    }
+    if (
+        out.match_nested_test_outer_indices == 0 ||
+        out.match_nested_test_path_indices == 0 ||
+        out.match_nested_test_values == 0
+    ) {
+        return false;
+    }
+    if (
+        out.match_binding_local_slots == 0 ||
+        out.match_binding_outer_indices == 0 ||
+        out.match_binding_inner_indices == 0 ||
+        out.match_binding_path_indices == 0 ||
+        out.match_binding_payload_indices == 0 ||
+        out.match_binding_modes == 0 ||
+        out.match_path_parents == 0 ||
+        out.match_path_payload_indices == 0
+    ) {
+        return false;
+    }
+    if (
+        out.global_name_offsets == 0 ||
+        out.global_name_lengths == 0 ||
+        out.global_module_ids == 0 ||
+        out.global_identity_suffix_cache == 0 ||
+        out.global_type_structs == 0 ||
+        out.global_types == 0 ||
+        out.global_array_extents == 0 ||
+        out.global_function_types == 0 ||
+        out.global_mutable_flags == 0 ||
+        out.global_extern_flags == 0 ||
+        out.global_tls_flags == 0 ||
+        out.global_internal_flags == 0 ||
+        out.global_public_flags == 0 ||
+        out.global_initializer_nodes == 0
+    ) {
+        return false;
+    }
+    if (out.function_name_offsets == 0) {
+        return false;
+    }
+    if (out.function_name_lengths == 0 || out.function_identity_suffix_cache == 0 || out.function_declaration_offsets == 0) {
+        return false;
+    }
+    if (out.function_parameter_starts == 0) {
+        return false;
+    }
+    if (out.function_parameter_counts == 0) {
+        return false;
+    }
+    if (out.function_local_starts == 0 || out.function_last_locals == 0) {
+        return false;
+    }
+    if (out.function_local_counts == 0) {
+        return false;
+    }
+    if (out.function_statement_starts == 0) {
+        return false;
+    }
+    if (out.function_statement_counts == 0) {
+        return false;
+    }
+    if (out.function_is_extern == 0) {
+        return false;
+    }
+    if (out.function_is_const == 0) {
+        return false;
+    }
+    if (out.function_is_async == 0 || out.function_is_unsafe == 0) {
+        return false;
+    }
+    if (out.function_root_statement_counts == 0) {
+        return false;
+    }
+    if (out.function_extern_kinds == 0) {
+        return false;
+    }
+    if (
+        out.function_return_types == 0 ||
+        out.function_returns_value == 0 ||
+        out.function_return_references == 0 ||
+        out.function_return_reference_mutable == 0
+    ) {
+        return false;
+    }
+    if (out.function_return_type_structs == 0) {
+        return false;
+    }
+    if (out.function_return_slices == 0) {
+        return false;
+    }
+    if (
+        out.function_return_slice_mutable == 0 ||
+        out.function_return_lifetimes == 0 ||
+        out.function_return_function_types == 0 ||
+        out.function_pointer_signatures == 0 ||
+        out.function_lifetime_parameter_starts == 0 ||
+        out.function_lifetime_parameter_counts == 0 ||
+        out.lifetime_name_offsets == 0 ||
+        out.lifetime_name_lengths == 0
+    ) {
+        return false;
+    }
+    if (
+        out.function_abi_kinds == 0 ||
+        out.function_link_name_offsets == 0 ||
+        out.function_link_name_lengths == 0 ||
+        out.function_target_feature_offsets == 0 ||
+        out.function_target_feature_lengths == 0 ||
+        out.function_effect_flags == 0
+    ) {
+        return false;
+    }
+    if (out.function_drop_structs == 0) {
+        return false;
+    }
+    if (
+        out.function_generic_template_indices == 0 ||
+        out.function_generic_type_structs == 0 ||
+        out.function_generic_types == 0 ||
+        out.function_generic_body_parsed == 0 ||
+        out.function_generic_argument_starts == 0 ||
+        out.function_generic_argument_counts == 0 ||
+        out.function_generic_argument_type_structs == 0 ||
+        out.function_generic_argument_types == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_function_name_offsets == 0 ||
+        out.generic_function_name_lengths == 0 ||
+        out.generic_function_source_offsets == 0 ||
+        out.generic_function_type_name_offsets == 0 ||
+        out.generic_function_type_name_lengths == 0 ||
+        out.generic_function_bound_counts == 0 ||
+        out.generic_function_bounds == 0
+    ) {
+        return false;
+    }
+    if (
+        out.generic_parameter_name_offsets == 0 ||
+        out.generic_parameter_name_lengths == 0 ||
+        out.generic_parameter_kinds == 0 ||
+        out.generic_parameter_const_types == 0 ||
+        out.generic_parameter_bound_starts == 0 ||
+        out.generic_parameter_bound_counts == 0 ||
+        out.generic_parameter_bounds == 0 ||
+        out.generic_function_parameter_starts == 0 ||
+        out.generic_function_parameter_counts == 0 ||
+        out.generic_struct_parameter_starts == 0 ||
+        out.generic_struct_parameter_counts == 0
+    ) {
+        return false;
+    }
+    if (
+        out.function_type_parameter_starts == 0 ||
+        out.function_type_parameter_counts == 0 ||
+        out.function_type_parameter_type_structs == 0 ||
+        out.function_type_parameter_types == 0 ||
+        out.function_type_parameter_function_types == 0 ||
+        out.function_type_return_types == 0 ||
+        out.function_type_return_type_structs == 0 ||
+        out.function_type_return_function_types == 0
+    ) {
+        return false;
+    }
+    if (out.function_defer_starts == 0) {
+        return false;
+    }
+    if (out.function_defer_counts == 0) {
+        return false;
+    }
+    if (
+        out.parameter_name_offsets == 0 ||
+        out.parameter_lifetimes == 0 ||
+        out.parameter_array_extents == 0 ||
+        out.parameter_function_types == 0
+    ) {
+        return false;
+    }
+    if (out.parameter_name_lengths == 0) {
+        return false;
+    }
+    if (out.parameter_function_indices == 0) {
+        return false;
+    }
+    if (out.parameter_type_structs == 0) {
+        return false;
+    }
+    if (out.parameter_types == 0) {
+        return false;
+    }
+    if (out.parameter_references == 0 || out.parameter_reference_mutable == 0) {
+        return false;
+    }
+    if (out.parameter_slices == 0) {
+        return false;
+    }
+    if (out.parameter_slice_mutable == 0) {
+        return false;
+    }
+    if (out.parameter_mutated == 0) {
+        return false;
+    }
+    if (out.local_name_offsets == 0) {
+        return false;
+    }
+    if (
+        out.local_name_lengths == 0 ||
+        out.local_declaration_offsets == 0 ||
+        out.local_slots == 0 ||
+        out.local_previous_function_locals == 0
+    ) {
+        return false;
+    }
+    if (out.local_function_indices == 0) {
+        return false;
+    }
+    if (out.local_block_indices == 0) {
+        return false;
+    }
+    if (out.local_type_structs == 0) {
+        return false;
+    }
+    if (out.local_types == 0) {
+        return false;
+    }
+    if (out.local_references == 0 || out.local_reference_mutable == 0 || out.local_lifetimes == 0) {
+        return false;
+    }
+    if (out.local_slices == 0) {
+        return false;
+    }
+    if (out.local_slice_mutable == 0) {
+        return false;
+    }
+    if (out.local_array_extents == 0) {
+        return false;
+    }
+    if (out.local_array_element_starts == 0) {
+        return false;
+    }
+    if (out.local_array_element_counts == 0) {
+        return false;
+    }
+    if (out.local_final_moved == 0) {
+        return false;
+    }
+    if (out.parameter_final_moved == 0) {
+        return false;
+    }
+    if (out.final_moved_path_root_kinds == 0) {
+        return false;
+    }
+    if (out.final_moved_path_root_indices == 0) {
+        return false;
+    }
+    if (out.final_moved_paths == 0) {
+        return false;
+    }
+    if (out.array_elements == 0) {
+        return false;
+    }
+    if (out.node_kinds == 0 || out.node_lifetimes == 0) {
+        return false;
+    }
+    if (out.node_a == 0) {
+        return false;
+    }
+    if (out.node_b == 0) {
+        return false;
+    }
+    if (out.node_c == 0) {
+        return false;
+    }
+    if (out.node_values == 0) {
+        return false;
+    }
+    if (out.node_type_structs == 0) {
+        return false;
+    }
+    if (out.node_types == 0) {
+        return false;
+    }
+    if (out.node_references == 0 || out.node_reference_mutable == 0) {
+        return false;
+    }
+    if (out.node_slices == 0) {
+        return false;
+    }
+    if (out.node_slice_mutable == 0) {
+        return false;
+    }
+    if (out.node_array_extents == 0) {
+        return false;
+    }
+    if (out.arguments == 0) {
+        return false;
+    }
+    if (out.block_starts == 0) {
+        return false;
+    }
+    if (out.block_ends == 0) {
+        return false;
+    }
+    if (out.block_statement_starts == 0) {
+        return false;
+    }
+    if (out.block_statement_counts == 0) {
+        return false;
+    }
+    if (out.block_function_indices == 0) {
+        return false;
+    }
+    if (out.block_parent_indices == 0) {
+        return false;
+    }
+    if (out.block_loop_depths == 0 || out.block_unsafe_depths == 0) {
+        return false;
+    }
+    if (
+        out.block_generic_active == 0 ||
+        out.block_generic_template_indices == 0 ||
+        out.block_generic_type_name_offsets == 0 ||
+        out.block_generic_type_name_lengths == 0 ||
+        out.block_generic_type_structures == 0 ||
+        out.block_generic_type_kinds == 0 ||
+        out.block_generic_signature_only == 0 ||
+        out.block_generic_reparse_function_indices == 0 ||
+        out.block_generic_substitution_counts == 0 ||
+        out.block_generic_substitution_name_offsets == 0 ||
+        out.block_generic_substitution_name_lengths == 0 ||
+        out.block_generic_substitution_type_structures == 0 ||
+        out.block_generic_substitution_types == 0
+    ) {
+        return false;
+    }
+    if (out.block_defer_starts == 0) {
+        return false;
+    }
+    if (out.block_defer_counts == 0) {
+        return false;
+    }
+    if (out.block_defer_contexts == 0) {
+        return false;
+    }
+    if (out.defer_blocks == 0) {
+        return false;
+    }
+    if (out.statement_kinds == 0) {
+        return false;
+    }
+    if (out.statement_block_indices == 0) {
+        return false;
+    }
+    if (out.statement_function_indices == 0) {
+        return false;
+    }
+    if (out.statement_source_offsets == 0) {
+        return false;
+    }
+    if (out.statement_a == 0) {
+        return false;
+    }
+    if (out.statement_b == 0) {
+        return false;
+    }
+    if (out.statement_c == 0) {
+        return false;
+    }
+    if (out.statement_predrop_structures == 0) {
+        return false;
+    }
+    if (out.statement_predrop_root_kinds == 0) {
+        return false;
+    }
+    if (out.statement_predrop_root_indices == 0) {
+        return false;
+    }
+    if (out.statement_predrop_paths == 0) {
+        return false;
+    }
+    if (out.statement_predrop_moved_starts == 0) {
+        return false;
+    }
+    if (out.statement_predrop_moved_counts == 0) {
+        return false;
+    }
+    if (out.predrop_moved_paths == 0) {
+        return false;
+    }
+    if (
+        out.incremental_module_ids == 0 ||
+        out.incremental_module_source_fingerprints == 0 ||
+        out.incremental_module_interface_fingerprints == 0 ||
+        out.incremental_module_package_hashes == 0 ||
+        out.incremental_module_namespace_hashes == 0 ||
+        out.incremental_function_module_ids == 0 ||
+        out.incremental_module_function_starts == 0 ||
+        out.incremental_module_function_counts == 0 ||
+        out.incremental_module_function_indices == 0 ||
+        out.incremental_module_dependency_owners == 0 ||
+        out.incremental_module_dependency_targets == 0 ||
+        out.incremental_module_dirty_kinds == 0 ||
+        out.incremental_module_hir_fingerprints == 0 ||
+        out.incremental_module_cached_mir_fingerprints == 0 ||
+        out.incremental_module_cache_kinds == 0
+    ) {
+        return false;
+    }
+    return true;
+}
+
+public fn destroy_hir(HirModule&mut out) {
+    raz_compiler_rt_arena_destroy(out.incremental_module_ids);
+    raz_compiler_rt_arena_destroy(out.incremental_module_source_fingerprints);
+    raz_compiler_rt_arena_destroy(out.incremental_module_interface_fingerprints);
+    raz_compiler_rt_arena_destroy(out.incremental_module_package_hashes);
+    raz_compiler_rt_arena_destroy(out.incremental_module_namespace_hashes);
+    raz_compiler_rt_arena_destroy(out.incremental_function_module_ids);
+    raz_compiler_rt_arena_destroy(out.incremental_module_function_starts);
+    raz_compiler_rt_arena_destroy(out.incremental_module_function_counts);
+    raz_compiler_rt_arena_destroy(out.incremental_module_function_indices);
+    raz_compiler_rt_arena_destroy(out.incremental_module_dependency_owners);
+    raz_compiler_rt_arena_destroy(out.incremental_module_dependency_targets);
+    raz_compiler_rt_arena_destroy(out.incremental_module_dirty_kinds);
+    raz_compiler_rt_arena_destroy(out.incremental_module_hir_fingerprints);
+    raz_compiler_rt_arena_destroy(out.incremental_module_cached_mir_fingerprints);
+    raz_compiler_rt_arena_destroy(out.incremental_module_cache_kinds);
+    raz_compiler_rt_arena_destroy(out.struct_name_offsets);
+    raz_compiler_rt_arena_destroy(out.struct_name_lengths);
+    raz_compiler_rt_arena_destroy(out.struct_identity_suffix_cache);
+    raz_compiler_rt_arena_destroy(out.struct_field_starts);
+    raz_compiler_rt_arena_destroy(out.struct_field_counts);
+    raz_compiler_rt_arena_destroy(out.struct_tuple_flags);
+    raz_compiler_rt_arena_destroy(out.struct_packed_flags);
+    raz_compiler_rt_arena_destroy(out.struct_repr_c_flags);
+    raz_compiler_rt_arena_destroy(out.struct_explicit_alignments);
+    raz_compiler_rt_arena_destroy(out.struct_attribute_counts);
+    raz_compiler_rt_arena_destroy(out.struct_drop_functions);
+    raz_compiler_rt_arena_destroy(out.struct_clone_functions);
+    raz_compiler_rt_arena_destroy(out.struct_derived_clone_flags);
+    raz_compiler_rt_arena_destroy(out.struct_copy_flags);
+    raz_compiler_rt_arena_destroy(out.struct_generic_template_indices);
+    raz_compiler_rt_arena_destroy(out.struct_generic_argument_starts);
+    raz_compiler_rt_arena_destroy(out.struct_generic_argument_counts);
+    raz_compiler_rt_arena_destroy(out.struct_generic_argument_type_structs);
+    raz_compiler_rt_arena_destroy(out.struct_generic_argument_types);
+    raz_compiler_rt_arena_destroy(out.struct_generic_type_structs);
+    raz_compiler_rt_arena_destroy(out.struct_generic_types);
+    raz_compiler_rt_arena_destroy(out.generic_struct_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_struct_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_struct_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_struct_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_struct_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_struct_derive_copy_flags);
+    raz_compiler_rt_arena_destroy(out.generic_struct_derive_clone_flags);
+    raz_compiler_rt_arena_destroy(out.generic_drop_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_drop_struct_templates);
+    raz_compiler_rt_arena_destroy(out.generic_drop_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_drop_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_drop_requires_drop);
+    raz_compiler_rt_arena_destroy(out.generic_clone_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_clone_struct_templates);
+    raz_compiler_rt_arena_destroy(out.generic_clone_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_clone_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_clone_requires_clone);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_struct_templates);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_parameter_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_parameter_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_parameter_kinds);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_bound_counts);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_bound_parameter_indices);
+    raz_compiler_rt_arena_destroy(out.generic_inherent_bounds);
+    raz_compiler_rt_arena_destroy(out.inherent_method_structures);
+    raz_compiler_rt_arena_destroy(out.inherent_method_name_offsets);
+    raz_compiler_rt_arena_destroy(out.inherent_method_name_lengths);
+    raz_compiler_rt_arena_destroy(out.inherent_method_functions);
+    raz_compiler_rt_arena_destroy(out.inherent_method_receivers);
+    raz_compiler_rt_arena_destroy(out.function_inherent_structs);
+    raz_compiler_rt_arena_destroy(out.function_inherent_source_offsets);
+    raz_compiler_rt_arena_destroy(out.function_inherent_body_parsed);
+    raz_compiler_rt_arena_destroy(out.function_trait_default_methods);
+    raz_compiler_rt_arena_destroy(out.trait_name_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_name_lengths);
+    raz_compiler_rt_arena_destroy(out.trait_object_safe_flags);
+    raz_compiler_rt_arena_destroy(out.trait_alias_flags);
+    raz_compiler_rt_arena_destroy(out.trait_method_starts);
+    raz_compiler_rt_arena_destroy(out.trait_method_counts);
+    raz_compiler_rt_arena_destroy(out.trait_method_trait_indices);
+    raz_compiler_rt_arena_destroy(out.trait_method_name_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_method_name_lengths);
+    raz_compiler_rt_arena_destroy(out.trait_method_source_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_method_default_flags);
+    raz_compiler_rt_arena_destroy(out.trait_method_effect_flags);
+    raz_compiler_rt_arena_destroy(out.trait_associated_type_starts);
+    raz_compiler_rt_arena_destroy(out.trait_associated_type_counts);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_starts);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_counts);
+    raz_compiler_rt_arena_destroy(out.trait_associated_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_associated_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_name_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_name_lengths);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_type_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_associated_const_type_lengths);
+    raz_compiler_rt_arena_destroy(out.trait_supertrait_starts);
+    raz_compiler_rt_arena_destroy(out.trait_supertrait_counts);
+    raz_compiler_rt_arena_destroy(out.trait_supertraits);
+    raz_compiler_rt_arena_destroy(out.trait_impl_traits);
+    raz_compiler_rt_arena_destroy(out.trait_impl_structures);
+    raz_compiler_rt_arena_destroy(out.trait_impl_source_offsets);
+    raz_compiler_rt_arena_destroy(out.trait_impl_generic_indices);
+    raz_compiler_rt_arena_destroy(out.generic_trait_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_trait_traits);
+    raz_compiler_rt_arena_destroy(out.generic_trait_struct_templates);
+    raz_compiler_rt_arena_destroy(out.generic_trait_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_trait_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_trait_bound_counts);
+    raz_compiler_rt_arena_destroy(out.generic_trait_bounds);
+    raz_compiler_rt_arena_destroy(out.struct_field_name_offsets);
+    raz_compiler_rt_arena_destroy(out.struct_field_name_lengths);
+    raz_compiler_rt_arena_destroy(out.struct_field_type_offsets);
+    raz_compiler_rt_arena_destroy(out.struct_field_type_lengths);
+    raz_compiler_rt_arena_destroy(out.struct_field_type_structs);
+    raz_compiler_rt_arena_destroy(out.struct_field_types);
+    raz_compiler_rt_arena_destroy(out.struct_field_references);
+    raz_compiler_rt_arena_destroy(out.struct_field_slices);
+    raz_compiler_rt_arena_destroy(out.struct_field_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.struct_field_array_extents);
+    raz_compiler_rt_arena_destroy(out.struct_field_function_types);
+    raz_compiler_rt_arena_destroy(out.enum_name_offsets);
+    raz_compiler_rt_arena_destroy(out.enum_name_lengths);
+    raz_compiler_rt_arena_destroy(out.enum_member_starts);
+    raz_compiler_rt_arena_destroy(out.enum_member_counts);
+    raz_compiler_rt_arena_destroy(out.enum_member_name_offsets);
+    raz_compiler_rt_arena_destroy(out.enum_member_name_lengths);
+    raz_compiler_rt_arena_destroy(out.enum_member_values);
+    raz_compiler_rt_arena_destroy(out.enum_member_payload_starts);
+    raz_compiler_rt_arena_destroy(out.enum_member_payload_counts);
+    raz_compiler_rt_arena_destroy(out.enum_has_payload);
+    raz_compiler_rt_arena_destroy(out.enum_copy_flags);
+    raz_compiler_rt_arena_destroy(out.enum_derived_clone_flags);
+    raz_compiler_rt_arena_destroy(out.enum_marker_trait_starts);
+    raz_compiler_rt_arena_destroy(out.enum_marker_trait_counts);
+    raz_compiler_rt_arena_destroy(out.enum_marker_traits);
+    raz_compiler_rt_arena_destroy(out.enum_payload_types);
+    raz_compiler_rt_arena_destroy(out.enum_payload_enum_indices);
+    raz_compiler_rt_arena_destroy(out.enum_payload_type_structs);
+    raz_compiler_rt_arena_destroy(out.enum_payload_array_extents);
+    raz_compiler_rt_arena_destroy(out.enum_generic_template_indices);
+    raz_compiler_rt_arena_destroy(out.enum_generic_argument_starts);
+    raz_compiler_rt_arena_destroy(out.enum_generic_argument_counts);
+    raz_compiler_rt_arena_destroy(out.enum_generic_argument_type_structs);
+    raz_compiler_rt_arena_destroy(out.enum_generic_argument_types);
+    raz_compiler_rt_arena_destroy(out.generic_enum_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_enum_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_enum_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_enum_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.generic_enum_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.generic_enum_derive_copy_flags);
+    raz_compiler_rt_arena_destroy(out.generic_enum_derive_clone_flags);
+    raz_compiler_rt_arena_destroy(out.global_name_offsets);
+    raz_compiler_rt_arena_destroy(out.global_name_lengths);
+    raz_compiler_rt_arena_destroy(out.global_module_ids);
+    raz_compiler_rt_arena_destroy(out.global_identity_suffix_cache);
+    raz_compiler_rt_arena_destroy(out.global_type_structs);
+    raz_compiler_rt_arena_destroy(out.global_types);
+    raz_compiler_rt_arena_destroy(out.global_array_extents);
+    raz_compiler_rt_arena_destroy(out.global_function_types);
+    raz_compiler_rt_arena_destroy(out.global_mutable_flags);
+    raz_compiler_rt_arena_destroy(out.global_extern_flags);
+    raz_compiler_rt_arena_destroy(out.global_tls_flags);
+    raz_compiler_rt_arena_destroy(out.global_internal_flags);
+    raz_compiler_rt_arena_destroy(out.global_public_flags);
+    raz_compiler_rt_arena_destroy(out.global_initializer_nodes);
+    raz_compiler_rt_arena_destroy(out.constant_name_offsets);
+    raz_compiler_rt_arena_destroy(out.constant_name_lengths);
+    raz_compiler_rt_arena_destroy(out.constant_nodes);
+    raz_compiler_rt_arena_destroy(out.constant_types);
+    raz_compiler_rt_arena_destroy(out.constant_function_indices);
+    raz_compiler_rt_arena_destroy(out.constant_block_indices);
+    raz_compiler_rt_arena_destroy(out.constant_source_offsets);
+    raz_compiler_rt_arena_destroy(out.match_arm_values);
+    raz_compiler_rt_arena_destroy(out.match_arm_blocks);
+    raz_compiler_rt_arena_destroy(out.match_arm_guards);
+    raz_compiler_rt_arena_destroy(out.match_arm_wildcards);
+    raz_compiler_rt_arena_destroy(out.match_arm_enum_indices);
+    raz_compiler_rt_arena_destroy(out.match_arm_member_indices);
+    raz_compiler_rt_arena_destroy(out.match_arm_binding_starts);
+    raz_compiler_rt_arena_destroy(out.match_arm_binding_counts);
+    raz_compiler_rt_arena_destroy(out.match_arm_nested_test_starts);
+    raz_compiler_rt_arena_destroy(out.match_arm_nested_test_counts);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_outer_indices);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_path_indices);
+    raz_compiler_rt_arena_destroy(out.match_nested_test_values);
+    raz_compiler_rt_arena_destroy(out.match_binding_local_slots);
+    raz_compiler_rt_arena_destroy(out.match_binding_outer_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_inner_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_path_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_payload_indices);
+    raz_compiler_rt_arena_destroy(out.match_binding_modes);
+    raz_compiler_rt_arena_destroy(out.match_path_parents);
+    raz_compiler_rt_arena_destroy(out.match_path_payload_indices);
+    raz_compiler_rt_arena_destroy(out.function_name_offsets);
+    raz_compiler_rt_arena_destroy(out.function_name_lengths);
+    raz_compiler_rt_arena_destroy(out.function_identity_suffix_cache);
+    raz_compiler_rt_arena_destroy(out.function_declaration_offsets);
+    raz_compiler_rt_arena_destroy(out.function_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.function_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.function_local_starts);
+    raz_compiler_rt_arena_destroy(out.function_local_counts);
+    raz_compiler_rt_arena_destroy(out.function_last_locals);
+    raz_compiler_rt_arena_destroy(out.function_statement_starts);
+    raz_compiler_rt_arena_destroy(out.function_statement_counts);
+    raz_compiler_rt_arena_destroy(out.function_is_extern);
+    raz_compiler_rt_arena_destroy(out.function_is_const);
+    raz_compiler_rt_arena_destroy(out.function_is_async);
+    raz_compiler_rt_arena_destroy(out.function_is_unsafe);
+    raz_compiler_rt_arena_destroy(out.function_root_statement_counts);
+    raz_compiler_rt_arena_destroy(out.function_extern_kinds);
+    raz_compiler_rt_arena_destroy(out.function_return_types);
+    raz_compiler_rt_arena_destroy(out.function_returns_value);
+    raz_compiler_rt_arena_destroy(out.function_return_references);
+    raz_compiler_rt_arena_destroy(out.function_return_reference_mutable);
+    raz_compiler_rt_arena_destroy(out.function_return_type_structs);
+    raz_compiler_rt_arena_destroy(out.function_return_slices);
+    raz_compiler_rt_arena_destroy(out.function_return_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.function_return_lifetimes);
+    raz_compiler_rt_arena_destroy(out.function_return_function_types);
+    raz_compiler_rt_arena_destroy(out.function_pointer_signatures);
+    raz_compiler_rt_arena_destroy(out.function_lifetime_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.function_lifetime_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.lifetime_name_offsets);
+    raz_compiler_rt_arena_destroy(out.lifetime_name_lengths);
+    raz_compiler_rt_arena_destroy(out.function_abi_kinds);
+    raz_compiler_rt_arena_destroy(out.function_link_name_offsets);
+    raz_compiler_rt_arena_destroy(out.function_link_name_lengths);
+    raz_compiler_rt_arena_destroy(out.function_target_feature_offsets);
+    raz_compiler_rt_arena_destroy(out.function_target_feature_lengths);
+    raz_compiler_rt_arena_destroy(out.function_effect_flags);
+    raz_compiler_rt_arena_destroy(out.function_drop_structs);
+    raz_compiler_rt_arena_destroy(out.function_clone_structs);
+    raz_compiler_rt_arena_destroy(out.function_closure_ids);
+    raz_compiler_rt_arena_destroy(out.function_closure_kinds);
+    raz_compiler_rt_arena_destroy(out.function_closure_body_starts);
+    raz_compiler_rt_arena_destroy(out.function_closure_body_ends);
+    raz_compiler_rt_arena_destroy(out.function_closure_root_blocks);
+    raz_compiler_rt_arena_destroy(out.function_closure_body_parsed);
+    raz_compiler_rt_arena_destroy(out.function_closure_parent_functions);
+    raz_compiler_rt_arena_destroy(out.function_closure_parent_blocks);
+    raz_compiler_rt_arena_destroy(out.function_closure_explicit_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.function_closure_capture_starts);
+    raz_compiler_rt_arena_destroy(out.function_closure_capture_counts);
+    raz_compiler_rt_arena_destroy(out.closure_capture_root_kinds);
+    raz_compiler_rt_arena_destroy(out.closure_capture_root_indices);
+    raz_compiler_rt_arena_destroy(out.comptime_blocks);
+    raz_compiler_rt_arena_destroy(out.function_generic_template_indices);
+    raz_compiler_rt_arena_destroy(out.function_generic_argument_starts);
+    raz_compiler_rt_arena_destroy(out.function_generic_argument_counts);
+    raz_compiler_rt_arena_destroy(out.function_generic_argument_type_structs);
+    raz_compiler_rt_arena_destroy(out.function_generic_argument_types);
+    raz_compiler_rt_arena_destroy(out.function_generic_type_structs);
+    raz_compiler_rt_arena_destroy(out.function_generic_types);
+    raz_compiler_rt_arena_destroy(out.function_generic_body_parsed);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_kinds);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_const_types);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_bound_starts);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_bound_counts);
+    raz_compiler_rt_arena_destroy(out.generic_parameter_bounds);
+    raz_compiler_rt_arena_destroy(out.generic_function_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.generic_function_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.generic_struct_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.generic_struct_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_starts);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_counts);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_type_structs);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_types);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_references);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_slices);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.function_type_parameter_function_types);
+    raz_compiler_rt_arena_destroy(out.function_type_return_type_structs);
+    raz_compiler_rt_arena_destroy(out.function_type_return_types);
+    raz_compiler_rt_arena_destroy(out.function_type_return_references);
+    raz_compiler_rt_arena_destroy(out.function_type_return_slices);
+    raz_compiler_rt_arena_destroy(out.function_type_return_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.function_type_return_function_types);
+    raz_compiler_rt_arena_destroy(out.generic_function_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_function_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_function_source_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_function_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.generic_function_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.generic_function_bound_counts);
+    raz_compiler_rt_arena_destroy(out.generic_function_bounds);
+    raz_compiler_rt_arena_destroy(out.function_defer_starts);
+    raz_compiler_rt_arena_destroy(out.function_defer_counts);
+    raz_compiler_rt_arena_destroy(out.parameter_name_offsets);
+    raz_compiler_rt_arena_destroy(out.parameter_name_lengths);
+    raz_compiler_rt_arena_destroy(out.parameter_function_indices);
+    raz_compiler_rt_arena_destroy(out.parameter_type_structs);
+    raz_compiler_rt_arena_destroy(out.parameter_types);
+    raz_compiler_rt_arena_destroy(out.parameter_references);
+    raz_compiler_rt_arena_destroy(out.parameter_reference_mutable);
+    raz_compiler_rt_arena_destroy(out.parameter_lifetimes);
+    raz_compiler_rt_arena_destroy(out.parameter_slices);
+    raz_compiler_rt_arena_destroy(out.parameter_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.parameter_array_extents);
+    raz_compiler_rt_arena_destroy(out.parameter_mutated);
+    raz_compiler_rt_arena_destroy(out.parameter_function_types);
+    raz_compiler_rt_arena_destroy(out.local_name_offsets);
+    raz_compiler_rt_arena_destroy(out.local_name_lengths);
+    raz_compiler_rt_arena_destroy(out.local_declaration_offsets);
+    raz_compiler_rt_arena_destroy(out.local_slots);
+    raz_compiler_rt_arena_destroy(out.local_previous_function_locals);
+    raz_compiler_rt_arena_destroy(out.local_function_indices);
+    raz_compiler_rt_arena_destroy(out.local_block_indices);
+    raz_compiler_rt_arena_destroy(out.local_type_structs);
+    raz_compiler_rt_arena_destroy(out.local_types);
+    raz_compiler_rt_arena_destroy(out.local_references);
+    raz_compiler_rt_arena_destroy(out.local_reference_mutable);
+    raz_compiler_rt_arena_destroy(out.local_lifetimes);
+    raz_compiler_rt_arena_destroy(out.local_slices);
+    raz_compiler_rt_arena_destroy(out.local_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.local_array_extents);
+    raz_compiler_rt_arena_destroy(out.local_array_element_starts);
+    raz_compiler_rt_arena_destroy(out.local_array_element_counts);
+    raz_compiler_rt_arena_destroy(out.local_final_moved);
+    raz_compiler_rt_arena_destroy(out.local_callable_functions);
+    raz_compiler_rt_arena_destroy(out.local_callable_kinds);
+    raz_compiler_rt_arena_destroy(out.local_callable_capture_starts);
+    raz_compiler_rt_arena_destroy(out.local_callable_capture_counts);
+    raz_compiler_rt_arena_destroy(out.local_callable_consumed);
+    raz_compiler_rt_arena_destroy(out.local_function_types);
+    raz_compiler_rt_arena_destroy(out.callable_capture_locals);
+    raz_compiler_rt_arena_destroy(out.parameter_final_moved);
+    raz_compiler_rt_arena_destroy(out.final_moved_path_root_kinds);
+    raz_compiler_rt_arena_destroy(out.final_moved_path_root_indices);
+    raz_compiler_rt_arena_destroy(out.final_moved_paths);
+    raz_compiler_rt_arena_destroy(out.array_elements);
+    raz_compiler_rt_arena_destroy(out.node_kinds);
+    raz_compiler_rt_arena_destroy(out.node_a);
+    raz_compiler_rt_arena_destroy(out.node_b);
+    raz_compiler_rt_arena_destroy(out.node_c);
+    raz_compiler_rt_arena_destroy(out.node_values);
+    raz_compiler_rt_arena_destroy(out.node_type_structs);
+    raz_compiler_rt_arena_destroy(out.node_types);
+    raz_compiler_rt_arena_destroy(out.node_references);
+    raz_compiler_rt_arena_destroy(out.node_reference_mutable);
+    raz_compiler_rt_arena_destroy(out.node_lifetimes);
+    raz_compiler_rt_arena_destroy(out.node_slices);
+    raz_compiler_rt_arena_destroy(out.node_slice_mutable);
+    raz_compiler_rt_arena_destroy(out.node_array_extents);
+    raz_compiler_rt_arena_destroy(out.node_function_types);
+    raz_compiler_rt_arena_destroy(out.arguments);
+    raz_compiler_rt_arena_destroy(out.block_starts);
+    raz_compiler_rt_arena_destroy(out.block_ends);
+    raz_compiler_rt_arena_destroy(out.block_statement_starts);
+    raz_compiler_rt_arena_destroy(out.block_statement_counts);
+    raz_compiler_rt_arena_destroy(out.block_function_indices);
+    raz_compiler_rt_arena_destroy(out.block_parent_indices);
+    raz_compiler_rt_arena_destroy(out.block_loop_depths);
+    raz_compiler_rt_arena_destroy(out.block_unsafe_depths);
+    raz_compiler_rt_arena_destroy(out.block_generic_active);
+    raz_compiler_rt_arena_destroy(out.block_generic_template_indices);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_name_offsets);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_name_lengths);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_structures);
+    raz_compiler_rt_arena_destroy(out.block_generic_type_kinds);
+    raz_compiler_rt_arena_destroy(out.block_generic_signature_only);
+    raz_compiler_rt_arena_destroy(out.block_generic_reparse_function_indices);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_counts);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_name_offsets);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_name_lengths);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_type_structures);
+    raz_compiler_rt_arena_destroy(out.block_generic_substitution_types);
+    raz_compiler_rt_arena_destroy(out.block_defer_starts);
+    raz_compiler_rt_arena_destroy(out.block_defer_counts);
+    raz_compiler_rt_arena_destroy(out.block_defer_contexts);
+    raz_compiler_rt_arena_destroy(out.defer_blocks);
+    raz_compiler_rt_arena_destroy(out.statement_kinds);
+    raz_compiler_rt_arena_destroy(out.statement_block_indices);
+    raz_compiler_rt_arena_destroy(out.statement_function_indices);
+    raz_compiler_rt_arena_destroy(out.statement_source_offsets);
+    raz_compiler_rt_arena_destroy(out.statement_a);
+    raz_compiler_rt_arena_destroy(out.statement_b);
+    raz_compiler_rt_arena_destroy(out.statement_c);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_structures);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_root_kinds);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_root_indices);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_paths);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_moved_starts);
+    raz_compiler_rt_arena_destroy(out.statement_predrop_moved_counts);
+    raz_compiler_rt_arena_destroy(out.predrop_moved_paths);
+}

@@ -1,6 +1,6 @@
 # Frontend integration
 
-Forge 1.2 provides an optional `forge::frontend` support layer for language authors. It does not prescribe a grammar or AST. It supplies the infrastructure most frontends otherwise rebuild themselves.
+Forge provides an optional `forge::frontend` support layer for language authors. It does not prescribe a grammar or AST. It supplies the infrastructure most frontends otherwise rebuild themselves.
 
 ## Components
 

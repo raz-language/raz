@@ -30,7 +30,7 @@ std::uint32_t word_at(const std::vector<std::byte>& bytes, std::size_t offset) {
     return value;
 }
 
-constexpr auto host_aarch64_abi() {
+[[maybe_unused]] constexpr auto host_aarch64_abi() {
 #if defined(__APPLE__)
     return forge::codegen::aarch64::Abi::darwin;
 #else

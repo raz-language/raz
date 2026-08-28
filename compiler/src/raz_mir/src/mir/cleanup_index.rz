@@ -1,0 +1,86 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir::cleanup_index;
+
+public import raz_mir::clone;
+
+public import hir::semantic::dropck;
+
+
+fn hir_function_needs_drop_cleanup_uncached(HirModule& hir, i64 function_index) -> bool {
+    i64 link = raz_compiler_rt_arena_get(hir.function_last_locals, function_index);
+    while (link > 0) {
+        i64 local = link - 1;
+        if (
+            raz_compiler_rt_arena_get(hir.local_references, local) == 0 &&
+            hir_structure_needs_drop(hir, raz_compiler_rt_arena_get(hir.local_type_structs, local), 0)
+        ) {
+            return true;
+        }
+        link = raz_compiler_rt_arena_get(hir.local_previous_function_locals, local);
+    }
+
+    i64 parameter = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 parameter_end = parameter + raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+    while (parameter < parameter_end) {
+        if (
+            raz_compiler_rt_arena_get(hir.parameter_references, parameter) == 0 &&
+            hir_structure_needs_drop(hir, raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter), 0)
+        ) {
+            return true;
+        }
+        parameter += 1;
+    }
+    return false;
+}
+
+
+// Scope-local lookup tables for HIR -> MIR cleanup lowering. HIR locals are
+// globally interleaved by synthesized closures/generics, while cleanup edges
+// only need the locals owned by one lexical scope. Build those chains once so
+// each return/break/continue/? edge does not rescan the module-wide local arena.
+fn mir_prepare_scope_local_index(HirModule& hir, MirModule&mut out) -> bool {
+    if (hir.function_count > 16384 || hir.block_count > 65536 || hir.local_count > 32768) {
+        return false;
+    }
+
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        raz_compiler_rt_arena_set_unchecked(out.lowering_function_root_local_heads, function_index, 0);
+        function_index += 1;
+    }
+
+    i64 block_index = 0;
+    while (block_index < hir.block_count) {
+        raz_compiler_rt_arena_set_unchecked(out.lowering_block_local_heads, block_index, 0);
+        block_index += 1;
+    }
+
+    // Pushing ascending arena indices onto each head preserves the exact
+    // descending local order previously produced by the full-arena scan.
+    i64 local = 0;
+    while (local < hir.local_count) {
+        raz_compiler_rt_arena_set_unchecked(out.lowering_local_next, local, 0);
+        i64 function = raz_compiler_rt_arena_get(hir.local_function_indices, local);
+        i64 block = raz_compiler_rt_arena_get(hir.local_block_indices, local);
+        if (function >= 0 && function < hir.function_count) {
+            i64 previous = 0;
+            if (block >= 0 && block < hir.block_count) {
+                previous = raz_compiler_rt_arena_get_unchecked(out.lowering_block_local_heads, block);
+                raz_compiler_rt_arena_set_unchecked(out.lowering_block_local_heads, block, local + 1);
+            } else if (block == -1) {
+                previous = raz_compiler_rt_arena_get_unchecked(out.lowering_function_root_local_heads, function);
+                raz_compiler_rt_arena_set_unchecked(out.lowering_function_root_local_heads, function, local + 1);
+            }
+            raz_compiler_rt_arena_set_unchecked(out.lowering_local_next, local, previous);
+        }
+        local += 1;
+    }
+    return true;
+}
+
+fn mir_function_needs_drop_cleanup(MirModule& out, i64 function_index) -> bool {
+    return function_index >= 0 && function_index < out.function_count &&
+        raz_compiler_rt_arena_get_unchecked(out.lowering_function_drop_flags, function_index) != 0;
+}

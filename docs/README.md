@@ -1,14 +1,14 @@
 # Raz documentation
 
-Reference for the Raz 1.0 language, compiler, standard library, package system, and toolchain.
+This directory is the reference set for the Raz 1.0 language, compiler, standard library, package system, and toolchain.
 
-**New to Raz?** Read [Getting Started](GETTING-STARTED.md) end to end, then keep the [Language specification](LANGUAGE-SPECIFICATION.md) and [CLI reference](CLI.md) open as references.
+**New to Raz?** Start with [Getting Started](GETTING-STARTED.md). Use the [Language specification](LANGUAGE-SPECIFICATION.md) for exact semantics and the [CLI reference](CLI.md) when you need command details.
 
 ## Learn the language
 
 | Document | What it covers |
 |---|---|
-| [Getting Started](GETTING-STARTED.md) | Twenty-nine chapters from first program to a complete one, with worked examples |
+| [Getting Started](GETTING-STARTED.md) | A guided tour from the first project through ownership, generics, async, packages, and native interop |
 | [Language specification](LANGUAGE-SPECIFICATION.md) | Normative reference: lexical structure, types, ownership, traits, async, compilation semantics |
 | [Language stability](LANGUAGE-STABILITY.md) | What the Raz 1.x compatibility promise covers and what may still change |
 | [Formatting](FORMATTING.md) | Canonical source layout and the formatter's contract |

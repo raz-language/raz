@@ -1,0 +1,530 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::query::fingerprints;
+
+public import raz_hir::query::types;
+
+// Module fingerprints are deterministic compiler-local summaries. The full
+// source fingerprint detects implementation changes. The exported-interface
+// fingerprint hashes only public top-level declaration regions, so changes
+// confined to private declarations do not force downstream interface changes.
+fn hir_query_fingerprint_mix(i64 fingerprint, i64 value) -> i64 {
+    i64 mixed = (fingerprint * 131 + value + 4099) % 281474976710597;
+
+    if (mixed < 0) {
+        mixed = 0 - mixed;
+    }
+    return mixed;
+}
+
+fn hir_query_source_range_fingerprint(Source& source, i64 start, i64 end) -> i64 {
+    if (start < 0) {
+        start = 0;
+    }
+    if (end > source.length) {
+        end = source.length;
+    }
+    if (end < start) {
+        end = start;
+    }
+    return raz_compiler_rt_arena_range_hash(source.bytes, start, end - start, 146959810393466);
+}
+
+fn hir_query_public_function_signature_end(
+    HirBuilder&mut builder,
+    Source& source,
+    i64 declaration_offset,
+    i64 fallback_end,
+) -> i64 {
+    i64 function_index = 0;
+    bool is_function = false;
+
+    while (function_index < builder.module.function_count) {
+        if (
+            raz_compiler_rt_arena_get(
+                builder.module.function_declaration_offsets,
+                function_index,
+            ) == declaration_offset
+        ) {
+            is_function = true;
+            break;
+        }
+        function_index += 1;
+    }
+    if (!is_function) {
+        return fallback_end;
+    }
+
+    i64 cursor = declaration_offset;
+    bool quoted = false;
+    i64 quote = 0;
+    bool escaped = false;
+
+    while (cursor < fallback_end && cursor < source.length) {
+        i64 byte = raz_compiler_rt_arena_get(source.bytes, cursor);
+
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == 92) {
+                escaped = true;
+            } else if (byte == quote) {
+                quoted = false;
+            }
+        } else if (byte == 34 || byte == 39) {
+            quoted = true;
+            quote = byte;
+        } else if (byte == 123) {
+            return cursor;
+        } else if (byte == 59) {
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+    return fallback_end;
+}
+
+fn hir_query_module_interface_fingerprint(HirBuilder&mut builder, i64 module_id, Source& source) -> i64 {
+    i64 fingerprint = 17;
+    i64 declaration = 0;
+
+    while (declaration < builder.declaration_visibility_count) {
+        i64 offset = raz_compiler_rt_arena_get(builder.declaration_visibility_offsets, declaration);
+        i64 visibility = raz_compiler_rt_arena_get(builder.declaration_visibility_values, declaration);
+
+        if (visibility == 1 && hir_module_at_offset(builder, offset) == module_id) {
+            i64 end = source.length;
+
+            if (declaration + 1 < builder.declaration_visibility_count) {
+                end = raz_compiler_rt_arena_get(builder.declaration_visibility_offsets, declaration + 1);
+            }
+            end = hir_query_public_function_signature_end(builder, source, offset, end);
+            fingerprint = hir_query_fingerprint_mix(
+                fingerprint,
+                hir_query_source_range_fingerprint(source, offset, end),
+            );
+        }
+        declaration += 1;
+    }
+    return fingerprint;
+}
+
+fn hir_query_record_module_fingerprint(
+    HirBuilder&mut builder,
+    i64 module_id,
+    i64 source_fingerprint,
+    i64 interface_fingerprint,
+) -> bool {
+    i64 index = 0;
+
+    while (index < builder.queries.query_module_fingerprint_count) {
+        if (raz_compiler_rt_arena_get(builder.queries.query_module_fingerprint_ids, index) == module_id) {
+            raz_compiler_rt_arena_set(builder.queries.query_module_source_fingerprints, index, source_fingerprint);
+            raz_compiler_rt_arena_set(
+                builder.queries.query_module_interface_fingerprints,
+                index,
+                interface_fingerprint,
+            );
+            return true;
+        }
+        index += 1;
+    }
+    if (builder.queries.query_module_fingerprint_count >= 4096) {
+        return false;
+    }
+    index = builder.queries.query_module_fingerprint_count;
+    builder.queries.query_module_fingerprint_count += 1;
+    raz_compiler_rt_arena_set(builder.queries.query_module_fingerprint_ids, index, module_id);
+    raz_compiler_rt_arena_set(builder.queries.query_module_source_fingerprints, index, source_fingerprint);
+    raz_compiler_rt_arena_set(builder.queries.query_module_interface_fingerprints, index, interface_fingerprint);
+    return true;
+}
+
+fn hir_query_record_module_fingerprints(HirBuilder&mut builder, Source& source) -> bool {
+    i64 segment = 0;
+
+    while (segment < builder.module_segment_count) {
+        i64 start = raz_compiler_rt_arena_get(builder.module_segment_offsets, segment);
+        i64 end = source.length;
+
+        if (segment + 1 < builder.module_segment_count) {
+            end = raz_compiler_rt_arena_get(builder.module_segment_offsets, segment + 1);
+        }
+
+        i64 module_id = raz_compiler_rt_arena_get(builder.module_segment_ids, segment);
+        i64 source_fingerprint = hir_query_source_range_fingerprint(source, start, end);
+        i64 interface_fingerprint = hir_query_module_interface_fingerprint(builder, module_id, source);
+
+        if (
+            !hir_query_record_module_fingerprint(
+                builder,
+                module_id,
+                source_fingerprint,
+                interface_fingerprint,
+            )
+        ) {
+            return false;
+        }
+        segment += 1;
+    }
+    return true;
+}
+
+fn hir_query_incremental_module_index(HirModule& out, i64 module_id) -> i64 {
+    // Module ids are assigned densely as segment + 1 by hir_begin_module.
+
+    i64 index = module_id - 1;
+
+    if (
+        index >= 0 &&
+        index < out.incremental_module_fingerprint_count &&
+        raz_compiler_rt_arena_get(out.incremental_module_ids, index) == module_id
+    ) {
+        return index;
+    }
+    return -1;
+}
+
+fn hir_query_module_lookup_hash(i64 package_hash, i64 namespace_hash) -> i64 {
+    i64 value = hir_query_fingerprint_mix(package_hash, namespace_hash);
+
+    if (value < 0) {
+        value = 0 - value;
+    }
+    return value;
+}
+
+fn hir_query_module_lookup_insert(
+    HirModule& out,
+    i64 table,
+    i64 next_modules,
+    i64 capacity,
+    i64 module_index,
+) -> bool {
+    i64 package_hash = raz_compiler_rt_arena_get(out.incremental_module_package_hashes, module_index);
+    i64 namespace_hash = raz_compiler_rt_arena_get(out.incremental_module_namespace_hashes, module_index);
+    i64 slot = hir_query_module_lookup_hash(package_hash, namespace_hash) % capacity;
+    i64 probes = 0;
+
+    while (probes < capacity) {
+        i64 stored = raz_compiler_rt_arena_get(table, slot);
+
+        if (stored == 0) {
+            raz_compiler_rt_arena_set(table, slot, module_index + 1);
+            raz_compiler_rt_arena_set(next_modules, module_index, 0);
+            return true;
+        }
+
+        i64 stored_index = stored - 1;
+
+        if (
+            raz_compiler_rt_arena_get(out.incremental_module_package_hashes, stored_index) == package_hash &&
+            raz_compiler_rt_arena_get(out.incremental_module_namespace_hashes, stored_index) == namespace_hash
+        ) {
+            // A namespace can span multiple source modules. Chain matches in
+            // the bucket rather than rescanning the entire module set later.
+            raz_compiler_rt_arena_set(next_modules, module_index, stored);
+            raz_compiler_rt_arena_set(table, slot, module_index + 1);
+            return true;
+        }
+        slot = (slot + 1) % capacity;
+        probes += 1;
+    }
+    return false;
+}
+
+fn hir_query_module_lookup_find(
+    HirModule& out,
+    i64 table,
+    i64 capacity,
+    i64 package_hash,
+    i64 namespace_hash,
+) -> i64 {
+    i64 slot = hir_query_module_lookup_hash(package_hash, namespace_hash) % capacity;
+    i64 probes = 0;
+
+    while (probes < capacity) {
+        i64 stored = raz_compiler_rt_arena_get(table, slot);
+
+        if (stored == 0) {
+            return -1;
+        }
+
+        i64 module_index = stored - 1;
+
+        if (
+            raz_compiler_rt_arena_get(out.incremental_module_package_hashes, module_index) == package_hash &&
+            raz_compiler_rt_arena_get(out.incremental_module_namespace_hashes, module_index) == namespace_hash
+        ) {
+            return module_index;
+        }
+        slot = (slot + 1) % capacity;
+        probes += 1;
+    }
+    return -1;
+}
+
+fn hir_query_edge_hash(i64 owner_id, i64 target_id) -> i64 {
+    i64 value = hir_query_fingerprint_mix(owner_id, target_id);
+
+    if (value < 0) {
+        value = 0 - value;
+    }
+    return value;
+}
+
+fn hir_query_edge_insert(i64 table, i64 capacity, i64 owner_id, i64 target_id) -> i64 {
+    i64 slot = hir_query_edge_hash(owner_id, target_id) % capacity;
+    i64 probes = 0;
+
+    // Module ids are <= 4096, so this packing is collision-free.
+
+    i64 packed = owner_id * 8192 + target_id + 1;
+
+    while (probes < capacity) {
+        i64 stored = raz_compiler_rt_arena_get(table, slot);
+
+        if (stored == 0) {
+            raz_compiler_rt_arena_set(table, slot, packed);
+            return 1;
+        }
+        if (stored == packed) {
+            return 0;
+        }
+        slot = (slot + 1) % capacity;
+        probes += 1;
+    }
+    return -1;
+}
+
+fn hir_query_export_incremental_module_graph(
+    HirBuilder&mut builder,
+    HirModule&mut out,
+    Source& source,
+) -> bool {
+    if (out.incremental_module_fingerprint_count != builder.module_segment_count) {
+        return false;
+    }
+
+    i64 module_count = out.incremental_module_fingerprint_count;
+    i64 module_index = 0;
+
+    while (module_index < builder.module_segment_count) {
+        i64 start = raz_compiler_rt_arena_get(builder.module_segment_offsets, module_index);
+        i64 end = source.length;
+
+        if (module_index + 1 < builder.module_segment_count) {
+            end = raz_compiler_rt_arena_get(builder.module_segment_offsets, module_index + 1);
+        }
+
+        // Package/namespace identity belongs to the module segment at its
+        // beginning. Probing end-1 can cross into the next package marker when
+        // the assembler places `__raz_package` between adjacent segments, which
+        // made the final dependency inherit the root package identity.
+        i64 probe = start;
+        raz_compiler_rt_arena_set(
+            out.incremental_module_package_hashes,
+            module_index,
+            hir_package_at_offset(builder, probe),
+        );
+        raz_compiler_rt_arena_set(
+            out.incremental_module_namespace_hashes,
+            module_index,
+            hir_namespace_at_offset(builder, probe),
+        );
+        raz_compiler_rt_arena_set(out.incremental_module_function_starts, module_index, 0);
+        raz_compiler_rt_arena_set(out.incremental_module_function_counts, module_index, 0);
+        module_index += 1;
+    }
+    // Count functions per module in one pass. The previous implementation
+    // rescanned the complete function table once for every module.
+
+    i64 function_index = 0;
+
+    while (function_index < out.function_count) {
+        i64 offset = raz_compiler_rt_arena_get(out.function_name_offsets, function_index);
+        i64 module_id = hir_module_at_offset(builder, offset);
+
+        raz_compiler_rt_arena_set(out.incremental_function_module_ids, function_index, module_id);
+
+        i64 dense_index = hir_query_incremental_module_index(out, module_id);
+
+        if (dense_index >= 0) {
+            i64 count = raz_compiler_rt_arena_get(out.incremental_module_function_counts, dense_index);
+
+            raz_compiler_rt_arena_set(out.incremental_module_function_counts, dense_index, count + 1);
+        }
+        function_index += 1;
+    }
+
+    i64 flat_function_count = 0;
+
+    module_index = 0;
+    while (module_index < module_count) {
+        i64 count = raz_compiler_rt_arena_get(out.incremental_module_function_counts, module_index);
+
+        raz_compiler_rt_arena_set(out.incremental_module_function_starts, module_index, flat_function_count);
+        flat_function_count += count;
+        if (flat_function_count > 16384) {
+            return false;
+        }
+        module_index += 1;
+    }
+
+    i64 write_cursors = raz_compiler_rt_arena_create(4096);
+
+    if (write_cursors == 0) {
+        return false;
+    }
+    module_index = 0;
+    while (module_index < module_count) {
+        raz_compiler_rt_arena_set(
+            write_cursors,
+            module_index,
+            raz_compiler_rt_arena_get(out.incremental_module_function_starts, module_index),
+        );
+        module_index += 1;
+    }
+    function_index = 0;
+    while (function_index < out.function_count) {
+        i64 module_id = raz_compiler_rt_arena_get(out.incremental_function_module_ids, function_index);
+        i64 dense_index = hir_query_incremental_module_index(out, module_id);
+
+        if (dense_index >= 0) {
+            i64 write = raz_compiler_rt_arena_get(write_cursors, dense_index);
+
+            raz_compiler_rt_arena_set(out.incremental_module_function_indices, write, function_index);
+            raz_compiler_rt_arena_set(write_cursors, dense_index, write + 1);
+        }
+        function_index += 1;
+    }
+    raz_compiler_rt_arena_destroy(write_cursors);
+    // Resolve imports through an open-addressed namespace table. Buckets chain
+    // modules sharing one package/namespace so import semantics stay identical.
+
+    i64 module_table_capacity = 8192;
+    i64 module_table = raz_compiler_rt_arena_create(module_table_capacity);
+    i64 module_next = raz_compiler_rt_arena_create(4096);
+    i64 edge_table_capacity = 32768;
+    i64 edge_table = raz_compiler_rt_arena_create(edge_table_capacity);
+
+    if (module_table == 0 || module_next == 0 || edge_table == 0) {
+        if (module_table != 0) {
+            raz_compiler_rt_arena_destroy(module_table);
+        }
+        if (module_next != 0) {
+            raz_compiler_rt_arena_destroy(module_next);
+        }
+        if (edge_table != 0) {
+            raz_compiler_rt_arena_destroy(edge_table);
+        }
+        return false;
+    }
+    module_index = 0;
+    while (module_index < module_count) {
+        if (
+            !hir_query_module_lookup_insert(
+                out,
+                module_table,
+                module_next,
+                module_table_capacity,
+                module_index,
+            )
+        ) {
+            raz_compiler_rt_arena_destroy(module_table);
+            raz_compiler_rt_arena_destroy(module_next);
+            raz_compiler_rt_arena_destroy(edge_table);
+            return false;
+        }
+        module_index += 1;
+    }
+    out.incremental_module_dependency_count = 0;
+
+    i64 import_index = 0;
+
+    while (import_index < builder.namespace_import_count) {
+        i64 owner_package = raz_compiler_rt_arena_get(builder.namespace_import_owner_packages, import_index);
+        i64 owner_namespace = raz_compiler_rt_arena_get(builder.namespace_import_owners, import_index);
+
+        i64 target_package = raz_compiler_rt_arena_get(
+            builder.namespace_import_target_packages,
+            import_index,
+        );
+
+        i64 target_namespace = raz_compiler_rt_arena_get(builder.namespace_import_targets, import_index);
+
+        i64 owner_module = hir_query_module_lookup_find(
+            out,
+            module_table,
+            module_table_capacity,
+            owner_package,
+            owner_namespace,
+        );
+        i64 target_head = hir_query_module_lookup_find(
+            out,
+            module_table,
+            module_table_capacity,
+            target_package,
+            target_namespace,
+        );
+        while (owner_module >= 0) {
+            i64 target_module = target_head;
+
+            while (target_module >= 0) {
+                if (owner_module != target_module) {
+                    i64 owner_id = raz_compiler_rt_arena_get(out.incremental_module_ids, owner_module);
+                    i64 target_id = raz_compiler_rt_arena_get(out.incremental_module_ids, target_module);
+
+                    i64 inserted = hir_query_edge_insert(
+                        edge_table,
+                        edge_table_capacity,
+                        owner_id,
+                        target_id,
+                    );
+                    if (inserted < 0) {
+                        raz_compiler_rt_arena_destroy(module_table);
+                        raz_compiler_rt_arena_destroy(module_next);
+                        raz_compiler_rt_arena_destroy(edge_table);
+                        return false;
+                    }
+                    if (inserted > 0) {
+                        if (out.incremental_module_dependency_count >= 16384) {
+                            raz_compiler_rt_arena_destroy(module_table);
+                            raz_compiler_rt_arena_destroy(module_next);
+                            raz_compiler_rt_arena_destroy(edge_table);
+                            return false;
+                        }
+
+                        i64 edge = out.incremental_module_dependency_count;
+
+                        out.incremental_module_dependency_count += 1;
+                        raz_compiler_rt_arena_set(out.incremental_module_dependency_owners, edge, owner_id);
+                        raz_compiler_rt_arena_set(out.incremental_module_dependency_targets, edge, target_id);
+                    }
+                }
+
+                i64 next_target = raz_compiler_rt_arena_get(module_next, target_module);
+
+                if (next_target == 0) {
+                    target_module = -1;
+                } else {
+                    target_module = next_target - 1;
+                }
+            }
+
+            i64 next_owner = raz_compiler_rt_arena_get(module_next, owner_module);
+
+            if (next_owner == 0) {
+                owner_module = -1;
+            } else {
+                owner_module = next_owner - 1;
+            }
+        }
+        import_index += 1;
+    }
+    raz_compiler_rt_arena_destroy(module_table);
+    raz_compiler_rt_arena_destroy(module_next);
+    raz_compiler_rt_arena_destroy(edge_table);
+    return true;
+}

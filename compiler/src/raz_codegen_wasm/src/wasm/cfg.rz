@@ -1,0 +1,168 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::cfg;
+
+public import raz_codegen_wasm::closures;
+public import raz_codegen_wasm::memory;
+
+// WebAssembly requires structured control flow while canonical Raz MIR keeps
+// instruction-index branches.  The portable lowering uses a dispatcher loop:
+// every MIR basic block receives a compact ordinal and branches update a local
+// program counter before continuing the loop.  This preserves arbitrary valid
+// MIR CFGs without introducing a second CFG representation in the backend.
+fn wasm_instruction_is_block_start(MirModule& mir, i64 function_index, i64 instruction) -> bool {
+    i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+
+    if (instruction == start) {
+        return true;
+    }
+    return raz_compiler_rt_arena_get(mir.opcodes, instruction) == 24;
+}
+
+fn wasm_function_block_count(MirModule& mir, i64 function_index) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    i64 end = start + count;
+    i64 blocks = 0;
+    i64 ip = start;
+
+    while (ip < end) {
+        if (wasm_instruction_is_block_start(mir, function_index, ip)) {
+            blocks += 1;
+        }
+        ip += 1;
+    }
+    return blocks;
+}
+
+fn wasm_block_start(MirModule& mir, i64 function_index, i64 ordinal) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    i64 end = start + count;
+    i64 block = 0;
+    i64 ip = start;
+
+    while (ip < end) {
+        if (wasm_instruction_is_block_start(mir, function_index, ip)) {
+            if (block == ordinal) {
+                return ip;
+            }
+            block += 1;
+        }
+        ip += 1;
+    }
+    return -1;
+}
+
+fn wasm_block_end(MirModule& mir, i64 function_index, i64 ordinal) -> i64 {
+    i64 block_start = wasm_block_start(mir, function_index, ordinal);
+
+    if (block_start < 0) {
+        return -1;
+    }
+
+    i64 function_start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 function_count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    i64 function_end = function_start + function_count;
+    i64 ip = block_start + 1;
+
+    while (ip < function_end) {
+        if (wasm_instruction_is_block_start(mir, function_index, ip)) {
+            return ip;
+        }
+        ip += 1;
+    }
+    return function_end;
+}
+
+fn wasm_block_for_target(MirModule& mir, i64 function_index, i64 target) -> i64 {
+    i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+
+    if (target < start || target >= start + count) {
+        return -1;
+    }
+    if (!wasm_instruction_is_block_start(mir, function_index, target)) {
+        return -1;
+    }
+
+    i64 blocks = wasm_function_block_count(mir, function_index);
+    i64 block = 0;
+
+    while (block < blocks) {
+        if (wasm_block_start(mir, function_index, block) == target) {
+            return block;
+        }
+        block += 1;
+    }
+    return -1;
+}
+
+fn wasm_function_can_emit_linear(MirModule& mir, i64 function_index) -> bool {
+    if (wasm_function_block_count(mir, function_index) != 1) {
+        return false;
+    }
+
+    i64 start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    i64 ip = start;
+
+    while (ip < start + count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 22 || opcode == 23) {
+            return false;
+        }
+        // A value-carrying block marker consumes the dispatcher edge-value local.
+        // Entry-only linear functions never need one.
+        if (opcode == 24 && raz_compiler_rt_arena_get(mir.op_a, ip) != 0) {
+            return false;
+        }
+        ip += 1;
+    }
+    return true;
+}
+
+fn wasm_cfg_async_count(HirModule& hir) -> i64 {
+    i64 count = 0;
+    i64 function_index = 0;
+
+    while (function_index < hir.function_count) {
+        if (raz_compiler_rt_arena_get(hir.function_is_async, function_index) != 0) {
+            count += 1;
+        }
+        function_index += 1;
+    }
+    return count;
+}
+
+fn wasm_module_needs_table(HirModule& hir, MirModule& mir) -> bool {
+    if (wasm_cfg_async_count(hir) != 0 || wasm_closure_count(mir) != 0) {
+        return true;
+    }
+
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 43 || opcode == 44 || opcode == 50 || opcode == 51) {
+            return true;
+        }
+        ip += 1;
+    }
+    return false;
+}
+
+fn wasm_block_ends_in_terminator(MirModule& mir, i64 function_index, i64 ordinal) -> bool {
+    i64 end = wasm_block_end(mir, function_index, ordinal);
+
+    if (end <= 0) {
+        return false;
+    }
+
+    i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, end - 1);
+
+    return opcode == 10 || opcode == 21 || opcode == 22 || opcode == 23;
+}

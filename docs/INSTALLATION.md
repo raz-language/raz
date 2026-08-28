@@ -116,12 +116,21 @@ raz-<version>-<platform>/
     raz
     razc
     razup
+    forge
+    forge-as
+    forge-dis
+    forge-opt
+    forge-codegen
+    forge-run
+    oblink
   lib/
-    raz_runtime
+    native runtime and Forge bridge libraries
   share/
     raz/
       library/
+      completions/
   licenses/
+  BUILD_INFO.json
   README.md
   VERSION
   manifest.sha256
@@ -129,4 +138,4 @@ raz-<version>-<platform>/
 
 On Windows, executable and library file names use the native `.exe` and `.lib` suffixes.
 
-`manifest.sha256` contains a SHA-256 digest for every file in the portable toolchain and can be used to verify archive contents before installation.
+`manifest.sha256` contains a SHA-256 digest for every payload file in the portable toolchain (the manifest itself is excluded) and can be used to verify archive contents before installation. `BUILD_INFO.json` records the platform, compiler digest, and staged tool set. Shell completion scripts are generated from the same production command image during staging.

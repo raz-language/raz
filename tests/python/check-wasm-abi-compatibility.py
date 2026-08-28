@@ -6,11 +6,11 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[2]
-memory = (ROOT / 'compiler/src/backend/wasm/memory.rz').read_text()
-globals_ = (ROOT / 'compiler/src/backend/wasm/globals.rz').read_text()
-async_ = (ROOT / 'compiler/src/backend/wasm/async.rz').read_text()
-writer = (ROOT / 'compiler/src/backend/wasm/writer.rz').read_text()
-runtime = (ROOT / 'compiler/src/backend/wasm/runtime_memory.rz').read_text()
+memory = (ROOT / 'compiler/src/raz_codegen_wasm/src/wasm/memory.rz').read_text()
+globals_ = (ROOT / 'compiler/src/raz_codegen_wasm/src/wasm/globals.rz').read_text()
+async_ = (ROOT / 'compiler/src/raz_codegen_wasm/src/wasm/async.rz').read_text()
+writer = (ROOT / 'compiler/src/raz_codegen_wasm/src/wasm/writer.rz').read_text()
+runtime = (ROOT / 'compiler/src/raz_codegen_wasm/src/wasm/runtime_memory.rz').read_text()
 doc = (ROOT / 'docs/WASM-ABI-v1.md').read_text()
 
 checks = {

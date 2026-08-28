@@ -6,8 +6,8 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-codegen = (root / "compiler/src/backend/wasm/codegen.rz").read_text(encoding="utf-8")
-async_src = (root / "compiler/src/backend/wasm/async.rz").read_text(encoding="utf-8")
+codegen = (root / "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz").read_text(encoding="utf-8")
+async_src = (root / "compiler/src/raz_codegen_wasm/src/wasm/async.rz").read_text(encoding="utf-8")
 
 opcodes = {
     1: "const", 2: "parameter", 3: "local_load", 4: "add", 5: "sub", 6: "mul", 7: "div",

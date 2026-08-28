@@ -5,12 +5,12 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
 files = {
-    "model": root / "compiler/src/hir/core/model.rz",
-    "decl": root / "compiler/src/hir/semantic/declarations.rz",
-    "expr": root / "compiler/src/hir/semantic/expressions.rz",
-    "mir": root / "compiler/src/mir/lowering.rz",
-    "llvm": root / "compiler/src/backend/llvm/globals_codegen.rz",
-    "forge": root / "compiler/src/backend/forge/globals_codegen.rz",
+    "model": root / "compiler/src/raz_hir/src/hir/core/model.rz",
+    "decl": root / "compiler/src/raz_hir/src/hir/semantic/declarations.rz",
+    "expr": root / "compiler/src/raz_hir/src/hir/semantic/expressions.rz",
+    "mir": root / "compiler/src/raz_mir/src/mir/lowering.rz",
+    "llvm": root / "compiler/src/raz_codegen_llvm/src/llvm/globals_codegen.rz",
+    "forge": root / "compiler/src/raz_codegen_forge/src/forge/globals_codegen.rz",
 }
 text = {k: p.read_text(encoding="utf-8") for k, p in files.items()}
 required = {
@@ -25,8 +25,8 @@ for name, markers in required.items():
     for marker in markers:
         if marker not in text[name]:
             raise SystemExit(f"aggregate-globals: FAIL {name} missing {marker!r}")
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
-if "src/backend/llvm/globals_codegen.rz" not in order:
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
+if "src/raz_codegen_llvm/src/llvm/globals_codegen.rz" not in order:
     raise SystemExit("aggregate-globals: FAIL missing llvm globals semantic module")
 example = (root / "tests/examples/backends/aggregate_globals.rz").read_text(encoding="utf-8")
 for marker in ["global mut i64 values[4]", "global Config config", "Config {", "pair: Pair {", "bias: 5"]:

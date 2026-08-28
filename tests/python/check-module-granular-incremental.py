@@ -6,14 +6,14 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-hir_model = (root / 'compiler/src/hir/core/model.rz').read_text()
-hir_builder = (root / 'compiler/src/hir/core/builder.rz').read_text()
-comptime = (root / 'compiler/src/hir/semantic/comptime.rz').read_text()
-mir_model = (root / 'compiler/src/mir/core/model.rz').read_text()
-mir_builder = (root / 'compiler/src/mir/core/builder.rz').read_text()
-lowering = (root / 'compiler/src/mir/lowering.rz').read_text()
-inc = (root / 'compiler/src/driver/incremental.rz').read_text()
-main = (root / 'compiler/src/main.rz').read_text()
+hir_model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
+hir_builder = (root / 'compiler/src/raz_hir/src/hir/core/builder.rz').read_text()
+comptime = (root / 'compiler/src/raz_hir/src/hir/semantic/comptime.rz').read_text()
+mir_model = (root / 'compiler/src/raz_mir/src/mir/core/model.rz').read_text()
+mir_builder = (root / 'compiler/src/raz_mir/src/mir/core/builder.rz').read_text()
+lowering = (root / 'compiler/src/raz_mir/src/mir/lowering.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
 
 checks = {
     'stable module ordinal replaces source-offset identity':
@@ -32,6 +32,9 @@ checks = {
         'fn incremental_mir_module_fingerprint(' in inc,
     'optimized MIR module state persists':
         'fn incremental_persist_module_mir_state(' in inc and 'incremental_persist_module_mir_state(' in main,
+    'executable MIR module units persist after optimization':
+        'fn incremental_persist_mir_units(' in inc and
+        main.index('run_mir_pipeline(') < main.index('incremental_persist_mir_units(') < main.index('emit_backend_module('),
 }
 
 failed = [name for name, ok in checks.items() if not ok]

@@ -1,0 +1,1088 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_llvm::target;
+
+public import raz_codegen_llvm::writer;
+
+// LLVM target/toolchain configuration. Target selection and tool orchestration
+// are implemented in Raz; process launch remains a permanent host ABI boundary.
+public struct LlvmTargetOptions {
+    i64 target_arg;
+    i64 target_offset;
+    i64 target_length;
+    i64 data_layout_arg;
+    i64 data_layout_offset;
+    i64 data_layout_length;
+    i64 cpu_arg;
+    i64 cpu_offset;
+    i64 cpu_length;
+    i64 features_arg;
+    i64 features_offset;
+    i64 features_length;
+    i64 runtime_arg;
+    i64 runtime_offset;
+    i64 runtime_length;
+    i64 emit_kind;
+    i64 optimization_kind;
+    bool debug_info;
+    i64 lto_kind;
+    i64 library_path_arg;
+    i64 library_path_offset;
+    i64 library_path_length;
+    i64 libraries_arg;
+    i64 libraries_offset;
+    i64 libraries_length;
+    i64 linker_arg;
+    i64 linker_offset;
+    i64 linker_length;
+    i64 link_args_arg;
+    i64 link_args_offset;
+    i64 link_args_length;
+    i64 relocation_kind;
+    i64 code_model_kind;
+    i64 visibility_kind;
+    i64 export_arg;
+    i64 export_offset;
+    i64 export_length;
+    i64 import_arg;
+    i64 import_offset;
+    i64 import_length;
+    i64 weak_arg;
+    i64 weak_offset;
+    i64 weak_length;
+    i64 linkonce_arg;
+    i64 linkonce_offset;
+    i64 linkonce_length;
+}
+
+public fn llvm_target_options_init(LlvmTargetOptions&mut out) {
+    out.target_arg = 0;
+    out.target_offset = 0;
+    out.target_length = 0;
+    out.data_layout_arg = 0;
+    out.data_layout_offset = 0;
+    out.data_layout_length = 0;
+    out.cpu_arg = 0;
+    out.cpu_offset = 0;
+    out.cpu_length = 0;
+    out.features_arg = 0;
+    out.features_offset = 0;
+    out.features_length = 0;
+    out.runtime_arg = 0;
+    out.runtime_offset = 0;
+    out.runtime_length = 0;
+    out.emit_kind = 0;
+    out.optimization_kind = -1;
+    out.debug_info = false;
+    out.lto_kind = -1;
+    out.library_path_arg = 0;
+    out.library_path_offset = 0;
+    out.library_path_length = 0;
+    out.libraries_arg = 0;
+    out.libraries_offset = 0;
+    out.libraries_length = 0;
+    out.linker_arg = 0;
+    out.linker_offset = 0;
+    out.linker_length = 0;
+    out.link_args_arg = 0;
+    out.link_args_offset = 0;
+    out.link_args_length = 0;
+    out.relocation_kind = -1;
+    out.code_model_kind = -1;
+    out.visibility_kind = -1;
+    out.export_arg = 0;
+    out.export_offset = 0;
+    out.export_length = 0;
+    out.import_arg = 0;
+    out.import_offset = 0;
+    out.import_length = 0;
+    out.weak_arg = 0;
+    out.weak_offset = 0;
+    out.weak_length = 0;
+    out.linkonce_arg = 0;
+    out.linkonce_offset = 0;
+    out.linkonce_length = 0;
+}
+
+fn llvm_option_prefix_literal(i64 value, i64 length, string prefix) -> bool {
+    i64 prefix_length = compiler_literal_length(prefix);
+    if (value == 0 || length <= prefix_length) { return false; }
+    i64 i = 0;
+    while (i < prefix_length) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn llvm_option_value_equals_literal(i64 value, i64 offset, i64 length, string expected) -> bool {
+    i64 expected_length = compiler_literal_length(expected);
+    if (length != expected_length) { return false; }
+    i64 i = 0;
+    while (i < expected_length) {
+        if (raz_compiler_rt_arena_get(value, offset + i) != compiler_literal_byte(expected, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn llvm_option_prefix(i64 value, i64 length, i64[]prefix, i64 prefix_length) -> bool {
+    if (value == 0 || length <= prefix_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < prefix_length) {
+        if (raz_compiler_rt_arena_get(value, i) != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn llvm_option_value_equals(i64 value, i64 offset, i64 length, i64[]expected, i64 expected_length) -> bool {
+    if (length != expected_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < expected_length) {
+        if (raz_compiler_rt_arena_get(value, offset + i) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Returns 1 when consumed, 0 when this is not an LLVM option, -1 when invalid.
+public fn llvm_parse_target_option(LlvmTargetOptions&mut out, i64 value, i64 length) -> i64 {
+        if (llvm_option_prefix_literal(value, length, "--target=")) {
+        out.target_arg = value;
+        out.target_offset = 9;
+        out.target_length = length - 9;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--data-layout=")) {
+        out.data_layout_arg = value;
+        out.data_layout_offset = 14;
+        out.data_layout_length = length - 14;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--cpu=")) {
+        out.cpu_arg = value;
+        out.cpu_offset = 6;
+        out.cpu_length = length - 6;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--features=")) {
+        out.features_arg = value;
+        out.features_offset = 11;
+        out.features_length = length - 11;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--runtime=")) {
+        out.runtime_arg = value;
+        out.runtime_offset = 10;
+        out.runtime_length = length - 10;
+        return 1;
+    }
+    // --debug
+    if (length == 7) {
+                if (llvm_option_value_equals_literal(value, 0, length, "--debug")) {
+            out.debug_info = true;
+            return 1;
+        }
+    }
+    // --opt=0|1|2|3|s|z
+
+        if (llvm_option_prefix_literal(value, length, "--opt=")) {
+        if (length != 7) {
+            return -1;
+        }
+
+        i64 mode = raz_compiler_rt_arena_get(value, 6);
+
+        if (mode == 48) {
+            out.optimization_kind = 0;
+            return 1;
+        }
+        if (mode == 49) {
+            out.optimization_kind = 1;
+            return 1;
+        }
+        if (mode == 50) {
+            out.optimization_kind = 2;
+            return 1;
+        }
+        if (mode == 51) {
+            out.optimization_kind = 3;
+            return 1;
+        }
+        if (mode == 115) {
+            out.optimization_kind = 4;
+            return 1;
+        }
+        if (mode == 122) {
+            out.optimization_kind = 5;
+            return 1;
+        }
+        return -1;
+    }
+    // --lto=none|thin|full
+
+        if (llvm_option_prefix_literal(value, length, "--lto=")) {
+                                i64 value_length = length - 6;
+
+        if (llvm_option_value_equals_literal(value, 6, value_length, "none")) {
+            out.lto_kind = 0;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 6, value_length, "thin")) {
+            out.lto_kind = 1;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 6, value_length, "full")) {
+            out.lto_kind = 2;
+            return 1;
+        }
+        return -1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--library-path=")) {
+        out.library_path_arg = value;
+        out.library_path_offset = 15;
+        out.library_path_length = length - 15;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--lib=")) {
+        out.libraries_arg = value;
+        out.libraries_offset = 6;
+        out.libraries_length = length - 6;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--linker=")) {
+        out.linker_arg = value;
+        out.linker_offset = 9;
+        out.linker_length = length - 9;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--link-arg=")) {
+        out.link_args_arg = value;
+        out.link_args_offset = 11;
+        out.link_args_length = length - 11;
+        return 1;
+    }
+    // --relocation=default|static|pic
+
+        if (llvm_option_prefix_literal(value, length, "--relocation=")) {
+                                i64 value_length = length - 13;
+
+        if (llvm_option_value_equals_literal(value, 13, value_length, "default")) {
+            out.relocation_kind = 0;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "static")) {
+            out.relocation_kind = 1;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "pic")) {
+            out.relocation_kind = 2;
+            return 1;
+        }
+        return -1;
+    }
+    // --visibility=default|hidden
+
+        if (llvm_option_prefix_literal(value, length, "--visibility=")) {
+                        i64 value_length = length - 13;
+
+        if (llvm_option_value_equals_literal(value, 13, value_length, "default")) {
+            out.visibility_kind = 0;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "hidden")) {
+            out.visibility_kind = 1;
+            return 1;
+        }
+        return -1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--export=")) {
+        out.export_arg = value;
+        out.export_offset = 9;
+        out.export_length = length - 9;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--import=")) {
+        out.import_arg = value;
+        out.import_offset = 9;
+        out.import_length = length - 9;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--weak=")) {
+        out.weak_arg = value;
+        out.weak_offset = 7;
+        out.weak_length = length - 7;
+        return 1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--linkonce=")) {
+        out.linkonce_arg = value;
+        out.linkonce_offset = 11;
+        out.linkonce_length = length - 11;
+        return 1;
+    }
+    // --code-model=default|small|medium|large
+
+        if (llvm_option_prefix_literal(value, length, "--code-model=")) {
+                                        i64 value_length = length - 13;
+
+        if (llvm_option_value_equals_literal(value, 13, value_length, "default")) {
+            out.code_model_kind = 0;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "small")) {
+            out.code_model_kind = 1;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "medium")) {
+            out.code_model_kind = 2;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 13, value_length, "large")) {
+            out.code_model_kind = 3;
+            return 1;
+        }
+        return -1;
+    }
+
+        if (llvm_option_prefix_literal(value, length, "--emit=")) {
+                                i64 value_length = length - 7;
+
+        if (llvm_option_value_equals_literal(value, 7, value_length, "llvm")) {
+            out.emit_kind = 0;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 7, value_length, "obj")) {
+            out.emit_kind = 1;
+            return 1;
+        }
+        if (llvm_option_value_equals_literal(value, 7, value_length, "exe")) {
+            out.emit_kind = 2;
+            return 1;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+fn llvm_target_options_active(LlvmTargetOptions& options) -> bool {
+    return (
+        options.target_length > 0 ||
+        options.data_layout_length > 0 ||
+        options.cpu_length > 0 ||
+        options.features_length > 0 ||
+        options.runtime_length > 0 ||
+        options.emit_kind != 0 ||
+        options.optimization_kind >= 0 ||
+        options.debug_info ||
+        options.lto_kind >= 0 ||
+        options.library_path_length > 0 ||
+        options.libraries_length > 0 ||
+        options.linker_length > 0 ||
+        options.link_args_length > 0 ||
+        options.relocation_kind >= 0 ||
+        options.code_model_kind >= 0 ||
+        options.visibility_kind >= 0 ||
+        options.export_length > 0 ||
+        options.import_length > 0 ||
+        options.weak_length > 0 ||
+        options.linkonce_length > 0
+    );
+}
+
+public fn llvm_target_options_require_llvm(LlvmTargetOptions& options) -> bool {
+    // Optimization level is a backend-neutral compiler setting. Every other
+    // option in this structure controls LLVM-specific target/link behavior.
+    return (
+        options.target_length > 0 ||
+        options.data_layout_length > 0 ||
+        options.cpu_length > 0 ||
+        options.features_length > 0 ||
+        options.runtime_length > 0 ||
+        options.emit_kind != 0 ||
+        options.debug_info ||
+        options.lto_kind >= 0 ||
+        options.library_path_length > 0 ||
+        options.libraries_length > 0 ||
+        options.linker_length > 0 ||
+        options.link_args_length > 0 ||
+        options.relocation_kind >= 0 ||
+        options.code_model_kind >= 0 ||
+        options.visibility_kind >= 0 ||
+        options.export_length > 0 ||
+        options.import_length > 0 ||
+        options.weak_length > 0 ||
+        options.linkonce_length > 0
+    );
+}
+
+fn llvm_writer_arena_range(ForgeWriter&mut out, i64 data, i64 offset, i64 length) {
+    i64 i = 0;
+
+    while (i < length) {
+        writer_put(out, raz_compiler_rt_arena_get(data, offset + i));
+        i += 1;
+    }
+}
+
+fn llvm_target_contains_literal(LlvmTargetOptions& options, string needle) -> bool {
+    i64 needle_length = compiler_literal_length(needle);
+    if (options.target_length <= 0 || needle_length <= 0 || needle_length > options.target_length) { return false; }
+    i64 start = 0;
+    while (start + needle_length <= options.target_length) {
+        i64 i = 0;
+        bool matched = true;
+        while (i < needle_length) {
+            if (raz_compiler_rt_arena_get(options.target_arg, options.target_offset + start + i) != compiler_literal_byte(needle, i)) { matched = false; }
+            i += 1;
+        }
+        if (matched) { return true; }
+        start += 1;
+    }
+    return false;
+}
+
+fn llvm_target_contains(LlvmTargetOptions& options, i64[]needle, i64 needle_length) -> bool {
+    if (options.target_length <= 0 || needle_length <= 0 || needle_length > options.target_length) {
+        return false;
+    }
+
+    i64 start = 0;
+
+    while (start + needle_length <= options.target_length) {
+        i64 i = 0;
+        bool matched = true;
+
+        while (i < needle_length) {
+            if (
+                raz_compiler_rt_arena_get(options.target_arg, options.target_offset + start + i) !=
+                needle[i]
+            ) {
+                matched = false;
+            }
+            i += 1;
+        }
+        if (matched) {
+            return true;
+        }
+        start += 1;
+    }
+    return false;
+}
+
+fn llvm_cache_mix(i64 value, i64 next) -> i64 {
+    i64 mixed = (value * 131 + next + 4099) % 281474976710597;
+
+    if (mixed < 0) {
+        mixed = 0 - mixed;
+    }
+    return mixed;
+}
+
+fn llvm_cache_range(i64 key, i64 data, i64 offset, i64 length) -> i64 {
+    key = llvm_cache_mix(key, length);
+    if (data != 0 && length > 0) {
+        key = llvm_cache_mix(
+            key,
+            raz_compiler_rt_arena_range_hash(data, offset, length, 146959810393466),
+        );
+    }
+    return key;
+}
+
+// Fingerprint every LLVM option that can change emitted IR, object bytes, or
+// final link behavior. Incremental native artifacts must never alias across
+// target triples (or CPU/features/runtime/linker policy).
+fn llvm_codegen_cache_key(LlvmTargetOptions& options) -> i64 {
+    i64 key = 146959810393466;
+
+    key = llvm_cache_mix(key, options.emit_kind);
+    key = llvm_cache_mix(key, options.optimization_kind);
+    if (options.debug_info) {
+        key = llvm_cache_mix(key, 1);
+    } else {
+        key = llvm_cache_mix(key, 0);
+    }
+    key = llvm_cache_mix(key, options.lto_kind);
+    key = llvm_cache_mix(key, options.relocation_kind);
+    key = llvm_cache_mix(key, options.code_model_kind);
+    key = llvm_cache_mix(key, options.visibility_kind);
+    key = llvm_cache_range(key, options.target_arg, options.target_offset, options.target_length);
+    key = llvm_cache_range(key, options.data_layout_arg, options.data_layout_offset, options.data_layout_length);
+    key = llvm_cache_range(key, options.cpu_arg, options.cpu_offset, options.cpu_length);
+    key = llvm_cache_range(key, options.features_arg, options.features_offset, options.features_length);
+    key = llvm_cache_range(key, options.runtime_arg, options.runtime_offset, options.runtime_length);
+    key = llvm_cache_range(key, options.library_path_arg, options.library_path_offset, options.library_path_length);
+    key = llvm_cache_range(key, options.libraries_arg, options.libraries_offset, options.libraries_length);
+    key = llvm_cache_range(key, options.linker_arg, options.linker_offset, options.linker_length);
+    key = llvm_cache_range(key, options.link_args_arg, options.link_args_offset, options.link_args_length);
+    key = llvm_cache_range(key, options.export_arg, options.export_offset, options.export_length);
+    key = llvm_cache_range(key, options.import_arg, options.import_offset, options.import_length);
+    key = llvm_cache_range(key, options.weak_arg, options.weak_offset, options.weak_length);
+    key = llvm_cache_range(key, options.linkonce_arg, options.linkonce_offset, options.linkonce_length);
+    return key;
+}
+
+public fn backend_codegen_cache_key(i64 backend, LlvmTargetOptions& options) -> i64 {
+    // Forge shares the frontend optimization option with LLVM. Native artifact
+    // identity must include that tier; otherwise an O0 object can satisfy a
+    // later O1/O2 request from target/cache.
+    if (backend == 0) {
+        i64 optimization = options.optimization_kind;
+        if (optimization < 0) {
+            optimization = 2;
+        }
+        return 4096 + optimization;
+    }
+    if (backend == 1) {
+        return llvm_codegen_cache_key(options);
+    }
+    return 0;
+}
+
+fn llvm_backend_codegen_cache_key(i64 backend, LlvmTargetOptions& options) -> i64 {
+    return backend_codegen_cache_key(backend, options);
+}
+
+fn llvm_target_architecture(LlvmTargetOptions& options) -> i64 {
+    if (options.target_length <= 0) {
+        return raz_rt_host_arch();
+    }
+
+                    if (
+        llvm_target_contains_literal(options, "x86_64") ||
+        llvm_target_contains_literal(options, "amd64")
+    ) {
+        return 1;
+    }
+    if (
+        llvm_target_contains_literal(options, "aarch64") ||
+        llvm_target_contains_literal(options, "arm64")
+    ) {
+        return 2;
+    }
+    return 0;
+}
+
+fn llvm_target_platform(LlvmTargetOptions& options) -> i64 {
+    if (options.target_length <= 0) {
+        return raz_compiler_rt_host_platform();
+    }
+
+                            if (
+        llvm_target_contains_literal(options, "windows") ||
+        llvm_target_contains_literal(options, "msvc")
+    ) {
+        return 1;
+    }
+    if (llvm_target_contains_literal(options, "linux")) {
+        return 2;
+    }
+    if (
+        llvm_target_contains_literal(options, "apple") ||
+        llvm_target_contains_literal(options, "darwin") ||
+        llvm_target_contains_literal(options, "macos")
+    ) {
+        return 3;
+    }
+    return 0;
+}
+
+fn llvm_target_matches_host(LlvmTargetOptions& options) -> bool {
+    if (options.target_length <= 0) {
+        return true;
+    }
+
+    i64 target_arch = llvm_target_architecture(options);
+    i64 target_platform = llvm_target_platform(options);
+
+    return (
+        target_arch != 0 &&
+        target_platform != 0 &&
+        target_arch == raz_rt_host_arch() &&
+        target_platform == raz_compiler_rt_host_platform()
+    );
+}
+
+public fn llvm_cross_target_executable_requires_runtime(LlvmTargetOptions& options) -> bool {
+    return (
+        options.emit_kind == 2 &&
+        options.target_length > 0 &&
+        !llvm_target_matches_host(options) &&
+        options.runtime_length <= 0
+    );
+}
+
+fn llvm_append_platform_link_libraries(ForgeWriter&mut command, LlvmTargetOptions& options) {
+    i64 platform = llvm_target_platform(options);
+
+    if (platform == 1) {
+        
+        llvm_literal(command, " -lws2_32 -lbcrypt -lcrypt32");
+    } else if (platform == 2) {
+        
+        llvm_literal(command, " -pthread");
+    }
+}
+
+fn llvm_write_stderr_literal(string text) {
+    i64 length = compiler_literal_length(text);
+    i64 buffer = raz_compiler_rt_arena_create(length);
+    if (buffer == 0) { return; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    raz_compiler_rt_stdio_write_ascii(2, buffer, length);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn llvm_copy_literal(i64 output, i64 capacity, string text) -> i64 {
+    i64 length = compiler_literal_length(text);
+    if (output == 0 || length <= 0 || length > capacity) { return -1; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    return length;
+}
+
+// Resolve Clang through the runtime instead of assuming LLVM was added to PATH.
+// On Windows the runtime also probes the official Program Files LLVM location,
+// which is how the stock installer is commonly configured.
+fn llvm_resolve_driver(bool cxx, i64 output, i64 capacity) -> i64 {
+    i64 key = raz_compiler_rt_arena_create(32);
+    i64 candidate = raz_compiler_rt_arena_create(8192);
+    if (key == 0 || candidate == 0) {
+        if (key != 0) { raz_compiler_rt_arena_destroy(key); }
+        if (candidate != 0) { raz_compiler_rt_arena_destroy(candidate); }
+        return -1;
+    }
+
+    string env_name = "RAZ_LLVM_CC";
+    string default_name = "clang";
+    if (cxx) {
+        env_name = "RAZ_LLVM_CXX";
+        default_name = "clang++";
+    }
+    i64 key_length = llvm_copy_literal(key, 32, env_name);
+    i64 candidate_length = -1;
+    if (key_length > 0) {
+        candidate_length = raz_compiler_rt_env_get_ascii(key, key_length, candidate, 8192);
+    }
+    i64 resolved = -1;
+    if (candidate_length > 0) {
+        resolved = raz_compiler_rt_tool_resolve_ascii(candidate, candidate_length, output, capacity);
+    }
+    if (resolved <= 0) {
+        candidate_length = llvm_copy_literal(candidate, 8192, default_name);
+        if (candidate_length > 0) {
+            resolved = raz_compiler_rt_tool_resolve_ascii(candidate, candidate_length, output, capacity);
+        }
+    }
+    raz_compiler_rt_arena_destroy(candidate);
+    raz_compiler_rt_arena_destroy(key);
+    return resolved;
+}
+
+fn llvm_append_runtime_link_args(ForgeWriter&mut command) {
+    i64 args = raz_compiler_rt_arena_create(32768);
+    if (args == 0) { return; }
+    i64 length = raz_compiler_runtime_link_args_i64(args, 32768);
+    if (length > 0) {
+        writer_space(command);
+        llvm_writer_arena_range(command, args, 0, length);
+    }
+    raz_compiler_rt_arena_destroy(args);
+}
+
+fn llvm_emit_target_metadata(ForgeWriter&mut out, LlvmTargetOptions& options) {
+    if (options.data_layout_length > 0) {
+        
+
+        llvm_literal(out, "target datalayout = \"");
+        llvm_writer_arena_range(
+            out,
+            options.data_layout_arg,
+            options.data_layout_offset,
+            options.data_layout_length,
+        );
+        writer_put(out, 34);
+        writer_newline(out);
+    }
+    if (options.target_length > 0) {
+        
+
+        llvm_literal(out, "target triple = \"");
+        llvm_writer_arena_range(out, options.target_arg, options.target_offset, options.target_length);
+        writer_put(out, 34);
+        writer_newline(out);
+    }
+    if (options.data_layout_length > 0 || options.target_length > 0) {
+        writer_newline(out);
+    }
+}
+
+public fn llvm_make_ir_sidecar(i64 output_path, i64 output_length) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(output_length + 4);
+
+    if (path == 0) {
+        return 0;
+    }
+    if (raz_compiler_rt_arena_copy(path, 0, output_path, 0, output_length) != output_length) {
+        raz_compiler_rt_arena_destroy(path);
+        return 0;
+    }
+    raz_compiler_rt_arena_set(path, output_length, 46);
+    raz_compiler_rt_arena_set(path, output_length + 1, 108);
+    raz_compiler_rt_arena_set(path, output_length + 2, 108);
+    return path;
+}
+
+fn llvm_command_quote_range(ForgeWriter&mut out, i64 data, i64 offset, i64 length) {
+    writer_put(out, 34);
+    llvm_writer_arena_range(out, data, offset, length);
+    writer_put(out, 34);
+}
+
+fn llvm_command_feature_flags(ForgeWriter&mut command, LlvmTargetOptions& options) {
+    i64 start = 0;
+    i64 cursor = 0;
+
+    while (cursor <= options.features_length) {
+        bool end = cursor == options.features_length;
+        bool separator = false;
+
+        if (!end) {
+            separator = raz_compiler_rt_arena_get(
+                options.features_arg,
+                options.features_offset + cursor
+            ) == 44;
+        }
+        if (end || separator) {
+            i64 feature_length = cursor - start;
+
+            if (feature_length > 0) {
+                
+
+                llvm_literal(command, " -Xclang -target-feature -Xclang \"");
+                llvm_writer_arena_range(
+                    command,
+                    options.features_arg,
+                    options.features_offset + start,
+                    feature_length,
+                );
+                writer_put(command, 34);
+            }
+            start = cursor + 1;
+        }
+        cursor += 1;
+    }
+}
+
+fn llvm_command_comma_list(ForgeWriter&mut command, i64 data, i64 offset, i64 length, i64 prefix_kind) {
+    i64 start = 0;
+    i64 cursor = 0;
+
+    while (cursor <= length) {
+        bool end = cursor == length;
+        bool separator = false;
+
+        if (!end) {
+            separator = raz_compiler_rt_arena_get(data, offset + cursor) == 44;
+        }
+        if (end || separator) {
+            i64 item_length = cursor - start;
+
+            if (item_length > 0) {
+                if (prefix_kind == 1) {
+                    
+
+                    llvm_literal(command, " -L");
+                } else if (prefix_kind == 2) {
+                    
+
+                    llvm_literal(command, " -l");
+                } else {
+                    writer_space(command);
+                }
+                llvm_command_quote_range(command, data, offset + start, item_length);
+            }
+            start = cursor + 1;
+        }
+        cursor += 1;
+    }
+}
+
+fn llvm_command_optimization(ForgeWriter&mut command, LlvmTargetOptions& options) {
+    if (options.optimization_kind == 0) {
+        
+
+        llvm_literal(command, " -O0");
+    } else if (options.optimization_kind == 1) {
+        
+
+        llvm_literal(command, " -O1");
+    } else if (options.optimization_kind == 2) {
+        
+
+        llvm_literal(command, " -O2");
+    } else if (options.optimization_kind == 3) {
+        
+
+        llvm_literal(command, " -O3");
+    } else if (options.optimization_kind == 4) {
+        
+
+        llvm_literal(command, " -Os");
+    } else if (options.optimization_kind == 5) {
+        
+
+        llvm_literal(command, " -Oz");
+    }
+}
+
+public fn llvm_finalize_native_output(
+    LlvmTargetOptions& options,
+    i64 ir_path,
+    i64 ir_length,
+    i64 output_path,
+    i64 output_length,
+) -> bool {
+    ForgeWriter command;
+    // A project build links through this path without passing --runtime, so
+    // resolve the same runtime archive the Forge link driver finds internally.
+    // Without it every image referencing the runtime fails to link.
+    i64 default_runtime = 0;
+    i64 default_runtime_length = 0;
+
+    if (
+        options.emit_kind == 2 &&
+        options.runtime_length <= 0 &&
+        llvm_target_matches_host(options)
+    ) {
+        default_runtime = raz_compiler_rt_arena_create(4096);
+        if (default_runtime != 0) {
+            default_runtime_length = raz_compiler_runtime_library_path_i64(default_runtime, 4096);
+            if (default_runtime_length < 0) {
+                default_runtime_length = 0;
+            }
+        }
+    }
+
+    writer_init(&mut command);
+    i64 driver = raz_compiler_rt_arena_create(8192);
+    i64 driver_length = -1;
+    if (driver != 0) {
+        driver_length = llvm_resolve_driver(options.emit_kind == 2, driver, 8192);
+    }
+    if (driver_length <= 0) {
+        if (options.emit_kind == 2) {
+            llvm_write_stderr_literal("error: LLVM C++ link driver was not found\n  help: install LLVM for Windows/Linux or set RAZ_LLVM_CXX to clang++\n");
+        } else {
+            llvm_write_stderr_literal("error: LLVM object driver was not found\n  help: install LLVM for Windows/Linux or set RAZ_LLVM_CC to clang\n");
+        }
+        if (driver != 0) { raz_compiler_rt_arena_destroy(driver); }
+        writer_destroy(&mut command);
+        if (default_runtime != 0) { raz_compiler_rt_arena_destroy(default_runtime); }
+        return false;
+    }
+    llvm_command_quote_range(&mut command, driver, 0, driver_length);
+    raz_compiler_rt_arena_destroy(driver);
+    llvm_command_optimization(&mut command, options);
+    // Clang assigns the selected driver target when lowering textual IR. Raz's
+    // IR may intentionally omit a triple for host compilation, so suppress the
+    // driver's benign module-retarget warning.
+
+    
+
+    llvm_literal(&mut command, " -Wno-override-module");
+    if (options.debug_info) {
+        
+
+        llvm_literal(&mut command, " -g");
+    }
+    if (options.relocation_kind == 1) {
+        
+
+        llvm_literal(&mut command, " -fno-pic");
+    } else if (options.relocation_kind == 2) {
+        
+
+        llvm_literal(&mut command, " -fPIC");
+    }
+    if (options.code_model_kind == 1) {
+        
+
+        llvm_literal(&mut command, " -mcmodel=small");
+    } else if (options.code_model_kind == 2) {
+        
+
+        llvm_literal(&mut command, " -mcmodel=medium");
+    } else if (options.code_model_kind == 3) {
+        
+
+        llvm_literal(&mut command, " -mcmodel=large");
+    }
+    if (options.lto_kind == 1) {
+        
+
+        llvm_literal(&mut command, " -flto=thi");
+        writer_put(&mut command, 110);
+    } else if (options.lto_kind == 2) {
+        
+
+        llvm_literal(&mut command, " -flto");
+    }
+    if (options.linker_length > 0) {
+        
+
+        llvm_literal(&mut command, " -fuse-");
+
+        
+
+        llvm_literal(&mut command, "ld=\"");
+        llvm_writer_arena_range(
+            &mut command,
+            options.linker_arg,
+            options.linker_offset,
+            options.linker_length,
+        );
+        writer_put(&mut command, 34);
+    }
+    if (options.target_length > 0) {
+        
+
+        llvm_literal(&mut command, " --target=");
+        llvm_writer_arena_range(
+            &mut command,
+            options.target_arg,
+            options.target_offset,
+            options.target_length,
+        );
+    }
+    if (options.cpu_length > 0) {
+        
+
+        llvm_literal(&mut command, " -Xclang -target-cpu -Xclang \"");
+        llvm_writer_arena_range(&mut command, options.cpu_arg, options.cpu_offset, options.cpu_length);
+        writer_put(&mut command, 34);
+    }
+    if (options.features_length > 0) {
+        llvm_command_feature_flags(&mut command, options);
+    }
+    if (options.emit_kind == 1) {
+        
+
+        llvm_literal(&mut command, " -c -x ir  ");
+    } else {
+        
+
+        llvm_literal(&mut command, " -x ir ");
+    }
+    llvm_command_quote_range(&mut command, ir_path, 0, ir_length);
+    if (options.emit_kind == 2 && options.runtime_length > 0) {
+        // `-x ir` is sticky in Clang. Reset it immediately before a runtime
+        // archive/object so the following native input is not parsed as IR.
+
+        
+
+        llvm_literal(&mut command, " -x none");
+        writer_space(&mut command);
+        llvm_command_quote_range(
+            &mut command,
+            options.runtime_arg,
+            options.runtime_offset,
+            options.runtime_length,
+        );
+        // The runtime archive pulls Windows sockets/crypto members, so the same
+        // system libraries the Forge and bootstrap link drivers pass are needed
+        // here. Without them an image that touches the runtime fails on
+        // BCryptGenRandom and friends.
+        llvm_append_runtime_link_args(&mut command);
+        llvm_append_platform_link_libraries(&mut command, options);
+    }
+    if (options.emit_kind == 2 && options.runtime_length <= 0 && default_runtime_length > 0) {
+        
+
+        llvm_literal(&mut command, " -x none");
+        writer_space(&mut command);
+        llvm_command_quote_range(&mut command, default_runtime, 0, default_runtime_length);
+        llvm_append_runtime_link_args(&mut command);
+        llvm_append_platform_link_libraries(&mut command, options);
+    }
+    if (options.emit_kind == 2 && options.library_path_length > 0) {
+        llvm_command_comma_list(
+            &mut command,
+            options.library_path_arg,
+            options.library_path_offset,
+            options.library_path_length,
+            1,
+        );
+    }
+    if (options.emit_kind == 2 && options.libraries_length > 0) {
+        llvm_command_comma_list(
+            &mut command,
+            options.libraries_arg,
+            options.libraries_offset,
+            options.libraries_length,
+            2,
+        );
+    }
+    if (options.emit_kind == 2 && options.link_args_length > 0) {
+        llvm_command_comma_list(
+            &mut command,
+            options.link_args_arg,
+            options.link_args_offset,
+            options.link_args_length,
+            0,
+        );
+    }
+
+    
+
+    llvm_literal(&mut command, " -o ");
+    llvm_command_quote_range(&mut command, output_path, 0, output_length);
+    if (command.failed) {
+        writer_destroy(&mut command);
+        if (default_runtime != 0) {
+            raz_compiler_rt_arena_destroy(default_runtime);
+        }
+        return false;
+    }
+
+    i64 status = raz_compiler_rt_process_run_ascii(command.data, command.length);
+
+    writer_destroy(&mut command);
+    if (default_runtime != 0) {
+        raz_compiler_rt_arena_destroy(default_runtime);
+    }
+    return status == 0;
+}

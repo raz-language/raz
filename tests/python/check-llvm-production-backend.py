@@ -8,13 +8,13 @@ import sys
 sys.dont_write_bytecode = True
 
 root = Path(__file__).resolve().parents[2]
-target = (root / 'compiler/src/backend/llvm/target.rz').read_text(encoding='utf-8')
-llvm = (root / 'compiler/src/backend/llvm/codegen.rz').read_text(encoding='utf-8')
-main = (root / 'compiler/src/main.rz').read_text(encoding='utf-8')
-backend = (root / 'compiler/src/driver/backend.rz').read_text(encoding='utf-8')
+target = (root / 'compiler/src/raz_codegen_llvm/src/llvm/target.rz').read_text(encoding='utf-8')
+llvm = (root / 'compiler/src/raz_codegen_llvm/src/llvm/codegen.rz').read_text(encoding='utf-8')
+main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+backend = (root / 'compiler/src/raz_driver/src/backend.rz').read_text(encoding='utf-8')
 runtime_root = root / 'src/runtime'
 runtime = '\n'.join(p.read_text(encoding='utf-8') for p in sorted(runtime_root.glob('*.cpp')))
-order = {path.relative_to(root / 'compiler').as_posix() for path in (root / 'compiler/src').rglob('*.rz')}
+order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 required_target = [
     'public struct LlvmTargetOptions',
@@ -53,8 +53,16 @@ for marker in ['--backend=llvm', '--target=', '--data-layout=', '--cpu=', '--fea
     # parser symbols instead for options other than the human-readable backend docs.
     pass
 
-if 'src/backend/llvm/target.rz' not in order:
+if 'src/raz_codegen_llvm/src/llvm/target.rz' not in order:
     raise SystemExit('llvm-production-backend: FAIL llvm_target.rz missing from canonical production compiler source graph')
+for marker in [
+    'fn llvm_string_decoded_length',
+    'fn llvm_emit_string_initializer',
+    'bool raw_slice = raz_compiler_rt_arena_get(mir.op_c, instruction) != 0;',
+]:
+    if marker not in llvm:
+        raise SystemExit(f'llvm-production-backend: FAIL missing decoded string-literal lowering marker: {marker}')
+
 if 'llvm_emit_target_metadata(&mut writer, options)' not in llvm:
     raise SystemExit('llvm-production-backend: FAIL LLVM module does not emit target metadata')
 if 'llvm_literal(&mut writer, "define i32 @main() {");' not in llvm:
@@ -67,7 +75,7 @@ if 'LlvmTargetOptions& llvm_options' not in backend:
     raise SystemExit('llvm-production-backend: FAIL backend dispatch does not carry target options')
 if 'std::int64_t raz_rt_process_run' not in runtime:
     raise SystemExit('llvm-production-backend: FAIL generic process runtime primitive missing')
-if 'fn raz_compiler_rt_process_run_ascii' not in (root / 'compiler/src/frontend/lexer.rz').read_text(encoding='utf-8'):
+if 'fn raz_compiler_rt_process_run_ascii' not in (root / 'compiler/src/raz_lexer/src/lexer.rz').read_text(encoding='utf-8'):
     raise SystemExit('llvm-production-backend: FAIL Raz-side process adapter missing')
 
 

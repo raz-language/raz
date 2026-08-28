@@ -1,0 +1,2384 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::reflection;
+
+public import raz_hir::semantic::ownership;
+
+// Compile-time structural reflection for the Raz-owned frontend.
+// Reflection is resolved from HIR metadata so results are deterministic and do
+// not depend on host RTTI, C++ helpers, or runtime object inspection.
+fn hir_reflection_name(
+    Source& source,
+    i64 offset,
+    i64 length,
+    i64 expected_length,
+    i64 a,
+    i64 b,
+    i64 c,
+    i64 d,
+) -> bool {
+    if (length != expected_length) {
+        return false;
+    }
+    if (expected_length > 0 && source_byte(source, offset) != a) {
+        return false;
+    }
+    if (expected_length > 1 && source_byte(source, offset + 1) != b) {
+        return false;
+    }
+    if (expected_length > 2 && source_byte(source, offset + 2) != c) {
+        return false;
+    }
+    if (expected_length > 3 && source_byte(source, offset + 3) != d) {
+        return false;
+    }
+    return true;
+}
+
+fn hir_reflection_hash_source_slice(Source& source, i64 offset, i64 length) -> i64 {
+    // Deterministic 64-bit polynomial hash used only by the comptime evaluator
+    // for string/name equality. Runtime strings still materialize real bytes.
+
+    i64 hash = 1469598103934665603;
+    i64 index = 0;
+
+    while (index < length) {
+        hash = (hash ^ source_byte(source, offset + index)) * 1099511628211;
+        index += 1;
+    }
+    return hash;
+}
+
+fn hir_reflection_comptime_string_hash(Source& source, i64 offset, i64 length) -> i64 {
+    // Aggregate comptime handles reserve values >= 2^60. Keep string hashes in
+    // the scalar range so an ordinary reflected name can never be mistaken for
+    // an arena-backed aggregate handle during equality.
+    return hir_reflection_hash_source_slice(source, offset, length) & 1152921504606846975;
+}
+
+fn hir_reflection_add_name_string(HirBuilder&mut builder, i64 offset, i64 length, i64&mut out) -> bool {
+    // Reflection metadata is allowed to refer only to slices in the current
+    // source buffer. Guard the raw arena-backed runtime before hashing so a
+    // malformed or not-yet-materialized metadata slot becomes a semantic
+    // failure instead of an out-of-bounds compiler crash.
+    if (offset < 0 || length <= 0 || offset + length > builder.scan.input.length) {
+        return false;
+    }
+
+    i64 node = -1;
+
+    // node_c == 1 marks a raw compiler-owned source slice rather than a quoted
+    // source literal. MIR/Forge emits the bytes directly plus the trailing NUL.
+    if (
+        !hir_add_node(
+            builder,
+            46,
+            offset,
+            length,
+            1,
+            hir_reflection_comptime_string_hash(&builder.scan.input, offset, length),
+            &mut node,
+        )
+    ) {
+        return false;
+    }
+    hir_set_node_type(builder, node, 13);
+    *out = node;
+    return true;
+}
+
+fn hir_reflection_token_is(
+    Source& source,
+    i64 offset,
+    i64 length,
+    i64 expected_offset,
+    i64 expected_length,
+) -> bool {
+    return token_same(source, offset, length, expected_offset, expected_length);
+}
+
+fn hir_reflection_builtin_kind(Source& source, i64 offset, i64 length) -> i64 {
+    // Numeric IDs are local to the reflection parser and never escape HIR.
+    if (
+        length == 7 &&
+        source_byte(source, offset) == 115 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 122 &&
+        source_byte(source, offset + 3) == 101 &&
+        source_byte(source, offset + 4) == 95 &&
+        source_byte(source, offset + 5) == 111 &&
+        source_byte(source, offset + 6) == 102
+    ) {
+        return 1;
+        // size_of
+    }
+    if (
+        length == 8 &&
+        source_byte(source, offset) == 97 &&
+        source_byte(source, offset + 1) == 108 &&
+        source_byte(source, offset + 2) == 105 &&
+        source_byte(source, offset + 3) == 103 &&
+        source_byte(source, offset + 4) == 110 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 111 &&
+        source_byte(source, offset + 7) == 102
+    ) {
+        return 2;
+        // align_of
+    }
+    if (
+        length == 11 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 100 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 99 &&
+        source_byte(source, offset + 7) == 111 &&
+        source_byte(source, offset + 8) == 117 &&
+        source_byte(source, offset + 9) == 110 &&
+        source_byte(source, offset + 10) == 116
+    ) {
+        return 3;
+        // field_count
+    }
+    if (
+        length == 13 &&
+        source_byte(source, offset) == 118 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 114 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 97 &&
+        source_byte(source, offset + 5) == 110 &&
+        source_byte(source, offset + 6) == 116 &&
+        source_byte(source, offset + 7) == 95 &&
+        source_byte(source, offset + 8) == 99 &&
+        source_byte(source, offset + 9) == 111 &&
+        source_byte(source, offset + 10) == 117 &&
+        source_byte(source, offset + 11) == 110 &&
+        source_byte(source, offset + 12) == 116
+    ) {
+        return 4;
+        // variant_count
+    }
+    if (
+        length == 7 &&
+        source_byte(source, offset) == 105 &&
+        source_byte(source, offset + 1) == 115 &&
+        source_byte(source, offset + 2) == 95 &&
+        source_byte(source, offset + 3) == 99 &&
+        source_byte(source, offset + 4) == 111 &&
+        source_byte(source, offset + 5) == 112 &&
+        source_byte(source, offset + 6) == 121
+    ) {
+        return 5;
+        // is_copy
+    }
+    if (
+        length == 8 &&
+        source_byte(source, offset) == 105 &&
+        source_byte(source, offset + 1) == 115 &&
+        source_byte(source, offset + 2) == 95 &&
+        source_byte(source, offset + 3) == 99 &&
+        source_byte(source, offset + 4) == 108 &&
+        source_byte(source, offset + 5) == 111 &&
+        source_byte(source, offset + 6) == 110 &&
+        source_byte(source, offset + 7) == 101
+    ) {
+        return 6;
+        // is_clone
+    }
+    if (
+        length == 10 &&
+        source_byte(source, offset) == 110 &&
+        source_byte(source, offset + 1) == 101 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 100 &&
+        source_byte(source, offset + 4) == 115 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 100 &&
+        source_byte(source, offset + 7) == 114 &&
+        source_byte(source, offset + 8) == 111 &&
+        source_byte(source, offset + 9) == 112
+    ) {
+        return 7;
+        // needs_drop
+    }
+    if (
+        length == 12 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 100 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 111 &&
+        source_byte(source, offset + 7) == 102 &&
+        source_byte(source, offset + 8) == 102 &&
+        source_byte(source, offset + 9) == 115 &&
+        source_byte(source, offset + 10) == 101 &&
+        source_byte(source, offset + 11) == 116
+    ) {
+        return 8;
+        // field_offset
+    }
+    if (
+        length == 10 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 100 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 115 &&
+        source_byte(source, offset + 7) == 105 &&
+        source_byte(source, offset + 8) == 122 &&
+        source_byte(source, offset + 9) == 101
+    ) {
+        return 9;
+        // field_size
+    }
+    if (
+        length == 11 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 100 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 97 &&
+        source_byte(source, offset + 7) == 108 &&
+        source_byte(source, offset + 8) == 105 &&
+        source_byte(source, offset + 9) == 103 &&
+        source_byte(source, offset + 10) == 110
+    ) {
+        return 10;
+        // field_align
+    }
+    if (
+        length == 20 &&
+        source_byte(source, offset) == 118 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 114 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 97 &&
+        source_byte(source, offset + 5) == 110 &&
+        source_byte(source, offset + 6) == 116 &&
+        source_byte(source, offset + 7) == 95
+    ) {
+        return 11;
+        // variant_discriminant
+    }
+    if (
+        length == 14 &&
+        source_byte(source, offset) == 112 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 121 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 111 &&
+        source_byte(source, offset + 5) == 97 &&
+        source_byte(source, offset + 6) == 100 &&
+        source_byte(source, offset + 7) == 95
+    ) {
+        return 12;
+        // payload_offset
+    }
+    if (
+        length == 10 &&
+        source_byte(source, offset) == 102 &&
+        source_byte(source, offset + 1) == 105 &&
+        source_byte(source, offset + 2) == 101 &&
+        source_byte(source, offset + 3) == 108 &&
+        source_byte(source, offset + 4) == 100 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 110 &&
+        source_byte(source, offset + 7) == 97 &&
+        source_byte(source, offset + 8) == 109 &&
+        source_byte(source, offset + 9) == 101
+    ) {
+        return 13;
+        // field_name
+    }
+    if (
+        length == 12 &&
+        source_byte(source, offset) == 118 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 114 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 97 &&
+        source_byte(source, offset + 5) == 110 &&
+        source_byte(source, offset + 6) == 116 &&
+        source_byte(source, offset + 7) == 95 &&
+        source_byte(source, offset + 8) == 110 &&
+        source_byte(source, offset + 9) == 97 &&
+        source_byte(source, offset + 10) == 109 &&
+        source_byte(source, offset + 11) == 101
+    ) {
+        return 14;
+        // variant_name
+    }
+    if (
+        length == 12 &&
+        source_byte(source, offset) == 109 &&
+        source_byte(source, offset + 1) == 101 &&
+        source_byte(source, offset + 2) == 116 &&
+        source_byte(source, offset + 3) == 104 &&
+        source_byte(source, offset + 4) == 111 &&
+        source_byte(source, offset + 5) == 100 &&
+        source_byte(source, offset + 6) == 95 &&
+        source_byte(source, offset + 7) == 99 &&
+        source_byte(source, offset + 8) == 111 &&
+        source_byte(source, offset + 9) == 117 &&
+        source_byte(source, offset + 10) == 110 &&
+        source_byte(source, offset + 11) == 116
+    ) {
+        return 15;
+        // method_count
+    }
+    if (
+        length == 11 &&
+        source_byte(source, offset) == 109 &&
+        source_byte(source, offset + 1) == 101 &&
+        source_byte(source, offset + 2) == 116 &&
+        source_byte(source, offset + 3) == 104 &&
+        source_byte(source, offset + 4) == 111 &&
+        source_byte(source, offset + 5) == 100 &&
+        source_byte(source, offset + 6) == 95 &&
+        source_byte(source, offset + 7) == 110 &&
+        source_byte(source, offset + 8) == 97 &&
+        source_byte(source, offset + 9) == 109 &&
+        source_byte(source, offset + 10) == 101
+    ) {
+        return 16;
+        // method_name
+    }
+    if (
+        length == 18 &&
+        source_byte(source, offset) == 116 &&
+        source_byte(source, offset + 1) == 114 &&
+        source_byte(source, offset + 2) == 97 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 116 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 109 &&
+        source_byte(source, offset + 7) == 101 &&
+        source_byte(source, offset + 8) == 116 &&
+        source_byte(source, offset + 9) == 104 &&
+        source_byte(source, offset + 10) == 111 &&
+        source_byte(source, offset + 11) == 100 &&
+        source_byte(source, offset + 12) == 95 &&
+        source_byte(source, offset + 13) == 99 &&
+        source_byte(source, offset + 14) == 111 &&
+        source_byte(source, offset + 15) == 117 &&
+        source_byte(source, offset + 16) == 110 &&
+        source_byte(source, offset + 17) == 116
+    ) {
+        return 17;
+        // trait_method_count
+    }
+    if (
+        length == 17 &&
+        source_byte(source, offset) == 116 &&
+        source_byte(source, offset + 1) == 114 &&
+        source_byte(source, offset + 2) == 97 &&
+        source_byte(source, offset + 3) == 105 &&
+        source_byte(source, offset + 4) == 116 &&
+        source_byte(source, offset + 5) == 95 &&
+        source_byte(source, offset + 6) == 109 &&
+        source_byte(source, offset + 7) == 101 &&
+        source_byte(source, offset + 8) == 116 &&
+        source_byte(source, offset + 9) == 104 &&
+        source_byte(source, offset + 10) == 111 &&
+        source_byte(source, offset + 11) == 100 &&
+        source_byte(source, offset + 12) == 95 &&
+        source_byte(source, offset + 13) == 110 &&
+        source_byte(source, offset + 14) == 97 &&
+        source_byte(source, offset + 15) == 109 &&
+        source_byte(source, offset + 16) == 101
+    ) {
+        return 18;
+        // trait_method_name
+    }
+    if (
+        length == 20 &&
+        source_byte(source, offset) == 97 &&
+        source_byte(source, offset + 1) == 115 &&
+        source_byte(source, offset + 2) == 115 &&
+        source_byte(source, offset + 3) == 111 &&
+        source_byte(source, offset + 4) == 99 &&
+        source_byte(source, offset + 5) == 105 &&
+        source_byte(source, offset + 6) == 97 &&
+        source_byte(source, offset + 7) == 116 &&
+        source_byte(source, offset + 8) == 101 &&
+        source_byte(source, offset + 9) == 100 &&
+        source_byte(source, offset + 10) == 95 &&
+        source_byte(source, offset + 11) == 116 &&
+        source_byte(source, offset + 12) == 121 &&
+        source_byte(source, offset + 13) == 112 &&
+        source_byte(source, offset + 14) == 101 &&
+        source_byte(source, offset + 15) == 95 &&
+        source_byte(source, offset + 16) == 110 &&
+        source_byte(source, offset + 17) == 97 &&
+        source_byte(source, offset + 18) == 109 &&
+        source_byte(source, offset + 19) == 101
+    ) {
+        return 19;
+        // associated_type_name
+    }
+    if (
+        length == 21 &&
+        source_byte(source, offset) == 97 &&
+        source_byte(source, offset + 1) == 115 &&
+        source_byte(source, offset + 2) == 115 &&
+        source_byte(source, offset + 3) == 111 &&
+        source_byte(source, offset + 4) == 99 &&
+        source_byte(source, offset + 5) == 105 &&
+        source_byte(source, offset + 6) == 97 &&
+        source_byte(source, offset + 7) == 116 &&
+        source_byte(source, offset + 8) == 101 &&
+        source_byte(source, offset + 9) == 100 &&
+        source_byte(source, offset + 10) == 95 &&
+        source_byte(source, offset + 11) == 99 &&
+        source_byte(source, offset + 12) == 111 &&
+        source_byte(source, offset + 13) == 110 &&
+        source_byte(source, offset + 14) == 115 &&
+        source_byte(source, offset + 15) == 116 &&
+        source_byte(source, offset + 16) == 95 &&
+        source_byte(source, offset + 17) == 110 &&
+        source_byte(source, offset + 18) == 97 &&
+        source_byte(source, offset + 19) == 109 &&
+        source_byte(source, offset + 20) == 101
+    ) {
+        return 20;
+        // associated_const_name
+    }
+    if (
+        length == 15 &&
+        source_byte(source, offset) == 97 &&
+        source_byte(source, offset + 1) == 116 &&
+        source_byte(source, offset + 2) == 116 &&
+        source_byte(source, offset + 3) == 114 &&
+        source_byte(source, offset + 4) == 105 &&
+        source_byte(source, offset + 5) == 98 &&
+        source_byte(source, offset + 6) == 117 &&
+        source_byte(source, offset + 7) == 116 &&
+        source_byte(source, offset + 8) == 101 &&
+        source_byte(source, offset + 9) == 95 &&
+        source_byte(source, offset + 10) == 99 &&
+        source_byte(source, offset + 11) == 111 &&
+        source_byte(source, offset + 12) == 117 &&
+        source_byte(source, offset + 13) == 110 &&
+        source_byte(source, offset + 14) == 116
+    ) {
+        return 21;
+        // attribute_count
+    }
+    if (
+        length == 13 &&
+        source_byte(source, offset) == 104 &&
+        source_byte(source, offset + 1) == 97 &&
+        source_byte(source, offset + 2) == 115 &&
+        source_byte(source, offset + 3) == 95 &&
+        source_byte(source, offset + 4) == 97 &&
+        source_byte(source, offset + 5) == 116 &&
+        source_byte(source, offset + 6) == 116 &&
+        source_byte(source, offset + 7) == 114 &&
+        source_byte(source, offset + 8) == 105 &&
+        source_byte(source, offset + 9) == 98 &&
+        source_byte(source, offset + 10) == 117 &&
+        source_byte(source, offset + 11) == 116 &&
+        source_byte(source, offset + 12) == 101
+    ) {
+        return 22;
+        // has_attribute
+    }
+
+    i64 reflected_hash = hir_reflection_hash_source_slice(source, offset, length);
+
+    if (length == 23 && reflected_hash == 3377439173180415016) {
+        return 23;
+    }
+    // method_return_type_name
+    if (length == 22 && reflected_hash == -2850914117167342502) {
+        return 24;
+    }
+    // method_parameter_count
+    if (length == 26 && reflected_hash == 2545323940893818783) {
+        return 25;
+    }
+    // method_parameter_type_name
+    if (length == 20 && reflected_hash == -2191878719026086742) {
+        return 26;
+    }
+    // method_has_attribute
+    if (length == 29 && reflected_hash == -5406023234729815289) {
+        return 27;
+    }
+    // trait_method_return_type_name
+    if (length == 28 && reflected_hash == -5316691659877460249) {
+        return 28;
+    }
+    // trait_method_parameter_count
+    if (length == 32 && reflected_hash == -5187411729588907794) {
+        return 29;
+    }
+    // trait_method_parameter_type_name
+    if (length == 26 && reflected_hash == 1449815898639251591) {
+        return 30;
+    }
+    // trait_method_has_attribute
+    if (length == 26 && reflected_hash == -8260085484845131732) {
+        return 31;
+    }
+    // associated_const_type_name
+    if (length == 16 && reflected_hash == -1903301327658217534) {
+        return 32;
+    }
+    // implements_trait
+    if (length == 26 && reflected_hash == -8361486088703991667) {
+        return 33;
+    }
+    // impl_associated_type_count
+    if (length == 25 && reflected_hash == 2606494203061626925) {
+        return 34;
+    }
+    // impl_associated_type_name
+    if (length == 33 && reflected_hash == -926829386752885345) {
+        return 35;
+    }
+    // impl_associated_type_binding_name
+    if (length == 27 && reflected_hash == 2229443037809667696) {
+        return 36;
+    }
+    // impl_associated_const_count
+    if (length == 26 && reflected_hash == -7455553827107885886) {
+        return 37;
+    }
+    // impl_associated_const_name
+    if (length == 31 && reflected_hash == -6439496987464256383) {
+        return 38;
+    }
+    // impl_associated_const_type_name
+    if (length == 27 && reflected_hash == -3055237888264634282) {
+        return 39;
+    }
+    // impl_associated_const_value
+    if (length == 15 && reflected_hash == -8910525636772988976) {
+        return 40;
+    }
+    // field_type_name
+    if (length == 14 && reflected_hash == 7894132170516232873) {
+        return 41;
+    }
+    // attribute_name
+    if (length == 21 && reflected_hash == -2543498108882866703) {
+        return 42;
+    }
+    // variant_payload_count
+    if (length == 25 && reflected_hash == 6292763268817818236) {
+        return 43;
+    }
+    // variant_payload_type_name
+    if (length == 21 && reflected_hash == -4641684230231392858) {
+        return 44;
+    }
+    // associated_type_count
+    if (length == 22 && reflected_hash == -622017378144792543) {
+        return 45;
+    }
+    // associated_const_count
+    return 0;
+}
+
+fn hir_reflection_align_up(i64 value, i64 alignment) -> i64 {
+    if (alignment <= 1) {
+        return value;
+    }
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+// Compute size and alignment in one traversal. Before Pass Z, size_of<T>() and
+// align_of<T>() recursively walked the same aggregate graph independently, and
+// field_offset repeated both walks for every preceding field. Concrete layouts
+// are immutable once materialized; the global structure/field counts form a
+// conservative epoch so late generic materialization invalidates older entries.
+fn hir_reflection_type_layout(
+    HirBuilder&mut builder,
+    i64 structure,
+    i64 type_kind,
+    i64 depth,
+    i64&mut out_size,
+    i64&mut out_alignment,
+) {
+    if (depth > 32) {
+        *out_size = 0;
+        *out_alignment = 1;
+        return;
+    }
+    if (structure < 0) {
+        i64 width = primitive_type_width(type_kind);
+
+        if (width <= 0) {
+            *out_size = 8;
+            *out_alignment = 1;
+            return;
+        }
+        *out_size = (width + 7) / 8;
+        if (width <= 8) {
+            *out_alignment = 1;
+        } else if (width <= 16) {
+            *out_alignment = 2;
+        } else if (width <= 32) {
+            *out_alignment = 4;
+        } else {
+            *out_alignment = 8;
+        }
+        return;
+    }
+
+    i64 cached_size = 0;
+    i64 cached_alignment = 1;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_layout(),
+            structure,
+            type_kind,
+            0,
+            builder.module.struct_count,
+            builder.module.struct_field_count,
+            &mut cached_size,
+            &mut cached_alignment,
+        )
+    ) {
+        builder.layout_cache_hits += 1;
+        *out_size = cached_size;
+        *out_alignment = cached_alignment;
+        return;
+    }
+    builder.layout_cache_misses += 1;
+    if (!hir_query_begin(builder, hir_query_kind_layout(), structure, type_kind, 0)) {
+        *out_size = 0;
+        *out_alignment = 1;
+        return;
+    }
+
+    bool packed = raz_compiler_rt_arena_get(builder.module.struct_packed_flags, structure) != 0;
+    i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+    i64 offset = 0;
+    i64 structure_alignment = 1;
+    i64 index = 0;
+
+    while (index < count) {
+        i64 field = first + index;
+        i64 child_size = 0;
+        i64 child_alignment = 1;
+
+        hir_reflection_type_layout(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field),
+            raz_compiler_rt_arena_get(builder.module.struct_field_types, field),
+            depth + 1,
+            &mut child_size,
+            &mut child_alignment,
+        );
+        if (packed) {
+            child_alignment = 1;
+        }
+
+        i64 extent = raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field);
+
+        if (extent > 0) {
+            child_size *= extent;
+        }
+        offset = hir_reflection_align_up(offset, child_alignment);
+        offset += child_size;
+        if (child_alignment > structure_alignment) {
+            structure_alignment = child_alignment;
+        }
+        index += 1;
+    }
+
+    i64 explicit_alignment = raz_compiler_rt_arena_get(builder.module.struct_explicit_alignments, structure);
+
+    if (explicit_alignment > structure_alignment) {
+        structure_alignment = explicit_alignment;
+    }
+
+    i64 size = hir_reflection_align_up(offset, structure_alignment);
+
+    hir_query_end(
+        builder,
+        hir_query_kind_layout(),
+        structure,
+        type_kind,
+        0,
+        builder.module.struct_count,
+        builder.module.struct_field_count,
+        size,
+        structure_alignment,
+        true,
+    );
+    *out_size = size;
+    *out_alignment = structure_alignment;
+}
+
+fn hir_reflection_type_align(HirBuilder&mut builder, i64 structure, i64 type_kind, i64 depth) -> i64 {
+    i64 size = 0;
+    i64 alignment = 1;
+
+    hir_reflection_type_layout(builder, structure, type_kind, depth, &mut size, &mut alignment);
+    return alignment;
+}
+
+fn hir_reflection_type_size(HirBuilder&mut builder, i64 structure, i64 type_kind, i64 depth) -> i64 {
+    i64 size = 0;
+    i64 alignment = 1;
+
+    hir_reflection_type_layout(builder, structure, type_kind, depth, &mut size, &mut alignment);
+    return size;
+}
+
+fn hir_reflection_string_matches(Source& source, Token& token, i64 offset, i64 length) -> bool {
+    if (token.kind != TokenKind::String || token.length != length + 2) {
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < length) {
+        if (source_byte(source, token.offset + 1 + index) != source_byte(source, offset + index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_reflection_find_field(HirBuilder&mut builder, i64 structure, Token& name) -> i64 {
+    i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+    i64 index = 0;
+
+    while (index < count) {
+        i64 field = first + index;
+
+        if (
+            hir_reflection_string_matches(
+                &builder.scan.input,
+                name,
+                raz_compiler_rt_arena_get(builder.module.struct_field_name_offsets, field),
+                raz_compiler_rt_arena_get(builder.module.struct_field_name_lengths, field),
+            )
+        ) {
+            return field;
+        }
+        index += 1;
+    }
+    return -1;
+}
+
+fn hir_reflection_field_offset(HirBuilder&mut builder, i64 structure, i64 target_field) -> i64 {
+    i64 cached_offset = -1;
+    i64 unused = 0;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_field_offset(),
+            structure,
+            target_field,
+            0,
+            builder.module.struct_count,
+            builder.module.struct_field_count,
+            &mut cached_offset,
+            &mut unused,
+        )
+    ) {
+        builder.layout_cache_hits += 1;
+        return cached_offset;
+    }
+    builder.layout_cache_misses += 1;
+    if (!hir_query_begin(builder, hir_query_kind_field_offset(), structure, target_field, 0)) {
+        return -1;
+    }
+
+    i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+    i64 offset = 0;
+    i64 index = 0;
+
+    while (index < count) {
+        i64 field = first + index;
+        i64 child_structure = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field);
+        i64 child_type = raz_compiler_rt_arena_get(builder.module.struct_field_types, field);
+        i64 child_size = 0;
+        i64 child_alignment = 1;
+
+        hir_reflection_type_layout(
+            builder,
+            child_structure,
+            child_type,
+            0,
+            &mut child_size,
+            &mut child_alignment,
+        );
+        if (raz_compiler_rt_arena_get(builder.module.struct_packed_flags, structure) != 0) {
+            child_alignment = 1;
+        }
+        offset = hir_reflection_align_up(offset, child_alignment);
+        if (field == target_field) {
+            hir_query_end(
+                builder,
+                hir_query_kind_field_offset(),
+                structure,
+                target_field,
+                0,
+                builder.module.struct_count,
+                builder.module.struct_field_count,
+                offset,
+                0,
+                true,
+            );
+            return offset;
+        }
+
+        i64 extent = raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field);
+
+        if (extent > 0) {
+            child_size *= extent;
+        }
+        offset += child_size;
+        index += 1;
+    }
+    hir_query_end(
+        builder,
+        hir_query_kind_field_offset(),
+        structure,
+        target_field,
+        0,
+        builder.module.struct_count,
+        builder.module.struct_field_count,
+        -1,
+        0,
+        true,
+    );
+    return -1;
+}
+
+fn hir_reflection_add_type_name(HirBuilder&mut builder, i64 structure, i64 type_kind, i64&mut out) -> bool {
+    if (structure >= 0) {
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.struct_name_offsets, structure),
+            raz_compiler_rt_arena_get(builder.module.struct_name_lengths, structure),
+            out,
+        );
+    }
+    if (hir_type_is_enum(type_kind)) {
+        i64 enumeration = hir_type_enum_index(type_kind);
+
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.enum_name_offsets, enumeration),
+            raz_compiler_rt_arena_get(builder.module.enum_name_lengths, enumeration),
+            out,
+        );
+    }
+    // Primitive type names already occur in source signatures. Reuse the first
+    // canonical token so reflected strings have real source-backed bytes.
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = 0;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End) {
+        if (
+            current.kind == TokenKind::Identifier &&
+            token_is_scalar_type(&builder.scan.input, current.offset, current.length) &&
+            primitive_type_kind(&builder.scan.input, current.offset, current.length) == type_kind
+        ) {
+            return hir_reflection_add_name_string(builder, current.offset, current.length, out);
+        }
+        next_token(&mut scan, &mut current);
+    }
+    hir_fail(builder, DiagnosticCode::UnknownType);
+    return false;
+}
+
+fn hir_reflection_inherent_function(HirBuilder&mut builder, i64 method) -> i64 {
+    if (method < 0 || method >= builder.module.inherent_method_count) {
+        return -1;
+    }
+
+    i64 function_index = raz_compiler_rt_arena_get(builder.module.inherent_method_functions, method);
+
+    if (function_index >= 0 && function_index < builder.module.function_count) {
+        return function_index;
+    }
+    // Some compiler reservation paths publish the inherent-method record
+    // before its executable function slot is finalized. Recover through the
+    // canonical function table rather than indexing an invalid arena slot.
+
+    i64 structure = raz_compiler_rt_arena_get(builder.module.inherent_method_structures, method);
+    i64 name_offset = raz_compiler_rt_arena_get(builder.module.inherent_method_name_offsets, method);
+    i64 name_length = raz_compiler_rt_arena_get(builder.module.inherent_method_name_lengths, method);
+    i64 candidate = 0;
+
+    while (candidate < builder.module.function_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.function_inherent_structs, candidate) == structure &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.function_name_offsets, candidate),
+                raz_compiler_rt_arena_get(builder.module.function_name_lengths, candidate),
+                name_offset,
+                name_length,
+            )
+        ) {
+            return candidate;
+        }
+        candidate += 1;
+    }
+    return -1;
+}
+
+fn hir_reflection_struct_field_name_token(
+    HirBuilder&mut builder,
+    i64 structure,
+    i64 reflected_index,
+    Token&mut out_token,
+) -> bool {
+    if (
+        structure < 0 ||
+        reflected_index < 0 ||
+        reflected_index >= raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure) ||
+        raz_compiler_rt_arena_get(builder.module.struct_tuple_flags, structure) != 0
+    ) {
+        return false;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.struct_name_offsets, structure);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && current.kind != TokenKind::LeftBrace) {
+        next_token(&mut scan, &mut current);
+    }
+    if (current.kind != TokenKind::LeftBrace) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+
+    i64 field_index = 0;
+    i64 nested = 0;
+    i64 candidate_offset = -1;
+    i64 candidate_length = 0;
+
+    while (current.kind != TokenKind::End && current.kind != TokenKind::RightBrace) {
+        if (
+            current.kind == TokenKind::Less ||
+            current.kind == TokenKind::LeftBracket ||
+            current.kind == TokenKind::LeftParen
+        ) {
+            nested += 1;
+        } else if (
+            current.kind == TokenKind::Greater ||
+            current.kind == TokenKind::RightBracket ||
+            current.kind == TokenKind::RightParen
+        ) {
+            if (nested > 0) {
+                nested -= 1;
+            }
+        } else if (current.kind == TokenKind::Identifier && nested == 0) {
+            candidate_offset = current.offset;
+            candidate_length = current.length;
+        } else if (current.kind == TokenKind::Semicolon && nested == 0) {
+            if (field_index == reflected_index && candidate_offset >= 0 && candidate_length > 0) {
+                init_token(out_token, TokenKind::Identifier, candidate_offset, candidate_length);
+                return true;
+            }
+            field_index += 1;
+            candidate_offset = -1;
+            candidate_length = 0;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    return false;
+}
+
+fn hir_reflection_inherent_method_type_token(
+    HirBuilder&mut builder,
+    i64 method,
+    i64 parameter_index,
+    bool return_type,
+    Token&mut out_token,
+) -> bool {
+    if (method < 0 || method >= builder.module.inherent_method_count) {
+        return false;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.inherent_method_name_offsets, method);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftParen) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+
+    i64 depth = 1;
+    i64 parameter = 0;
+    bool at_parameter_start = true;
+
+    while (current.kind != TokenKind::End && depth > 0) {
+        if (!return_type && depth == 1 && at_parameter_start) {
+            if (parameter == parameter_index && current.kind == TokenKind::Identifier) {
+                init_token(out_token, current.kind, current.offset, current.length);
+                return true;
+            }
+            at_parameter_start = false;
+        }
+        if (
+            current.kind == TokenKind::LeftParen ||
+            current.kind == TokenKind::LeftBracket ||
+            current.kind == TokenKind::Less
+        ) {
+            depth += 1;
+        } else if (
+            current.kind == TokenKind::RightParen ||
+            current.kind == TokenKind::RightBracket ||
+            current.kind == TokenKind::Greater
+        ) {
+            depth -= 1;
+        } else if (current.kind == TokenKind::Comma && depth == 1) {
+            parameter += 1;
+            at_parameter_start = true;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (!return_type) {
+        return false;
+    }
+    while (
+        current.kind != TokenKind::End &&
+        current.kind != TokenKind::Arrow &&
+        current.kind != TokenKind::Semicolon &&
+        current.kind != TokenKind::LeftBrace
+    ) {
+        next_token(&mut scan, &mut current);
+    }
+    if (current.kind != TokenKind::Arrow) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        return false;
+    }
+    init_token(out_token, current.kind, current.offset, current.length);
+    return true;
+}
+
+fn hir_reflection_enum_payload_type_token(
+    HirBuilder&mut builder,
+    i64 enumeration,
+    i64 member_index,
+    i64 payload_index,
+    Token&mut out_token,
+) -> bool {
+    if (
+        enumeration < 0 ||
+        member_index < 0 ||
+        member_index >= raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration) ||
+        payload_index < 0
+    ) {
+        return false;
+    }
+
+    i64 member = raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration) + member_index;
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.enum_member_name_offsets, member);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftParen) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+
+    i64 depth = 1;
+    i64 parameter = 0;
+    bool at_parameter_start = true;
+
+    while (current.kind != TokenKind::End && depth > 0) {
+        if (depth == 1 && at_parameter_start) {
+            if (parameter == payload_index && current.kind == TokenKind::Identifier) {
+                init_token(out_token, current.kind, current.offset, current.length);
+                return true;
+            }
+            at_parameter_start = false;
+        }
+        if (
+            current.kind == TokenKind::LeftParen ||
+            current.kind == TokenKind::LeftBracket ||
+            current.kind == TokenKind::Less
+        ) {
+            depth += 1;
+        } else if (
+            current.kind == TokenKind::RightParen ||
+            current.kind == TokenKind::RightBracket ||
+            current.kind == TokenKind::Greater
+        ) {
+            depth -= 1;
+        } else if (current.kind == TokenKind::Comma && depth == 1) {
+            parameter += 1;
+            at_parameter_start = true;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    return false;
+}
+
+fn hir_reflection_attribute_bit(HirBuilder&mut builder, Token& name) -> i64 {
+    if (name.kind != TokenKind::String || name.length < 2) {
+        return 0;
+    }
+
+    i64 length = name.length - 2;
+    i64 hash = hir_reflection_hash_source_slice(&builder.scan.input, name.offset + 1, length);
+
+    if (length == 4 && hash == -7702250181017097099) {
+        return 1;
+    }
+    if (length == 8 && hash == 6059623800844865924) {
+        return 2;
+    }
+    if (length == 8 && hash == 2612937578762240294) {
+        return 4;
+    }
+    if (length == 13 && hash == 7012607592194693311) {
+        return 8;
+    }
+    return 0;
+}
+
+fn hir_reflection_trait_method_parameter_count(HirBuilder&mut builder, i64 method) -> i64 {
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.trait_method_source_offsets, method);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    // fn
+    next_token(&mut scan, &mut current);
+    // name
+    next_token(&mut scan, &mut current);
+    // (
+    if (current.kind != TokenKind::LeftParen) {
+        return -1;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind == TokenKind::RightParen) {
+        return 0;
+    }
+
+    i64 depth = 1;
+    i64 count = 1;
+
+    while (current.kind != TokenKind::End && depth > 0) {
+        if (
+            current.kind == TokenKind::LeftParen ||
+            current.kind == TokenKind::LeftBracket ||
+            current.kind == TokenKind::Less
+        ) {
+            depth += 1;
+        } else if (
+            current.kind == TokenKind::RightParen ||
+            current.kind == TokenKind::RightBracket ||
+            current.kind == TokenKind::Greater
+        ) {
+            depth -= 1;
+        } else if (current.kind == TokenKind::Comma && depth == 1) {
+            count += 1;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    return count;
+}
+
+fn hir_reflection_trait_method_type_token(
+    HirBuilder&mut builder,
+    i64 method,
+    i64 parameter_index,
+    bool return_type,
+    Token&mut out_token,
+) -> bool {
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.trait_method_source_offsets, method);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    // fn
+    next_token(&mut scan, &mut current);
+    // name
+    next_token(&mut scan, &mut current);
+    // (
+    if (current.kind != TokenKind::LeftParen) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+
+    i64 depth = 1;
+    i64 parameter = 0;
+    bool at_parameter_start = true;
+
+    while (current.kind != TokenKind::End && depth > 0) {
+        if (depth == 1 && at_parameter_start && !return_type) {
+            if (parameter == parameter_index && current.kind == TokenKind::Identifier) {
+                init_token(out_token, current.kind, current.offset, current.length);
+                return true;
+            }
+            at_parameter_start = false;
+        }
+        if (
+            current.kind == TokenKind::LeftParen ||
+            current.kind == TokenKind::LeftBracket ||
+            current.kind == TokenKind::Less
+        ) {
+            depth += 1;
+        } else if (
+            current.kind == TokenKind::RightParen ||
+            current.kind == TokenKind::RightBracket ||
+            current.kind == TokenKind::Greater
+        ) {
+            depth -= 1;
+        } else if (current.kind == TokenKind::Comma && depth == 1) {
+            parameter += 1;
+            at_parameter_start = true;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (!return_type) {
+        return false;
+    }
+    while (
+        current.kind != TokenKind::End &&
+        current.kind != TokenKind::Arrow &&
+        current.kind != TokenKind::Semicolon &&
+        current.kind != TokenKind::LeftBrace
+    ) {
+        next_token(&mut scan, &mut current);
+    }
+    if (current.kind != TokenKind::Arrow) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        return false;
+    }
+    init_token(out_token, current.kind, current.offset, current.length);
+    return true;
+}
+
+fn hir_reflection_find_implementation(HirBuilder&mut builder, i64 structure, i64 trait_index) -> i64 {
+    i64 implementation = 0;
+
+    while (implementation < builder.module.trait_impl_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.trait_impl_structures, implementation) == structure &&
+            raz_compiler_rt_arena_get(builder.module.trait_impl_traits, implementation) == trait_index
+        ) {
+            return implementation;
+        }
+        implementation += 1;
+    }
+    return -1;
+}
+
+fn hir_reflection_impl_item_token(
+    HirBuilder&mut builder,
+    i64 implementation,
+    bool associated_type,
+    i64 reflected_index,
+    Token&mut out_token,
+) -> bool {
+    i64 source_offset = raz_compiler_rt_arena_get(builder.module.trait_impl_source_offsets, implementation);
+
+    if (source_offset < 0) {
+        return false;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = source_offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && current.kind != TokenKind::LeftBrace) {
+        next_token(&mut scan, &mut current);
+    }
+    if (current.kind != TokenKind::LeftBrace) {
+        return false;
+    }
+
+    i64 depth = 1;
+    i64 seen = 0;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && depth > 0) {
+        if (current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        bool is_type_item =
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &current);
+        bool is_const_item =
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &current);
+        if ((associated_type && is_type_item) || (!associated_type && is_const_item)) {
+            if (seen == reflected_index) {
+                if (associated_type) {
+                    next_token(&mut scan, &mut current);
+                    // name
+                    next_token(&mut scan, &mut current);
+                    // =
+                    if (current.kind != TokenKind::Equal) {
+                        return false;
+                    }
+                    next_token(&mut scan, &mut current);
+                    // binding type
+                    init_token(out_token, current.kind, current.offset, current.length);
+                    return current.kind == TokenKind::Identifier;
+                }
+                // const NAME : Type = value;
+                next_token(&mut scan, &mut current);
+                // name
+                next_token(&mut scan, &mut current);
+                // :
+                if (current.kind != TokenKind::Colon) {
+                    return false;
+                }
+                next_token(&mut scan, &mut current);
+                // type
+                next_token(&mut scan, &mut current);
+                // =
+                if (current.kind != TokenKind::Equal) {
+                    return false;
+                }
+                next_token(&mut scan, &mut current);
+                // value
+                init_token(out_token, current.kind, current.offset, current.length);
+                return current.kind == TokenKind::Integer;
+            }
+            seen += 1;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    return false;
+}
+
+fn hir_reflection_add_impl_binding_name(
+    HirBuilder&mut builder,
+    i64 implementation,
+    Token& binding,
+    i64&mut out,
+) -> bool {
+    i64 generic_impl = raz_compiler_rt_arena_get(builder.module.trait_impl_generic_indices, implementation);
+
+    if (
+        generic_impl >= 0 &&
+        token_same(
+            &builder.scan.input,
+            binding.offset,
+            binding.length,
+            raz_compiler_rt_arena_get(builder.module.generic_trait_type_name_offsets, generic_impl),
+            raz_compiler_rt_arena_get(builder.module.generic_trait_type_name_lengths, generic_impl),
+        )
+    ) {
+        i64 structure = raz_compiler_rt_arena_get(builder.module.trait_impl_structures, implementation);
+
+        i64 argument_count = raz_compiler_rt_arena_get(
+            builder.module.struct_generic_argument_counts,
+            structure,
+        );
+        if (argument_count > 0) {
+            i64 argument = raz_compiler_rt_arena_get(
+                builder.module.struct_generic_argument_starts,
+                structure
+            );
+            return hir_reflection_add_type_name(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.struct_generic_argument_type_structs, argument),
+                raz_compiler_rt_arena_get(builder.module.struct_generic_argument_types, argument),
+                out,
+            );
+        }
+    }
+    return hir_reflection_add_name_string(builder, binding.offset, binding.length, out);
+}
+
+fn hir_reflection_attribute_name(HirBuilder&mut builder, i64 structure, i64 index, i64&mut out) -> bool {
+    if (
+        structure < 0 ||
+        index < 0 ||
+        index >= raz_compiler_rt_arena_get(builder.module.struct_attribute_counts, structure)
+    ) {
+        return false;
+    }
+
+    i64 selected = 0;
+
+    if (raz_compiler_rt_arena_get(builder.module.struct_repr_c_flags, structure) != 0) {
+        if (index == selected) {
+            i64 cursor = 0;
+
+            while (cursor + 7 <= builder.scan.input.length) {
+                if (
+                    source_byte(&builder.scan.input, cursor) == 114 &&
+                    source_byte(&builder.scan.input, cursor + 1) == 101 &&
+                    source_byte(&builder.scan.input, cursor + 2) == 112 &&
+                    source_byte(&builder.scan.input, cursor + 3) == 114 &&
+                    source_byte(&builder.scan.input, cursor + 4) == 40 &&
+                    source_byte(&builder.scan.input, cursor + 5) == 67 &&
+                    source_byte(&builder.scan.input, cursor + 6) == 41
+                ) {
+                    return hir_reflection_add_name_string(builder, cursor, 7, out);
+                }
+                cursor += 1;
+            }
+            return false;
+        }
+        selected += 1;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.struct_packed_flags, structure) != 0) {
+        if (index == selected) {
+            i64 cursor = 0;
+
+            while (cursor + 6 <= builder.scan.input.length) {
+                if (
+                    source_byte(&builder.scan.input, cursor) == 112 &&
+                    source_byte(&builder.scan.input, cursor + 1) == 97 &&
+                    source_byte(&builder.scan.input, cursor + 2) == 99 &&
+                    source_byte(&builder.scan.input, cursor + 3) == 107 &&
+                    source_byte(&builder.scan.input, cursor + 4) == 101 &&
+                    source_byte(&builder.scan.input, cursor + 5) == 100
+                ) {
+                    return hir_reflection_add_name_string(builder, cursor, 6, out);
+                }
+                cursor += 1;
+            }
+            return false;
+        }
+        selected += 1;
+    }
+    if (
+        raz_compiler_rt_arena_get(builder.module.struct_explicit_alignments, structure) > 0 &&
+        index == selected
+    ) {
+        i64 cursor = 0;
+
+        while (cursor + 7 <= builder.scan.input.length) {
+            if (
+                source_byte(&builder.scan.input, cursor) == 97 &&
+                source_byte(&builder.scan.input, cursor + 1) == 108 &&
+                source_byte(&builder.scan.input, cursor + 2) == 105 &&
+                source_byte(&builder.scan.input, cursor + 3) == 103 &&
+                source_byte(&builder.scan.input, cursor + 4) == 110 &&
+                source_byte(&builder.scan.input, cursor + 5) == 40
+            ) {
+                i64 end = cursor + 6;
+
+                while (end < builder.scan.input.length && source_byte(&builder.scan.input, end) != 41) {
+                    end += 1;
+                }
+                if (end < builder.scan.input.length) {
+                    return hir_reflection_add_name_string(builder, cursor, end - cursor + 1, out);
+                }
+            }
+            cursor += 1;
+        }
+    }
+    return false;
+}
+
+fn hir_parse_structural_reflection(
+    HirBuilder&mut builder,
+    i64 name_offset,
+    i64 name_length,
+    i64&mut out,
+) -> bool {
+    i64 builtin = hir_reflection_builtin_kind(&builder.scan.input, name_offset, name_length);
+
+    if (builtin == 0 || builder.current.kind != TokenKind::Less) {
+        return false;
+    }
+    hir_advance(builder);
+
+    i64 structure = -1;
+    i64 type_kind = 0;
+    i64 trait_index = -1;
+    i64 reference = 0;
+    i64 slice = 0;
+    i64 slice_mutable = 0;
+
+    if (builtin >= 32 && builtin <= 39) {
+        if (
+            !hir_parse_type_spec(
+                builder,
+                &mut structure,
+                &mut type_kind,
+                &mut reference,
+                &mut slice,
+                &mut slice_mutable,
+            ) ||
+            !hir_expect(builder, TokenKind::Comma) ||
+            builder.current.kind != TokenKind::Identifier
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+        trait_index = hir_find_trait(builder, builder.current.offset, builder.current.length);
+        if (trait_index < 0) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+        hir_advance(builder);
+    } else if (
+        (builtin >= 17 && builtin <= 20) ||
+        (builtin >= 27 && builtin <= 31) ||
+        builtin == 44 ||
+        builtin == 45
+    ) {
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+        trait_index = hir_find_trait(builder, builder.current.offset, builder.current.length);
+        if (trait_index < 0) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+        hir_advance(builder);
+    } else {
+        // Plain payload-free enums intentionally use the scalar runtime ABI,
+        // but structural reflection still needs their declaration identity.
+        // Preserve that identity locally before the ordinary type parser
+        // collapses the value representation to scalar kind 0.
+
+        i64 reflected_plain_enum = -1;
+
+        if (builder.current.kind == TokenKind::Identifier) {
+            reflected_plain_enum = hir_find_enum(builder, builder.current.offset, builder.current.length);
+        }
+        if (
+            !hir_parse_type_spec(
+                builder,
+                &mut structure,
+                &mut type_kind,
+                &mut reference,
+                &mut slice,
+                &mut slice_mutable,
+            )
+        ) {
+            return false;
+        }
+        if (reflected_plain_enum >= 0) {
+            type_kind = hir_enum_type_kind(reflected_plain_enum);
+        }
+    }
+    if (!hir_expect(builder, TokenKind::Greater) || !hir_expect(builder, TokenKind::LeftParen)) {
+        return false;
+    }
+    Token reflected_name = Token {
+        kind: builder.current.kind,
+        offset: builder.current.offset,
+        length: builder.current.length,
+    };
+    // One scratch token for reflection branches. Keeping aggregate locals out of
+    // sibling conditional scopes avoids manufacturing branch-local drop state
+    // in the bootstrap SSA lowering.
+
+    Token reflected_type_token;
+    i64 reflected_index = -1;
+    i64 reflected_second_index = -1;
+    bool has_name_argument = builtin == 8 || builtin == 9 || builtin == 10 || builtin == 11 || builtin == 22;
+
+    if (has_name_argument) {
+        if (builder.current.kind != TokenKind::String) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        hir_advance(builder);
+    } else if (
+        builtin == 13 ||
+        builtin == 14 ||
+        builtin == 16 ||
+        builtin == 18 ||
+        builtin == 19 ||
+        builtin == 20 ||
+        (builtin >= 23 && builtin <= 31) ||
+        builtin == 34 ||
+        builtin == 35 ||
+        builtin == 37 ||
+        builtin == 38 ||
+        builtin == 39 ||
+        builtin == 40 ||
+        builtin == 41 ||
+        builtin == 42 ||
+        builtin == 43
+    ) {
+        if (builder.current.kind != TokenKind::Integer) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        reflected_index = parse_integer_value(&builder.scan.input, &builder.current);
+        hir_advance(builder);
+        if (builtin == 25 || builtin == 29 || builtin == 43) {
+            if (!hir_expect(builder, TokenKind::Comma) || builder.current.kind != TokenKind::Integer) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            reflected_second_index = parse_integer_value(&builder.scan.input, &builder.current);
+            hir_advance(builder);
+        } else if (builtin == 26 || builtin == 30) {
+            if (!hir_expect(builder, TokenKind::Comma) || builder.current.kind != TokenKind::String) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            reflected_name.kind = builder.current.kind;
+            reflected_name.offset = builder.current.offset;
+            reflected_name.length = builder.current.length;
+            hir_advance(builder);
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightParen)) {
+        return false;
+    }
+
+    i64 value = 0;
+
+    if (builtin == 1) {
+        value = hir_reflection_type_size(builder, structure, type_kind, 0);
+    } else if (builtin == 2) {
+        value = hir_reflection_type_align(builder, structure, type_kind, 0);
+    } else if (builtin == 3) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        value = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+    } else if (builtin == 4) {
+        if (!hir_type_is_enum(type_kind)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        value = raz_compiler_rt_arena_get(builder.module.enum_member_counts, hir_type_enum_index(type_kind));
+    } else if (builtin == 5) {
+        if (structure < 0) {
+            value = 1;
+        } else {
+            value = raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure);
+        }
+    } else if (builtin == 6) {
+        if (structure < 0) {
+            value = 1;
+        } else if (
+            raz_compiler_rt_arena_get(builder.module.struct_clone_functions, structure) >= 0 ||
+            raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure) != 0 ||
+            raz_compiler_rt_arena_get(builder.module.struct_derived_clone_flags, structure) != 0
+        ) {
+            value = 1;
+        }
+    } else if (builtin == 7) {
+        if (
+            structure >= 0 &&
+            raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0
+        ) {
+            value = 1;
+        }
+    } else if (builtin == 8 || builtin == 9 || builtin == 10) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 field = hir_reflection_find_field(builder, structure, &reflected_name);
+
+        if (field < 0) {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+            return false;
+        }
+
+        i64 field_structure = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field);
+        i64 field_type = raz_compiler_rt_arena_get(builder.module.struct_field_types, field);
+
+        if (builtin == 8) {
+            value = hir_reflection_field_offset(builder, structure, field);
+        } else if (builtin == 9) {
+            value = hir_reflection_type_size(builder, field_structure, field_type, 0);
+
+            i64 extent = raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field);
+
+            if (extent > 0) {
+                value *= extent;
+            }
+        } else {
+            value = hir_reflection_type_align(builder, field_structure, field_type, 0);
+        }
+    } else if (builtin == 11) {
+        if (!hir_type_is_enum(type_kind)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 enumeration = hir_type_enum_index(type_kind);
+        i64 first = raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration);
+        i64 count = raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration);
+        i64 index = 0;
+        bool found = false;
+
+        while (index < count) {
+            i64 member = first + index;
+
+            if (
+                hir_reflection_string_matches(
+                    &builder.scan.input,
+                    &reflected_name,
+                    raz_compiler_rt_arena_get(builder.module.enum_member_name_offsets, member),
+                    raz_compiler_rt_arena_get(builder.module.enum_member_name_lengths, member),
+                )
+            ) {
+                value = raz_compiler_rt_arena_get(builder.module.enum_member_values, member);
+                found = true;
+                break;
+            }
+            index += 1;
+        }
+        if (!found) {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+            return false;
+        }
+    } else if (builtin == 12) {
+        if (!hir_type_is_enum(type_kind)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        // Tagged enums use an 8-byte discriminant slot before payload storage.
+        value = 8;
+    }
+    if (builtin == 13) {
+        if (
+            !hir_reflection_struct_field_name_token(
+                builder,
+                structure,
+                reflected_index,
+                &mut reflected_type_token,
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        return hir_reflection_add_name_string(
+            builder,
+            reflected_type_token.offset,
+            reflected_type_token.length,
+            out,
+        );
+    }
+    if (builtin == 14) {
+        if (!hir_type_is_enum(type_kind)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 enumeration = hir_type_enum_index(type_kind);
+
+        if (
+            reflected_index < 0 ||
+            reflected_index >= raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration)
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 member =
+            raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration) +
+            reflected_index;
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.enum_member_name_offsets, member),
+            raz_compiler_rt_arena_get(builder.module.enum_member_name_lengths, member),
+            out,
+        );
+    }
+    if (builtin == 15 || builtin == 16) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 count = 0;
+        i64 selected = -1;
+        i64 method = 0;
+
+        while (method < builder.module.inherent_method_count) {
+            if (raz_compiler_rt_arena_get(builder.module.inherent_method_structures, method) == structure) {
+                if (count == reflected_index) {
+                    selected = method;
+                }
+                count += 1;
+            }
+            method += 1;
+        }
+        if (builtin == 15) {
+            value = count;
+        } else {
+            if (selected < 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                raz_compiler_rt_arena_get(builder.module.inherent_method_name_offsets, selected),
+                raz_compiler_rt_arena_get(builder.module.inherent_method_name_lengths, selected),
+                out,
+            );
+        }
+    }
+    if (builtin == 17) {
+        value = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+    }
+    if (builtin == 18) {
+        i64 count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+
+        if (reflected_index < 0 || reflected_index >= count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 method =
+            raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index) +
+            reflected_index;
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, method),
+            raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, method),
+            out,
+        );
+    }
+    if (builtin == 19) {
+        i64 count = raz_compiler_rt_arena_get(builder.module.trait_associated_type_counts, trait_index);
+
+        if (reflected_index < 0 || reflected_index >= count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 item =
+            raz_compiler_rt_arena_get(builder.module.trait_associated_type_starts, trait_index) +
+            reflected_index;
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_offsets, item),
+            raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_lengths, item),
+            out,
+        );
+    }
+    if (builtin == 20) {
+        i64 count = raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index);
+
+        if (reflected_index < 0 || reflected_index >= count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 item =
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_starts, trait_index) +
+            reflected_index;
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_offsets, item),
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_lengths, item),
+            out,
+        );
+    }
+    if (builtin == 21) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        value = raz_compiler_rt_arena_get(builder.module.struct_attribute_counts, structure);
+    }
+    if (builtin == 22) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        // Attribute-name reflection uses the retained structural flags.
+        bool repr_name =
+            reflected_name.length == 6 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 1) == 114 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 2) == 101 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 3) == 112 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 4) == 114;
+        bool packed_name =
+            reflected_name.length == 8 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 1) == 112 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 2) == 97 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 3) == 99 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 4) == 107 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 5) == 101 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 6) == 100;
+        bool align_name =
+            reflected_name.length == 7 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 1) == 97 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 2) == 108 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 3) == 105 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 4) == 103 &&
+            source_byte(&builder.scan.input, reflected_name.offset + 5) == 110;
+        value = 0;
+        if (repr_name && raz_compiler_rt_arena_get(builder.module.struct_repr_c_flags, structure) != 0) {
+            value = 1;
+        }
+        if (packed_name && raz_compiler_rt_arena_get(builder.module.struct_packed_flags, structure) != 0) {
+            value = 1;
+        }
+        if (
+            align_name &&
+            raz_compiler_rt_arena_get(builder.module.struct_explicit_alignments, structure) > 0
+        ) {
+            value = 1;
+        }
+    }
+    if (builtin >= 23 && builtin <= 26) {
+        if (structure < 0 || reflected_index < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 count = 0;
+        i64 selected = -1;
+        i64 method = 0;
+
+        while (method < builder.module.inherent_method_count) {
+            if (raz_compiler_rt_arena_get(builder.module.inherent_method_structures, method) == structure) {
+                if (count == reflected_index) {
+                    selected = method;
+                }
+                count += 1;
+            }
+            method += 1;
+        }
+        if (selected < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 function_index = hir_reflection_inherent_function(builder, selected);
+
+        if (function_index < 0) {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+            return false;
+        }
+        if (builtin == 23) {
+            if (
+                !hir_reflection_inherent_method_type_token(
+                    builder,
+                    selected,
+                    0,
+                    true,
+                    &mut reflected_type_token,
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                reflected_type_token.offset,
+                reflected_type_token.length,
+                out,
+            );
+        }
+        if (builtin == 24) {
+            value = raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index);
+        }
+        if (builtin == 25) {
+            i64 parameter_count = raz_compiler_rt_arena_get(
+                builder.module.function_parameter_counts,
+                function_index,
+            );
+            if (reflected_second_index < 0 || reflected_second_index >= parameter_count) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            if (
+                !hir_reflection_inherent_method_type_token(
+                    builder,
+                    selected,
+                    reflected_second_index,
+                    false,
+                    &mut reflected_type_token,
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                reflected_type_token.offset,
+                reflected_type_token.length,
+                out,
+            );
+        }
+        if (builtin == 26) {
+            i64 bit = hir_reflection_attribute_bit(builder, &reflected_name);
+
+            value = 0;
+            if (
+                bit != 0 &&
+                (raz_compiler_rt_arena_get(builder.module.function_effect_flags, function_index) & bit) != 0
+            ) {
+                value = 1;
+            }
+        }
+    }
+    if (builtin >= 27 && builtin <= 30) {
+        i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+
+        if (reflected_index < 0 || reflected_index >= method_count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 method =
+            raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index) +
+            reflected_index;
+        if (builtin == 27) {
+            if (
+                !hir_reflection_trait_method_type_token(builder, method, 0, true, &mut reflected_type_token)
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                reflected_type_token.offset,
+                reflected_type_token.length,
+                out,
+            );
+        }
+        if (builtin == 28) {
+            value = hir_reflection_trait_method_parameter_count(builder, method);
+        }
+        if (builtin == 29) {
+            if (
+                reflected_second_index < 0 ||
+                reflected_second_index >= hir_reflection_trait_method_parameter_count(builder, method)
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            if (
+                !hir_reflection_trait_method_type_token(
+                    builder,
+                    method,
+                    reflected_second_index,
+                    false,
+                    &mut reflected_type_token,
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                reflected_type_token.offset,
+                reflected_type_token.length,
+                out,
+            );
+        }
+        if (builtin == 30) {
+            i64 bit = hir_reflection_attribute_bit(builder, &reflected_name);
+
+            value = 0;
+            if (
+                bit != 0 &&
+                (raz_compiler_rt_arena_get(builder.module.trait_method_effect_flags, method) & bit) != 0
+            ) {
+                value = 1;
+            }
+        }
+    }
+    if (builtin == 31) {
+        i64 count = raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index);
+
+        if (reflected_index < 0 || reflected_index >= count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 item =
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_starts, trait_index) +
+            reflected_index;
+        return hir_reflection_add_name_string(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_type_offsets, item),
+            raz_compiler_rt_arena_get(builder.module.trait_associated_const_type_lengths, item),
+            out,
+        );
+    }
+    if (builtin >= 32 && builtin <= 39) {
+        if (structure < 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 implementation = hir_reflection_find_implementation(builder, structure, trait_index);
+
+        if (builtin == 32) {
+            value = 0;
+            if (implementation >= 0 || hir_type_satisfies_bound(builder, structure, type_kind, trait_index)) {
+                value = 1;
+                implementation = hir_reflection_find_implementation(builder, structure, trait_index);
+            }
+        } else {
+            if (implementation < 0 && hir_type_satisfies_bound(builder, structure, type_kind, trait_index)) {
+                implementation = hir_reflection_find_implementation(builder, structure, trait_index);
+            }
+            if (implementation < 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            if (builtin == 33) {
+                value = raz_compiler_rt_arena_get(builder.module.trait_associated_type_counts, trait_index);
+            } else if (builtin == 34 || builtin == 35) {
+                i64 count = raz_compiler_rt_arena_get(
+                    builder.module.trait_associated_type_counts,
+                    trait_index
+                );
+                if (reflected_index < 0 || reflected_index >= count) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                if (builtin == 34) {
+                    i64 item =
+                        raz_compiler_rt_arena_get(builder.module.trait_associated_type_starts, trait_index) +
+                        reflected_index;
+                    return hir_reflection_add_name_string(
+                        builder,
+                        raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_offsets, item),
+                        raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_lengths, item),
+                        out,
+                    );
+                }
+
+                Token binding;
+
+                if (
+                    !hir_reflection_impl_item_token(
+                        builder,
+                        implementation,
+                        true,
+                        reflected_index,
+                        &mut binding,
+                    )
+                ) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                return hir_reflection_add_impl_binding_name(builder, implementation, &binding, out);
+            } else if (builtin == 36) {
+                value = raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index);
+            } else if (builtin == 37 || builtin == 38) {
+                i64 count = raz_compiler_rt_arena_get(
+                    builder.module.trait_associated_const_counts,
+                    trait_index,
+                );
+                if (reflected_index < 0 || reflected_index >= count) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                i64 item =
+                    raz_compiler_rt_arena_get(builder.module.trait_associated_const_starts, trait_index) +
+                    reflected_index;
+                if (builtin == 37) {
+                    return hir_reflection_add_name_string(
+                        builder,
+                        raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_offsets, item),
+                        raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_lengths, item),
+                        out,
+                    );
+                }
+                return hir_reflection_add_name_string(
+                    builder,
+                    raz_compiler_rt_arena_get(builder.module.trait_associated_const_type_offsets, item),
+                    raz_compiler_rt_arena_get(builder.module.trait_associated_const_type_lengths, item),
+                    out,
+                );
+            } else if (builtin == 39) {
+                i64 count = raz_compiler_rt_arena_get(
+                    builder.module.trait_associated_const_counts,
+                    trait_index,
+                );
+                if (reflected_index < 0 || reflected_index >= count) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+
+                Token constant_value;
+
+                if (
+                    !hir_reflection_impl_item_token(
+                        builder,
+                        implementation,
+                        false,
+                        reflected_index,
+                        &mut constant_value,
+                    )
+                ) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                value = parse_integer_value(&builder.scan.input, &constant_value);
+            }
+        }
+    }
+    if (builtin == 44) {
+        value = raz_compiler_rt_arena_get(builder.module.trait_associated_type_counts, trait_index);
+    }
+    if (builtin == 45) {
+        value = raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index);
+    }
+    if (builtin == 40) {
+        if (
+            structure < 0 ||
+            reflected_index < 0 ||
+            reflected_index >= raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure)
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 field =
+            raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure) +
+            reflected_index;
+        return hir_reflection_add_type_name(
+            builder,
+            raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, field),
+            raz_compiler_rt_arena_get(builder.module.struct_field_types, field),
+            out,
+        );
+    }
+    if (builtin == 41) {
+        if (!hir_reflection_attribute_name(builder, structure, reflected_index, out)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        return true;
+    }
+    if (builtin == 42 || builtin == 43) {
+        if (!hir_type_is_enum(type_kind)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 enumeration = hir_type_enum_index(type_kind);
+        i64 member_count = raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration);
+
+        if (reflected_index < 0 || reflected_index >= member_count) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        i64 member =
+            raz_compiler_rt_arena_get(builder.module.enum_member_starts, enumeration) +
+            reflected_index;
+        i64 payload_count = raz_compiler_rt_arena_get(builder.module.enum_member_payload_counts, member);
+
+        if (builtin == 42) {
+            value = payload_count;
+        } else {
+            if (reflected_second_index < 0 || reflected_second_index >= payload_count) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            if (
+                !hir_reflection_enum_payload_type_token(
+                    builder,
+                    enumeration,
+                    reflected_index,
+                    reflected_second_index,
+                    &mut reflected_type_token,
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            return hir_reflection_add_name_string(
+                builder,
+                reflected_type_token.offset,
+                reflected_type_token.length,
+                out,
+            );
+        }
+    }
+
+    i64 literal = -1;
+
+    if (!hir_add_node(builder, 1, 0, 0, 0, value, &mut literal)) {
+        return false;
+    }
+    if (
+        builtin == 5 ||
+        builtin == 6 ||
+        builtin == 7 ||
+        builtin == 22 ||
+        builtin == 26 ||
+        builtin == 30 ||
+        builtin == 32
+    ) {
+        hir_set_node_type(builder, literal, 12);
+    }
+    *out = literal;
+    return true;
+}

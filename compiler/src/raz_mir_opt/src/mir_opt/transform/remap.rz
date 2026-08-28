@@ -1,0 +1,366 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::remap;
+
+public import mir::analysis::liveness;
+public import raz_mir_opt::transform::const_prop;
+
+// Complete instruction/value remapping used by compacting MIR transforms.
+// MIR currently uses instruction indices as value identities, so every
+// register operand, branch target, function range, and call-argument value
+// must be rewritten as one atomic operation.
+public struct MirInstructionMap {
+    // One signed lane carries both maps. Kept instructions store new_ip + 1.
+    // Removed instructions store -(next_kept + 1). This eliminates the old
+    // parallel next_kept arena while preserving O(1) value and target remaps.
+
+    i64 entries;
+    i64 kept_count;
+}
+
+fn destroy_mir_instruction_map(MirInstructionMap&mut map) {
+    raz_compiler_rt_arena_destroy(map.entries);
+    map.entries = 0;
+    map.kept_count = 0;
+}
+
+fn build_mir_instruction_map(MirModule& mir, i64 keep_flags, MirInstructionMap&mut map) -> bool {
+    map.entries = raz_compiler_rt_arena_create(mir.instruction_count + 1);
+    map.kept_count = 0;
+    if (map.entries == 0) {
+        return false;
+    }
+
+    i64 old_ip = 0;
+
+    // First assign compacted identities only to retained instructions. The +1
+    // encoding reserves zero for removed entries while the arena is zero-filled.
+    while (old_ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get_unchecked(keep_flags, old_ip) != 0) {
+            raz_compiler_rt_arena_set_unchecked(map.entries, old_ip, map.kept_count + 1);
+            map.kept_count += 1;
+        }
+        old_ip += 1;
+    }
+    // The sentinel maps the end-of-function/program target to the compacted end.
+    raz_compiler_rt_arena_set_unchecked(map.entries, mir.instruction_count, map.kept_count + 1);
+    // Fill removed entries backwards with the next retained target. A negative
+    // encoding distinguishes a valid branch target from a valid SSA value.
+
+    i64 next = map.kept_count;
+
+    old_ip = mir.instruction_count;
+    while (old_ip > 0) {
+        old_ip -= 1;
+
+        i64 encoded = raz_compiler_rt_arena_get_unchecked(map.entries, old_ip);
+
+        if (encoded > 0) {
+            next = encoded - 1;
+        } else {
+            raz_compiler_rt_arena_set_unchecked(map.entries, old_ip, -(next + 1));
+        }
+    }
+    return true;
+}
+
+fn mir_map_value(MirModule& mir, MirInstructionMap& map, i64 value) -> i64 {
+    if (value < 0 || value >= mir.instruction_count) {
+        return value;
+    }
+
+    i64 encoded = raz_compiler_rt_arena_get_unchecked(map.entries, value);
+
+    if (encoded <= 0) {
+        return -1;
+    }
+    return encoded - 1;
+}
+
+fn mir_map_target(MirModule& mir, MirInstructionMap& map, i64 target) -> i64 {
+    if (target < 0 || target > mir.instruction_count) {
+        return target;
+    }
+
+    i64 encoded = raz_compiler_rt_arena_get_unchecked(map.entries, target);
+
+    if (encoded > 0) {
+        return encoded - 1;
+    }
+    return -encoded - 1;
+}
+
+fn mir_get_operand(MirModule& mir, i64 ip, i64 operand) -> i64 {
+    if (operand == 0) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_a, ip);
+    }
+    if (operand == 1) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_b, ip);
+    }
+    if (operand == 2) {
+        return raz_compiler_rt_arena_get_unchecked(mir.op_c, ip);
+    }
+    return raz_compiler_rt_arena_get_unchecked(mir.op_d, ip);
+}
+
+fn mir_set_operand(MirModule&mut mir, i64 ip, i64 operand, i64 value) {
+    if (operand == 0) {
+        raz_compiler_rt_arena_set_unchecked(mir.op_a, ip, value);
+    } else if (operand == 1) {
+        raz_compiler_rt_arena_set_unchecked(mir.op_b, ip, value);
+    } else if (operand == 2) {
+        raz_compiler_rt_arena_set_unchecked(mir.op_c, ip, value);
+    } else {
+        raz_compiler_rt_arena_set_unchecked(mir.op_d, ip, value);
+    }
+}
+
+fn mir_resolve_value_replacement(i64 replacements, i64 instruction_count, i64 value) -> i64 {
+    if (value < 0 || value >= instruction_count) {
+        return value;
+    }
+
+    i64 current = value;
+    i64 steps = 0;
+
+    // Replacement entries encode target + 1 so the arena's zero-filled state
+    // means "no replacement". The bounded walk is a defensive cycle guard;
+    // valid SSA replacement chains terminate long before this limit.
+    while (steps < instruction_count) {
+        i64 encoded = raz_compiler_rt_arena_get_unchecked(replacements, current);
+
+        if (encoded == 0) {
+            return current;
+        }
+
+        i64 next = encoded - 1;
+
+        if (next < 0 || next >= instruction_count || next == current) {
+            return -1;
+        }
+        current = next;
+        steps += 1;
+    }
+    return -1;
+}
+
+fn mir_apply_value_replacements(MirModule&mut mir, i64 replacements) -> bool {
+    i64 ip = 0;
+
+    // Apply every pending SSA replacement in one instruction scan. This is the
+    // bulk path used by copy propagation; it avoids one whole-MIR scan for each
+    // redundant copy while still resolving transitive replacement chains.
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get_unchecked(mir.opcodes, ip);
+        i64 register_mask = mir_register_operand_mask(opcode);
+        i64 operand = 0;
+
+        while (operand < 4) {
+            if ((register_mask&(1 << operand)) != 0) {
+                i64 value = mir_get_operand(mir, ip, operand);
+
+                if (value >= 0 && value < mir.instruction_count) {
+                    i64 replacement = mir_resolve_value_replacement(
+                        replacements,
+                        mir.instruction_count,
+                        value
+                    );
+                    if (replacement < 0) {
+                        return false;
+                    }
+                    if (replacement != value) {
+                        mir_set_operand(mir, ip, operand, replacement);
+                    }
+                }
+            }
+            operand += 1;
+        }
+        ip += 1;
+    }
+
+    i64 argument = 0;
+
+    while (argument < mir.call_argument_count) {
+        i64 value = raz_compiler_rt_arena_get(mir.call_arguments, argument);
+
+        if (value >= 0 && value < mir.instruction_count) {
+            i64 replacement = mir_resolve_value_replacement(replacements, mir.instruction_count, value);
+
+            if (replacement < 0) {
+                return false;
+            }
+            if (replacement != value) {
+                raz_compiler_rt_arena_set(mir.call_arguments, argument, replacement);
+            }
+        }
+        argument += 1;
+    }
+    return true;
+}
+
+fn mir_replace_value_uses(MirModule&mut mir, i64 old_value, i64 new_value) -> bool {
+    if (
+        old_value < 0 ||
+        old_value >= mir.instruction_count ||
+        new_value < 0 ||
+        new_value >= mir.instruction_count
+    ) {
+        return false;
+    }
+
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+        i64 register_mask = mir_register_operand_mask(opcode);
+        i64 operand = 0;
+
+        while (operand < 4) {
+            if ((register_mask&(1 << operand)) != 0) {
+                if (mir_get_operand(mir, ip, operand) == old_value) {
+                    mir_set_operand(mir, ip, operand, new_value);
+                }
+            }
+            operand += 1;
+        }
+        ip += 1;
+    }
+
+    i64 argument = 0;
+
+    while (argument < mir.call_argument_count) {
+        if (raz_compiler_rt_arena_get(mir.call_arguments, argument) == old_value) {
+            raz_compiler_rt_arena_set(mir.call_arguments, argument, new_value);
+        }
+        argument += 1;
+    }
+    return true;
+}
+
+fn compact_mir_instructions(MirModule&mut mir, i64 keep_flags) -> bool {
+    MirInstructionMap map;
+
+    if (!build_mir_instruction_map(mir, keep_flags, &mut map)) {
+        return false;
+    }
+    // Rewrite value operands and control-flow targets while old indices still
+    // address the original instruction stream.
+
+    i64 old_ip = 0;
+
+    while (old_ip < mir.instruction_count) {
+        if (raz_compiler_rt_arena_get_unchecked(keep_flags, old_ip) != 0) {
+            i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, old_ip);
+            i64 register_mask = mir_register_operand_mask(opcode);
+            i64 operand = 0;
+
+            while (operand < 4) {
+                if ((register_mask&(1 << operand)) != 0) {
+                    i64 value = mir_get_operand(mir, old_ip, operand);
+
+                    if (value >= 0) {
+                        i64 mapped = mir_map_value(mir, &map, value);
+
+                        if (mapped < 0) {
+                            destroy_mir_instruction_map(&mut map);
+                            return false;
+                        }
+                        mir_set_operand(mir, old_ip, operand, mapped);
+                    }
+                }
+                operand += 1;
+            }
+            if (opcode == 22) {
+                mir_set_operand(mir, old_ip, 1, mir_map_target(mir, &map, mir_get_operand(mir, old_ip, 1)));
+            } else if (opcode == 23) {
+                mir_set_operand(mir, old_ip, 1, mir_map_target(mir, &map, mir_get_operand(mir, old_ip, 1)));
+                mir_set_operand(mir, old_ip, 2, mir_map_target(mir, &map, mir_get_operand(mir, old_ip, 2)));
+            }
+        }
+        old_ip += 1;
+    }
+
+    i64 argument = 0;
+
+    while (argument < mir.call_argument_count) {
+        i64 value = raz_compiler_rt_arena_get(mir.call_arguments, argument);
+
+        if (value >= 0 && value < mir.instruction_count) {
+            i64 mapped = mir_map_value(mir, &map, value);
+
+            if (mapped < 0) {
+                destroy_mir_instruction_map(&mut map);
+                return false;
+            }
+            raz_compiler_rt_arena_set(mir.call_arguments, argument, mapped);
+        }
+        argument += 1;
+    }
+
+    i64 ownership_event = 0;
+
+    while (ownership_event < mir.ownership.ownership_event_count) {
+        i64 instruction = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, ownership_event);
+        i64 mapped_instruction = mir_map_target(mir, &map, instruction);
+
+        raz_compiler_rt_arena_set(mir.ownership.ownership_event_instructions, ownership_event, mapped_instruction);
+        ownership_event += 1;
+    }
+
+    i64 function_index = 0;
+
+    while (function_index < mir.function_count) {
+        i64 old_start = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+        i64 old_count = raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+        i64 old_end = old_start + old_count;
+        i64 new_start = mir_map_target(mir, &map, old_start);
+        i64 new_end = mir_map_target(mir, &map, old_end);
+
+        raz_compiler_rt_arena_set(mir.function_instruction_starts, function_index, new_start);
+        raz_compiler_rt_arena_set(mir.function_instruction_counts, function_index, new_end - new_start);
+        function_index += 1;
+    }
+    // Compact in place. new_ip never exceeds old_ip, so forward copying is safe.
+    old_ip = 0;
+    while (old_ip < mir.instruction_count) {
+        i64 new_ip = mir_map_value(mir, &map, old_ip);
+
+        if (new_ip >= 0 && new_ip != old_ip) {
+            raz_compiler_rt_arena_set_unchecked(
+                mir.opcodes,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.opcodes, old_ip)
+            );
+            raz_compiler_rt_arena_set_unchecked(
+                mir.op_types,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.op_types, old_ip)
+            );
+            raz_compiler_rt_arena_set_unchecked(
+                mir.op_a,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.op_a, old_ip)
+            );
+            raz_compiler_rt_arena_set_unchecked(
+                mir.op_b,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.op_b, old_ip)
+            );
+            raz_compiler_rt_arena_set_unchecked(
+                mir.op_c,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.op_c, old_ip)
+            );
+            raz_compiler_rt_arena_set_unchecked(
+                mir.op_d,
+                new_ip,
+                raz_compiler_rt_arena_get_unchecked(mir.op_d, old_ip)
+            );
+        }
+        old_ip += 1;
+    }
+    mir.instruction_count = map.kept_count;
+    destroy_mir_instruction_map(&mut map);
+    return true;
+}

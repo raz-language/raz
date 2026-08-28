@@ -6,9 +6,9 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-liveness = (root / "compiler/src/mir/analysis/liveness.rz").read_text(encoding="utf-8")
-dce = (root / "compiler/src/mir/transform/dce.rz").read_text(encoding="utf-8")
-builder = (root / "compiler/src/mir/core/builder.rz").read_text(encoding="utf-8")
+liveness = (root / "compiler/src/raz_mir/src/mir/analysis/liveness.rz").read_text(encoding="utf-8")
+dce = (root / "compiler/src/raz_mir_opt/src/mir_opt/transform/dce.rz").read_text(encoding="utf-8")
+builder = (root / "compiler/src/raz_mir/src/mir/core/builder.rz").read_text(encoding="utf-8")
 
 checks = {
     "MirUseInfo stores counts only": "i64 last_uses;" not in liveness and "i64 use_counts;" in liveness,

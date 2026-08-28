@@ -1,0 +1,2008 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::generics::type_instantiation;
+
+public import raz_hir::traits::matching;
+import raz_hir::generics::instantiate;
+import raz_hir::generics::const_generics;
+
+fn hir_generic_parameter_index(
+    HirBuilder&mut builder,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 name_offset,
+    i64 name_length,
+) -> i64 {
+    i64 start = 0;
+    i64 count = 0;
+
+    if (owner_kind == 1) {
+        start = raz_compiler_rt_arena_get(builder.module.generic_function_parameter_starts, owner_index);
+        count = raz_compiler_rt_arena_get(builder.module.generic_function_parameter_counts, owner_index);
+    } else if (owner_kind == 2) {
+        start = raz_compiler_rt_arena_get(builder.module.generic_struct_parameter_starts, owner_index);
+        count = raz_compiler_rt_arena_get(builder.module.generic_struct_parameter_counts, owner_index);
+    } else if (owner_kind == 4) {
+        // Generic inherent impl parameters are stored directly on the impl record
+        // rather than in the shared generic-parameter table. This owner kind lets
+        // signature parsing preserve the impl's own spelling (`impl<U> Box<U>`)
+        // while substituting the concrete target arguments positionally.
+        count = raz_compiler_rt_arena_get(builder.module.generic_inherent_parameter_counts, owner_index);
+    } else {
+        start = raz_compiler_rt_arena_get(builder.module.generic_enum_parameter_starts, owner_index);
+        count = raz_compiler_rt_arena_get(builder.module.generic_enum_parameter_counts, owner_index);
+    }
+
+    i64 index = 0;
+
+    while (index < count) {
+        i64 parameter_offset = 0;
+        i64 parameter_length = 0;
+
+        if (owner_kind == 4) {
+            parameter_offset = raz_compiler_rt_arena_get(
+                builder.module.generic_inherent_parameter_name_offsets,
+                owner_index * 8 + index,
+            );
+            parameter_length = raz_compiler_rt_arena_get(
+                builder.module.generic_inherent_parameter_name_lengths,
+                owner_index * 8 + index,
+            );
+        } else {
+            i64 parameter = start + index;
+
+            parameter_offset = raz_compiler_rt_arena_get(builder.module.generic_parameter_name_offsets, parameter);
+            parameter_length = raz_compiler_rt_arena_get(builder.module.generic_parameter_name_lengths, parameter);
+        }
+        if (
+            token_same(
+                &builder.scan.input,
+                parameter_offset,
+                parameter_length,
+                name_offset,
+                name_length,
+            )
+        ) {
+            return index;
+        }
+        index += 1;
+    }
+    return -1;
+}
+
+fn hir_generic_scanned_type(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out_structure,
+    i64&mut out_type,
+    i64&mut out_reference,
+    i64&mut out_slice,
+    i64&mut out_slice_mutable,
+) -> bool {
+    *out_structure = -1;
+    *out_type = 0;
+    *out_reference = 0;
+    *out_slice = 0;
+    *out_slice_mutable = 0;
+    if (current.kind != TokenKind::Identifier) {
+        return false;
+    }
+    i64 parameter_index = hir_generic_parameter_index(
+        builder,
+        owner_kind,
+        owner_index,
+        current.offset,
+        current.length,
+    );
+    if (parameter_index >= 0 && parameter_index < argument_count) {
+        i64 parameter_start = 0;
+
+        i64 parameter_kind = 0;
+
+        if (owner_kind == 1) {
+            parameter_start = raz_compiler_rt_arena_get(
+                builder.module.generic_function_parameter_starts,
+                owner_index,
+            );
+            parameter_kind = raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_kinds,
+                parameter_start + parameter_index,
+            );
+        } else if (owner_kind == 2) {
+            parameter_start = raz_compiler_rt_arena_get(
+                builder.module.generic_struct_parameter_starts,
+                owner_index,
+            );
+            parameter_kind = raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_kinds,
+                parameter_start + parameter_index,
+            );
+        } else if (owner_kind == 4) {
+            parameter_kind = raz_compiler_rt_arena_get(
+                builder.module.generic_inherent_parameter_kinds,
+                owner_index * 8 + parameter_index,
+            );
+        } else {
+            parameter_start = raz_compiler_rt_arena_get(
+                builder.module.generic_enum_parameter_starts,
+                owner_index,
+            );
+            parameter_kind = raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_kinds,
+                parameter_start + parameter_index,
+            );
+        }
+        if (parameter_kind != 0) {
+            return false;
+        }
+        *out_structure = raz_compiler_rt_arena_get(argument_structures, parameter_index);
+        *out_type = raz_compiler_rt_arena_get(argument_types, parameter_index);
+        if (*out_structure < 0 && *out_type == 16) {
+            *out_type = 0;
+        }
+        next_token(scan, current);
+        if (current.kind == TokenKind::ColonColon) {
+            next_token(scan, current);
+            if (current.kind != TokenKind::Identifier) {
+                return false;
+            }
+
+            i64 trait_offset = current.offset;
+            i64 trait_length = current.length;
+
+            next_token(scan, current);
+            if (current.kind != TokenKind::ColonColon) {
+                return false;
+            }
+            next_token(scan, current);
+            if (current.kind != TokenKind::Identifier) {
+                return false;
+            }
+
+            i64 item_offset = current.offset;
+            i64 item_length = current.length;
+
+            next_token(scan, current);
+            if (
+                !hir_resolve_concrete_associated_type(
+                    builder,
+                    *out_structure,
+                    trait_offset,
+                    trait_length,
+                    item_offset,
+                    item_length,
+                    out_structure,
+                    out_type,
+                )
+            ) {
+                return false;
+            }
+        }
+    } else {
+        i64 type_offset = current.offset;
+        i64 type_length = current.length;
+        i64 generic_struct = hir_find_generic_struct(builder, type_offset, type_length);
+        i64 generic_enum = hir_find_generic_enum(builder, type_offset, type_length);
+
+        *out_structure = hir_find_struct(builder, type_offset, type_length);
+        *out_type = primitive_type_kind(&builder.scan.input, type_offset, type_length);
+
+        i64 type_enum = hir_find_enum(builder, type_offset, type_length);
+
+        next_token(scan, current);
+        if (generic_struct >= 0 && current.kind == TokenKind::Less) {
+            next_token(scan, current);
+
+            i64 nested_structures = raz_compiler_rt_arena_create(32);
+            i64 nested_types = raz_compiler_rt_arena_create(32);
+            i64 nested_count = 0;
+            bool parsing_arguments = true;
+
+            while (parsing_arguments) {
+                if (nested_count >= 32) {
+                    raz_compiler_rt_arena_destroy(nested_structures);
+                    raz_compiler_rt_arena_destroy(nested_types);
+                    return false;
+                }
+
+                i64 nested_structure = -1;
+                i64 nested_type = 0;
+
+                i64 nested_parameter_start = raz_compiler_rt_arena_get(
+                    builder.module.generic_struct_parameter_starts,
+                    generic_struct,
+                );
+                i64 nested_parameter_kind = raz_compiler_rt_arena_get(
+                    builder.module.generic_parameter_kinds,
+                    nested_parameter_start + nested_count,
+                );
+                if (nested_parameter_kind == 2) {
+                    nested_structure = -2;
+                    if (
+                        !hir_generic_scanned_const_expression(
+                            builder,
+                            scan,
+                            current,
+                            owner_kind,
+                            owner_index,
+                            argument_count,
+                            argument_structures,
+                            argument_types,
+                            &mut nested_type,
+                        )
+                    ) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                } else {
+                    i64 nested_reference = 0;
+                    i64 nested_slice = 0;
+                    i64 nested_slice_mutable = 0;
+
+                    if (
+                        !hir_generic_scanned_type(
+                            builder,
+                            scan,
+                            current,
+                            owner_kind,
+                            owner_index,
+                            argument_count,
+                            argument_structures,
+                            argument_types,
+                            &mut nested_structure,
+                            &mut nested_type,
+                            &mut nested_reference,
+                            &mut nested_slice,
+                            &mut nested_slice_mutable,
+                        )
+                    ) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                    if (nested_reference != 0 || nested_slice != 0) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                }
+                raz_compiler_rt_arena_set(nested_structures, nested_count, nested_structure);
+                raz_compiler_rt_arena_set(nested_types, nested_count, nested_type);
+                nested_count += 1;
+                if (current.kind == TokenKind::Comma) {
+                    next_token(scan, current);
+                } else {
+                    parsing_arguments = false;
+                }
+            }
+            if (current.kind != TokenKind::Greater) {
+                raz_compiler_rt_arena_destroy(nested_structures);
+                raz_compiler_rt_arena_destroy(nested_types);
+                return false;
+            }
+            next_token(scan, current);
+            *out_structure = hir_instantiate_generic_struct(
+                builder,
+                generic_struct,
+                nested_count,
+                nested_structures,
+                nested_types,
+            );
+            *out_type = 0;
+            raz_compiler_rt_arena_destroy(nested_structures);
+            raz_compiler_rt_arena_destroy(nested_types);
+            if (*out_structure < 0) {
+                return false;
+            }
+        } else if (generic_enum >= 0 && current.kind == TokenKind::Less) {
+            next_token(scan, current);
+
+            i64 nested_structures = raz_compiler_rt_arena_create(32);
+            i64 nested_types = raz_compiler_rt_arena_create(32);
+            i64 nested_count = 0;
+            bool parsing_arguments = true;
+
+            while (parsing_arguments) {
+                if (nested_count >= 32) {
+                    raz_compiler_rt_arena_destroy(nested_structures);
+                    raz_compiler_rt_arena_destroy(nested_types);
+                    return false;
+                }
+
+                i64 nested_structure = -1;
+                i64 nested_type = 0;
+
+                i64 nested_parameter_start = raz_compiler_rt_arena_get(
+                    builder.module.generic_enum_parameter_starts,
+                    generic_enum,
+                );
+                i64 nested_parameter_kind = raz_compiler_rt_arena_get(
+                    builder.module.generic_parameter_kinds,
+                    nested_parameter_start + nested_count,
+                );
+                if (nested_parameter_kind == 2) {
+                    nested_structure = -2;
+                    if (
+                        !hir_generic_scanned_const_expression(
+                            builder,
+                            scan,
+                            current,
+                            owner_kind,
+                            owner_index,
+                            argument_count,
+                            argument_structures,
+                            argument_types,
+                            &mut nested_type,
+                        )
+                    ) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                } else {
+                    i64 nested_reference = 0;
+                    i64 nested_slice = 0;
+                    i64 nested_slice_mutable = 0;
+
+                    if (
+                        !hir_generic_scanned_type(
+                            builder,
+                            scan,
+                            current,
+                            owner_kind,
+                            owner_index,
+                            argument_count,
+                            argument_structures,
+                            argument_types,
+                            &mut nested_structure,
+                            &mut nested_type,
+                            &mut nested_reference,
+                            &mut nested_slice,
+                            &mut nested_slice_mutable,
+                        )
+                    ) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                    if (nested_reference != 0 || nested_slice != 0) {
+                        raz_compiler_rt_arena_destroy(nested_structures);
+                        raz_compiler_rt_arena_destroy(nested_types);
+                        return false;
+                    }
+                }
+                raz_compiler_rt_arena_set(nested_structures, nested_count, nested_structure);
+                raz_compiler_rt_arena_set(nested_types, nested_count, nested_type);
+                nested_count += 1;
+                if (current.kind == TokenKind::Comma) {
+                    next_token(scan, current);
+                } else {
+                    parsing_arguments = false;
+                }
+            }
+            if (current.kind != TokenKind::Greater) {
+                raz_compiler_rt_arena_destroy(nested_structures);
+                raz_compiler_rt_arena_destroy(nested_types);
+                return false;
+            }
+            next_token(scan, current);
+            i64 instantiated_enum = hir_instantiate_generic_enum(
+                builder,
+                generic_enum,
+                nested_count,
+                nested_structures,
+                nested_types,
+            );
+            raz_compiler_rt_arena_destroy(nested_structures);
+            raz_compiler_rt_arena_destroy(nested_types);
+            if (instantiated_enum < 0) {
+                return false;
+            }
+            *out_structure = -1;
+            *out_type = hir_enum_value_type_kind(builder, instantiated_enum);
+        } else if (type_enum >= 0) {
+            *out_structure = -1;
+            *out_type = hir_enum_value_type_kind(builder, type_enum);
+        } else if (
+            *out_structure < 0 &&
+            !token_is_scalar_type(&builder.scan.input, type_offset, type_length)
+        ) {
+            return false;
+        }
+    }
+    if (current.kind == TokenKind::LeftBracket) {
+        i64 saved_scan_offset = scan.offset;
+        TokenKind saved_kind = current.kind;
+        i64 saved_offset = current.offset;
+        i64 saved_length = current.length;
+
+        next_token(scan, current);
+        if (current.kind == TokenKind::RightBracket) {
+            *out_slice = 1;
+            next_token(scan, current);
+            if (current.kind == TokenKind::Identifier && token_is_mut(&builder.scan.input, current)) {
+                *out_slice_mutable = 1;
+                next_token(scan, current);
+            }
+        } else {
+            scan.offset = saved_scan_offset;
+            init_token(current, saved_kind, saved_offset, saved_length);
+        }
+    }
+    if (current.kind == TokenKind::Ampersand) {
+        *out_reference = 1;
+        next_token(scan, current);
+        if (current.kind == TokenKind::Identifier && token_is_mut(&builder.scan.input, current)) {
+            next_token(scan, current);
+        }
+    } else if (current.kind == TokenKind::Star) {
+        next_token(scan, current);
+        if (current.kind != TokenKind::Identifier) {
+            return false;
+        }
+        if (token_is_const(&builder.scan.input, current)) {
+            *out_reference = 2;
+        } else if (token_is_mut(&builder.scan.input, current)) {
+            *out_reference = 3;
+        } else {
+            return false;
+        }
+        next_token(scan, current);
+    }
+    return true;
+}
+
+fn hir_generic_struct_field_type(
+    HirBuilder&mut builder,
+    Lexer&mut scan,
+    Token&mut current,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+    i64&mut out_structure,
+    i64&mut out_type,
+    i64&mut out_reference,
+    i64&mut out_slice,
+    i64&mut out_slice_mutable,
+) -> bool {
+    return hir_generic_scanned_type(
+        builder,
+        scan,
+        current,
+        2,
+        generic,
+        argument_count,
+        argument_structures,
+        argument_types,
+        out_structure,
+        out_type,
+        out_reference,
+        out_slice,
+        out_slice_mutable,
+    );
+}
+
+fn hir_trait_query_epoch(HirBuilder&mut builder) -> i64 {
+    i64 epoch = builder.module.trait_count + 1;
+
+    epoch = (epoch * 131 + builder.module.trait_impl_count + 1) % 281474976710597;
+    epoch = (epoch * 131 + builder.module.generic_trait_impl_count + 1) % 281474976710597;
+    epoch = (epoch * 131 + builder.module.struct_count + 1) % 281474976710597;
+    epoch = (epoch * 131 + builder.module.enum_count + 1) % 281474976710597;
+    return epoch;
+}
+
+fn hir_scalar_method_target(i64 type_kind) -> i64 {
+    return -100000 - type_kind;
+}
+
+public fn hir_method_target_is_scalar(i64 target) -> bool {
+    return target <= -100000;
+}
+
+public fn hir_method_target_scalar_type(i64 target) -> i64 {
+    return -100000 - target;
+}
+
+fn hir_find_trait_impl(HirBuilder&mut builder, i64 trait_index, i64 structure) -> i64 {
+    i64 type_id = hir_query_intern_value_type(builder, structure, 12);
+
+    if (type_id < 0) {
+        return -1;
+    }
+
+    i64 result = -1;
+    i64 unused = 0;
+    i64 epoch = builder.module.trait_impl_count;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_trait_impl(),
+            trait_index,
+            type_id,
+            0,
+            epoch,
+            0,
+            &mut result,
+            &mut unused,
+        )
+    ) {
+        builder.trait_query_cache_hits += 1;
+        return result;
+    }
+    builder.trait_query_cache_misses += 1;
+
+    i64 implementation = 0;
+
+    while (implementation < builder.module.trait_impl_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.trait_impl_traits, implementation) == trait_index &&
+            raz_compiler_rt_arena_get(builder.module.trait_impl_structures, implementation) == structure
+        ) {
+            result = implementation;
+            break;
+        }
+        implementation += 1;
+    }
+    if (hir_query_begin(builder, hir_query_kind_trait_impl(), trait_index, type_id, 0)) {
+        hir_query_end(
+            builder,
+            hir_query_kind_trait_impl(),
+            trait_index,
+            type_id,
+            0,
+            epoch,
+            0,
+            result,
+            0,
+            true,
+        );
+    }
+    return result;
+}
+
+fn hir_type_satisfies_bound_uncached(
+    HirBuilder&mut builder,
+    i64 structure,
+    i64 type_kind,
+    i64 bound,
+) -> bool {
+    if (bound == -2) {
+        if (structure < 0 && hir_type_is_enum(type_kind)) {
+            i64 enumeration = hir_type_enum_index(type_kind);
+
+            return (
+                raz_compiler_rt_arena_get(builder.module.enum_copy_flags, enumeration) != 0 ||
+                raz_compiler_rt_arena_get(builder.module.enum_derived_clone_flags, enumeration) != 0
+            );
+        }
+        if (structure < 0) {
+            // Scalar value types, including i64 whose canonical type kind is 0,
+            // have value-copy Clone semantics. Type kind zero is not an
+            // "unknown" sentinel once type parsing has succeeded.
+            return true;
+        }
+        if (raz_compiler_rt_arena_get(builder.module.struct_clone_functions, structure) >= 0) {
+            return true;
+        }
+        // A generic aggregate is Clone when its concrete element is Clone and
+        // a generic Clone template can materialize for that aggregate.
+
+        i64 template = raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, structure);
+
+        if (template >= 0) {
+            i64 child_structure = raz_compiler_rt_arena_get(
+                builder.module.struct_generic_type_structs,
+                structure,
+            );
+
+            i64 child_type = raz_compiler_rt_arena_get(builder.module.struct_generic_types, structure);
+            i64 generic_clone = 0;
+
+            while (generic_clone < builder.module.generic_clone_impl_count) {
+                if (
+                    raz_compiler_rt_arena_get(
+                        builder.module.generic_clone_struct_templates,
+                        generic_clone,
+                    ) == template
+                ) {
+                    if (
+                        raz_compiler_rt_arena_get(
+                            builder.module.generic_clone_requires_clone,
+                            generic_clone,
+                        ) == 0 ||
+                        hir_type_satisfies_bound(builder, child_structure, child_type, -2)
+                    ) {
+                        return true;
+                    }
+                }
+                generic_clone += 1;
+            }
+        }
+        return false;
+    }
+    if (bound == -4) {
+        if (structure < 0 && hir_type_is_enum(type_kind)) {
+            return raz_compiler_rt_arena_get(
+                builder.module.enum_copy_flags,
+                hir_type_enum_index(type_kind),
+            ) != 0;
+        }
+        if (structure < 0) {
+            // All validated scalar value types are Copy. In particular i64 is
+            // represented by type kind 0 and must not be mistaken for absence.
+            return true;
+        }
+        return raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure) != 0;
+    }
+    if (bound == -3) {
+        if (structure < 0) {
+            return false;
+        }
+        if (raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0) {
+            return true;
+        }
+
+        i64 template = raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, structure);
+
+        if (template >= 0) {
+            i64 child_structure = raz_compiler_rt_arena_get(
+                builder.module.struct_generic_type_structs,
+                structure,
+            );
+
+            i64 child_type = raz_compiler_rt_arena_get(builder.module.struct_generic_types, structure);
+            i64 generic_drop = 0;
+
+            while (generic_drop < builder.module.generic_drop_impl_count) {
+                if (
+                    raz_compiler_rt_arena_get(
+                        builder.module.generic_drop_struct_templates,
+                        generic_drop,
+                    ) == template
+                ) {
+                    if (
+                        raz_compiler_rt_arena_get(
+                            builder.module.generic_drop_requires_drop,
+                            generic_drop
+                        ) == 0 ||
+                        hir_type_satisfies_bound(builder, child_structure, child_type, -3)
+                    ) {
+                        return true;
+                    }
+                }
+                generic_drop += 1;
+            }
+        }
+        return false;
+    }
+    if (bound < 0) {
+        return false;
+    }
+    if (
+        bound < builder.module.trait_count &&
+        raz_compiler_rt_arena_get(builder.module.trait_alias_flags, bound) != 0
+    ) {
+        i64 first = raz_compiler_rt_arena_get(builder.module.trait_supertrait_starts, bound);
+        i64 count = raz_compiler_rt_arena_get(builder.module.trait_supertrait_counts, bound);
+        i64 index = 0;
+
+        while (index < count) {
+            if (
+                !hir_type_satisfies_bound(
+                    builder,
+                    structure,
+                    type_kind,
+                    raz_compiler_rt_arena_get(builder.module.trait_supertraits, first + index),
+                )
+            ) {
+                return false;
+            }
+            index += 1;
+        }
+        return count > 0;
+    }
+    if (structure < 0) {
+        if (!hir_type_is_enum(type_kind)) {
+            return hir_find_trait_impl(builder, bound, hir_scalar_method_target(type_kind)) >= 0;
+        }
+
+        i64 enumeration = hir_type_enum_index(type_kind);
+        i64 start = raz_compiler_rt_arena_get(builder.module.enum_marker_trait_starts, enumeration);
+        i64 count = raz_compiler_rt_arena_get(builder.module.enum_marker_trait_counts, enumeration);
+        i64 index = 0;
+
+        while (index < count) {
+            if (raz_compiler_rt_arena_get(builder.module.enum_marker_traits, start + index) == bound) {
+                return true;
+            }
+            index += 1;
+        }
+        return false;
+    }
+    if (hir_find_trait_impl(builder, bound, structure) >= 0) {
+        return true;
+    }
+
+    i64 template = raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, structure);
+
+    if (template < 0) {
+        return false;
+    }
+
+    i64 generic_impl = 0;
+
+    while (generic_impl < builder.module.generic_trait_impl_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.generic_trait_traits, generic_impl) == bound &&
+            raz_compiler_rt_arena_get(builder.module.generic_trait_struct_templates, generic_impl) == template
+        ) {
+            i64 child_structure = -1;
+            i64 child_type = 0;
+
+            bool matched = hir_generic_trait_impl_applies(
+                builder,
+                generic_impl,
+                structure,
+                &mut child_structure,
+                &mut child_type,
+            );
+            i64 bound_count = raz_compiler_rt_arena_get(
+                builder.module.generic_trait_bound_counts,
+                generic_impl,
+            );
+
+            i64 bound_index = 0;
+
+            while (matched && bound_index < bound_count) {
+                matched = hir_type_satisfies_bound(
+                    builder,
+                    child_structure,
+                    child_type,
+                    raz_compiler_rt_arena_get(
+                        builder.module.generic_trait_bounds,
+                        generic_impl * 8 + bound_index,
+                    ),
+                );
+                bound_index += 1;
+            }
+            if (matched) {
+                i64 supertrait_start = raz_compiler_rt_arena_get(
+                    builder.module.trait_supertrait_starts,
+                    bound
+                );
+                i64 supertrait_count = raz_compiler_rt_arena_get(
+                    builder.module.trait_supertrait_counts,
+                    bound
+                );
+
+                i64 supertrait_index = 0;
+
+                while (supertrait_index < supertrait_count) {
+                    if (
+                        !hir_type_satisfies_bound(
+                            builder,
+                            structure,
+                            type_kind,
+                            raz_compiler_rt_arena_get(
+                                builder.module.trait_supertraits,
+                                supertrait_start + supertrait_index,
+                            ),
+                        )
+                    ) {
+                        matched = false;
+                        break;
+                    }
+                    supertrait_index += 1;
+                }
+                if (matched) {
+                    return true;
+                }
+            }
+        }
+        generic_impl += 1;
+    }
+    return false;
+}
+
+fn hir_type_satisfies_bound(HirBuilder&mut builder, i64 structure, i64 type_kind, i64 bound) -> bool {
+    i64 type_id = hir_query_intern_value_type(builder, structure, type_kind);
+
+    if (type_id < 0) {
+        return false;
+    }
+
+    i64 result = 0;
+    i64 unused = 0;
+    i64 epoch = hir_trait_query_epoch(builder);
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_trait_bound(),
+            type_id,
+            bound,
+            0,
+            epoch,
+            0,
+            &mut result,
+            &mut unused,
+        )
+    ) {
+        builder.trait_query_cache_hits += 1;
+        return result != 0;
+    }
+    builder.trait_query_cache_misses += 1;
+    if (!hir_query_begin(builder, hir_query_kind_trait_bound(), type_id, bound, 0)) {
+        return false;
+    }
+
+    bool satisfied = hir_type_satisfies_bound_uncached(builder, structure, type_kind, bound);
+    i64 cached_result = 0;
+
+    if (satisfied) {
+        cached_result = 1;
+    }
+    // The semantic database revision now invalidates stale negatives whenever
+    // declaration/materialization state changes, so both outcomes are safe.
+    hir_query_end(builder, hir_query_kind_trait_bound(), type_id, bound, 0, epoch, 0, cached_result, 0, true);
+    return satisfied;
+}
+
+fn hir_validate_supertraits_for_structure(
+    HirBuilder&mut builder,
+    i64 trait_index,
+    i64 structure,
+    i64 type_kind,
+) -> bool {
+    i64 first = raz_compiler_rt_arena_get(builder.module.trait_supertrait_starts, trait_index);
+    i64 count = raz_compiler_rt_arena_get(builder.module.trait_supertrait_counts, trait_index);
+    i64 index = 0;
+
+    while (index < count) {
+        i64 supertrait = raz_compiler_rt_arena_get(builder.module.trait_supertraits, first + index);
+
+        if (!hir_type_satisfies_bound(builder, structure, type_kind, supertrait)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_apply_pending_struct_derives(HirBuilder&mut builder, i64 structure) -> bool {
+    if (builder.pending_derive_copy != 0) {
+        if (raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+        i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+        i64 field = 0;
+
+        while (field < count) {
+            i64 child = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, first + field);
+
+            if (child >= 0 && raz_compiler_rt_arena_get(builder.module.struct_copy_flags, child) == 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            field += 1;
+        }
+        raz_compiler_rt_arena_set(builder.module.struct_copy_flags, structure, 1);
+    }
+    // Clone derivation is structural. Copy aggregates can be duplicated directly;
+    // non-Copy aggregates are marked for fieldwise MIR cloning, and every nested
+    // owned structure must itself be Clone-capable.
+    if (builder.pending_derive_clone != 0 && builder.pending_derive_copy == 0) {
+        i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+        i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+        i64 field = 0;
+
+        while (field < count) {
+            i64 child = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, first + field);
+
+            if (
+                child >= 0 &&
+                raz_compiler_rt_arena_get(builder.module.struct_copy_flags, child) == 0 &&
+                raz_compiler_rt_arena_get(builder.module.struct_clone_functions, child) < 0 &&
+                raz_compiler_rt_arena_get(builder.module.struct_derived_clone_flags, child) == 0
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            field += 1;
+        }
+        raz_compiler_rt_arena_set(builder.module.struct_derived_clone_flags, structure, 1);
+    }
+
+    i64 index = 0;
+
+    while (index < builder.pending_derive_trait_count) {
+        i64 trait_index = raz_compiler_rt_arena_get(builder.pending_derive_traits, index);
+
+        if (
+            hir_find_trait_impl(builder, trait_index, structure) >= 0 ||
+            builder.module.trait_impl_count >= 4096
+        ) {
+            hir_fail(builder, DiagnosticCode::DuplicateName);
+            return false;
+        }
+        if (!hir_validate_supertraits_for_structure(builder, trait_index, structure, 0)) {
+            return false;
+        }
+
+        i64 implementation = builder.module.trait_impl_count;
+
+        builder.module.trait_impl_count += 1;
+        raz_compiler_rt_arena_set(builder.module.trait_impl_traits, implementation, trait_index);
+        raz_compiler_rt_arena_set(builder.module.trait_impl_structures, implementation, structure);
+        raz_compiler_rt_arena_set(builder.module.trait_impl_source_offsets, implementation, -1);
+        raz_compiler_rt_arena_set(builder.module.trait_impl_generic_indices, implementation, -1);
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_validate_generic_arguments(
+    HirBuilder&mut builder,
+    i64 owner_kind,
+    i64 owner_index,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> bool {
+    i64 parameter_start = 0;
+    i64 parameter_count = 0;
+
+    if (owner_kind == 1) {
+        parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_function_parameter_starts,
+            owner_index,
+        );
+        parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_function_parameter_counts,
+            owner_index,
+        );
+    } else if (owner_kind == 2) {
+        parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_starts,
+            owner_index,
+        );
+        parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_counts,
+            owner_index,
+        );
+    } else {
+        parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_starts,
+            owner_index
+        );
+        parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_counts,
+            owner_index
+        );
+    }
+    if (argument_count != parameter_count) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 index = 0;
+
+    while (index < parameter_count) {
+        i64 parameter = parameter_start + index;
+        i64 parameter_kind = raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, parameter);
+        i64 argument_structure = raz_compiler_rt_arena_get(argument_structures, index);
+
+        if (parameter_kind == 2) {
+            if (argument_structure != -2) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else if (parameter_kind == 1) {
+            if (argument_structure != -3) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else if (parameter_kind == 0 && argument_structure < -1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 bound_start = raz_compiler_rt_arena_get(builder.module.generic_parameter_bound_starts, parameter);
+        i64 bound_count = raz_compiler_rt_arena_get(builder.module.generic_parameter_bound_counts, parameter);
+        i64 bound_index = 0;
+
+        while (bound_index < bound_count) {
+            if (
+                !hir_type_satisfies_bound(
+                    builder,
+                    raz_compiler_rt_arena_get(argument_structures, index),
+                    raz_compiler_rt_arena_get(argument_types, index),
+                    raz_compiler_rt_arena_get(
+                        builder.module.generic_parameter_bounds,
+                        bound_start + bound_index,
+                    ),
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            bound_index += 1;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_generic_struct_arguments_match(
+    HirBuilder&mut builder,
+    i64 structure,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> bool {
+    if (
+        raz_compiler_rt_arena_get(builder.module.struct_generic_argument_counts, structure) != argument_count
+    ) {
+        return false;
+    }
+
+    i64 start = raz_compiler_rt_arena_get(builder.module.struct_generic_argument_starts, structure);
+    i64 index = 0;
+
+    while (index < argument_count) {
+        if (
+            raz_compiler_rt_arena_get(
+                builder.module.struct_generic_argument_type_structs,
+                start + index,
+            ) != raz_compiler_rt_arena_get(argument_structures, index) ||
+            raz_compiler_rt_arena_get(
+                builder.module.struct_generic_argument_types,
+                start + index,
+            ) != raz_compiler_rt_arena_get(argument_types, index)
+        ) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_instantiate_generic_struct(
+    HirBuilder&mut builder,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    i64 request = hir_query_intern_monomorphization(
+        builder,
+        2,
+        generic,
+        argument_count,
+        argument_structures,
+        argument_types,
+    );
+    if (request < 0) {
+        return -1;
+    }
+
+    i64 cached_result = -1;
+    i64 unused = 0;
+    i64 epoch0 = builder.module.generic_struct_count;
+    i64 epoch1 = builder.module.trait_impl_count + builder.module.generic_trait_impl_count * 4099;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_monomorphization(),
+            request,
+            0,
+            0,
+            epoch0,
+            epoch1,
+            &mut cached_result,
+            &mut unused,
+        ) &&
+        cached_result >= 0 &&
+        cached_result < builder.module.struct_count &&
+        raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, cached_result) == generic &&
+        hir_generic_struct_arguments_match(
+            builder,
+            cached_result,
+            argument_count,
+            argument_structures,
+            argument_types,
+        )
+    ) {
+        builder.generic_cache_hits += 1;
+        return cached_result;
+    }
+    builder.generic_cache_misses += 1;
+    if (!hir_query_begin(builder, hir_query_kind_monomorphization(), request, 0, 0)) {
+        return -1;
+    }
+    i64 result = hir_instantiate_generic_struct_uncached(
+        builder,
+        generic,
+        argument_count,
+        argument_structures,
+        argument_types,
+    );
+    hir_query_end(
+        builder,
+        hir_query_kind_monomorphization(),
+        request,
+        0,
+        0,
+        epoch0,
+        epoch1,
+        result,
+        argument_count,
+        result >= 0,
+    );
+    return result;
+}
+
+fn hir_instantiate_generic_struct_uncached(
+    HirBuilder&mut builder,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    if (
+        !hir_validate_generic_arguments(
+            builder,
+            2,
+            generic,
+            argument_count,
+            argument_structures,
+            argument_types,
+        )
+    ) {
+        return -1;
+    }
+
+    i64 structure = 0;
+
+    while (structure < builder.module.struct_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.struct_generic_template_indices, structure) == generic &&
+            hir_generic_struct_arguments_match(
+                builder,
+                structure,
+                argument_count,
+                argument_structures,
+                argument_types,
+            )
+        ) {
+            return structure;
+        }
+        structure += 1;
+    }
+    if (builder.module.struct_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return -1;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.generic_struct_source_offsets, generic);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier || !token_is_struct(&builder.scan.input, &current)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return -1;
+    }
+
+    i64 name_offset = current.offset;
+    i64 name_length = current.length;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Less) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+
+    i64 generic_depth = 1;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && generic_depth > 0) {
+        if (current.kind == TokenKind::Less) {
+            generic_depth += 1;
+        } else if (current.kind == TokenKind::Greater) {
+            generic_depth -= 1;
+            if (generic_depth == 0) {
+                next_token(&mut scan, &mut current);
+                break;
+            }
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (generic_depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    if (current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    next_token(&mut scan, &mut current);
+    structure = builder.module.struct_count;
+    builder.module.struct_count += 1;
+    raz_compiler_rt_arena_set(builder.module.struct_name_offsets, structure, name_offset);
+    raz_compiler_rt_arena_set(builder.module.struct_name_lengths, structure, name_length);
+    raz_compiler_rt_arena_set(
+        builder.module.struct_field_starts,
+        structure,
+        builder.module.struct_field_count
+    );
+    raz_compiler_rt_arena_set(builder.module.struct_field_counts, structure, 0);
+    raz_compiler_rt_arena_set(builder.module.struct_drop_functions, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_clone_functions, structure, -1);
+    raz_compiler_rt_arena_set(builder.module.struct_copy_flags, structure, 0);
+    raz_compiler_rt_arena_set(builder.module.struct_derived_clone_flags, structure, 0);
+    raz_compiler_rt_arena_set(builder.module.struct_generic_template_indices, structure, generic);
+
+    i64 first_structure = -1;
+    i64 first_type = 0;
+
+    i64 first_parameter_start = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_parameter_starts,
+        generic,
+    );
+    i64 first_parameter_count = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_parameter_counts,
+        generic,
+    );
+
+    i64 first_parameter_index = 0;
+    bool found_first_type_parameter = false;
+
+    while (first_parameter_index < first_parameter_count && !found_first_type_parameter) {
+        if (
+            raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_kinds,
+                first_parameter_start + first_parameter_index,
+            ) == 0
+        ) {
+            first_structure = raz_compiler_rt_arena_get(argument_structures, first_parameter_index);
+            first_type = raz_compiler_rt_arena_get(argument_types, first_parameter_index);
+            found_first_type_parameter = true;
+        }
+        first_parameter_index += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.struct_generic_type_structs, structure, first_structure);
+    raz_compiler_rt_arena_set(builder.module.struct_generic_types, structure, first_type);
+    raz_compiler_rt_arena_set(
+        builder.module.struct_generic_argument_starts,
+        structure,
+        builder.module.struct_generic_argument_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.struct_generic_argument_counts, structure, argument_count);
+
+    i64 stored_argument = 0;
+
+    while (stored_argument < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.struct_generic_argument_type_structs,
+            builder.module.struct_generic_argument_count,
+            raz_compiler_rt_arena_get(argument_structures, stored_argument),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_generic_argument_types,
+            builder.module.struct_generic_argument_count,
+            raz_compiler_rt_arena_get(argument_types, stored_argument),
+        );
+        builder.module.struct_generic_argument_count += 1;
+        stored_argument += 1;
+    }
+
+    i64 staged_type_offsets = raz_compiler_rt_arena_create(4096);
+    i64 staged_type_lengths = raz_compiler_rt_arena_create(4096);
+    i64 staged_type_structs = raz_compiler_rt_arena_create(4096);
+    i64 staged_types = raz_compiler_rt_arena_create(4096);
+    i64 staged_references = raz_compiler_rt_arena_create(4096);
+    i64 staged_slices = raz_compiler_rt_arena_create(4096);
+    i64 staged_slice_mutable = raz_compiler_rt_arena_create(4096);
+    i64 staged_array_extents = raz_compiler_rt_arena_create(4096);
+    i64 staged_function_types = raz_compiler_rt_arena_create(4096);
+    i64 staged_name_offsets = raz_compiler_rt_arena_create(4096);
+    i64 staged_name_lengths = raz_compiler_rt_arena_create(4096);
+
+    if (
+        staged_type_offsets == 0 ||
+        staged_type_lengths == 0 ||
+        staged_type_structs == 0 ||
+        staged_types == 0 ||
+        staged_references == 0 ||
+        staged_slices == 0 ||
+        staged_slice_mutable == 0 ||
+        staged_array_extents == 0 ||
+        staged_function_types == 0 ||
+        staged_name_offsets == 0 ||
+        staged_name_lengths == 0
+    ) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return -1;
+    }
+
+    i64 staged_count = 0;
+
+    while (current.kind != TokenKind::RightBrace) {
+        if (staged_count >= 4096) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return -1;
+        }
+
+        i64 type_offset = current.offset;
+        i64 type_length = current.length;
+        i64 field_structure = -1;
+        i64 field_type = 0;
+        i64 field_reference = 0;
+        i64 field_slice = 0;
+        i64 field_slice_mutable = 0;
+
+        if (
+            !hir_generic_struct_field_type(
+                builder,
+                &mut scan,
+                &mut current,
+                generic,
+                argument_count,
+                argument_structures,
+                argument_types,
+                &mut field_structure,
+                &mut field_type,
+                &mut field_reference,
+                &mut field_slice,
+                &mut field_slice_mutable,
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return -1;
+        }
+
+        i64 field_function_type = builder.last_type_function_signature;
+        i64 field_array_extent = -1;
+
+        if (current.kind == TokenKind::LeftBracket) {
+            next_token(&mut scan, &mut current);
+            if (
+                !hir_generic_scanned_const_expression(
+                    builder,
+                    &mut scan,
+                    &mut current,
+                    2,
+                    generic,
+                    argument_count,
+                    argument_structures,
+                    argument_types,
+                    &mut field_array_extent,
+                ) ||
+                field_array_extent <= 0 ||
+                current.kind != TokenKind::RightBracket
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            next_token(&mut scan, &mut current);
+        }
+        if (current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return -1;
+        }
+
+        i64 field_name_offset = current.offset;
+        i64 field_name_length = current.length;
+
+        next_token(&mut scan, &mut current);
+        if (current.kind == TokenKind::LeftBracket) {
+            if (field_array_extent >= 0 || field_slice != 0 || field_reference != 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            next_token(&mut scan, &mut current);
+            if (
+                !hir_generic_scanned_const_expression(
+                    builder,
+                    &mut scan,
+                    &mut current,
+                    2,
+                    generic,
+                    argument_count,
+                    argument_structures,
+                    argument_types,
+                    &mut field_array_extent,
+                ) ||
+                field_array_extent <= 0 ||
+                current.kind != TokenKind::RightBracket
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            next_token(&mut scan, &mut current);
+        }
+        raz_compiler_rt_arena_set(staged_type_offsets, staged_count, type_offset);
+        raz_compiler_rt_arena_set(staged_type_lengths, staged_count, type_length);
+        raz_compiler_rt_arena_set(staged_type_structs, staged_count, field_structure);
+        raz_compiler_rt_arena_set(staged_types, staged_count, field_type);
+        raz_compiler_rt_arena_set(staged_references, staged_count, field_reference);
+        raz_compiler_rt_arena_set(staged_slices, staged_count, field_slice);
+        raz_compiler_rt_arena_set(staged_slice_mutable, staged_count, field_slice_mutable);
+        raz_compiler_rt_arena_set(staged_array_extents, staged_count, field_array_extent);
+        raz_compiler_rt_arena_set(staged_function_types, staged_count, field_function_type);
+        raz_compiler_rt_arena_set(staged_name_offsets, staged_count, field_name_offset);
+        raz_compiler_rt_arena_set(staged_name_lengths, staged_count, field_name_length);
+        staged_count += 1;
+        if (current.kind != TokenKind::Semicolon) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return -1;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (builder.module.struct_field_count + staged_count > 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return -1;
+    }
+    // Nested generic field resolution can instantiate other structures. Commit
+    // this concrete aggregate only after all fields have been resolved so its
+    // field metadata remains one contiguous range.
+
+    i64 committed_start = builder.module.struct_field_count;
+    i64 staged = 0;
+
+    while (staged < staged_count) {
+        i64 field = builder.module.struct_field_count;
+
+        builder.module.struct_field_count += 1;
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_type_offsets,
+            field,
+            raz_compiler_rt_arena_get(staged_type_offsets, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_type_lengths,
+            field,
+            raz_compiler_rt_arena_get(staged_type_lengths, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_type_structs,
+            field,
+            raz_compiler_rt_arena_get(staged_type_structs, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_types,
+            field,
+            raz_compiler_rt_arena_get(staged_types, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_references,
+            field,
+            raz_compiler_rt_arena_get(staged_references, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_slices,
+            field,
+            raz_compiler_rt_arena_get(staged_slices, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_slice_mutable,
+            field,
+            raz_compiler_rt_arena_get(staged_slice_mutable, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_array_extents,
+            field,
+            raz_compiler_rt_arena_get(staged_array_extents, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_function_types,
+            field,
+            raz_compiler_rt_arena_get(staged_function_types, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_name_offsets,
+            field,
+            raz_compiler_rt_arena_get(staged_name_offsets, staged)
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.struct_field_name_lengths,
+            field,
+            raz_compiler_rt_arena_get(staged_name_lengths, staged)
+        );
+        staged += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.struct_field_starts, structure, committed_start);
+    raz_compiler_rt_arena_set(builder.module.struct_field_counts, structure, staged_count);
+    raz_compiler_rt_arena_destroy(staged_type_offsets);
+    raz_compiler_rt_arena_destroy(staged_type_lengths);
+    raz_compiler_rt_arena_destroy(staged_type_structs);
+    raz_compiler_rt_arena_destroy(staged_types);
+    raz_compiler_rt_arena_destroy(staged_references);
+    raz_compiler_rt_arena_destroy(staged_slices);
+    raz_compiler_rt_arena_destroy(staged_slice_mutable);
+    raz_compiler_rt_arena_destroy(staged_array_extents);
+    raz_compiler_rt_arena_destroy(staged_function_types);
+    raz_compiler_rt_arena_destroy(staged_name_offsets);
+    raz_compiler_rt_arena_destroy(staged_name_lengths);
+    if (!hir_reserve_generic_inherent_methods(builder, structure)) {
+        return -1;
+    }
+    // Generic derive intent is retained by the template and applied after the
+    // concrete fields are substituted, so validation sees their real types.
+
+    i64 saved_derive_copy = builder.pending_derive_copy;
+    i64 saved_derive_clone = builder.pending_derive_clone;
+    i64 saved_derive_trait_count = builder.pending_derive_trait_count;
+
+    builder.pending_derive_copy = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_derive_copy_flags,
+        generic,
+    );
+    builder.pending_derive_clone = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_derive_clone_flags,
+        generic,
+    );
+    builder.pending_derive_trait_count = 0;
+
+    bool derive_ok = hir_apply_pending_struct_derives(builder, structure);
+
+    builder.pending_derive_copy = saved_derive_copy;
+    builder.pending_derive_clone = saved_derive_clone;
+    builder.pending_derive_trait_count = saved_derive_trait_count;
+    if (!derive_ok) {
+        return -1;
+    }
+    return structure;
+}
+
+fn hir_generic_enum_arguments_match(
+    HirBuilder&mut builder,
+    i64 enumeration,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> bool {
+    if (
+        raz_compiler_rt_arena_get(builder.module.enum_generic_argument_counts, enumeration) != argument_count
+    ) {
+        return false;
+    }
+
+    i64 start = raz_compiler_rt_arena_get(builder.module.enum_generic_argument_starts, enumeration);
+    i64 index = 0;
+
+    while (index < argument_count) {
+        if (
+            raz_compiler_rt_arena_get(
+                builder.module.enum_generic_argument_type_structs,
+                start + index,
+            ) != raz_compiler_rt_arena_get(argument_structures, index) ||
+            raz_compiler_rt_arena_get(
+                builder.module.enum_generic_argument_types,
+                start + index,
+            ) != raz_compiler_rt_arena_get(argument_types, index)
+        ) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hir_instantiate_generic_enum(
+    HirBuilder&mut builder,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    i64 request = hir_query_intern_monomorphization(
+        builder,
+        3,
+        generic,
+        argument_count,
+        argument_structures,
+        argument_types,
+    );
+    if (request < 0) {
+        return -1;
+    }
+
+    i64 cached_result = -1;
+    i64 unused = 0;
+    i64 epoch0 = builder.module.generic_enum_count;
+    i64 epoch1 = builder.module.trait_impl_count + builder.module.generic_trait_impl_count * 4099;
+
+    if (
+        hir_query_lookup(
+            builder,
+            hir_query_kind_monomorphization(),
+            request,
+            0,
+            0,
+            epoch0,
+            epoch1,
+            &mut cached_result,
+            &mut unused,
+        ) &&
+        cached_result >= 0 &&
+        cached_result < builder.module.enum_count &&
+        raz_compiler_rt_arena_get(builder.module.enum_generic_template_indices, cached_result) == generic &&
+        hir_generic_enum_arguments_match(
+            builder,
+            cached_result,
+            argument_count,
+            argument_structures,
+            argument_types,
+        )
+    ) {
+        builder.generic_cache_hits += 1;
+        return cached_result;
+    }
+    builder.generic_cache_misses += 1;
+    if (!hir_query_begin(builder, hir_query_kind_monomorphization(), request, 0, 0)) {
+        return -1;
+    }
+    i64 result = hir_instantiate_generic_enum_uncached(
+        builder,
+        generic,
+        argument_count,
+        argument_structures,
+        argument_types,
+    );
+    hir_query_end(
+        builder,
+        hir_query_kind_monomorphization(),
+        request,
+        0,
+        0,
+        epoch0,
+        epoch1,
+        result,
+        argument_count,
+        result >= 0,
+    );
+    return result;
+}
+
+fn hir_instantiate_generic_enum_uncached(
+    HirBuilder&mut builder,
+    i64 generic,
+    i64 argument_count,
+    i64 argument_structures,
+    i64 argument_types,
+) -> i64 {
+    if (
+        !hir_validate_generic_arguments(
+            builder,
+            3,
+            generic,
+            argument_count,
+            argument_structures,
+            argument_types,
+        )
+    ) {
+        return -1;
+    }
+
+    i64 enumeration = 0;
+
+    while (enumeration < builder.module.enum_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.enum_generic_template_indices, enumeration) == generic &&
+            hir_generic_enum_arguments_match(
+                builder,
+                enumeration,
+                argument_count,
+                argument_structures,
+                argument_types,
+            )
+        ) {
+            return enumeration;
+        }
+        enumeration += 1;
+    }
+    if (builder.module.enum_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return -1;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = raz_compiler_rt_arena_get(builder.module.generic_enum_source_offsets, generic);
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier || !token_is_enum(&builder.scan.input, &current)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return -1;
+    }
+
+    i64 name_offset = current.offset;
+    i64 name_length = current.length;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Less) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+
+    i64 generic_depth = 1;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::End && generic_depth > 0) {
+        if (current.kind == TokenKind::Less) {
+            generic_depth += 1;
+        } else if (current.kind == TokenKind::Greater) {
+            generic_depth -= 1;
+            if (generic_depth == 0) {
+                next_token(&mut scan, &mut current);
+                break;
+            }
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (generic_depth != 0 || current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    next_token(&mut scan, &mut current);
+    enumeration = builder.module.enum_count;
+    builder.module.enum_count += 1;
+    raz_compiler_rt_arena_set(builder.module.enum_name_offsets, enumeration, name_offset);
+    raz_compiler_rt_arena_set(builder.module.enum_name_lengths, enumeration, name_length);
+    raz_compiler_rt_arena_set(
+        builder.module.enum_member_starts,
+        enumeration,
+        builder.module.enum_member_count
+    );
+    raz_compiler_rt_arena_set(builder.module.enum_member_counts, enumeration, 0);
+    raz_compiler_rt_arena_set(builder.module.enum_has_payload, enumeration, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.enum_copy_flags,
+        enumeration,
+        raz_compiler_rt_arena_get(builder.module.generic_enum_derive_copy_flags, generic),
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.enum_derived_clone_flags,
+        enumeration,
+        raz_compiler_rt_arena_get(builder.module.generic_enum_derive_clone_flags, generic),
+    );
+    raz_compiler_rt_arena_set(builder.module.enum_generic_template_indices, enumeration, generic);
+    raz_compiler_rt_arena_set(
+        builder.module.enum_generic_argument_starts,
+        enumeration,
+        builder.module.enum_generic_argument_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.enum_generic_argument_counts, enumeration, argument_count);
+
+    i64 stored_argument = 0;
+
+    while (stored_argument < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.enum_generic_argument_type_structs,
+            builder.module.enum_generic_argument_count,
+            raz_compiler_rt_arena_get(argument_structures, stored_argument),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.enum_generic_argument_types,
+            builder.module.enum_generic_argument_count,
+            raz_compiler_rt_arena_get(argument_types, stored_argument),
+        );
+        builder.module.enum_generic_argument_count += 1;
+        stored_argument += 1;
+    }
+
+    i64 next_value = 0;
+
+    while (current.kind != TokenKind::RightBrace && current.kind != TokenKind::End) {
+        if (current.kind != TokenKind::Identifier || builder.module.enum_member_count >= 4096) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return -1;
+        }
+
+        i64 member = builder.module.enum_member_count;
+
+        builder.module.enum_member_count += 1;
+        raz_compiler_rt_arena_set(builder.module.enum_member_name_offsets, member, current.offset);
+        raz_compiler_rt_arena_set(builder.module.enum_member_name_lengths, member, current.length);
+        raz_compiler_rt_arena_set(
+            builder.module.enum_member_payload_starts,
+            member,
+            builder.module.enum_payload_count,
+        );
+        raz_compiler_rt_arena_set(builder.module.enum_member_payload_counts, member, 0);
+        raz_compiler_rt_arena_set(
+            builder.module.enum_member_counts,
+            enumeration,
+            raz_compiler_rt_arena_get(builder.module.enum_member_counts, enumeration) + 1,
+        );
+        next_token(&mut scan, &mut current);
+        if (current.kind == TokenKind::LeftParen) {
+            raz_compiler_rt_arena_set(builder.module.enum_has_payload, enumeration, 1);
+            next_token(&mut scan, &mut current);
+            if (current.kind != TokenKind::RightParen) {
+                bool parsing_payloads = true;
+
+                while (parsing_payloads) {
+                    if (builder.module.enum_payload_count >= 8192) {
+                        hir_fail(builder, DiagnosticCode::TooManyItems);
+                        return -1;
+                    }
+
+                    i64 payload_structure = -1;
+                    i64 payload_type = 0;
+                    i64 payload_reference = 0;
+                    i64 payload_slice = 0;
+                    i64 payload_slice_mutable = 0;
+                    i64 payload_decl_enum = -1;
+                    if (current.kind == TokenKind::Identifier) {
+                        payload_decl_enum = hir_find_enum(builder, current.offset, current.length);
+                    }
+
+                    if (
+                        !hir_generic_scanned_type(
+                            builder,
+                            &mut scan,
+                            &mut current,
+                            3,
+                            generic,
+                            argument_count,
+                            argument_structures,
+                            argument_types,
+                            &mut payload_structure,
+                            &mut payload_type,
+                            &mut payload_reference,
+                            &mut payload_slice,
+                            &mut payload_slice_mutable,
+                        )
+                    ) {
+                        hir_fail(builder, DiagnosticCode::UnknownType);
+                        return -1;
+                    }
+
+                    i64 payload_array_extent = -1;
+
+                    if (current.kind == TokenKind::LeftBracket) {
+                        if (payload_reference != 0 || payload_slice != 0) {
+                            hir_fail(builder, DiagnosticCode::ExpectedToken);
+                            return -1;
+                        }
+                        next_token(&mut scan, &mut current);
+                        if (
+                            !hir_generic_scanned_const_expression(
+                                builder,
+                                &mut scan,
+                                &mut current,
+                                3,
+                                generic,
+                                argument_count,
+                                argument_structures,
+                                argument_types,
+                                &mut payload_array_extent,
+                            ) ||
+                            payload_array_extent <= 0 ||
+                            current.kind != TokenKind::RightBracket
+                        ) {
+                            hir_fail(builder, DiagnosticCode::ExpectedToken);
+                            return -1;
+                        }
+                        next_token(&mut scan, &mut current);
+                    }
+                    if (payload_reference != 0 || payload_slice != 0) {
+                        hir_fail(builder, DiagnosticCode::ExpectedToken);
+                        return -1;
+                    }
+
+                    i64 payload = builder.module.enum_payload_count;
+
+                    builder.module.enum_payload_count += 1;
+                    raz_compiler_rt_arena_set(
+                        builder.module.enum_payload_type_structs,
+                        payload,
+                        payload_structure,
+                    );
+                    raz_compiler_rt_arena_set(builder.module.enum_payload_types, payload, payload_type);
+                    i64 payload_enum = payload_decl_enum;
+                    if (hir_type_is_enum(payload_type)) {
+                        payload_enum = hir_type_enum_index(payload_type);
+                    }
+                    raz_compiler_rt_arena_set(builder.module.enum_payload_enum_indices, payload, payload_enum);
+                    raz_compiler_rt_arena_set(
+                        builder.module.enum_payload_array_extents,
+                        payload,
+                        payload_array_extent,
+                    );
+                    raz_compiler_rt_arena_set(
+                        builder.module.enum_member_payload_counts,
+                        member,
+                        raz_compiler_rt_arena_get(builder.module.enum_member_payload_counts, member) + 1,
+                    );
+                    if (current.kind == TokenKind::Comma) {
+                        next_token(&mut scan, &mut current);
+                    } else {
+                        parsing_payloads = false;
+                    }
+                }
+            }
+            if (current.kind != TokenKind::RightParen) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            next_token(&mut scan, &mut current);
+        }
+
+        i64 member_value = next_value;
+
+        if (current.kind == TokenKind::Equal) {
+            if (raz_compiler_rt_arena_get(builder.module.enum_member_payload_counts, member) != 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            next_token(&mut scan, &mut current);
+
+            bool negative = false;
+
+            if (current.kind == TokenKind::Minus) {
+                negative = true;
+                next_token(&mut scan, &mut current);
+            }
+            if (current.kind != TokenKind::Integer) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return -1;
+            }
+            member_value = parse_integer_value(&builder.scan.input, &current);
+            if (negative) {
+                member_value = 0 - member_value;
+            }
+            next_token(&mut scan, &mut current);
+        }
+        raz_compiler_rt_arena_set(builder.module.enum_member_values, member, member_value);
+        next_value = member_value + 1;
+        if (current.kind == TokenKind::Comma) {
+            next_token(&mut scan, &mut current);
+        }
+    }
+    if (current.kind != TokenKind::RightBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return -1;
+    }
+    if (!hir_reserve_generic_inherent_methods(builder, -2 - enumeration)) {
+        return -1;
+    }
+    return enumeration;
+}

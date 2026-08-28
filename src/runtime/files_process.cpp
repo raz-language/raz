@@ -335,6 +335,21 @@ std::int64_t raz_rt_file_flush(void* handle) {
   return 1;
 }
 
+std::int64_t raz_rt_file_sync(void* handle) {
+  if (handle == nullptr) { raz_set_last_error(EINVAL); return 0; }
+  auto* file = static_cast<std::FILE*>(handle);
+  if (std::fflush(file) != 0) { raz_set_errno_error(); return 0; }
+#if defined(_WIN32)
+  const int descriptor = _fileno(file);
+  if (descriptor < 0 || _commit(descriptor) != 0) { raz_set_errno_error(); return 0; }
+#else
+  const int descriptor = ::fileno(file);
+  if (descriptor < 0 || ::fsync(descriptor) != 0) { raz_set_errno_error(); return 0; }
+#endif
+  raz_clear_last_error();
+  return 1;
+}
+
 std::int64_t raz_rt_file_eof(void* handle) {
   return handle != nullptr && std::feof(static_cast<std::FILE*>(handle)) != 0 ? 1 : 0;
 }

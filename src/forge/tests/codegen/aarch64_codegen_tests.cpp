@@ -11,7 +11,7 @@
 
 #include "forge/codegen/aarch64/encoder.hpp"
 #include "forge/codegen/aarch64/register_allocation.hpp"
-#include "forge/target/aarch64_immediate.hpp"
+#include "forge/platform/aarch64_immediate.hpp"
 #include "forge/ir/parser.hpp"
 #include "forge/ir/verifier.hpp"
 #include "forge/machine/lower.hpp"

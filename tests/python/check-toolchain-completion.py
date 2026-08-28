@@ -5,11 +5,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-cli = (ROOT / 'compiler/src/driver/cli.rz').read_text(encoding='utf-8')
-commands = (ROOT / 'compiler/src/driver/commands.rz').read_text(encoding='utf-8')
-main = (ROOT / 'compiler/src/main.rz').read_text(encoding='utf-8')
-interp = (ROOT / 'compiler/src/mir/interpreter.rz').read_text(encoding='utf-8')
-registry = (ROOT / 'compiler/src/driver/registry.rz').read_text(encoding='utf-8')
+cli = (ROOT / 'compiler/src/raz_driver/src/cli.rz').read_text(encoding='utf-8')
+commands = (ROOT / 'compiler/src/raz_driver/src/commands.rz').read_text(encoding='utf-8')
+main = (ROOT / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+interp = (ROOT / 'compiler/src/raz_mir/src/mir/interpreter.rz').read_text(encoding='utf-8')
+registry = (ROOT / 'compiler/src/raz_driver/src/registry.rz').read_text(encoding='utf-8')
 host_main = (ROOT / 'src/bootstrap/tools/raz/main.cpp').read_text(encoding='utf-8')
 bootstrap = (ROOT / 'tools/bootstrap.py').read_text(encoding='utf-8')
 presets = (ROOT / 'CMakePresets.json').read_text(encoding='utf-8')

@@ -4,7 +4,7 @@
 #include "forge/codegen/aarch64/encoder.hpp"
 #include "forge/codegen/aarch64/register_allocation.hpp"
 
-#include "forge/target/aarch64_immediate.hpp"
+#include "forge/platform/aarch64_immediate.hpp"
 
 #include "forge/machine/verifier.hpp"
 

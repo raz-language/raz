@@ -1,6 +1,6 @@
 # Optimizer and analysis
 
-Forge 1.3 provides reusable analyses and deterministic scalar optimization passes for frontend authors and compiler integrations.
+Forge provides reusable analyses and deterministic scalar optimization passes for frontend authors and compiler integrations.
 
 ## Core analyses
 

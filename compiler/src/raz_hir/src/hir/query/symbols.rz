@@ -1,0 +1,72 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::query::symbols;
+
+public import raz_hir::query::engine;
+
+// Intern exact semantic names. Hashes accelerate the scan, but exact bytes
+// define identity, so source offsets and fingerprint collisions are irrelevant
+// to query correctness.
+fn hir_query_intern_symbol(HirBuilder&mut builder, i64 offset, i64 length) -> i64 {
+    i64 hash = raz_compiler_rt_arena_range_hash(builder.scan.input.bytes, offset, length, 17);
+    i64 bucket = hash % 16384;
+
+    if (bucket < 0) {
+        bucket = 0 - bucket;
+    }
+
+    i64 link = raz_compiler_rt_arena_get(builder.queries.query_symbol_buckets, bucket);
+
+    while (link > 0) {
+        i64 symbol = link - 1;
+
+        if (
+            raz_compiler_rt_arena_get(builder.queries.query_symbol_hashes, symbol) == hash &&
+            raz_compiler_rt_arena_get(builder.queries.query_symbol_lengths, symbol) == length &&
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.queries.query_symbol_offsets, symbol),
+                length,
+                offset,
+                length,
+            )
+        ) {
+            return symbol;
+        }
+        link = raz_compiler_rt_arena_get(builder.queries.query_symbol_next, symbol);
+    }
+    if (builder.queries.query_symbol_count >= 8192) {
+        return -1;
+    }
+
+    i64 symbol = builder.queries.query_symbol_count;
+
+    builder.queries.query_symbol_count += 1;
+    raz_compiler_rt_arena_set(builder.queries.query_symbol_hashes, symbol, hash);
+    raz_compiler_rt_arena_set(builder.queries.query_symbol_offsets, symbol, offset);
+    raz_compiler_rt_arena_set(builder.queries.query_symbol_lengths, symbol, length);
+    raz_compiler_rt_arena_set(
+        builder.queries.query_symbol_next,
+        symbol,
+        raz_compiler_rt_arena_get(builder.queries.query_symbol_buckets, bucket),
+    );
+    raz_compiler_rt_arena_set(builder.queries.query_symbol_buckets, bucket, symbol + 1);
+    return symbol;
+}
+
+fn hir_query_symbol_same(HirBuilder&mut builder, i64 symbol, i64 offset, i64 length) -> bool {
+    if (symbol < 0 || symbol >= builder.queries.query_symbol_count) {
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.queries.query_symbol_lengths, symbol) != length) {
+        return false;
+    }
+    return token_same(
+        &builder.scan.input,
+        raz_compiler_rt_arena_get(builder.queries.query_symbol_offsets, symbol),
+        length,
+        offset,
+        length,
+    );
+}

@@ -1,0 +1,3280 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::traits::solver;
+
+public import raz_hir::semantic::declarations;
+import raz_hir::semantic::comptime;
+
+// Trait declarations, implementations, and trait-contract validation.
+fn hir_parse_impl_method_function(HirBuilder&mut builder) -> bool {
+    i64 saved = builder.allow_function_name_reuse;
+
+    builder.allow_function_name_reuse = 1;
+
+    bool parsed = hir_parse_function(builder);
+
+    builder.allow_function_name_reuse = saved;
+    return parsed;
+}
+
+fn hir_parse_inherent_method_function(HirBuilder&mut builder, i64 inherent_target) -> bool {
+    i64 saved_target = builder.pending_inherent_target;
+
+    builder.pending_inherent_target = inherent_target;
+    bool parsed = hir_parse_impl_method_function(builder);
+    builder.pending_inherent_target = saved_target;
+    return parsed;
+}
+
+fn hir_trait_associated_type_required_count(HirBuilder&mut builder, i64 trait_index) -> i64 {
+    if (trait_index < 0 || trait_index >= builder.module.trait_count) {
+        return 0;
+    }
+
+    i64 first = raz_compiler_rt_arena_get(builder.module.trait_associated_type_starts, trait_index);
+
+    if (trait_index + 1 < builder.module.trait_count) {
+        return raz_compiler_rt_arena_get(
+            builder.module.trait_associated_type_starts,
+            trait_index + 1
+        ) - first;
+    }
+    return builder.module.trait_associated_type_count - first;
+}
+
+fn hir_trait_associated_const_required_count(HirBuilder&mut builder, i64 trait_index) -> i64 {
+    if (trait_index < 0 || trait_index >= builder.module.trait_count) {
+        return 0;
+    }
+
+    i64 first = raz_compiler_rt_arena_get(builder.module.trait_associated_const_starts, trait_index);
+
+    if (trait_index + 1 < builder.module.trait_count) {
+        return raz_compiler_rt_arena_get(
+            builder.module.trait_associated_const_starts,
+            trait_index + 1
+        ) - first;
+    }
+    return builder.module.trait_associated_const_count - first;
+}
+
+fn hir_find_trait_associated_type(HirBuilder&mut builder, i64 trait_index, i64 offset, i64 length) -> i64 {
+    i64 first = raz_compiler_rt_arena_get(builder.module.trait_associated_type_starts, trait_index);
+    i64 count = hir_trait_associated_type_required_count(builder, trait_index);
+    i64 item = 0;
+
+    while (item < count) {
+        i64 index = first + item;
+
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_offsets, index),
+                raz_compiler_rt_arena_get(builder.module.trait_associated_type_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            return item;
+        }
+        item += 1;
+    }
+    return -1;
+}
+
+fn hir_find_trait_associated_const(HirBuilder&mut builder, i64 trait_index, i64 offset, i64 length) -> i64 {
+    i64 first = raz_compiler_rt_arena_get(builder.module.trait_associated_const_starts, trait_index);
+    i64 count = hir_trait_associated_const_required_count(builder, trait_index);
+    i64 item = 0;
+
+    while (item < count) {
+        i64 index = first + item;
+
+        if (
+            token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_offsets, index),
+                raz_compiler_rt_arena_get(builder.module.trait_associated_const_name_lengths, index),
+                offset,
+                length,
+            )
+        ) {
+            return item;
+        }
+        item += 1;
+    }
+    return -1;
+}
+
+fn hir_validate_trait_impl_associated_items(
+    HirBuilder&mut builder,
+    i64 trait_index,
+    i64 body_source_offset,
+) -> bool {
+    i64 required_type_count = raz_compiler_rt_arena_get(
+        builder.module.trait_associated_type_counts,
+        trait_index,
+    );
+    i64 required_const_count = raz_compiler_rt_arena_get(
+        builder.module.trait_associated_const_counts,
+        trait_index,
+    );
+    if (required_type_count == 0 && required_const_count == 0) {
+        return true;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = body_source_offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 type_mask = 0;
+    i64 const_mask = 0;
+    i64 type_count = 0;
+    i64 const_count = 0;
+    i64 depth = 1;
+
+    next_token(&mut scan, &mut current);
+    while (depth > 0 && current.kind != TokenKind::End) {
+        if (current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &current)
+        ) {
+            next_token(&mut scan, &mut current);
+            if (current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_type(
+                builder,
+                trait_index,
+                current.offset,
+                current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((type_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            type_mask = type_mask | (1 << associated);
+            type_count += 1;
+        } else if (
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &current)
+        ) {
+            next_token(&mut scan, &mut current);
+            if (current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_const(
+                builder,
+                trait_index,
+                current.offset,
+                current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((const_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            const_mask = const_mask | (1 << associated);
+            const_count += 1;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (depth != 0 || type_count != required_type_count || const_count != required_const_count) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    return true;
+}
+
+fn hir_validate_trait_impl_return_contracts(
+    HirBuilder&mut builder,
+    i64 trait_index,
+    i64 body_source_offset,
+) -> bool {
+    i64 associated_name_offsets[16];
+    i64 associated_name_lengths[16];
+    i64 associated_value_offsets[16];
+    i64 associated_value_lengths[16];
+    i64 associated_count = 0;
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = body_source_offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 depth = 1;
+
+    next_token(&mut scan, &mut current);
+    while (depth > 0 && current.kind != TokenKind::End) {
+        if (current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &current)
+        ) {
+            Token associated_name;
+
+            next_token(&mut scan, &mut associated_name);
+
+            Token equal;
+
+            next_token(&mut scan, &mut equal);
+
+            Token associated_value;
+
+            next_token(&mut scan, &mut associated_value);
+            if (
+                associated_count < 16 &&
+                associated_name.kind == TokenKind::Identifier &&
+                equal.kind == TokenKind::Equal &&
+                associated_value.kind == TokenKind::Identifier
+            ) {
+                associated_name_offsets[associated_count] = associated_name.offset;
+                associated_name_lengths[associated_count] = associated_name.length;
+                associated_value_offsets[associated_count] = associated_value.offset;
+                associated_value_lengths[associated_count] = associated_value.length;
+                associated_count += 1;
+            }
+            current = associated_value;
+        } else if (
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_fn(&builder.scan.input, &current)
+        ) {
+            Token method_name;
+
+            next_token(&mut scan, &mut method_name);
+            if (method_name.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+
+            i64 method_start = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+            i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+            i64 matched_method = -1;
+            i64 method_slot = 0;
+
+            while (method_slot < method_count) {
+                i64 method = method_start + method_slot;
+
+                if (
+                    token_same(
+                        &builder.scan.input,
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, method),
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, method),
+                        method_name.offset,
+                        method_name.length,
+                    )
+                ) {
+                    matched_method = method;
+                    method_slot = method_count;
+                } else {
+                    method_slot += 1;
+                }
+            }
+            if (matched_method >= 0) {
+                Token actual;
+
+                next_token(&mut scan, &mut actual);
+
+                i64 paren_depth = 0;
+
+                while (actual.kind != TokenKind::End) {
+                    if (actual.kind == TokenKind::LeftParen) {
+                        paren_depth += 1;
+                    } else if (actual.kind == TokenKind::RightParen) {
+                        paren_depth -= 1;
+                        if (paren_depth == 0) {
+                            next_token(&mut scan, &mut actual);
+                            break;
+                        }
+                    }
+                    next_token(&mut scan, &mut actual);
+                }
+
+                i64 actual_return_offset = -1;
+                i64 actual_return_length = 0;
+
+                if (actual.kind == TokenKind::Arrow) {
+                    next_token(&mut scan, &mut actual);
+                    if (actual.kind == TokenKind::Identifier) {
+                        actual_return_offset = actual.offset;
+                        actual_return_length = actual.length;
+                    }
+                }
+
+                Lexer contract_scan;
+
+                contract_scan.input = builder.scan.input;
+                contract_scan.offset = raz_compiler_rt_arena_get(
+                    builder.module.trait_method_source_offsets,
+                    matched_method,
+                );
+                clear_diagnostic(&mut contract_scan.last_error);
+
+                Token expected;
+
+                next_token(&mut contract_scan, &mut expected);
+                next_token(&mut contract_scan, &mut expected);
+                next_token(&mut contract_scan, &mut expected);
+
+                i64 contract_paren_depth = 0;
+
+                while (expected.kind != TokenKind::End) {
+                    if (expected.kind == TokenKind::LeftParen) {
+                        contract_paren_depth += 1;
+                    } else if (expected.kind == TokenKind::RightParen) {
+                        contract_paren_depth -= 1;
+                        if (contract_paren_depth == 0) {
+                            next_token(&mut contract_scan, &mut expected);
+                            break;
+                        }
+                    }
+                    next_token(&mut contract_scan, &mut expected);
+                }
+
+                i64 expected_return_offset = -1;
+                i64 expected_return_length = 0;
+
+                if (expected.kind == TokenKind::Arrow) {
+                    next_token(&mut contract_scan, &mut expected);
+                    if (expected.kind == TokenKind::Identifier) {
+                        expected_return_offset = expected.offset;
+                        expected_return_length = expected.length;
+                    }
+                }
+                if (expected_return_offset >= 0 && token_is_self_type(&builder.scan.input, &expected)) {
+                    // Self is substituted by the implementation target; full
+                    // target-pattern validation happens during materialization.
+                    expected_return_offset = -2;
+                }
+                if (expected_return_offset >= 0) {
+                    i64 associated = 0;
+
+                    while (associated < associated_count) {
+                        if (
+                            token_same(
+                                &builder.scan.input,
+                                associated_name_offsets[associated],
+                                associated_name_lengths[associated],
+                                expected_return_offset,
+                                expected_return_length,
+                            )
+                        ) {
+                            expected_return_offset = associated_value_offsets[associated];
+                            expected_return_length = associated_value_lengths[associated];
+                            associated = associated_count;
+                        } else {
+                            associated += 1;
+                        }
+                    }
+                }
+                if (expected_return_offset != -2) {
+                    bool expected_void = expected_return_offset < 0;
+                    bool actual_void = actual_return_offset < 0;
+
+                    if (
+                        expected_void != actual_void ||
+                        (
+                            !expected_void &&
+                            !token_same(
+                                &builder.scan.input,
+                                expected_return_offset,
+                                expected_return_length,
+                                actual_return_offset,
+                                actual_return_length,
+                            )
+                        )
+                    ) {
+                        hir_fail(builder, DiagnosticCode::ExpectedToken);
+                        return false;
+                    }
+                }
+                current = actual;
+                continue;
+            }
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    return true;
+}
+
+// Validate the method surface of a trait implementation directly from its
+// source body. Generic implementation templates are intentionally deferred,
+// so this name/default check must happen before monomorphization as well as for
+// concrete implementations.
+fn hir_validate_trait_impl_methods(HirBuilder&mut builder, i64 trait_index, i64 body_source_offset) -> bool {
+    i64 method_start = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+    i64 method_count = raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+
+    if (method_count > 63) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    if (!hir_validate_trait_impl_return_contracts(builder, trait_index, body_source_offset)) {
+        return false;
+    }
+
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = body_source_offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 depth = 1;
+    i64 provided_mask = 0;
+
+    next_token(&mut scan, &mut current);
+    while (depth > 0 && current.kind != TokenKind::End) {
+        if (current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            next_token(&mut scan, &mut current);
+            continue;
+        }
+        if (
+            depth == 1 &&
+            current.kind == TokenKind::Identifier &&
+            token_is_fn(&builder.scan.input, &current)
+        ) {
+            next_token(&mut scan, &mut current);
+            if (current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+
+            i64 matched = -1;
+            i64 slot = 0;
+
+            while (slot < method_count) {
+                i64 method = method_start + slot;
+
+                if (
+                    token_same(
+                        &builder.scan.input,
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, method),
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, method),
+                        current.offset,
+                        current.length,
+                    )
+                ) {
+                    matched = slot;
+                    slot = method_count;
+                } else {
+                    slot += 1;
+                }
+            }
+            if (matched < 0 || (provided_mask&(1 << matched)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            provided_mask = provided_mask | (1 << matched);
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 required = 0;
+
+    while (required < method_count) {
+        i64 method = method_start + required;
+
+        if (
+            raz_compiler_rt_arena_get(builder.module.trait_method_default_flags, method) == 0 &&
+            (provided_mask&(1 << required)) == 0
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        required += 1;
+    }
+    return true;
+}
+
+fn hir_parse_generic_trait_impl_template(HirBuilder&mut builder) -> bool {
+    i64 source_offset = builder.current.offset;
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+    if (
+        builder.module.generic_inherent_impl_count >= 4096 ||
+        builder.module.generic_trait_impl_count >= 4096
+    ) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    // Generic trait impls may bind more than one parameter and may mix type and
+    // const parameters. Keep the compact impl metadata keyed by the first type
+    // parameter for compatibility, but validate that every declared parameter
+    // is constrained by the target pattern. This supports patterns such as
+    // Pair<T, i64>, Wrapper<Pair<T, i64>>, and Buffer<T, N> without accepting
+    // unconstrained impl parameters.
+
+    i64 parameter_offsets[8];
+    i64 parameter_lengths[8];
+    i64 parameter_kinds[8];
+    i64 parameter_uses[8];
+    i64 parameter_count = 0;
+    i64 type_name_offset = 0;
+    i64 type_name_length = 0;
+    i64 generic_trait = builder.module.generic_trait_impl_count;
+    i64 bound_count = 0;
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+        if (parameter_count >= 8) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+
+        i64 parameter_kind = 0;
+        i64 name_offset = 0;
+        i64 name_length = 0;
+
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            parameter_kind = 2;
+            hir_advance(builder);
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                !primitive_type_is_integer(
+                    primitive_type_kind(&builder.scan.input, builder.current.offset, builder.current.length),
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            hir_advance(builder);
+        } else {
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            if (type_name_length == 0) {
+                type_name_offset = name_offset;
+                type_name_length = name_length;
+            }
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Colon) {
+                hir_advance(builder);
+
+                bool parsing_bounds = true;
+
+                while (parsing_bounds) {
+                    if (bound_count >= 8 || builder.current.kind != TokenKind::Identifier) {
+                        hir_fail(builder, DiagnosticCode::TooManyItems);
+                        return false;
+                    }
+
+                    i64 bound = hir_bound_trait_id(builder, &mut builder.current);
+
+                    if (bound == -1) {
+                        hir_fail(builder, DiagnosticCode::UnknownName);
+                        return false;
+                    }
+                    // The existing compact impl record stores bounds for the
+                    // primary type parameter. Additional parameters are still
+                    // parsed and constrained by the target pattern.
+                    if (parameter_count == 0) {
+                        raz_compiler_rt_arena_set(
+                            builder.module.generic_trait_bounds,
+                            generic_trait * 8 + bound_count,
+                            bound,
+                        );
+                        bound_count += 1;
+                    }
+                    hir_advance(builder);
+                    if (builder.current.kind == TokenKind::Plus) {
+                        hir_advance(builder);
+                    } else {
+                        parsing_bounds = false;
+                    }
+                }
+            }
+        }
+        parameter_offsets[parameter_count] = name_offset;
+        parameter_lengths[parameter_count] = name_length;
+        parameter_kinds[parameter_count] = parameter_kind;
+        parameter_uses[parameter_count] = 0;
+        parameter_count += 1;
+        if (builder.current.kind == TokenKind::Comma) {
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Greater) {
+                parsing_parameters = false;
+            }
+        } else {
+            parsing_parameters = false;
+        }
+    }
+    if (parameter_count == 0 || type_name_length == 0 || !hir_expect(builder, TokenKind::Greater)) {
+        return false;
+    }
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::UnknownName);
+        return false;
+    }
+
+    i64 trait_index = hir_find_trait(builder, builder.current.offset, builder.current.length);
+
+    if (trait_index < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownName);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 generic_structure = hir_find_generic_struct(builder, builder.current.offset, builder.current.length);
+
+    if (generic_structure < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+
+    i64 existing = 0;
+
+    while (existing < builder.module.generic_trait_impl_count) {
+        if (
+            raz_compiler_rt_arena_get(builder.module.generic_trait_traits, existing) == trait_index &&
+            raz_compiler_rt_arena_get(
+                builder.module.generic_trait_struct_templates,
+                existing,
+            ) == generic_structure
+        ) {
+            hir_fail(builder, DiagnosticCode::DuplicateName);
+            return false;
+        }
+        existing += 1;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+
+    i64 pattern_depth = 1;
+
+    while (builder.current.kind != TokenKind::End && pattern_depth > 0) {
+        if (builder.current.kind == TokenKind::Less) {
+            pattern_depth += 1;
+        } else if (builder.current.kind == TokenKind::Greater) {
+            pattern_depth -= 1;
+            if (pattern_depth == 0) {
+                hir_advance(builder);
+                break;
+            }
+        }
+        if (pattern_depth > 0 && builder.current.kind == TokenKind::Identifier) {
+            i64 parameter_index = 0;
+
+            while (parameter_index < parameter_count) {
+                if (
+                    token_same(
+                        &builder.scan.input,
+                        parameter_offsets[parameter_index],
+                        parameter_lengths[parameter_index],
+                        builder.current.offset,
+                        builder.current.length,
+                    )
+                ) {
+                    parameter_uses[parameter_index] += 1;
+                }
+                parameter_index += 1;
+            }
+        }
+        if (pattern_depth > 0) {
+            hir_advance(builder);
+        }
+    }
+    if (pattern_depth != 0 || builder.current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 parameter_index = 0;
+
+    while (parameter_index < parameter_count) {
+        // Repeated generic parameters encode equality constraints that the
+        // compact matcher cannot represent yet; reject them rather than
+        // silently widening the implementation. Unused parameters are likewise
+        // invalid because they are unconstrained by the target type.
+        if (parameter_uses[parameter_index] != 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        parameter_index += 1;
+    }
+    if (!hir_validate_trait_impl_associated_items(builder, trait_index, builder.current.offset)) {
+        return false;
+    }
+    if (!hir_validate_trait_impl_methods(builder, trait_index, builder.current.offset)) {
+        return false;
+    }
+
+    i64 generic_impl = builder.module.generic_inherent_impl_count;
+
+    builder.module.generic_inherent_impl_count += 1;
+    builder.module.generic_trait_impl_count += 1;
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_source_offsets, generic_impl, source_offset);
+    raz_compiler_rt_arena_set(
+        builder.module.generic_inherent_struct_templates,
+        generic_impl,
+        generic_structure,
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_inherent_type_name_offsets,
+        generic_impl,
+        type_name_offset,
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_inherent_type_name_lengths,
+        generic_impl,
+        type_name_length,
+    );
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_parameter_counts, generic_impl, parameter_count);
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_bound_counts, generic_impl, 0);
+
+    i64 stored_parameter = 0;
+
+    while (stored_parameter < parameter_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_name_offsets,
+            generic_impl * 8 + stored_parameter,
+            parameter_offsets[stored_parameter],
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_name_lengths,
+            generic_impl * 8 + stored_parameter,
+            parameter_lengths[stored_parameter],
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_kinds,
+            generic_impl * 8 + stored_parameter,
+            parameter_kinds[stored_parameter],
+        );
+        stored_parameter += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.generic_trait_source_offsets, generic_trait, source_offset);
+    raz_compiler_rt_arena_set(builder.module.generic_trait_traits, generic_trait, trait_index);
+    raz_compiler_rt_arena_set(
+        builder.module.generic_trait_struct_templates,
+        generic_trait,
+        generic_structure
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_trait_type_name_offsets,
+        generic_trait,
+        type_name_offset
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_trait_type_name_lengths,
+        generic_trait,
+        type_name_length
+    );
+    raz_compiler_rt_arena_set(builder.module.generic_trait_bound_counts, generic_trait, bound_count);
+
+    i64 associated_type_mask = 0;
+    i64 associated_const_mask = 0;
+    i64 associated_type_provided_count = 0;
+    i64 associated_const_provided_count = 0;
+    i64 depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+            hir_advance(builder);
+            continue;
+        }
+        if (builder.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            hir_advance(builder);
+            if (depth == 0) {
+                return true;
+            }
+            continue;
+        }
+        if (
+            depth == 1 &&
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_type(
+                builder,
+                trait_index,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((associated_type_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            associated_type_mask = associated_type_mask | (1 << associated);
+            associated_type_provided_count += 1;
+        } else if (
+            depth == 1 &&
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_const(
+                builder,
+                trait_index,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((associated_const_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            associated_const_mask = associated_const_mask | (1 << associated);
+            associated_const_provided_count += 1;
+            // Validate the associated-const initializer while the generic impl
+            // parameter list is still available. Unknown identifiers here must
+            // not be deferred until materialization: `M + N` is invalid when
+            // only `N` is a declared const parameter.
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Colon) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            hir_advance(builder);
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                !token_is_scalar_type(&builder.scan.input, builder.current.offset, builder.current.length)
+            ) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Equal) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            hir_advance(builder);
+            while (builder.current.kind != TokenKind::Semicolon && builder.current.kind != TokenKind::End) {
+                if (builder.current.kind == TokenKind::Identifier) {
+                    bool known_const = false;
+                    i64 parameter_scan = 0;
+
+                    while (!known_const && parameter_scan < parameter_count) {
+                        if (
+                            parameter_kinds[parameter_scan] == 2 &&
+                            token_same(
+                                &builder.scan.input,
+                                parameter_offsets[parameter_scan],
+                                parameter_lengths[parameter_scan],
+                                builder.current.offset,
+                                builder.current.length,
+                            )
+                        ) {
+                            known_const = true;
+                        }
+                        parameter_scan += 1;
+                    }
+                    if (
+                        !known_const &&
+                        hir_find_constant(builder, builder.current.offset, builder.current.length) < 0
+                    ) {
+                        hir_fail(builder, DiagnosticCode::UnknownName);
+                        return false;
+                    }
+                }
+                hir_advance(builder);
+            }
+            if (builder.current.kind != TokenKind::Semicolon) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        }
+        hir_advance(builder);
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_parse_generic_inherent_impl_template(HirBuilder&mut builder) -> bool {
+    i64 source_offset = builder.current.offset;
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+    if (builder.module.generic_inherent_impl_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+    // Inherent impl templates mirror the generic parameter list of the target
+    // aggregate. Keep the compact implementation record keyed by the first
+    // type parameter, but accept the full mixed type/const list so constructs
+    // such as `impl<T, const usize N> Buffer<T, N>` are compilered too.
+
+    i64 parameter_offsets[8];
+    i64 parameter_lengths[8];
+    i64 parameter_kinds[8];
+    i64 parameter_const_types[8];
+    i64 parameter_count = 0;
+    i64 type_name_offset = 0;
+    i64 type_name_length = 0;
+    i64 generic_impl = builder.module.generic_inherent_impl_count;
+    i64 bound_count = 0;
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+        if (parameter_count >= 8) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+
+        i64 parameter_kind = 0;
+        i64 const_type = 0;
+        i64 name_offset = 0;
+        i64 name_length = 0;
+
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            parameter_kind = 2;
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            const_type = primitive_type_kind(
+                &builder.scan.input,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (!primitive_type_is_integer(const_type)) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            hir_advance(builder);
+        } else {
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            if (type_name_length == 0) {
+                type_name_offset = name_offset;
+                type_name_length = name_length;
+            }
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Colon) {
+                hir_advance(builder);
+
+                bool parsing_bounds = true;
+
+                while (parsing_bounds) {
+                    if (bound_count >= 8 || builder.current.kind != TokenKind::Identifier) {
+                        hir_fail(builder, DiagnosticCode::TooManyItems);
+                        return false;
+                    }
+
+                    i64 bound = hir_bound_trait_id(builder, &mut builder.current);
+
+                    if (bound == -1) {
+                        hir_fail(builder, DiagnosticCode::UnknownName);
+                        return false;
+                    }
+                    raz_compiler_rt_arena_set(
+                        builder.module.generic_inherent_bound_parameter_indices,
+                        generic_impl * 8 + bound_count,
+                        parameter_count,
+                    );
+                    raz_compiler_rt_arena_set(
+                        builder.module.generic_inherent_bounds,
+                        generic_impl * 8 + bound_count,
+                        bound,
+                    );
+                    bound_count += 1;
+                    hir_advance(builder);
+                    if (builder.current.kind == TokenKind::Plus) {
+                        hir_advance(builder);
+                    } else {
+                        parsing_bounds = false;
+                    }
+                }
+            }
+        }
+        parameter_offsets[parameter_count] = name_offset;
+        parameter_lengths[parameter_count] = name_length;
+        parameter_kinds[parameter_count] = parameter_kind;
+        parameter_const_types[parameter_count] = const_type;
+        parameter_count += 1;
+        if (builder.current.kind == TokenKind::Comma) {
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Greater) {
+                parsing_parameters = false;
+            }
+        } else {
+            parsing_parameters = false;
+        }
+    }
+    if (parameter_count == 0 || type_name_length == 0 || !hir_expect(builder, TokenKind::Greater)) {
+        return false;
+    }
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 generic_structure = hir_find_generic_struct(builder, builder.current.offset, builder.current.length);
+    i64 generic_enum = hir_find_generic_enum(builder, builder.current.offset, builder.current.length);
+
+    if (generic_structure < 0 && generic_enum < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+
+    i64 generic_target = generic_structure;
+    i64 target_parameter_start = 0;
+    i64 target_parameter_count = 0;
+
+    if (generic_structure >= 0) {
+        target_parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_starts,
+            generic_structure,
+        );
+        target_parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_counts,
+            generic_structure,
+        );
+    } else {
+        generic_target = -2 - generic_enum;
+        target_parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_starts,
+            generic_enum,
+        );
+        target_parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_counts,
+            generic_enum,
+        );
+    }
+    if (target_parameter_count != parameter_count) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    // Multiple inherent impl blocks for the same generic aggregate are legal.
+    // Coherence is enforced at the method level when templates materialize,
+    // so separate impl blocks can organize disjoint APIs without being treated
+    // as overlapping type implementations.
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+
+    i64 argument = 0;
+
+    while (argument < parameter_count) {
+        if (
+            builder.current.kind != TokenKind::Identifier ||
+            !token_same(
+                &builder.scan.input,
+                parameter_offsets[argument],
+                parameter_lengths[argument],
+                builder.current.offset,
+                builder.current.length,
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 target_parameter = target_parameter_start + argument;
+        i64 target_kind = raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, target_parameter);
+
+        if (target_kind != parameter_kinds[argument]) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (
+            target_kind == 2 &&
+            raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_const_types,
+                target_parameter,
+            ) != parameter_const_types[argument]
+        ) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+        hir_advance(builder);
+        argument += 1;
+        if (argument < parameter_count) {
+            if (!hir_expect(builder, TokenKind::Comma)) {
+                return false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::Greater) || builder.current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    builder.module.generic_inherent_impl_count += 1;
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_source_offsets, generic_impl, source_offset);
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_struct_templates, generic_impl, generic_target);
+    raz_compiler_rt_arena_set(
+        builder.module.generic_inherent_type_name_offsets,
+        generic_impl,
+        type_name_offset,
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_inherent_type_name_lengths,
+        generic_impl,
+        type_name_length,
+    );
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_parameter_counts, generic_impl, parameter_count);
+    raz_compiler_rt_arena_set(builder.module.generic_inherent_bound_counts, generic_impl, bound_count);
+
+    i64 stored_parameter = 0;
+
+    while (stored_parameter < parameter_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_name_offsets,
+            generic_impl * 8 + stored_parameter,
+            parameter_offsets[stored_parameter],
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_name_lengths,
+            generic_impl * 8 + stored_parameter,
+            parameter_lengths[stored_parameter],
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.generic_inherent_parameter_kinds,
+            generic_impl * 8 + stored_parameter,
+            parameter_kinds[stored_parameter],
+        );
+        stored_parameter += 1;
+    }
+
+    i64 depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+        }
+        hir_advance(builder);
+        if (depth == 0) {
+            return true;
+        }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_parse_inherent_impl(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+    i64 enumeration = -1;
+    i64 target_type = 0;
+    i64 inherent_target = structure;
+
+    if (structure < 0) {
+        enumeration = hir_find_enum(builder, builder.current.offset, builder.current.length);
+        if (enumeration >= 0) {
+            inherent_target = -2 - enumeration;
+        } else if (
+            token_is_scalar_type(&builder.scan.input, builder.current.offset, builder.current.length)
+        ) {
+            target_type = primitive_type_kind(
+                &builder.scan.input,
+                builder.current.offset,
+                builder.current.length,
+            );
+            inherent_target = hir_scalar_method_target(target_type);
+        } else {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+    while (builder.current.kind != TokenKind::RightBrace && builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::At) {
+            if (!hir_parse_pending_attributes(builder)) {
+                return false;
+            }
+            if (
+                builder.pending_abi_kind != 0 ||
+                builder.pending_link_name_length != 0 ||
+                builder.pending_target_feature_length != 0 ||
+                builder.pending_struct_attribute_count != 0
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else {
+            builder.pending_effect_flags = 0;
+        }
+        // `hir_parse_function` owns function-prefix validation. Inherent
+        // methods may use the same visibility/async/unsafe prefixes as normal
+        // functions, so do not require the first token to be literally `fn`.
+        if (builder.module.inherent_method_count >= 8192) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+
+        i64 function_index = builder.module.function_count;
+
+        if (!hir_parse_inherent_method_function(builder, inherent_target)) {
+            return false;
+        }
+
+        i64 name_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, function_index);
+        i64 name_length = raz_compiler_rt_arena_get(builder.module.function_name_lengths, function_index);
+
+        if (hir_find_inherent_method(builder, inherent_target, name_offset, name_length) >= 0) {
+            hir_fail(builder, DiagnosticCode::DuplicateName);
+            return false;
+        }
+
+        i64 method = builder.module.inherent_method_count;
+
+        builder.module.inherent_method_count += 1;
+        raz_compiler_rt_arena_set(builder.module.inherent_method_structures, method, inherent_target);
+        raz_compiler_rt_arena_set(builder.module.inherent_method_name_offsets, method, name_offset);
+        raz_compiler_rt_arena_set(builder.module.inherent_method_name_lengths, method, name_length);
+        raz_compiler_rt_arena_set(builder.module.inherent_method_functions, method, function_index);
+
+        i64 receiver = 0;
+
+        if (raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index) > 0) {
+            i64 first_parameter = raz_compiler_rt_arena_get(
+                builder.module.function_parameter_starts,
+                function_index,
+            );
+
+            bool receiver_type_matches = false;
+
+            if (structure >= 0) {
+                receiver_type_matches = raz_compiler_rt_arena_get(
+                    builder.module.parameter_type_structs,
+                    first_parameter,
+                ) == structure;
+            } else if (enumeration >= 0) {
+                receiver_type_matches =
+                    raz_compiler_rt_arena_get(builder.module.parameter_type_structs, first_parameter) < 0 &&
+                    raz_compiler_rt_arena_get(
+                        builder.module.parameter_types,
+                        first_parameter,
+                    ) == hir_enum_value_type_kind(builder, enumeration);
+            } else {
+                receiver_type_matches =
+                    raz_compiler_rt_arena_get(builder.module.parameter_type_structs, first_parameter) < 0 &&
+                    raz_compiler_rt_arena_get(
+                        builder.module.parameter_types,
+                        first_parameter,
+                    ) == target_type;
+            }
+            // A receiver may be borrowed or consumed by value. Call binding
+            // applies the parameter's reference semantics.
+            if (receiver_type_matches) {
+                receiver = 1;
+            }
+        }
+        raz_compiler_rt_arena_set(builder.module.inherent_method_receivers, method, receiver);
+        raz_compiler_rt_arena_set(builder.module.function_inherent_structs, function_index, inherent_target);
+        hir_clear_pending_attributes(builder);
+    }
+    return hir_expect(builder, TokenKind::RightBrace);
+}
+
+fn hir_trait_requirements_complete(i64 required_count, i64 provided_mask) -> bool {
+    i64 item = 0;
+
+    while (item < required_count) {
+        if ((provided_mask&(1 << item)) == 0) {
+            return false;
+        }
+        item += 1;
+    }
+    return true;
+}
+
+fn hir_skip_trait_method_declaration(HirBuilder&mut builder, i64 trait_index) -> bool {
+    // Trait declarations are not materialized as executable functions, but we
+    // still inspect their signatures so dyn Trait can enforce object safety.
+
+    i64 method_source_offset = builder.current.offset;
+
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 method_name_offset = builder.current.offset;
+    i64 method_name_length = builder.current.length;
+
+    if (builder.module.trait_method_count >= 4096) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 trait_method = builder.module.trait_method_count;
+
+    builder.module.trait_method_count += 1;
+    raz_compiler_rt_arena_set(builder.module.trait_method_trait_indices, trait_method, trait_index);
+    raz_compiler_rt_arena_set(builder.module.trait_method_name_offsets, trait_method, method_name_offset);
+    raz_compiler_rt_arena_set(builder.module.trait_method_name_lengths, trait_method, method_name_length);
+    raz_compiler_rt_arena_set(builder.module.trait_method_source_offsets, trait_method, method_source_offset);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_method_counts,
+        trait_index,
+        raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index) + 1,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_method_default_flags, trait_method, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_method_effect_flags,
+        trait_method,
+        builder.pending_effect_flags,
+    );
+    hir_advance(builder);
+
+    bool object_safe = true;
+
+    if (builder.current.kind == TokenKind::Less) {
+        // Generic methods cannot be represented by one stable vtable slot.
+        object_safe = false;
+    }
+
+    i64 paren_depth = 0;
+    i64 brace_depth = 0;
+    bool previous_self = false;
+    bool receiver_seen = false;
+    bool after_arrow = false;
+    bool done = false;
+
+    while (!done && builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftParen) {
+            paren_depth += 1;
+            previous_self = false;
+        } else if (builder.current.kind == TokenKind::RightParen) {
+            if (paren_depth > 0) {
+                paren_depth -= 1;
+            }
+            previous_self = false;
+        } else if (builder.current.kind == TokenKind::Arrow && paren_depth == 0) {
+            after_arrow = true;
+            previous_self = false;
+        } else if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_self_type(&builder.scan.input, &builder.current)
+        ) {
+            if (after_arrow) {
+                // Returning Self by value is not object-safe.
+                object_safe = false;
+            }
+            previous_self = paren_depth == 1;
+        } else if (builder.current.kind == TokenKind::Ampersand && previous_self && paren_depth == 1) {
+            receiver_seen = true;
+            previous_self = false;
+        } else {
+            previous_self = false;
+        }
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            if (brace_depth == 0) {
+                raz_compiler_rt_arena_set(builder.module.trait_method_default_flags, trait_method, 1);
+            }
+            brace_depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace && brace_depth > 0) {
+            brace_depth -= 1;
+            if (brace_depth == 0) {
+                hir_advance(builder);
+                done = true;
+                continue;
+            }
+        } else if (builder.current.kind == TokenKind::Semicolon && brace_depth == 0) {
+            hir_advance(builder);
+            done = true;
+            continue;
+        }
+        hir_advance(builder);
+    }
+    if (!done) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (!receiver_seen) {
+        object_safe = false;
+    }
+    if (!object_safe) {
+        raz_compiler_rt_arena_set(builder.module.trait_object_safe_flags, trait_index, 0);
+    }
+    return true;
+}
+
+fn hir_parse_trait_declaration(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier || builder.module.trait_count >= 256) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+    if (hir_namespace_has_top_level_name(builder, builder.current.offset, builder.current.length)) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+
+    i64 trait_index = builder.module.trait_count;
+
+    builder.module.trait_count += 1;
+    raz_compiler_rt_arena_set(builder.module.trait_name_offsets, trait_index, builder.current.offset);
+    raz_compiler_rt_arena_set(builder.module.trait_name_lengths, trait_index, builder.current.length);
+    raz_compiler_rt_arena_set(builder.module.trait_object_safe_flags, trait_index, 1);
+    raz_compiler_rt_arena_set(builder.module.trait_alias_flags, trait_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_method_starts,
+        trait_index,
+        builder.module.trait_method_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_method_counts, trait_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_associated_type_starts,
+        trait_index,
+        builder.module.trait_associated_type_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_associated_type_counts, trait_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_associated_const_starts,
+        trait_index,
+        builder.module.trait_associated_const_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_associated_const_counts, trait_index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_supertrait_starts,
+        trait_index,
+        builder.module.trait_supertrait_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_supertrait_counts, trait_index, 0);
+    hir_advance(builder);
+    // Generic trait parameter declarations are compile-time signature metadata.
+    // Trait bodies are retained token-wise today, so accept and validate the
+    // parameter pack here without pretending it changes runtime trait identity.
+    if (builder.current.kind == TokenKind::Less) {
+        hir_advance(builder);
+
+        i64 generic_parameter_count = 0;
+        bool parsing_generic_parameters = true;
+
+        while (parsing_generic_parameters) {
+            if (generic_parameter_count >= 32) {
+                hir_fail(builder, DiagnosticCode::TooManyItems);
+                return false;
+            }
+            if (builder.current.kind == TokenKind::Lifetime) {
+                hir_advance(builder);
+            } else {
+                if (
+                    builder.current.kind == TokenKind::Identifier &&
+                    token_is_const(&builder.scan.input, &builder.current)
+                ) {
+                    hir_advance(builder);
+                    if (
+                        builder.current.kind != TokenKind::Identifier ||
+                        !token_is_scalar_type(
+                            &builder.scan.input,
+                            builder.current.offset,
+                            builder.current.length,
+                        )
+                    ) {
+                        hir_fail(builder, DiagnosticCode::UnknownType);
+                        return false;
+                    }
+                    hir_advance(builder);
+                }
+                if (builder.current.kind != TokenKind::Identifier) {
+                    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                    return false;
+                }
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::Colon) {
+                    hir_advance(builder);
+
+                    bool parsing_bounds = true;
+
+                    while (parsing_bounds) {
+                        if (builder.current.kind != TokenKind::Identifier) {
+                            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                            return false;
+                        }
+                        hir_advance(builder);
+                        if (builder.current.kind == TokenKind::Plus) {
+                            hir_advance(builder);
+                        } else {
+                            parsing_bounds = false;
+                        }
+                    }
+                }
+            }
+            generic_parameter_count += 1;
+            if (builder.current.kind == TokenKind::Comma) {
+                hir_advance(builder);
+            } else {
+                parsing_generic_parameters = false;
+            }
+        }
+        if (!hir_expect(builder, TokenKind::Greater)) {
+            return false;
+        }
+    }
+    // Trait aliases are represented as marker traits whose complete contract is
+    // the transitive supertrait list: `trait Safe = Copy + Clone;`.
+    if (builder.current.kind == TokenKind::Equal) {
+        raz_compiler_rt_arena_set(builder.module.trait_alias_flags, trait_index, 1);
+        raz_compiler_rt_arena_set(builder.module.trait_object_safe_flags, trait_index, 0);
+        hir_advance(builder);
+
+        bool parsing_alias_bounds = true;
+
+        while (parsing_alias_bounds) {
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                builder.module.trait_supertrait_count >= 4096
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+
+            i64 supertrait = hir_bound_trait_id(builder, &mut builder.current);
+
+            if (supertrait == -1 || supertrait == -3 || supertrait == trait_index) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 first_supertrait = raz_compiler_rt_arena_get(
+                builder.module.trait_supertrait_starts,
+                trait_index,
+            );
+            i64 supertrait_count = raz_compiler_rt_arena_get(
+                builder.module.trait_supertrait_counts,
+                trait_index,
+            );
+
+            i64 probe = 0;
+
+            while (probe < supertrait_count) {
+                if (
+                    raz_compiler_rt_arena_get(
+                        builder.module.trait_supertraits,
+                        first_supertrait + probe,
+                    ) == supertrait
+                ) {
+                    hir_fail(builder, DiagnosticCode::DuplicateName);
+                    return false;
+                }
+                probe += 1;
+            }
+            raz_compiler_rt_arena_set(
+                builder.module.trait_supertraits,
+                builder.module.trait_supertrait_count,
+                supertrait,
+            );
+            builder.module.trait_supertrait_count += 1;
+            raz_compiler_rt_arena_set(
+                builder.module.trait_supertrait_counts,
+                trait_index,
+                supertrait_count + 1,
+            );
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Plus) {
+                hir_advance(builder);
+            } else {
+                parsing_alias_bounds = false;
+            }
+        }
+        return hir_expect(builder, TokenKind::Semicolon);
+    }
+    if (builder.current.kind == TokenKind::Colon) {
+        hir_advance(builder);
+
+        bool parsing_supertraits = true;
+
+        while (parsing_supertraits) {
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                builder.module.trait_supertrait_count >= 4096
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+
+            i64 supertrait = hir_bound_trait_id(builder, &mut builder.current);
+
+            if (supertrait == -1 || supertrait == -3 || supertrait == trait_index) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 first_supertrait = raz_compiler_rt_arena_get(
+                builder.module.trait_supertrait_starts,
+                trait_index,
+            );
+            i64 supertrait_count = raz_compiler_rt_arena_get(
+                builder.module.trait_supertrait_counts,
+                trait_index,
+            );
+
+            i64 probe = 0;
+
+            while (probe < supertrait_count) {
+                if (
+                    raz_compiler_rt_arena_get(
+                        builder.module.trait_supertraits,
+                        first_supertrait + probe,
+                    ) == supertrait
+                ) {
+                    hir_fail(builder, DiagnosticCode::DuplicateName);
+                    return false;
+                }
+                probe += 1;
+            }
+            raz_compiler_rt_arena_set(
+                builder.module.trait_supertraits,
+                builder.module.trait_supertrait_count,
+                supertrait,
+            );
+            builder.module.trait_supertrait_count += 1;
+            raz_compiler_rt_arena_set(
+                builder.module.trait_supertrait_counts,
+                trait_index,
+                supertrait_count + 1,
+            );
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Plus) {
+                hir_advance(builder);
+            } else {
+                parsing_supertraits = false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+    while (builder.current.kind != TokenKind::RightBrace && builder.current.kind != TokenKind::End) {
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                builder.module.trait_associated_type_count >= 4096 ||
+                raz_compiler_rt_arena_get(builder.module.trait_associated_type_counts, trait_index) >= 63
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            if (
+                hir_find_trait_associated_type(
+                    builder,
+                    trait_index,
+                    builder.current.offset,
+                    builder.current.length,
+                ) >= 0
+            ) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            raz_compiler_rt_arena_set(builder.module.trait_object_safe_flags, trait_index, 0);
+
+            i64 item = builder.module.trait_associated_type_count;
+
+            builder.module.trait_associated_type_count += 1;
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_type_name_offsets,
+                item,
+                builder.current.offset,
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_type_name_lengths,
+                item,
+                builder.current.length,
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_type_counts,
+                trait_index,
+                raz_compiler_rt_arena_get(builder.module.trait_associated_type_counts, trait_index) + 1,
+            );
+            hir_advance(builder);
+            while (builder.current.kind != TokenKind::Semicolon && builder.current.kind != TokenKind::End) {
+                hir_advance(builder);
+            }
+            if (!hir_expect(builder, TokenKind::Semicolon)) {
+                return false;
+            }
+        } else if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                builder.module.trait_associated_const_count >= 4096 ||
+                raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index) >= 63
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            if (
+                hir_find_trait_associated_const(
+                    builder,
+                    trait_index,
+                    builder.current.offset,
+                    builder.current.length,
+                ) >= 0
+            ) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+
+            i64 item = builder.module.trait_associated_const_count;
+
+            builder.module.trait_associated_const_count += 1;
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_const_name_offsets,
+                item,
+                builder.current.offset,
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_const_name_lengths,
+                item,
+                builder.current.length,
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_const_counts,
+                trait_index,
+                raz_compiler_rt_arena_get(builder.module.trait_associated_const_counts, trait_index) + 1,
+            );
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Colon) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_const_type_offsets,
+                item,
+                builder.current.offset,
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.trait_associated_const_type_lengths,
+                item,
+                builder.current.length,
+            );
+            while (builder.current.kind != TokenKind::Semicolon && builder.current.kind != TokenKind::End) {
+                hir_advance(builder);
+            }
+            if (!hir_expect(builder, TokenKind::Semicolon)) {
+                return false;
+            }
+        } else if (builder.current.kind == TokenKind::At) {
+            if (!hir_parse_pending_attributes(builder)) {
+                return false;
+            }
+            if (
+                builder.pending_effect_flags == 0 ||
+                builder.pending_abi_kind != 0 ||
+                builder.pending_link_name_length != 0 ||
+                builder.pending_target_feature_length != 0 ||
+                builder.pending_derive_copy != 0 ||
+                builder.pending_derive_clone != 0 ||
+                builder.pending_struct_attribute_count != 0 ||
+                builder.current.kind != TokenKind::Identifier ||
+                !token_is_fn(&builder.scan.input, &builder.current)
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+            if (!hir_skip_trait_method_declaration(builder, trait_index)) {
+                return false;
+            }
+            hir_clear_pending_attributes(builder);
+        } else if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_fn(&builder.scan.input, &builder.current)
+        ) {
+            builder.pending_effect_flags = 0;
+            if (!hir_skip_trait_method_declaration(builder, trait_index)) {
+                return false;
+            }
+        } else {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+    }
+    return hir_expect(builder, TokenKind::RightBrace);
+}
+
+fn hir_parse_trait_impl(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::UnknownName);
+        return false;
+    }
+
+    i64 trait_index = hir_find_trait(builder, builder.current.offset, builder.current.length);
+
+    if (trait_index < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownName);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+    i64 target_type = 0;
+    i64 semantic_target_type = 0;
+    i64 method_target = structure;
+
+    if (structure < 0) {
+        if (!token_is_scalar_type(&builder.scan.input, builder.current.offset, builder.current.length)) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+        bool semantic_bool =
+            builder.current.length == 4 &&
+            source_byte(&builder.scan.input, builder.current.offset) == 98 &&
+            source_byte(&builder.scan.input, builder.current.offset + 1) == 111 &&
+            source_byte(&builder.scan.input, builder.current.offset + 2) == 111 &&
+            source_byte(&builder.scan.input, builder.current.offset + 3) == 108;
+        target_type = primitive_type_kind(
+            &builder.scan.input,
+            builder.current.offset,
+            builder.current.length
+        );
+        semantic_target_type = target_type;
+        if (semantic_bool && target_type == 0) {
+            // bool shares i64's runtime representation, but it is a distinct
+            // semantic type for impl identity and trait solving. Marker 16 is
+            // already used by generic substitution for this exact purpose.
+            semantic_target_type = 16;
+        }
+        method_target = hir_scalar_method_target(semantic_target_type);
+    }
+    if (
+        hir_find_trait_impl(builder, trait_index, method_target) >= 0 ||
+        builder.module.trait_impl_count >= 4096
+    ) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+    if (!hir_validate_supertraits_for_structure(builder, trait_index, structure, semantic_target_type)) {
+        return false;
+    }
+    hir_advance(builder);
+
+    i64 impl_body_source_offset = builder.current.offset;
+
+    if (
+        builder.current.kind != TokenKind::LeftBrace ||
+        !hir_validate_trait_impl_associated_items(builder, trait_index, impl_body_source_offset)
+    ) {
+        return false;
+    }
+    if (!hir_validate_trait_impl_methods(builder, trait_index, impl_body_source_offset)) {
+        return false;
+    }
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 associated_type_mask = 0;
+    i64 associated_const_mask = 0;
+    i64 associated_type_provided_count = 0;
+    i64 associated_const_provided_count = 0;
+
+    while (builder.current.kind != TokenKind::RightBrace && builder.current.kind != TokenKind::End) {
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_type_keyword(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_type(
+                builder,
+                trait_index,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((associated_type_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            associated_type_mask = associated_type_mask | (1 << associated);
+            associated_type_provided_count += 1;
+            while (builder.current.kind != TokenKind::Semicolon && builder.current.kind != TokenKind::End) {
+                hir_advance(builder);
+            }
+            if (!hir_expect(builder, TokenKind::Semicolon)) {
+                return false;
+            }
+        } else if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            i64 associated = hir_find_trait_associated_const(
+                builder,
+                trait_index,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (associated < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            if ((associated_const_mask&(1 << associated)) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            associated_const_mask = associated_const_mask | (1 << associated);
+            associated_const_provided_count += 1;
+            while (builder.current.kind != TokenKind::Semicolon && builder.current.kind != TokenKind::End) {
+                hir_advance(builder);
+            }
+            if (!hir_expect(builder, TokenKind::Semicolon)) {
+                return false;
+            }
+        } else {
+            if (builder.current.kind == TokenKind::At) {
+                if (!hir_parse_pending_attributes(builder)) {
+                    return false;
+                }
+                if (
+                    builder.pending_effect_flags == 0 ||
+                    builder.pending_abi_kind != 0 ||
+                    builder.pending_link_name_length != 0 ||
+                    builder.pending_target_feature_length != 0 ||
+                    builder.pending_struct_attribute_count != 0
+                ) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+            } else {
+                builder.pending_effect_flags = 0;
+            }
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                !token_is_fn(&builder.scan.input, &builder.current) ||
+                builder.module.inherent_method_count >= 8192
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+
+            i64 function_index = builder.module.function_count;
+
+            if (!hir_parse_impl_method_function(builder)) {
+                return false;
+            }
+
+            i64 name_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, function_index);
+            i64 name_length = raz_compiler_rt_arena_get(builder.module.function_name_lengths, function_index);
+            i64 contract_method = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+
+            i64 contract_end =
+                contract_method +
+                raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+            bool contract_found = false;
+
+            while (contract_method < contract_end) {
+                if (
+                    token_same(
+                        &builder.scan.input,
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_offsets, contract_method),
+                        raz_compiler_rt_arena_get(builder.module.trait_method_name_lengths, contract_method),
+                        name_offset,
+                        name_length,
+                    )
+                ) {
+                    contract_found = true;
+                    i64 required_effects = raz_compiler_rt_arena_get(
+                        builder.module.trait_method_effect_flags,
+                        contract_method,
+                    );
+                    i64 provided_effects = raz_compiler_rt_arena_get(
+                        builder.module.function_effect_flags,
+                        function_index,
+                    );
+                    if ((required_effects & provided_effects) != required_effects) {
+                        hir_fail(builder, DiagnosticCode::ExpectedToken);
+                        return false;
+                    }
+                    contract_method = contract_end;
+                } else {
+                    contract_method += 1;
+                }
+            }
+            if (!contract_found) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            hir_clear_pending_attributes(builder);
+            if (hir_find_inherent_method(builder, method_target, name_offset, name_length) >= 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+
+            i64 method = builder.module.inherent_method_count;
+
+            builder.module.inherent_method_count += 1;
+            raz_compiler_rt_arena_set(builder.module.inherent_method_structures, method, method_target);
+            raz_compiler_rt_arena_set(builder.module.inherent_method_name_offsets, method, name_offset);
+            raz_compiler_rt_arena_set(builder.module.inherent_method_name_lengths, method, name_length);
+            raz_compiler_rt_arena_set(builder.module.inherent_method_functions, method, function_index);
+
+            i64 receiver = 0;
+
+            if (raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index) > 0) {
+                i64 first_parameter = raz_compiler_rt_arena_get(
+                    builder.module.function_parameter_starts,
+                    function_index,
+                );
+
+                bool receiver_type_matches = false;
+
+                if (structure >= 0) {
+                    receiver_type_matches = raz_compiler_rt_arena_get(
+                        builder.module.parameter_type_structs,
+                        first_parameter
+                    ) == structure;
+                } else {
+                    receiver_type_matches =
+                        raz_compiler_rt_arena_get(builder.module.parameter_type_structs, first_parameter) < 0 &&
+                        raz_compiler_rt_arena_get(
+                            builder.module.parameter_types,
+                            first_parameter
+                        ) == target_type;
+                }
+                // Consuming/by-value `self` is still an instance receiver.
+                if (receiver_type_matches) {
+                    receiver = 1;
+                }
+            }
+            raz_compiler_rt_arena_set(builder.module.inherent_method_receivers, method, receiver);
+            raz_compiler_rt_arena_set(
+                builder.module.function_inherent_structs,
+                function_index,
+                method_target
+            );
+        }
+    }
+    if (!hir_expect(builder, TokenKind::RightBrace)) {
+        return false;
+    }
+
+    i64 implementation = builder.module.trait_impl_count;
+
+    builder.module.trait_impl_count += 1;
+    raz_compiler_rt_arena_set(builder.module.trait_impl_traits, implementation, trait_index);
+    raz_compiler_rt_arena_set(builder.module.trait_impl_structures, implementation, method_target);
+    raz_compiler_rt_arena_set(
+        builder.module.trait_impl_source_offsets,
+        implementation,
+        impl_body_source_offset,
+    );
+    raz_compiler_rt_arena_set(builder.module.trait_impl_generic_indices, implementation, -1);
+    // Materialize any omitted default methods into the normal inherent-method
+    // table so calls use the same resolution/lowering path as explicit impl methods.
+
+    i64 trait_method = raz_compiler_rt_arena_get(builder.module.trait_method_starts, trait_index);
+
+    i64 trait_method_end =
+        trait_method +
+        raz_compiler_rt_arena_get(builder.module.trait_method_counts, trait_index);
+    while (trait_method < trait_method_end) {
+        if (!hir_reserve_trait_default_method(builder, method_target, trait_method)) {
+            return false;
+        }
+        trait_method += 1;
+    }
+    return true;
+}
+
+fn hir_validate_generic_special_receiver(HirBuilder&mut builder, i64 body_offset, bool clone_method) -> bool {
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = body_offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftBrace) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier || !token_is_fn(&builder.scan.input, &current)) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::Identifier) {
+        return false;
+    }
+    if (clone_method) {
+        if (!token_is_clone_function(&builder.scan.input, current.offset, current.length)) {
+            return false;
+        }
+    } else if (
+        current.length != 4 ||
+        source_byte(&builder.scan.input, current.offset) != 100 ||
+        source_byte(&builder.scan.input, current.offset + 1) != 114 ||
+        source_byte(&builder.scan.input, current.offset + 2) != 111 ||
+        source_byte(&builder.scan.input, current.offset + 3) != 112
+    ) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    if (current.kind != TokenKind::LeftParen) {
+        return false;
+    }
+
+    bool saw_reference = false;
+    bool mutable_reference = false;
+    i64 depth = 1;
+
+    next_token(&mut scan, &mut current);
+    while (depth > 0 && current.kind != TokenKind::End) {
+        if (current.kind == TokenKind::LeftParen) {
+            depth += 1;
+        } else if (current.kind == TokenKind::RightParen) {
+            depth -= 1;
+            if (depth == 0) {
+                break;
+            }
+        } else if (depth == 1 && current.kind == TokenKind::Ampersand) {
+            saw_reference = true;
+
+            Token next;
+
+            next_token(&mut scan, &mut next);
+            if (next.kind == TokenKind::Lifetime) {
+                next_token(&mut scan, &mut next);
+            }
+            if (next.kind == TokenKind::Identifier && token_is_mut(&builder.scan.input, &next)) {
+                mutable_reference = true;
+            }
+            current = next;
+            continue;
+        }
+        next_token(&mut scan, &mut current);
+    }
+    if (!saw_reference) {
+        return false;
+    }
+    if (clone_method) {
+        return !mutable_reference;
+    }
+    return mutable_reference;
+}
+
+fn hir_generic_builtin_impl_body_empty(HirBuilder&mut builder) -> bool {
+    Lexer scan;
+
+    scan.input = builder.scan.input;
+    scan.offset = builder.current.offset;
+    clear_diagnostic(&mut scan.last_error);
+
+    Token current;
+
+    next_token(&mut scan, &mut current);
+    while (current.kind != TokenKind::LeftBrace && current.kind != TokenKind::End) {
+        next_token(&mut scan, &mut current);
+    }
+    if (current.kind != TokenKind::LeftBrace) {
+        return false;
+    }
+    next_token(&mut scan, &mut current);
+    return current.kind == TokenKind::RightBrace;
+}
+
+fn hir_parse_generic_structural_builtin_impl(HirBuilder&mut builder, bool copy_impl) -> bool {
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+
+    i64 parameter_offsets = raz_compiler_rt_arena_create(32);
+    i64 parameter_lengths = raz_compiler_rt_arena_create(32);
+    i64 parameter_kinds = raz_compiler_rt_arena_create(32);
+    i64 parameter_const_types = raz_compiler_rt_arena_create(32);
+
+    if (
+        parameter_offsets == 0 ||
+        parameter_lengths == 0 ||
+        parameter_kinds == 0 ||
+        parameter_const_types == 0
+    ) {
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 parameter_count = 0;
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+        if (parameter_count >= 32) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            raz_compiler_rt_arena_destroy(parameter_offsets);
+            raz_compiler_rt_arena_destroy(parameter_lengths);
+            raz_compiler_rt_arena_destroy(parameter_kinds);
+            raz_compiler_rt_arena_destroy(parameter_const_types);
+            return false;
+        }
+
+        i64 parameter_kind = 0;
+        i64 parameter_const_type = 0;
+
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            parameter_kind = 2;
+            hir_advance(builder);
+            if (
+                builder.current.kind != TokenKind::Identifier ||
+                !primitive_type_is_integer(
+                    primitive_type_kind(&builder.scan.input, builder.current.offset, builder.current.length),
+                )
+            ) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                raz_compiler_rt_arena_destroy(parameter_offsets);
+                raz_compiler_rt_arena_destroy(parameter_lengths);
+                raz_compiler_rt_arena_destroy(parameter_kinds);
+                raz_compiler_rt_arena_destroy(parameter_const_types);
+                return false;
+            }
+            parameter_const_type = primitive_type_kind(
+                &builder.scan.input,
+                builder.current.offset,
+                builder.current.length,
+            );
+            hir_advance(builder);
+        }
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            raz_compiler_rt_arena_destroy(parameter_offsets);
+            raz_compiler_rt_arena_destroy(parameter_lengths);
+            raz_compiler_rt_arena_destroy(parameter_kinds);
+            raz_compiler_rt_arena_destroy(parameter_const_types);
+            return false;
+        }
+        raz_compiler_rt_arena_set(parameter_offsets, parameter_count, builder.current.offset);
+        raz_compiler_rt_arena_set(parameter_lengths, parameter_count, builder.current.length);
+        raz_compiler_rt_arena_set(parameter_kinds, parameter_count, parameter_kind);
+        raz_compiler_rt_arena_set(parameter_const_types, parameter_count, parameter_const_type);
+        parameter_count += 1;
+        hir_advance(builder);
+        if (parameter_kind == 0 && builder.current.kind == TokenKind::Colon) {
+            hir_advance(builder);
+
+            bool skipping_bounds = true;
+
+            while (skipping_bounds) {
+                if (builder.current.kind != TokenKind::Identifier) {
+                    hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                    raz_compiler_rt_arena_destroy(parameter_offsets);
+                    raz_compiler_rt_arena_destroy(parameter_lengths);
+                    raz_compiler_rt_arena_destroy(parameter_kinds);
+                    raz_compiler_rt_arena_destroy(parameter_const_types);
+                    return false;
+                }
+                hir_advance(builder);
+                if (builder.current.kind == TokenKind::Plus) {
+                    hir_advance(builder);
+                } else {
+                    skipping_bounds = false;
+                }
+            }
+        }
+        if (builder.current.kind == TokenKind::Comma) {
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::RightParen) {
+                parsing_parameters = false;
+            }
+        } else {
+            parsing_parameters = false;
+        }
+    }
+    if (!hir_expect(builder, TokenKind::Greater)) {
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    if (copy_impl) {
+        if (!token_is_copy_trait(&builder.scan.input, &builder.current)) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            raz_compiler_rt_arena_destroy(parameter_offsets);
+            raz_compiler_rt_arena_destroy(parameter_lengths);
+            raz_compiler_rt_arena_destroy(parameter_kinds);
+            raz_compiler_rt_arena_destroy(parameter_const_types);
+            return false;
+        }
+    } else if (!token_is_clone_trait(&builder.scan.input, &builder.current)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+
+    i64 generic_structure = hir_find_generic_struct(builder, builder.current.offset, builder.current.length);
+    i64 generic_enum = hir_find_generic_enum(builder, builder.current.offset, builder.current.length);
+
+    if (generic_structure < 0 && generic_enum < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+
+    i64 target_parameter_start = 0;
+    i64 target_parameter_count = 0;
+
+    if (generic_structure >= 0) {
+        target_parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_starts,
+            generic_structure,
+        );
+        target_parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_struct_parameter_counts,
+            generic_structure,
+        );
+    } else {
+        target_parameter_start = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_starts,
+            generic_enum,
+        );
+        target_parameter_count = raz_compiler_rt_arena_get(
+            builder.module.generic_enum_parameter_counts,
+            generic_enum,
+        );
+    }
+    if (target_parameter_count != parameter_count) {
+        hir_fail(builder, DiagnosticCode::WrongArgumentCount);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+
+    i64 argument_index = 0;
+
+    while (argument_index < parameter_count) {
+        if (
+            builder.current.kind != TokenKind::Identifier ||
+            !token_same(
+                &builder.scan.input,
+                raz_compiler_rt_arena_get(parameter_offsets, argument_index),
+                raz_compiler_rt_arena_get(parameter_lengths, argument_index),
+                builder.current.offset,
+                builder.current.length,
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            raz_compiler_rt_arena_destroy(parameter_offsets);
+            raz_compiler_rt_arena_destroy(parameter_lengths);
+            raz_compiler_rt_arena_destroy(parameter_kinds);
+            raz_compiler_rt_arena_destroy(parameter_const_types);
+            return false;
+        }
+
+        i64 target_parameter = target_parameter_start + argument_index;
+        i64 target_kind = raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, target_parameter);
+        i64 impl_kind = raz_compiler_rt_arena_get(parameter_kinds, argument_index);
+
+        if (
+            target_kind != impl_kind ||
+            (
+                target_kind == 2 &&
+                raz_compiler_rt_arena_get(
+                    builder.module.generic_parameter_const_types,
+                    target_parameter,
+                ) != raz_compiler_rt_arena_get(parameter_const_types, argument_index)
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            raz_compiler_rt_arena_destroy(parameter_offsets);
+            raz_compiler_rt_arena_destroy(parameter_lengths);
+            raz_compiler_rt_arena_destroy(parameter_kinds);
+            raz_compiler_rt_arena_destroy(parameter_const_types);
+            return false;
+        }
+        hir_advance(builder);
+        argument_index += 1;
+        if (argument_index < parameter_count) {
+            if (!hir_expect(builder, TokenKind::Comma)) {
+                raz_compiler_rt_arena_destroy(parameter_offsets);
+                raz_compiler_rt_arena_destroy(parameter_lengths);
+                raz_compiler_rt_arena_destroy(parameter_kinds);
+                raz_compiler_rt_arena_destroy(parameter_const_types);
+                return false;
+            }
+        }
+    }
+    if (
+        !hir_expect(builder, TokenKind::Greater) ||
+        !hir_expect(builder, TokenKind::LeftBrace) ||
+        builder.current.kind != TokenKind::RightBrace
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        raz_compiler_rt_arena_destroy(parameter_offsets);
+        raz_compiler_rt_arena_destroy(parameter_lengths);
+        raz_compiler_rt_arena_destroy(parameter_kinds);
+        raz_compiler_rt_arena_destroy(parameter_const_types);
+        return false;
+    }
+    hir_advance(builder);
+    raz_compiler_rt_arena_destroy(parameter_offsets);
+    raz_compiler_rt_arena_destroy(parameter_lengths);
+    raz_compiler_rt_arena_destroy(parameter_kinds);
+    raz_compiler_rt_arena_destroy(parameter_const_types);
+    if (generic_structure >= 0) {
+        if (copy_impl) {
+            if (
+                raz_compiler_rt_arena_get(
+                    builder.module.generic_struct_derive_copy_flags,
+                    generic_structure,
+                ) != 0
+            ) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            raz_compiler_rt_arena_set(builder.module.generic_struct_derive_copy_flags, generic_structure, 1);
+        } else {
+            if (
+                raz_compiler_rt_arena_get(
+                    builder.module.generic_struct_derive_clone_flags,
+                    generic_structure,
+                ) != 0
+            ) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            raz_compiler_rt_arena_set(builder.module.generic_struct_derive_clone_flags, generic_structure, 1);
+        }
+    } else {
+        // Generic enums use the same structural Copy/Clone contract as generic
+        // structs.  Retain the declaration on the enum template so every
+        // concrete instantiation inherits the flag during monomorphization.
+        if (copy_impl) {
+            if (raz_compiler_rt_arena_get(builder.module.generic_enum_derive_copy_flags, generic_enum) != 0) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            raz_compiler_rt_arena_set(builder.module.generic_enum_derive_copy_flags, generic_enum, 1);
+        } else {
+            if (
+                raz_compiler_rt_arena_get(builder.module.generic_enum_derive_clone_flags, generic_enum) != 0
+            ) {
+                hir_fail(builder, DiagnosticCode::DuplicateName);
+                return false;
+            }
+            raz_compiler_rt_arena_set(builder.module.generic_enum_derive_clone_flags, generic_enum, 1);
+        }
+    }
+    return true;
+}
+
+fn hir_parse_generic_copy_impl_template(HirBuilder&mut builder) -> bool {
+    return hir_parse_generic_structural_builtin_impl(builder, true);
+}
+
+fn hir_parse_generic_clone_impl_legacy(HirBuilder&mut builder) -> bool {
+    i64 source_offset = builder.current.offset;
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+    if (builder.current.kind != TokenKind::Identifier || builder.module.generic_clone_impl_count >= 256) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 type_name_offset = builder.current.offset;
+    i64 type_name_length = builder.current.length;
+
+    hir_advance(builder);
+
+    i64 requires_clone = 0;
+
+    if (builder.current.kind == TokenKind::Colon) {
+        hir_advance(builder);
+        if (
+            builder.current.kind != TokenKind::Identifier ||
+            !token_is_clone_trait(&builder.scan.input, &builder.current)
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        requires_clone = 1;
+        hir_advance(builder);
+    }
+    if (!hir_expect(builder, TokenKind::Greater)) {
+        return false;
+    }
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_clone_trait(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 generic_structure = hir_find_generic_struct(builder, builder.current.offset, builder.current.length);
+
+    if (generic_structure < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_same(
+            &builder.scan.input,
+            type_name_offset,
+            type_name_length,
+            builder.current.offset,
+            builder.current.length,
+        )
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Greater) || builder.current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (!hir_validate_generic_special_receiver(builder, builder.current.offset, true)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 generic_clone = builder.module.generic_clone_impl_count;
+
+    builder.module.generic_clone_impl_count += 1;
+    raz_compiler_rt_arena_set(builder.module.generic_clone_source_offsets, generic_clone, source_offset);
+    raz_compiler_rt_arena_set(
+        builder.module.generic_clone_struct_templates,
+        generic_clone,
+        generic_structure
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_clone_type_name_offsets,
+        generic_clone,
+        type_name_offset
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.generic_clone_type_name_lengths,
+        generic_clone,
+        type_name_length
+    );
+    raz_compiler_rt_arena_set(builder.module.generic_clone_requires_clone, generic_clone, requires_clone);
+
+    i64 depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+        }
+        hir_advance(builder);
+        if (depth == 0) {
+            return true;
+        }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_parse_generic_clone_impl_template(HirBuilder&mut builder) -> bool {
+    if (hir_generic_builtin_impl_body_empty(builder)) {
+        return hir_parse_generic_structural_builtin_impl(builder, false);
+    }
+    return hir_parse_generic_clone_impl_legacy(builder);
+}
+
+fn hir_parse_generic_drop_impl_template(HirBuilder&mut builder) -> bool {
+    i64 source_offset = builder.current.offset;
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+    if (builder.module.generic_drop_impl_count >= 256) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 parameter_offsets[8];
+    i64 parameter_lengths[8];
+    i64 parameter_kinds[8];
+    i64 parameter_const_types[8];
+    i64 parameter_count = 0;
+    i64 type_name_offset = 0;
+    i64 type_name_length = 0;
+    i64 requires_drop = 0;
+    bool parsing_parameters = true;
+
+    while (parsing_parameters) {
+        if (parameter_count >= 8) {
+            hir_fail(builder, DiagnosticCode::TooManyItems);
+            return false;
+        }
+
+        i64 parameter_kind = 0;
+        i64 parameter_const_type = 0;
+        i64 name_offset = 0;
+        i64 name_length = 0;
+
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_const(&builder.scan.input, &builder.current)
+        ) {
+            parameter_kind = 2;
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            parameter_const_type = primitive_type_kind(
+                &builder.scan.input,
+                builder.current.offset,
+                builder.current.length,
+            );
+            if (!primitive_type_is_integer(parameter_const_type)) {
+                hir_fail(builder, DiagnosticCode::UnknownType);
+                return false;
+            }
+            hir_advance(builder);
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            hir_advance(builder);
+        } else {
+            if (builder.current.kind != TokenKind::Identifier) {
+                hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+                return false;
+            }
+            name_offset = builder.current.offset;
+            name_length = builder.current.length;
+            if (type_name_length == 0) {
+                type_name_offset = name_offset;
+                type_name_length = name_length;
+            }
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Colon) {
+                // The legacy Drop template applicability flag represents the
+                // first type parameter. Keep that contract for now, but allow
+                // additional unbounded type/const parameters so Drop works for
+                // real multi-parameter containers such as HashMap<K, V>.
+                if (parameter_count != 0) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                hir_advance(builder);
+                if (
+                    builder.current.kind != TokenKind::Identifier ||
+                    !token_is_drop_trait(&builder.scan.input, &builder.current)
+                ) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                requires_drop = 1;
+                hir_advance(builder);
+            }
+        }
+
+        parameter_offsets[parameter_count] = name_offset;
+        parameter_lengths[parameter_count] = name_length;
+        parameter_kinds[parameter_count] = parameter_kind;
+        parameter_const_types[parameter_count] = parameter_const_type;
+        parameter_count += 1;
+
+        if (builder.current.kind == TokenKind::Comma) {
+            hir_advance(builder);
+            if (builder.current.kind == TokenKind::Greater) {
+                parsing_parameters = false;
+            }
+        } else {
+            parsing_parameters = false;
+        }
+    }
+    if (parameter_count == 0 || type_name_length == 0 || !hir_expect(builder, TokenKind::Greater)) {
+        return false;
+    }
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_drop_trait(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 generic_structure = hir_find_generic_struct(builder, builder.current.offset, builder.current.length);
+
+    if (generic_structure < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+
+    i64 target_parameter_start = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_parameter_starts,
+        generic_structure,
+    );
+    i64 target_parameter_count = raz_compiler_rt_arena_get(
+        builder.module.generic_struct_parameter_counts,
+        generic_structure,
+    );
+    if (target_parameter_count != parameter_count) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::Less)) {
+        return false;
+    }
+
+    i64 argument = 0;
+
+    while (argument < parameter_count) {
+        if (
+            builder.current.kind != TokenKind::Identifier ||
+            !token_same(
+                &builder.scan.input,
+                parameter_offsets[argument],
+                parameter_lengths[argument],
+                builder.current.offset,
+                builder.current.length,
+            )
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 target_parameter = target_parameter_start + argument;
+        i64 target_kind = raz_compiler_rt_arena_get(builder.module.generic_parameter_kinds, target_parameter);
+
+        if (target_kind != parameter_kinds[argument]) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (
+            target_kind == 2 &&
+            raz_compiler_rt_arena_get(
+                builder.module.generic_parameter_const_types,
+                target_parameter,
+            ) != parameter_const_types[argument]
+        ) {
+            hir_fail(builder, DiagnosticCode::UnknownType);
+            return false;
+        }
+        hir_advance(builder);
+        argument += 1;
+        if (argument < parameter_count) {
+            if (!hir_expect(builder, TokenKind::Comma)) {
+                return false;
+            }
+        }
+    }
+    if (!hir_expect(builder, TokenKind::Greater) || builder.current.kind != TokenKind::LeftBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (!hir_validate_generic_special_receiver(builder, builder.current.offset, false)) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 generic_drop = builder.module.generic_drop_impl_count;
+
+    builder.module.generic_drop_impl_count += 1;
+    raz_compiler_rt_arena_set(builder.module.generic_drop_source_offsets, generic_drop, source_offset);
+    raz_compiler_rt_arena_set(builder.module.generic_drop_struct_templates, generic_drop, generic_structure);
+    raz_compiler_rt_arena_set(builder.module.generic_drop_type_name_offsets, generic_drop, type_name_offset);
+    raz_compiler_rt_arena_set(builder.module.generic_drop_type_name_lengths, generic_drop, type_name_length);
+    raz_compiler_rt_arena_set(builder.module.generic_drop_requires_drop, generic_drop, requires_drop);
+
+    i64 depth = 0;
+
+    while (builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+        }
+        hir_advance(builder);
+        if (depth == 0) {
+            return true;
+        }
+    }
+    hir_fail(builder, DiagnosticCode::ExpectedToken);
+    return false;
+}
+
+fn hir_parse_copy_impl(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_copy_trait(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+
+    if (
+        structure < 0 ||
+        raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure) != 0 ||
+        raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+    if (builder.current.kind != TokenKind::RightBrace) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+
+    i64 first = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    i64 count = raz_compiler_rt_arena_get(builder.module.struct_field_counts, structure);
+    i64 field = 0;
+
+    while (field < count) {
+        i64 child = raz_compiler_rt_arena_get(builder.module.struct_field_type_structs, first + field);
+
+        if (child >= 0 && raz_compiler_rt_arena_get(builder.module.struct_copy_flags, child) == 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        field += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.struct_copy_flags, structure, 1);
+    return true;
+}
+
+fn hir_parse_clone_impl(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_clone_trait(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+
+    if (structure < 0 || raz_compiler_rt_arena_get(builder.module.struct_name_offsets, structure) < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.struct_clone_functions, structure) >= 0) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 function_index = builder.module.function_count;
+
+    if (!hir_parse_impl_method_function(builder)) {
+        return false;
+    }
+
+    i64 name_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, function_index);
+
+    if (
+        !token_is_clone_function(
+            &builder.scan.input,
+            name_offset,
+            raz_compiler_rt_arena_get(builder.module.function_name_lengths, function_index),
+        )
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index) != 1) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 parameter = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, function_index);
+
+    if (
+        raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter) != structure ||
+        raz_compiler_rt_arena_get(builder.module.parameter_references, parameter) != 1 ||
+        raz_compiler_rt_arena_get(builder.module.parameter_reference_mutable, parameter) != 0
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (
+        raz_compiler_rt_arena_get(builder.module.function_return_type_structs, function_index) != structure ||
+        raz_compiler_rt_arena_get(builder.module.function_return_slices, function_index) != 0
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    raz_compiler_rt_arena_set(builder.module.struct_clone_functions, structure, function_index);
+    raz_compiler_rt_arena_set(builder.module.function_clone_structs, function_index, structure);
+    builder.module.clone_impl_count += 1;
+    return hir_expect(builder, TokenKind::RightBrace);
+}
+
+fn hir_parse_drop_impl(HirBuilder&mut builder) -> bool {
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_drop_trait(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_for(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    hir_advance(builder);
+    if (builder.current.kind != TokenKind::Identifier) {
+        hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+        return false;
+    }
+
+    i64 structure = hir_find_struct(builder, builder.current.offset, builder.current.length);
+
+    if (structure < 0 || raz_compiler_rt_arena_get(builder.module.struct_name_offsets, structure) < 0) {
+        hir_fail(builder, DiagnosticCode::UnknownType);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.struct_copy_flags, structure) != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.struct_drop_functions, structure) >= 0) {
+        hir_fail(builder, DiagnosticCode::DuplicateName);
+        return false;
+    }
+    hir_advance(builder);
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+
+    i64 function_index = builder.module.function_count;
+
+    if (!hir_parse_impl_method_function(builder)) {
+        return false;
+    }
+
+    i64 name_offset = raz_compiler_rt_arena_get(builder.module.function_name_offsets, function_index);
+
+    if (
+        raz_compiler_rt_arena_get(builder.module.function_name_lengths, function_index) != 4 ||
+        source_byte(&builder.scan.input, name_offset) != 100 ||
+        source_byte(&builder.scan.input, name_offset + 1) != 114 ||
+        source_byte(&builder.scan.input, name_offset + 2) != 111 ||
+        source_byte(&builder.scan.input, name_offset + 3) != 112
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(builder.module.function_parameter_counts, function_index) != 1) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    i64 parameter = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, function_index);
+
+    if (
+        raz_compiler_rt_arena_get(builder.module.parameter_type_structs, parameter) != structure ||
+        raz_compiler_rt_arena_get(builder.module.parameter_references, parameter) != 1 ||
+        raz_compiler_rt_arena_get(builder.module.parameter_reference_mutable, parameter) == 0
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    raz_compiler_rt_arena_set(builder.module.struct_drop_functions, structure, function_index);
+    raz_compiler_rt_arena_set(builder.module.function_drop_structs, function_index, structure);
+    builder.module.drop_impl_count += 1;
+    return hir_expect(builder, TokenKind::RightBrace);
+}
+
+// Validate the simple return-type portion of trait method contracts directly
+// from source. This runs for concrete and generic impl templates before their
+// bodies are materialized. Associated type aliases declared in the impl are
+// resolved for identifier-shaped returns, which covers the stable trait surface
+// without relying on late monomorphization to discover a bad implementation.

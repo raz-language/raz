@@ -1,6 +1,6 @@
 # Raz WebAssembly ABI v1
 
-This document defines the stable WebAssembly ABI emitted by Raz for the wasm32 core-module target. It is a compatibility contract between the Raz compiler, the Raz standard library, and WASI hosts. Changes that alter an externally observable layout, tag, calling convention, or host-boundary rule require an ABI-version change or an explicitly compatible extension.
+This specification defines the stable WebAssembly ABI emitted by Raz for the wasm32 core-module target. It is a compatibility contract between the Raz compiler, the Raz standard library, and WASI hosts. Changes that alter an externally observable layout, tag, calling convention, or host-boundary rule require an ABI-version change or an explicitly compatible extension.
 
 ## Target model
 
@@ -11,6 +11,8 @@ Raz emits core WebAssembly modules directly from backend-neutral MIR. The baseli
 Bytes `0..511` are reserved for generated WASI adapter scratch. Allocator metadata begins at byte `512`. Static Raz data begins at byte `1024`. The runtime heap begins at the next eight-byte-aligned address after the final unique static-data object, with a minimum base of `1024`.
 
 Aggregate MIR storage uses eight-byte slots. Structures and fixed arrays are contiguous slot sequences. A slice is a two-slot image `{data_handle, length}`. Static string literals are NUL terminated and byte-identical literals are deduplicated.
+
+The compiler prepares the static string pool once before module emission. Byte-identical literal deduplication therefore remains part of the ABI while address lookup and data-section emission use a cached hashed index rather than rescanning MIR for every literal. This is an implementation/performance guarantee and does not change the observable string layout.
 
 The wasm32 address-space ceiling is `0xffffffff`. Allocation arithmetic must fail or trap before publishing an address beyond that ceiling. WebAssembly page growth failure traps at the allocation boundary.
 

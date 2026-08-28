@@ -1,0 +1,433 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::runtime_future;
+
+public import raz_codegen_wasm::async;
+
+// Low-level std::thread::future kernel for wasm32. Standalone runtime futures
+// deliberately share the compiler async-frame header so MIR await can consume
+// either kind without a bridge object:
+//   +0  resume pc (unused for external futures)
+//   +8  result bits
+//   +16 poll table index (-1 = externally completed)
+//   +24 spill count (0)
+//   +32 status (0 pending, 1 complete, -1 cancelled)
+//   +40..+63 reserved
+fn wasm_future_name_is_literal(Source& source, HirModule& hir, i64 function_index, string name) -> bool {
+    return wasm_wasi_name_is_literal(source, hir, function_index, name);
+}
+
+fn wasm_future_name_is(Source& source, HirModule& hir, i64 function_index, i64[]name, i64 length) -> bool {
+    return wasm_wasi_name_is(source, hir, function_index, name, length);
+}
+
+fn wasm_future_create(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_create");
+}
+
+fn wasm_future_complete_i64(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_complete_i64");
+}
+
+fn wasm_future_cancel(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_cancel");
+}
+
+fn wasm_future_status(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_status");
+}
+
+fn wasm_future_wait_millis(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_wait_millis");
+}
+
+fn wasm_future_result_i64(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_result_i64");
+}
+
+fn wasm_future_then_i64(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_then_i64");
+}
+
+fn wasm_future_continuation_count(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_continuation_count");
+}
+
+fn wasm_future_destroy(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return wasm_future_name_is_literal(source, hir, function_index, "raz_rt_future_destroy");
+}
+
+fn wasm_future_runtime_function_supported(Source& source, HirModule& hir, i64 function_index) -> bool {
+    return (
+        wasm_future_create(source, hir, function_index) ||
+        wasm_future_complete_i64(source, hir, function_index) ||
+        wasm_future_cancel(source, hir, function_index) ||
+        wasm_future_status(source, hir, function_index) ||
+        wasm_future_wait_millis(source, hir, function_index) ||
+        wasm_future_result_i64(source, hir, function_index) ||
+        wasm_future_then_i64(source, hir, function_index) ||
+        wasm_future_continuation_count(source, hir, function_index) ||
+        wasm_future_destroy(source, hir, function_index)
+    );
+}
+
+fn wasm_future_i64_load(ForgeWriter&mut out, i64 pointer_local, i64 offset) {
+    wasm_local_get(out, pointer_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 41);
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_future_i64_store_local(ForgeWriter&mut out, i64 pointer_local, i64 value_local, i64 offset) {
+    wasm_local_get(out, pointer_local);
+    wasm_u8(out, 167);
+    wasm_local_get(out, value_local);
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_future_i64_store_const(ForgeWriter&mut out, i64 pointer_local, i64 value, i64 offset) {
+    wasm_local_get(out, pointer_local);
+    wasm_u8(out, 167);
+    wasm_u8(out, 66);
+    wasm_i64(out, value);
+    wasm_u8(out, 55);
+    wasm_u32(out, 3);
+    wasm_u32(out, offset);
+}
+
+fn wasm_future_return_i64(ForgeWriter&mut out, i64 value) {
+    wasm_u8(out, 66);
+    wasm_i64(out, value);
+    wasm_u8(out, 15);
+}
+
+fn wasm_future_emit_create_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    // local 0 = future frame pointer.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+    i64 alloc_function = wasm_wasi_find_named_function_literal(source, hir, "raz_rt_alloc");
+
+    if (alloc_function >= 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 64);
+        wasm_u8(&mut body, 16);
+        wasm_u32(&mut body, wasm_wasi_defined_function(alloc_function));
+        wasm_local_set(&mut body, 0);
+    } else {
+        wasm_u8(&mut body, 35);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 173);
+        wasm_local_set(&mut body, 0);
+        wasm_u8(&mut body, 35);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 64);
+        wasm_u8(&mut body, 106);
+        wasm_u8(&mut body, 36);
+        wasm_u32(&mut body, 0);
+        wasm_memory_emit_ensure_capacity(&mut body);
+    }
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+
+    i64 slot = 0;
+
+    while (slot < 8) {
+        wasm_future_i64_store_const(&mut body, 0, 0, slot * 8);
+        slot += 1;
+    }
+    wasm_future_i64_store_const(&mut body, 0, -1, 16);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_complete_body(ForgeWriter&mut section, bool cancelled) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_future_i64_load(&mut body, 0, 32);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    if (cancelled) {
+        wasm_future_i64_store_const(&mut body, 0, -1, 32);
+    } else {
+        wasm_future_i64_store_local(&mut body, 0, 1, 8);
+        wasm_future_i64_store_const(&mut body, 0, 1, 32);
+    }
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_status_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_future_i64_load(&mut body, 0, 32);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_wait_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    // local 2 = observed status.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 83);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_future_i64_load(&mut body, 0, 32);
+    wasm_local_set(&mut body, 2);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_wasi_emit_poll_delay_local(&mut body, 1);
+    wasm_future_i64_load(&mut body, 0, 32);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_result_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    // local 2 = status.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 126);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_future_i64_load(&mut body, 0, 32);
+    wasm_local_set(&mut body, 2);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 83);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, -1);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_future_return_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    // output may be null when the caller only queries readiness.
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_future_i64_load(&mut body, 0, 8);
+    wasm_u8(&mut body, 55);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 1);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_destroy_body(ForgeWriter&mut section, Source& source, HirModule& hir) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    i64 dealloc_function = wasm_wasi_find_named_function_literal(source, hir, "raz_rt_dealloc");
+
+    if (dealloc_function >= 0) {
+        wasm_local_get(&mut body, 0);
+        wasm_u8(&mut body, 16);
+        wasm_u32(&mut body, wasm_wasi_defined_function(dealloc_function));
+    }
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_unsupported_then_body(ForgeWriter&mut section) -> bool {
+    ForgeWriter body;
+
+    writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // Native continuation addresses are process pointers. They cannot be safely
+    // reinterpreted as wasm table indices; require a typed Raz closure instead.
+    wasm_wasi_set_last_error(&mut body, 58);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_future_emit_zero_body(ForgeWriter&mut section) -> bool {
+    return wasm_wasi_emit_constant_i64_body(section, 0);
+}
+
+fn wasm_future_runtime_emit_body(
+    ForgeWriter&mut section,
+    Source& source,
+    HirModule& hir,
+    i64 function_index,
+) -> bool {
+    if (wasm_future_create(source, hir, function_index)) {
+        return wasm_future_emit_create_body(section, source, hir);
+    }
+    if (wasm_future_complete_i64(source, hir, function_index)) {
+        return wasm_future_emit_complete_body(section, false);
+    }
+    if (wasm_future_cancel(source, hir, function_index)) {
+        return wasm_future_emit_complete_body(section, true);
+    }
+    if (wasm_future_status(source, hir, function_index)) {
+        return wasm_future_emit_status_body(section);
+    }
+    if (wasm_future_wait_millis(source, hir, function_index)) {
+        return wasm_future_emit_wait_body(section);
+    }
+    if (wasm_future_result_i64(source, hir, function_index)) {
+        return wasm_future_emit_result_body(section);
+    }
+    if (wasm_future_then_i64(source, hir, function_index)) {
+        return wasm_future_emit_unsupported_then_body(section);
+    }
+    if (wasm_future_continuation_count(source, hir, function_index)) {
+        return wasm_future_emit_zero_body(section);
+    }
+    if (wasm_future_destroy(source, hir, function_index)) {
+        return wasm_future_emit_destroy_body(section, source, hir);
+    }
+    return false;
+}

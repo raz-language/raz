@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import sys
 
 
 def run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -26,6 +27,34 @@ def fail(label: str, result: subprocess.CompletedProcess[str]) -> None:
     print(result.stdout, end='')
     print(result.stderr, end='')
     raise SystemExit(f'{label} failed: {result.returncode}')
+
+
+
+
+def runtime_link_dependencies(runtime: Path) -> list[str]:
+    """Mirror the installed toolchain's self-describing runtime link layout."""
+    configured = os.environ.get('RAZ_RUNTIME_LINK_DEPS', '')
+    if configured:
+        values = configured.replace(os.pathsep, ';').split(';')
+        return [value for value in values if value and Path(value).is_file()]
+    directory = runtime.parent
+    if os.name == 'nt':
+        names = ['raz_runtime_ssl.lib', 'raz_runtime_crypto.lib', 'raz_runtime_ssl.a', 'raz_runtime_crypto.a']
+    else:
+        names = ['libraz_runtime_ssl.so', 'libraz_runtime_crypto.so', 'libraz_runtime_ssl.a', 'libraz_runtime_crypto.a']
+    return [str(directory / item) for item in names if (directory / item).is_file()]
+
+def resolve_forge_cli(forge_run: Path) -> Path:
+    """Resolve Forge 2.0's compiler CLI while keeping --forge-run compatible."""
+    name = forge_run.name.lower()
+    if name in {'forge-run', 'forge-run.exe'}:
+        sibling = forge_run.with_name('forge.exe' if name.endswith('.exe') else 'forge')
+        if sibling.is_file():
+            return sibling
+        raise SystemExit(
+            f'backend-differential-wasm: {forge_run} is the execution CLI, but sibling Forge compiler {sibling} is missing'
+        )
+    return forge_run
 
 
 def main() -> int:
@@ -40,6 +69,11 @@ def main() -> int:
     ap.add_argument('--features')
     args = ap.parse_args()
 
+    args.source = args.source.resolve()
+    args.razc = args.razc.resolve()
+    args.forge_run = args.forge_run.resolve()
+    args.runtime = args.runtime.resolve()
+
     source = args.source.resolve()
     with tempfile.TemporaryDirectory(prefix='raz-backend-diff-wasm-') as td:
         tmp = Path(td)
@@ -51,16 +85,23 @@ def main() -> int:
         forge_compile = run([str(args.razc), '--backend=forge', str(source), str(fir)])
         if forge_compile.returncode != 0:
             fail('Forge compilation', forge_compile)
+        forge_cli = resolve_forge_cli(args.forge_run)
         if os.name == 'nt':
-            forge_codegen = run([str(args.forge_run), str(fir), f'--emit-coff={forge_object}', '--abi=windows'])
+            object_format = 'coff'
+        elif sys.platform == 'darwin':
+            object_format = 'macho'
         else:
-            forge_codegen = run([str(args.forge_run), str(fir), f'--emit-elf={forge_object}', '--abi=sysv'])
+            object_format = 'elf'
+        forge_codegen = run([
+            str(forge_cli), 'compile', str(fir),
+            f'--format={object_format}', '-o', str(forge_object),
+        ])
         if forge_codegen.returncode != 0:
             fail('Forge object emission', forge_codegen)
         linker = os.environ.get('CXX') or shutil.which('clang++') or shutil.which('c++') or shutil.which('g++')
         if not linker:
             raise SystemExit('backend-differential-wasm: no C++ linker driver found')
-        link_cmd = [str(linker), str(forge_object), str(args.runtime)]
+        link_cmd = [str(linker), str(forge_object), str(args.runtime), *runtime_link_dependencies(args.runtime)]
         if os.name != 'nt':
             link_cmd += ['-lpthread', '-ldl']
         link_cmd += ['-o', str(native)]

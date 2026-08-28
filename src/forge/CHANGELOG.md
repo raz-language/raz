@@ -1,5 +1,6 @@
 ## Unreleased
-- Renamed the internal Forge implementation directory `src/target/` to `src/platform/` so source packaging and cleanup cannot confuse target ABI/data-layout implementation files with generated build `target/` trees; the public `forge/target/*` API remains unchanged.
+- Closed the standalone-tool release matrix under strict warnings: `forge`, `forge-as`, `forge-dis`, `forge-opt`, `forge-codegen`, and `forge-run` now build together under the Raz root configuration, with the full 75-test standalone suite passing under `FORGE_ENABLE_WERROR=ON`.
+- Renamed Forge target-specific source/API/test directories to `platform` (`src/platform/`, `include/forge/platform/`, and `tests/platform/`) so source packaging and cleanup cannot confuse platform ABI/data-layout implementation files with generated build `target/` trees.
 - Fixed SCCP handling of opaque/unmodelled result-producing operations so calls and address-like operations cannot remain at lattice bottom and incorrectly dominate block-parameter meets; this closes the Raz O2 self-host native-path miscompile. Comparison constant folding now also preserves `i1` result typing.
 - Added NEON half-vector tail lowering for non-power-of-two contiguous packs: 8-byte remainders use `D` loads/stores and vector arithmetic, so runs such as 6×`f32`/`i32` and 3×`f64`/`i64` stay packed without over-reading memory; AArch64 SLP now groups these tail-safe runs and differential tests cover a six-lane integer chain.
 - Extended AArch64 canonical SLP and NEON codegen to floating-point expressions: contiguous `f32`/`f64` scalar-broadcast maps, vector-vector maps, chained maps, postfix DAGs, and reusable DAGs now retain add/sub/mul/div semantics and emit native Advanced SIMD operations instead of remaining scalar.
@@ -53,7 +54,7 @@
 ### Optimizer correctness
 
 - Temporarily restricted cross-block stack promotion around CFG backedges after the previous iterative predecessor-value construction was shown to create stale loop state and make the optimized production Raz LSP spin indefinitely at `-O2`; the dominance-frontier implementation above now supersedes that temporary restriction.
-- Restored the target ABI/data-layout tests to source packages and extended the workspace packager so Forge's legitimate `tests/target/` directory is preserved alongside `src/target/` and `include/forge/target/`.
+- Restored the target ABI/data-layout tests to source packages and extended the workspace packager so Forge's legitimate `tests/platform/` directory is preserved alongside `src/target/` and `include/forge/platform/`.
 
 ### Compile throughput
 
@@ -69,12 +70,12 @@
 
 ### Build
 
-- Restored `tests/target/data_layout_tests.cpp` and
-  `tests/target/abi_classification_tests.cpp`. `CMakeLists.txt` referenced both,
+- Restored `tests/platform/data_layout_tests.cpp` and
+  `tests/platform/abi_classification_tests.cpp`. `CMakeLists.txt` referenced both,
   but neither was present, so the project could not configure at all and CI
   could never have run.
 - Added `is_power_of_two`, `is_aligned`, `checked_align_to`, and `align_to` to
-  `forge/target/data_layout.hpp`. `checked_align_to` reports overflow rather
+  `forge/platform/data_layout.hpp`. `checked_align_to` reports overflow rather
   than wrapping, so a hostile or generated alignment cannot silently place a
   field before the start of its aggregate.
 

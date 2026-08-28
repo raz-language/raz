@@ -1,0 +1,158 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir_opt::transform::const_prop;
+
+public import raz_mir_opt::transform::simplify_cfg;
+
+// Fold scalar integer operations whose operands are literal MIR constants.
+// Instructions keep their indices, so every existing register reference stays valid.
+fn mir_constant_value(MirModule& mir, i64 instruction, i64&mut value) -> bool {
+    if (instruction < 0 || instruction >= mir.instruction_count) {
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(mir.opcodes, instruction) != 1) {
+        return false;
+    }
+    // Float constants do not carry a numeric payload here: op_a/op_b hold the
+    // literal's source spelling as (offset, length) so the backend can emit the
+    // exact text. Folding one as an integer would do arithmetic on source
+    // offsets -- `2.5 + 3.5` became `offset(2.5) + offset(3.5)`. This pass folds
+    // scalar integers only, so refuse any constant that is not one.
+    if (primitive_type_is_float(raz_compiler_rt_arena_get(mir.op_types, instruction))) {
+        return false;
+    }
+    if (raz_compiler_rt_arena_get(mir.op_b, instruction) != 0) {
+        return false;
+    }
+    *value = raz_compiler_rt_arena_get(mir.op_a, instruction);
+    return true;
+}
+
+fn mir_replace_with_constant(MirModule&mut mir, i64 instruction, i64 value) {
+    raz_compiler_rt_arena_set(mir.opcodes, instruction, 1);
+    raz_compiler_rt_arena_set(mir.op_a, instruction, value);
+    raz_compiler_rt_arena_set(mir.op_b, instruction, 0);
+    raz_compiler_rt_arena_set(mir.op_c, instruction, 0);
+    raz_compiler_rt_arena_set(mir.op_d, instruction, 0);
+}
+
+fn propagate_mir_constants(MirModule&mut mir) -> bool {
+    i64 ip = 0;
+
+    while (ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 18) {
+            i64 operand = 0;
+
+            if (mir_constant_value(mir, raz_compiler_rt_arena_get(mir.op_a, ip), &mut operand)) {
+                if (operand == 0) {
+                    mir_replace_with_constant(mir, ip, 1);
+                } else {
+                    mir_replace_with_constant(mir, ip, 0);
+                }
+            }
+        } else if (
+            (opcode >= 4 && opcode <= 7) ||
+            (opcode >= 11 && opcode <= 16) ||
+            opcode == 19 ||
+            opcode == 20 ||
+            (opcode >= 34 && opcode <= 39)
+        ) {
+            i64 left = 0;
+            i64 right = 0;
+
+            if (
+                mir_constant_value(mir, raz_compiler_rt_arena_get(mir.op_a, ip), &mut left) &&
+                mir_constant_value(mir, raz_compiler_rt_arena_get(mir.op_b, ip), &mut right)
+            ) {
+                bool fold = true;
+                i64 value = 0;
+
+                if (opcode == 4) {
+                    value = left + right;
+                } else if (opcode == 5) {
+                    value = left - right;
+                } else if (opcode == 6) {
+                    value = left * right;
+                } else if (opcode == 7) {
+                    if (right == 0) {
+                        fold = false;
+                    } else {
+                        value = left / right;
+                    }
+                } else if (opcode == 11) {
+                    if (left == right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 12) {
+                    if (left != right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 13) {
+                    if (left < right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 14) {
+                    if (left <= right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 15) {
+                    if (left > right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 16) {
+                    if (left >= right) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 19) {
+                    if (left != 0 && right != 0) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 20) {
+                    if (left != 0 || right != 0) {
+                        value = 1;
+                    } else {
+                        value = 0;
+                    }
+                } else if (opcode == 34) {
+                    if (right == 0) {
+                        fold = false;
+                    } else {
+                        value = left % right;
+                    }
+                } else if (opcode == 35) {
+                    value = left & right;
+                } else if (opcode == 36) {
+                    value = left | right;
+                } else if (opcode == 37) {
+                    value = left ^ right;
+                } else if (opcode == 38) {
+                    value = left << right;
+                } else {
+                    value = left >> right;
+                }
+                if (fold) {
+                    mir_replace_with_constant(mir, ip, value);
+                }
+            }
+        }
+        ip += 1;
+    }
+    return true;
+}

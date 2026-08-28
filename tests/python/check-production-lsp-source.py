@@ -7,17 +7,17 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-CLI = (ROOT / "compiler/src/driver/cli.rz").read_text(encoding="utf-8")
-COMMANDS = (ROOT / "compiler/src/driver/commands.rz").read_text(encoding="utf-8")
-LSP = (ROOT / "compiler/src/driver/lsp.rz").read_text(encoding="utf-8")
+CLI = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+COMMANDS = (ROOT / "compiler/src/raz_driver/src/commands.rz").read_text(encoding="utf-8")
+LSP = (ROOT / "compiler/src/raz_driver/src/lsp.rz").read_text(encoding="utf-8")
 RUNTIME = (ROOT / "src/runtime/files_process.cpp").read_text(encoding="utf-8")
-ORDER = {path.relative_to(ROOT / "compiler").as_posix() for path in (ROOT / "compiler/src").rglob("*.rz")}
+ORDER = {path.relative_to(ROOT / "compiler").as_posix() for path in list((ROOT / "compiler").rglob("*.rz"))}
 BOOTSTRAP = (ROOT / "tools/bootstrap.py").read_text(encoding="utf-8")
 
 checks = {
     "production CLI owns lsp command": 'string candidate_lsp = "lsp"' in CLI and 'if (cli_arg_equals_literal(value, length, "lsp"))' in CLI,
     "production dispatcher routes lsp": "return lsp_command(process_argc);" in COMMANDS,
-    "LSP is in production source graph": "src/driver/lsp.rz" in ORDER,
+    "LSP is in production source graph": "src/raz_driver/src/lsp.rz" in ORDER,
     "LSP uses native stdio boundary": "extern fn raz_rt_stdio_read" in LSP and "extern fn raz_rt_stdio_flush" in LSP,
     "LSP forces byte-exact stdio": "extern fn raz_rt_stdio_set_binary" in LSP and "raz_rt_stdio_set_binary(0)" in LSP and "raz_rt_stdio_set_binary(1)" in LSP and "_setmode(descriptor, _O_BINARY)" in RUNTIME,
     "LSP framing is Raz-owned": "fn lsp_read_message(" in LSP and "fn lsp_send(" in LSP,

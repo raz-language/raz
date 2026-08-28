@@ -154,7 +154,7 @@ def main() -> int:
     assert published[0]["params"]["diagnostics"], published[0]
     first = published[0]["params"]["diagnostics"][0]
     assert first["severity"] == 1
-    assert str(first["code"]).startswith("E")
+    assert first["code"] == "D1001"
     assert published[-2]["params"]["diagnostics"] == [], published[-2]
     assert published[-1]["params"]["diagnostics"] == [], published[-1]
 

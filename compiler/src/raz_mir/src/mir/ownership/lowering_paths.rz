@@ -1,0 +1,204 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_mir::ownership::lowering_paths;
+
+public import raz_mir::core::builder;
+
+// Build a static ownership path from a local/parameter through named field
+// projections. Dynamic indexing remains represented by whole-local ownership until
+// the index/path model is extended; field paths are stable semantic identities.
+fn mir_collect_hir_ownership_path(
+    HirModule& hir,
+    MirModule& mir,
+    i64 node,
+    i64 components,
+    i64 depth,
+    i64&mut root_slot,
+) -> i64 {
+    if (node < 0 || depth >= 64) {
+        return -1;
+    }
+
+    i64 kind = raz_compiler_rt_arena_get(hir.node_kinds, node);
+
+    if (kind == 3) {
+        *root_slot = raz_compiler_rt_arena_get(hir.node_a, node);
+        return depth;
+    }
+    if (kind == 2) {
+        i64 parameter_slot = raz_compiler_rt_arena_get(hir.node_a, node);
+
+        if (
+            raz_compiler_rt_arena_get(
+                hir.parameter_mutated,
+                mir.lowering_parameter_start + parameter_slot
+            ) == 0
+        ) {
+            return -1;
+        }
+        *root_slot = mir.lowering_parameter_local_base + parameter_slot;
+        return depth;
+    }
+    if (kind == 16) {
+        i64 next_depth = mir_collect_hir_ownership_path(
+            hir,
+            mir,
+            raz_compiler_rt_arena_get(hir.node_a, node),
+            components,
+            depth,
+            root_slot,
+        );
+        if (next_depth < 0 || next_depth >= 64) {
+            return -1;
+        }
+        raz_compiler_rt_arena_set(components, next_depth, raz_compiler_rt_arena_get(hir.node_b, node));
+        return next_depth + 1;
+    }
+    return -1;
+}
+
+fn mir_record_hir_path_event(
+    HirModule& hir,
+    MirModule&mut mir,
+    i64 instruction,
+    i64 kind,
+    i64 operand,
+) -> bool {
+    i64 components = raz_compiler_rt_arena_create(65);
+
+    if (components == 0) {
+        return false;
+    }
+
+    i64 root_slot = -1;
+    i64 count = mir_collect_hir_ownership_path(hir, mir, operand, components, 0, &mut root_slot);
+    bool recorded = true;
+
+    if (count >= 0 && root_slot >= 0) {
+        recorded = mir_record_ownership_path_event(mir, instruction, kind, root_slot, components, count);
+    }
+    raz_compiler_rt_arena_destroy(components);
+    return recorded;
+}
+
+fn mir_record_hir_move_event(HirModule& hir, MirModule&mut mir, i64 instruction, i64 operand) -> bool {
+    return mir_record_hir_path_event(hir, mir, instruction, 1, operand);
+}
+
+fn mir_event_holder_before(MirModule& mir, i64 event, i64 before_instruction) -> i64 {
+    i64 origin = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+    i64 ip = origin + 1;
+
+    while (ip < before_instruction && ip < mir.instruction_count) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+
+        if (opcode == 9 && raz_compiler_rt_arena_get(mir.op_b, ip) == origin) {
+            return raz_compiler_rt_arena_get(mir.op_a, ip);
+        }
+        if (opcode == 21 || opcode == 22 || opcode == 23 || opcode == 24) {
+            break;
+        }
+        ip += 1;
+    }
+    return -1;
+}
+
+fn mir_find_reborrow_parent(MirModule& mir, i64 instruction) -> i64 {
+    if (instruction < 0 || instruction >= mir.instruction_count) {
+        return -1;
+    }
+
+    i64 source = raz_compiler_rt_arena_get(mir.op_a, instruction);
+
+    if (raz_compiler_rt_arena_get(mir.opcodes, instruction) != 26 || source < 0 || source >= instruction) {
+        return -1;
+    }
+
+    i64 source_opcode = raz_compiler_rt_arena_get(mir.opcodes, source);
+    i64 source_slot = -1;
+
+    if (source_opcode == 3 || source_opcode == 25) {
+        source_slot = raz_compiler_rt_arena_get(mir.op_a, source);
+    }
+
+    i64 event = mir.ownership.ownership_event_count - 1;
+
+    while (event >= 0) {
+        i64 kind = raz_compiler_rt_arena_get(mir.ownership.ownership_event_kinds, event);
+        i64 origin = raz_compiler_rt_arena_get(mir.ownership.ownership_event_instructions, event);
+
+        if ((kind == 3 || kind == 4) && origin < instruction) {
+            if (
+                source == origin ||
+                (source_slot >= 0 && mir_event_holder_before(mir, event, instruction) == source_slot)
+            ) {
+                return event;
+            }
+        }
+        event -= 1;
+    }
+    return -1;
+}
+
+fn mir_record_reborrow_event(MirModule&mut mir, i64 instruction, i64 kind) -> bool {
+    i64 parent = mir_find_reborrow_parent(mir, instruction);
+
+    if (parent < 0) {
+        return true;
+    }
+
+    i64 count = raz_compiler_rt_arena_get(mir.ownership.ownership_event_path_counts, parent);
+    i64 start = raz_compiler_rt_arena_get(mir.ownership.ownership_event_path_starts, parent);
+    i64 slot = raz_compiler_rt_arena_get(mir.ownership.ownership_event_slots, parent);
+    i64 components = raz_compiler_rt_arena_create(count + 1);
+
+    if (components == 0) {
+        return false;
+    }
+
+    i64 component = 0;
+
+    while (component < count) {
+        raz_compiler_rt_arena_set(
+            components,
+            component,
+            raz_compiler_rt_arena_get(mir.ownership.ownership_path_components, start + component),
+        );
+        component += 1;
+    }
+
+    i64 event = mir.ownership.ownership_event_count;
+    bool recorded = mir_record_ownership_path_event(mir, instruction, kind, slot, components, count);
+
+    raz_compiler_rt_arena_destroy(components);
+    if (!recorded) {
+        return false;
+    }
+    raz_compiler_rt_arena_set(mir.ownership.ownership_event_parents, event, parent);
+    return true;
+}
+
+fn mir_record_hir_borrow_event(
+    HirModule& hir,
+    MirModule&mut mir,
+    i64 instruction,
+    i64 operand,
+    i64 mutable_borrow,
+) -> bool {
+    i64 kind = 3;
+
+    if (mutable_borrow != 0) {
+        kind = 4;
+    }
+
+    i64 before = mir.ownership.ownership_event_count;
+
+    if (!mir_record_hir_path_event(hir, mir, instruction, kind, operand)) {
+        return false;
+    }
+    if (mir.ownership.ownership_event_count != before) {
+        return true;
+    }
+    return mir_record_reborrow_event(mir, instruction, kind);
+}

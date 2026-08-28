@@ -261,7 +261,12 @@ SyntaxNode Parser::parse_import() {
   const auto first = expect(TokenKind::identifier, "expected module name after 'import'");
   result.label = token_text(first);
   while (consume(TokenKind::colon_colon)) {
-    const auto part = expect(TokenKind::identifier, "expected module path component");
+    // `comptime` is contextual in the production frontend.  The frozen host
+    // lexer tokenizes it eagerly, so accept it as a path component after `::`
+    // rather than forcing compiler modules to rename a valid namespace.
+    const auto part = at(TokenKind::kw_comptime)
+        ? Token(advance())
+        : expect(TokenKind::identifier, "expected module path component");
     result.label += "::" + token_text(part);
   }
 
@@ -281,7 +286,9 @@ SyntaxNode Parser::parse_namespace() {
   const auto name = expect(TokenKind::identifier, "expected namespace name");
   result.label = token_text(name);
   while (consume(TokenKind::colon_colon)) {
-    const auto part = expect(TokenKind::identifier, "expected namespace path component");
+    const auto part = at(TokenKind::kw_comptime)
+        ? Token(advance())
+        : expect(TokenKind::identifier, "expected namespace path component");
     result.label += "::" + token_text(part);
   }
 

@@ -69,12 +69,14 @@ declaration identity is maintained in an open-addressed `(package, namespace, na
 index, so duplicate detection does not rescan every previously declared symbol.
 
 For unchanged semantic checks, Raz persists a versioned project-source snapshot and
-semantic key under `target/cache`. The snapshot is validated against every contributing
-manifest/module using file size and a normalized high-resolution modification tick;
-a valid snapshot avoids project traversal and source rereads, and an exact semantic-key
-match avoids rebuilding HIR. Same-size rewrites therefore invalidate correctly on
-filesystems whose native file-clock epoch is signed. Any uncertainty is treated as a
-miss and runs the normal compiler pipeline.
+semantic key under `target/cache`. The snapshot is validated against every contributing manifest/module using file
+size, a normalized high-resolution modification tick, and a persisted content
+fingerprint. Metadata is an inexpensive first rejection, while the content fingerprint
+is the correctness boundary: timestamp-preserving editors, archive extraction, and
+source generators cannot make changed bytes look fresh. A valid snapshot still avoids
+project traversal, parsing, and source assembly, and an exact semantic-key match avoids
+rebuilding HIR. Any metadata/read/hash uncertainty is treated as a miss and runs the
+normal compiler pipeline.
 
 For a non-interface source edit, `raz check` can reuse the previous successful semantic
 result for ordinary non-generic bodies in source-clean modules. Declarations and exported

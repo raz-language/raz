@@ -7,9 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 fmt = (ROOT / 'library/std/fmt/fmt.rz').read_text(encoding='utf-8')
 stdio = (ROOT / 'library/std/io/stdio.rz').read_text(encoding='utf-8')
-cli = (ROOT / 'compiler/src/driver/cli.rz').read_text(encoding='utf-8')
-interp = (ROOT / 'compiler/src/mir/interpreter.rz').read_text(encoding='utf-8')
-main = (ROOT / 'compiler/src/main.rz').read_text(encoding='utf-8')
+cli = (ROOT / 'compiler/src/raz_driver/src/cli.rz').read_text(encoding='utf-8')
+interp = (ROOT / 'compiler/src/raz_mir/src/mir/interpreter.rz').read_text(encoding='utf-8')
+main = (ROOT / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
 testing = (ROOT / 'library/std/testing/testing.rz').read_text(encoding='utf-8')
 
 checks = {

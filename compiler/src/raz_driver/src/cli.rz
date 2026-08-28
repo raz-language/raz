@@ -1,0 +1,4171 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::cli;
+
+public import raz_driver::project;
+
+// Human-facing compiler CLI. Keep bootstrap/legacy invocations compatible while
+// providing discoverable commands and backend-specific help.
+extern fn raz_rt_stdio_is_terminal(i64 stream) -> i64;
+
+fn cli_write_stream(i64 stream, i64[]text, i64 length) {
+    if (length <= 0) {
+        return;
+    }
+
+    i64 buffer = raz_compiler_rt_arena_create(length);
+
+    if (buffer == 0) {
+        return;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, text[i]);
+        i += 1;
+    }
+    raz_compiler_rt_stdio_write_ascii(stream, buffer, length);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn cli_write_literal_stream(i64 stream, string text) {
+    i64 length = compiler_literal_length(text);
+    if (length <= 0) { return; }
+    i64 buffer = raz_compiler_rt_arena_create(length);
+    if (buffer == 0) { return; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    raz_compiler_rt_stdio_write_ascii(stream, buffer, length);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn cli_write_literal(string text) { cli_write_literal_stream(1, text); }
+
+fn cli_write(i64[]text, i64 length) {
+    if (length <= 0) {
+        return;
+    }
+
+    i64 buffer = raz_compiler_rt_arena_create(length);
+
+    if (buffer == 0) {
+        return;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, text[i]);
+        i += 1;
+    }
+    raz_compiler_rt_stdio_write_ascii(1, buffer, length);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn cli_write_arena_stream(i64 stream, i64 value, i64 length) {
+    if (value == 0 || length <= 0) {
+        return;
+    }
+    raz_compiler_rt_stdio_write_ascii(stream, value, length);
+}
+
+fn cli_print_status_detail(i64 detail, i64 detail_length) {
+    if (detail == 0 || detail_length <= 0) {
+        return;
+    }
+    if (!path_has_toml_extension(detail, detail_length)) {
+        cli_write_arena_stream(1, detail, detail_length);
+        return;
+    }
+
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 name = raz_compiler_rt_arena_create(4096);
+    i64 version = raz_compiler_rt_arena_create(256);
+
+    if (manifest == 0 || name == 0 || version == 0) {
+        if (manifest != 0) {
+            raz_compiler_rt_arena_destroy(manifest);
+        }
+        if (name != 0) {
+            raz_compiler_rt_arena_destroy(name);
+        }
+        if (version != 0) {
+            raz_compiler_rt_arena_destroy(version);
+        }
+        cli_write_arena_stream(1, detail, detail_length);
+        return;
+    }
+
+    i64 manifest_length = raz_compiler_rt_read_ascii(detail, detail_length, manifest, 65536);
+    i64 name_length = -1;
+    i64 version_length = -1;
+
+    if (manifest_length > 0) {
+        name_length = manifest_package_name(manifest, manifest_length, name, 4096);
+        version_length = manifest_package_version(manifest, manifest_length, version, 256);
+    }
+    if (name_length > 0) {
+        cli_write_arena_stream(1, name, name_length);
+        if (version_length > 0) {
+            
+
+            cli_write_literal_stream(1, " v");
+            cli_write_arena_stream(1, version, version_length);
+        }
+    } else {
+        cli_write_arena_stream(1, detail, detail_length);
+    }
+    raz_compiler_rt_arena_destroy(version);
+    raz_compiler_rt_arena_destroy(name);
+    raz_compiler_rt_arena_destroy(manifest);
+}
+
+// Returns whether human-facing stdout status lines should use ANSI styling.
+// `RAZ_COLOR` is set by the outer `raz` driver when --color is explicit, while
+// direct production-compiler invocations (including bootstrap reproducibility
+// generations) fall back to terminal detection. `NO_COLOR` remains the
+// conventional auto-mode opt-out.
+fn cli_status_color_enabled() -> bool {
+    i64 explicit = cli_explicit_color_mode();
+    if (explicit >= 0) { return explicit == 1; }
+    i64 name = raz_compiler_rt_arena_create(16);
+    i64 value = raz_compiler_rt_arena_create(16);
+    if (name == 0 || value == 0) {
+        if (name != 0) { raz_compiler_rt_arena_destroy(name); }
+        if (value != 0) { raz_compiler_rt_arena_destroy(value); }
+        return raz_rt_stdio_is_terminal(1) > 0;
+    }
+
+    string color_name = "RAZ_COLOR";
+    i64 i = 0;
+    while (i < 9) {
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(color_name, i));
+        i += 1;
+    }
+    i64 color_length = raz_compiler_rt_env_get_ascii(name, 9, value, 16);
+    if (color_length > 0) {
+        bool force_on =
+            cli_arg_equals_literal(value, color_length, "always") ||
+            cli_arg_equals_literal(value, color_length, "1") ||
+            cli_arg_equals_literal(value, color_length, "true");
+        bool force_off =
+            cli_arg_equals_literal(value, color_length, "never") ||
+            cli_arg_equals_literal(value, color_length, "0") ||
+            cli_arg_equals_literal(value, color_length, "false");
+        if (force_on || force_off) {
+            raz_compiler_rt_arena_destroy(value);
+            raz_compiler_rt_arena_destroy(name);
+            return force_on;
+        }
+    }
+
+    string no_color_name = "NO_COLOR";
+    i = 0;
+    while (i < 8) {
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(no_color_name, i));
+        i += 1;
+    }
+    i64 no_color = raz_compiler_rt_env_get_ascii(name, 8, value, 16);
+    raz_compiler_rt_arena_destroy(value);
+    raz_compiler_rt_arena_destroy(name);
+    if (no_color >= 0) { return false; }
+    return raz_rt_stdio_is_terminal(1) > 0;
+}
+
+fn cli_status_color_begin() {
+    if (!cli_status_color_enabled()) { return; }
+    i64 green_bold[7] = [27, 91, 49, 59, 51, 50, 109];
+    cli_write_stream(1, &green_bold, 7);
+}
+
+fn cli_status_color_end() {
+    if (!cli_status_color_enabled()) { return; }
+    i64 reset[4] = [27, 91, 48, 109];
+    cli_write_stream(1, &reset, 4);
+}
+
+// Writes the right-aligned status label and returns its length, or 0 for an
+// unknown kind. Labels are padded to a common width so the verbs line up down
+// the left edge of a build the way cargo's do.
+fn cli_print_status_label(i64 kind) -> i64 {
+    i64 label_length = 0;
+    if (kind >= 1 && kind <= 16) { cli_status_color_begin(); }
+
+    if (kind == 1) {
+        
+
+        label_length = 9;
+
+        
+
+        cli_write_literal_stream(1, "   ");
+        cli_write_literal_stream(1, "Compiling");
+    } else if (kind == 2) {
+        
+
+        label_length = 8;
+
+        
+
+        cli_write_literal_stream(1, "    ");
+        cli_write_literal_stream(1, "Checking");
+    } else if (kind == 3) {
+        
+
+        label_length = 5;
+
+        
+
+        cli_write_literal_stream(1, "       ");
+        cli_write_literal_stream(1, "Fresh");
+    } else if (kind == 4) {
+        
+
+        label_length = 7;
+
+        
+
+        cli_write_literal_stream(1, "     ");
+        cli_write_literal_stream(1, "Running");
+    } else if (kind == 5) {
+        
+
+        label_length = 7;
+
+        
+
+        cli_write_literal_stream(1, "     ");
+        cli_write_literal_stream(1, "Testing");
+    } else if (kind == 6) {
+        
+
+        label_length = 8;
+
+        
+
+        cli_write_literal_stream(1, "    ");
+        cli_write_literal_stream(1, "Finished");
+    } else if (kind == 7) {
+        
+
+        label_length = 7;
+
+        
+
+        cli_write_literal_stream(1, "     ");
+        cli_write_literal_stream(1, "Checked");
+    } else if (kind == 8) {
+        
+
+        label_length = 6;
+
+        
+
+        cli_write_literal_stream(1, "      ");
+        cli_write_literal_stream(1, "Tested");
+    } else if (kind == 9) {
+        label_length = 8;
+        cli_write_literal_stream(1, "    ");
+        cli_write_literal_stream(1, "Updating");
+    } else if (kind == 10) {
+        label_length = 9;
+        cli_write_literal_stream(1, "   ");
+        cli_write_literal_stream(1, "Resolving");
+    } else if (kind == 11) {
+        label_length = 8;
+        cli_write_literal_stream(1, "    ");
+        cli_write_literal_stream(1, "Resolved");
+    } else if (kind == 12) {
+        label_length = 7;
+        cli_write_literal_stream(1, "     ");
+        cli_write_literal_stream(1, "Linking");
+    } else if (kind == 13) {
+        label_length = 11;
+        cli_write_literal_stream(1, " ");
+        cli_write_literal_stream(1, "Downloading");
+    } else if (kind == 14) {
+        label_length = 9;
+        cli_write_literal_stream(1, "   ");
+        cli_write_literal_stream(1, "Installed");
+    } else if (kind == 15) {
+        label_length = 8;
+        cli_write_literal_stream(1, "    ");
+        cli_write_literal_stream(1, "Removing");
+    } else if (kind == 16) {
+        label_length = 6;
+        cli_write_literal_stream(1, "      ");
+        cli_write_literal_stream(1, "Adding");
+    }
+    if (label_length > 0) { cli_status_color_end(); }
+    return label_length;
+}
+
+fn cli_print_status(i64 kind, i64 detail, i64 detail_length) {
+    if (cli_quiet_requested()) { return; }
+    if (cli_print_status_label(kind) <= 0) {
+        return;
+    }
+
+    
+    
+
+    cli_write_literal_stream(1, " ");
+    cli_print_status_detail(detail, detail_length);
+    cli_write_literal_stream(1, "\n");
+}
+
+fn cli_print_status_literal(i64 kind, string detail) {
+    if (cli_quiet_requested()) { return; }
+    if (cli_print_status_label(kind) <= 0) { return; }
+    cli_write_literal_stream(1, " ");
+    cli_write_literal_stream(1, detail);
+    cli_write_literal_stream(1, "\n");
+}
+
+fn cli_print_status_name_version(i64 kind, i64 name, i64 name_length, i64 version, i64 version_length) {
+    if (cli_quiet_requested()) { return; }
+    if (cli_print_status_label(kind) <= 0) { return; }
+    cli_write_literal_stream(1, " ");
+    cli_write_arena_stream(1, name, name_length);
+    if (version != 0 && version_length > 0) {
+        cli_write_literal_stream(1, " v");
+        cli_write_arena_stream(1, version, version_length);
+    }
+    cli_write_literal_stream(1, "\n");
+}
+
+// `raz run` executes the linked artifact, so the status line names the file
+// that is about to run rather than the package it came from. Backticks match
+// the surrounding profile line and make the path unambiguous when it contains
+// spaces.
+fn cli_print_running_artifact(i64 path, i64 length) {
+    if (cli_quiet_requested()) { return; }
+    if (cli_print_status_label(4) <= 0) {
+        return;
+    }
+
+    
+    
+
+    cli_write_literal_stream(1, " `");
+    cli_write_arena_stream(1, path, length);
+    cli_write_literal_stream(1, "`\n");
+}
+
+// Returns the position of the exact `--` argument separator, or -1 when the
+// command line has no separator. The production driver parses arguments before
+// the separator as Raz options/input and preserves everything after it verbatim
+// for the program launched by `raz run`.
+fn cli_argument_separator_index(i64 argc) -> i64 {
+    i64 argument = raz_compiler_rt_arena_create(2);
+
+    if (argument == 0) {
+        return -1;
+    }
+
+    i64 index = 2;
+
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, argument, 2);
+
+        if (
+            length == 2 &&
+            raz_compiler_rt_arena_get(argument, 0) == 45 &&
+            raz_compiler_rt_arena_get(argument, 1) == 45
+        ) {
+            raz_compiler_rt_arena_destroy(argument);
+            return index;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(argument);
+    return -1;
+}
+
+// Partitions process argv into the arguments owned by Raz and the arguments
+// owned by the program launched by `raz run`. The separator itself belongs to
+// neither side. Keeping this policy in the CLI module prevents the compiler
+// entrypoint from growing command-line parsing rules of its own.
+fn cli_prepare_argument_partition(
+    i64 process_argc,
+    i64 cli_command,
+    i64&mut out_cli_argc,
+    i64&mut out_first_program_argument,
+) -> bool {
+    i64 separator = cli_argument_separator_index(process_argc);
+
+    if (separator >= 0 && cli_command != 12) {
+        cli_write_literal_stream(2, "error: argument separator '--' is only valid for command 'run'\n");
+        return false;
+    }
+    *out_cli_argc = process_argc;
+    *out_first_program_argument = process_argc;
+    if (separator >= 0) {
+        *out_cli_argc = separator;
+        *out_first_program_argument = separator + 1;
+    }
+    // The compact driver bound protects Raz option parsing only. Forwarded
+    // program argv is deliberately outside that bound.
+    return *out_cli_argc <= 32;
+}
+
+// Returns the first argument that can be a command option/input. Commands that
+// name an explicit subcommand consume argv[1]; direct compiler invocation does
+// not. Keeping this map here makes the entrypoint independent of command IDs.
+fn cli_command_argument_base(i64 command) -> i64 {
+    if (command >= 3 && command <= 6) {
+        return 2;
+    }
+    if (command == 10 || command == 11 || command == 12 || command == 16 || command == 17 || command == 40 || command == 45) {
+        return 2;
+    }
+    return 1;
+}
+
+// Runs the linked executable and reports its exit status as our own. Program
+// arguments are copied into the runtime's compact NUL-separated argv buffer;
+// no shell is involved, so quoting, spaces, and option-looking values such as
+// `--help` are delivered exactly as the user supplied them after `--`.
+fn cli_run_native_artifact(i64 path, i64 length, i64 first_program_argument, i64 process_argc, ) -> i64 {
+    if (path == 0 || length <= 0) {
+        return -1;
+    }
+    cli_print_running_artifact(path, length);
+    if (first_program_argument >= process_argc) {
+        return raz_compiler_rt_process_run_argv_ascii(path, length, 0, 0, 0);
+    }
+
+    i64 blob_length = 0;
+    i64 argument_count = 0;
+    i64 index = first_program_argument;
+
+    // Size first so the forwarding path has no arbitrary per-argument limit.
+    while (index < process_argc) {
+        i64 argument_length = raz_compiler_rt_process_arg(index, 0, 0);
+
+        if (argument_length < 0 || blob_length > 2147483647 - argument_length - 1) {
+            return -1;
+        }
+        blob_length += argument_length + 1;
+        argument_count += 1;
+        index += 1;
+    }
+
+    i64 blob = raz_compiler_rt_arena_create(blob_length);
+
+    if (blob == 0) {
+        return -1;
+    }
+
+    i64 cursor = 0;
+
+    index = first_program_argument;
+    while (index < process_argc) {
+        i64 argument_length = raz_compiler_rt_process_arg(index, 0, 0);
+        i64 argument = raz_compiler_rt_arena_create(argument_length + 1);
+
+        if (argument == 0) {
+            raz_compiler_rt_arena_destroy(blob);
+            return -1;
+        }
+
+        i64 actual_length = raz_compiler_rt_process_arg(index, argument, argument_length);
+
+        if (actual_length != argument_length) {
+            raz_compiler_rt_arena_destroy(argument);
+            raz_compiler_rt_arena_destroy(blob);
+            return -1;
+        }
+
+        i64 byte = 0;
+
+        while (byte < argument_length) {
+            raz_compiler_rt_arena_set(blob, cursor, raz_compiler_rt_arena_get(argument, byte));
+            cursor += 1;
+            byte += 1;
+        }
+        raz_compiler_rt_arena_set(blob, cursor, 0);
+        cursor += 1;
+        raz_compiler_rt_arena_destroy(argument);
+        index += 1;
+    }
+
+    i64 status = raz_compiler_rt_process_run_argv_ascii(path, length, blob, blob_length, argument_count, );
+
+    raz_compiler_rt_arena_destroy(blob);
+    return status;
+}
+
+// Launches the linked artifact when the command asked for a run, and reports
+// its exit status. Returns 0 when there is nothing to run so the caller can use
+// the result as its own status unconditionally.
+fn cli_maybe_run_artifact(
+    bool run_after_build,
+    i64 path,
+    i64 length,
+    i64 first_program_argument,
+    i64 process_argc,
+) -> i64 {
+    if (!run_after_build) {
+        return 0;
+    }
+    return cli_run_native_artifact(path, length, first_program_argument, process_argc);
+}
+
+
+// Returns true only for the canonical [build] target = "web" spelling.
+// The project loader owns manifest classification so CLI and compiler-main use
+// the same lowering decision. Legacy kind = "web" is mode 2, not this mode.
+fn cli_project_is_web_target(i64 manifest_path, i64 manifest_path_length) -> bool {
+    return project_manifest_web_mode(manifest_path, manifest_path_length) == 1;
+}
+
+
+// Static hosting is the contract of target=web. Public assets are copied into
+// dist before the build-time Raz page generator runs so generated HTML can be
+// written alongside ordinary CSS/images without a Node/npm bundling step.
+fn cli_web_wasm_output_path(i64 manifest_path, i64 manifest_path_length, i64&mut out_length) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 dist_path = raz_compiler_rt_arena_create(8192);
+    i64 output_path = raz_compiler_rt_arena_create(8192);
+    i64 dist_name = raz_compiler_rt_arena_create(4);
+    i64 wasm_name = raz_compiler_rt_arena_create(8);
+    *out_length = 0;
+    if (root == 0 || dist_path == 0 || output_path == 0 || dist_name == 0 || wasm_name == 0) { return 0; }
+
+    i64 rl = path_dirname(manifest_path, manifest_path_length, root, 4096);
+    string d = "dist";
+    string w = "app.wasm";
+    i64 i = 0;
+    while (i < 4) { raz_compiler_rt_arena_set(dist_name, i, compiler_literal_byte(d, i)); i += 1; }
+    i = 0;
+    while (i < 8) { raz_compiler_rt_arena_set(wasm_name, i, compiler_literal_byte(w, i)); i += 1; }
+    i64 dl = path_join(root, rl, dist_name, 4, dist_path, 8192);
+    i64 ol = path_join(dist_path, dl, wasm_name, 8, output_path, 8192);
+    raz_compiler_rt_arena_destroy(root);
+    raz_compiler_rt_arena_destroy(dist_path);
+    raz_compiler_rt_arena_destroy(dist_name);
+    raz_compiler_rt_arena_destroy(wasm_name);
+    if (rl <= 0 || dl <= 0 || ol <= 0) {
+        raz_compiler_rt_arena_destroy(output_path);
+        return 0;
+    }
+    *out_length = ol;
+    return output_path;
+}
+
+fn cli_web_wasm_chunks_marker_path(i64 manifest_path, i64 manifest_path_length, i64&mut out_length) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 dist_path = raz_compiler_rt_arena_create(8192);
+    i64 output_path = raz_compiler_rt_arena_create(8192);
+    i64 dist_name = raz_compiler_rt_arena_create(4);
+    i64 marker_name = raz_compiler_rt_arena_create(16);
+    *out_length = 0;
+    if (root == 0 || dist_path == 0 || output_path == 0 || dist_name == 0 || marker_name == 0) { return 0; }
+
+    i64 rl = path_dirname(manifest_path, manifest_path_length, root, 4096);
+    string d = "dist";
+    string m = ".raz-wasm-chunks";
+    i64 i = 0;
+    while (i < 4) { raz_compiler_rt_arena_set(dist_name, i, compiler_literal_byte(d, i)); i += 1; }
+    i = 0;
+    while (i < 16) { raz_compiler_rt_arena_set(marker_name, i, compiler_literal_byte(m, i)); i += 1; }
+    i64 dl = path_join(root, rl, dist_name, 4, dist_path, 8192);
+    i64 ol = path_join(dist_path, dl, marker_name, 16, output_path, 8192);
+    raz_compiler_rt_arena_destroy(root);
+    raz_compiler_rt_arena_destroy(dist_path);
+    raz_compiler_rt_arena_destroy(dist_name);
+    raz_compiler_rt_arena_destroy(marker_name);
+    if (rl <= 0 || dl <= 0 || ol <= 0) {
+        raz_compiler_rt_arena_destroy(output_path);
+        return 0;
+    }
+    *out_length = ol;
+    return output_path;
+}
+
+fn cli_web_wasm_chunk_output_path(
+    i64 manifest_path, i64 manifest_path_length,
+    i64 chunk_name, i64 chunk_name_length,
+    i64&mut out_length
+) -> i64 {
+    *out_length = 0;
+    if (chunk_name == 0 || chunk_name_length <= 0 || chunk_name_length > 128) { return 0; }
+    i64 i = 0;
+    while (i < chunk_name_length) {
+        i64 ch = raz_compiler_rt_arena_get(chunk_name, i);
+        bool ok = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 45 || ch == 95;
+        if (!ok) { return 0; }
+        i += 1;
+    }
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 dist = raz_compiler_rt_arena_create(8192);
+    i64 assets = raz_compiler_rt_arena_create(8192);
+    i64 chunks = raz_compiler_rt_arena_create(8192);
+    i64 filename = raz_compiler_rt_arena_create(256);
+    i64 output = raz_compiler_rt_arena_create(8192);
+    i64 dist_name = raz_compiler_rt_arena_create(4);
+    i64 assets_name = raz_compiler_rt_arena_create(6);
+    i64 chunks_name = raz_compiler_rt_arena_create(6);
+    if (root == 0 || dist == 0 || assets == 0 || chunks == 0 || filename == 0 || output == 0 || dist_name == 0 || assets_name == 0 || chunks_name == 0) { return 0; }
+    i64 rl = path_dirname(manifest_path, manifest_path_length, root, 4096);
+    string d = "dist"; string a = "assets"; string c = "chunks"; string ext = ".wasm";
+    i = 0; while (i < 4) { raz_compiler_rt_arena_set(dist_name, i, compiler_literal_byte(d, i)); i += 1; }
+    i = 0; while (i < 6) { raz_compiler_rt_arena_set(assets_name, i, compiler_literal_byte(a, i)); raz_compiler_rt_arena_set(chunks_name, i, compiler_literal_byte(c, i)); i += 1; }
+    i64 dl = path_join(root, rl, dist_name, 4, dist, 8192);
+    i64 al = path_join(dist, dl, assets_name, 6, assets, 8192);
+    i64 cl = path_join(assets, al, chunks_name, 6, chunks, 8192);
+    bool dirs_ok = rl > 0 && dl > 0 && al > 0 && cl > 0;
+    if (dirs_ok && raz_compiler_rt_path_exists_ascii(assets, al) == 0) { dirs_ok = raz_compiler_rt_create_dir_ascii(assets, al) == 0; }
+    if (dirs_ok && raz_compiler_rt_path_exists_ascii(chunks, cl) == 0) { dirs_ok = raz_compiler_rt_create_dir_ascii(chunks, cl) == 0; }
+    if (!dirs_ok) { return 0; }
+    i = 0; while (i < chunk_name_length) { raz_compiler_rt_arena_set(filename, i, raz_compiler_rt_arena_get(chunk_name, i)); i += 1; }
+    i64 e = 0; while (e < 5) { raz_compiler_rt_arena_set(filename, chunk_name_length + e, compiler_literal_byte(ext, e)); e += 1; }
+    i64 ol = path_join(chunks, cl, filename, chunk_name_length + 5, output, 8192);
+    raz_compiler_rt_arena_destroy(root); raz_compiler_rt_arena_destroy(dist); raz_compiler_rt_arena_destroy(assets); raz_compiler_rt_arena_destroy(chunks);
+    raz_compiler_rt_arena_destroy(filename); raz_compiler_rt_arena_destroy(dist_name); raz_compiler_rt_arena_destroy(assets_name); raz_compiler_rt_arena_destroy(chunks_name);
+    if (ol <= 0) { raz_compiler_rt_arena_destroy(output); return 0; }
+    *out_length = ol;
+    return output;
+}
+
+fn cli_web_wasm_required_marker_path(i64 manifest_path, i64 manifest_path_length, i64&mut out_length) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 dist_path = raz_compiler_rt_arena_create(8192);
+    i64 output_path = raz_compiler_rt_arena_create(8192);
+    i64 dist_name = raz_compiler_rt_arena_create(4);
+    i64 marker_name = raz_compiler_rt_arena_create(18);
+    *out_length = 0;
+    if (root == 0 || dist_path == 0 || output_path == 0 || dist_name == 0 || marker_name == 0) { return 0; }
+
+    i64 rl = path_dirname(manifest_path, manifest_path_length, root, 4096);
+    string d = "dist";
+    string m = ".raz-wasm-required";
+    i64 i = 0;
+    while (i < 4) { raz_compiler_rt_arena_set(dist_name, i, compiler_literal_byte(d, i)); i += 1; }
+    i = 0;
+    while (i < 18) { raz_compiler_rt_arena_set(marker_name, i, compiler_literal_byte(m, i)); i += 1; }
+    i64 dl = path_join(root, rl, dist_name, 4, dist_path, 8192);
+    i64 ol = path_join(dist_path, dl, marker_name, 18, output_path, 8192);
+    raz_compiler_rt_arena_destroy(root);
+    raz_compiler_rt_arena_destroy(dist_path);
+    raz_compiler_rt_arena_destroy(dist_name);
+    raz_compiler_rt_arena_destroy(marker_name);
+    if (rl <= 0 || dl <= 0 || ol <= 0) {
+        raz_compiler_rt_arena_destroy(output_path);
+        return 0;
+    }
+    *out_length = ol;
+    return output_path;
+}
+
+fn cli_prepare_web_dist(i64 manifest_path, i64 manifest_path_length) -> bool {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 public_path = raz_compiler_rt_arena_create(8192);
+    i64 dist_path = raz_compiler_rt_arena_create(8192);
+    i64 public_name = raz_compiler_rt_arena_create(6);
+    i64 dist_name = raz_compiler_rt_arena_create(4);
+    if (root == 0 || public_path == 0 || dist_path == 0 || public_name == 0 || dist_name == 0) { return false; }
+    i64 rl = path_dirname(manifest_path, manifest_path_length, root, 4096);
+    string p = "public"; string d = "dist"; i64 i = 0;
+    while (i < 6) { raz_compiler_rt_arena_set(public_name, i, compiler_literal_byte(p, i)); i += 1; }
+    i = 0; while (i < 4) { raz_compiler_rt_arena_set(dist_name, i, compiler_literal_byte(d, i)); i += 1; }
+    i64 pl = path_join(root, rl, public_name, 6, public_path, 8192);
+    i64 dl = path_join(root, rl, dist_name, 4, dist_path, 8192);
+    bool ok = rl > 0 && pl > 0 && dl > 0;
+    // dist/ is generated output. Recreate it for each target=web build so stale
+    // route-local app.js files or an old app.wasm cannot make a static rebuild
+    // accidentally look interactive. Public assets are copied back afterward.
+    if (ok && raz_compiler_rt_path_exists_ascii(dist_path, dl) != 0) {
+        ok = raz_compiler_rt_remove_path_ascii(dist_path, dl) == 0;
+    }
+    if (ok && raz_compiler_rt_path_exists_ascii(public_path, pl) != 0) {
+        ok = raz_compiler_rt_copy_tree_ascii(public_path, pl, dist_path, dl) == 0;
+    } else if (ok) {
+        ok = raz_compiler_rt_create_dir_ascii(dist_path, dl) == 0;
+    }
+    raz_compiler_rt_arena_destroy(root); raz_compiler_rt_arena_destroy(public_path); raz_compiler_rt_arena_destroy(dist_path);
+    raz_compiler_rt_arena_destroy(public_name); raz_compiler_rt_arena_destroy(dist_name);
+    return ok;
+}
+
+// Releases the arenas a compilation holds. Every exit path in the entrypoint
+// tears down the same set, so keeping the sequence here means a new early
+// return cannot quietly forget one of them.
+fn cli_release_compilation_arenas(i64 bytes, i64 manifest, i64 manifest_path, i64 output_path) {
+    if (bytes != 0) {
+        raz_compiler_rt_arena_destroy(bytes);
+    }
+    if (manifest != 0) {
+        raz_compiler_rt_arena_destroy(manifest);
+    }
+    if (manifest_path != 0) {
+        raz_compiler_rt_arena_destroy(manifest_path);
+    }
+    if (output_path != 0) {
+        raz_compiler_rt_arena_destroy(output_path);
+    }
+}
+
+// Elapsed seconds to two decimal places, as `1.23s`.
+fn cli_print_elapsed(i64 elapsed_nanos) {
+    i64 nanos = elapsed_nanos;
+
+    if (nanos < 0) {
+        nanos = 0;
+    }
+
+    i64 hundredths = nanos / 10000000;
+    i64 fraction = hundredths % 100;
+    
+    i64 digits[2];
+
+    cli_write_number(1, hundredths / 100);
+    cli_write_literal_stream(1, ".");
+    digits[0] = 48 + fraction / 10;
+    digits[1] = 48 + fraction % 10;
+    cli_write_stream(1, &digits, 2);
+}
+
+// The completion line reports what was produced rather than restating the
+// package name already shown by Compiling above it: which profile was built,
+// what optimization and debug settings that implies, and how long it took.
+fn cli_print_completion_summary(i64 command, bool release_profile, i64 started_nanos) {
+    if (cli_quiet_requested()) { return; }
+    if (command <= 0) {
+        return;
+    }
+
+    i64 kind = 6;
+
+    if (command == 4 || command == 11 || command == 17) {
+        kind = 7;
+    } else if (command == 15) {
+        cli_write_literal("Usage: raz new <name> [--web|--target web]\nCreates a native project by default, or a Raz web project with --web.\n");
+    } else if (command == 16) {
+        kind = 8;
+    }
+    if (cli_print_status_label(kind) <= 0) {
+        return;
+    }
+
+    
+    
+    
+    
+
+    cli_write_literal_stream(1, " `");
+    if (release_profile) {
+        
+
+        cli_write_literal_stream(1, "release");
+    } else {
+        
+
+        cli_write_literal_stream(1, "debug");
+    }
+    cli_write_literal_stream(1, "` profile ");
+    if (release_profile) {
+        
+
+        cli_write_literal_stream(1, "[optimized] target(s)");
+    } else {
+        
+
+        cli_write_literal_stream(1, "[unoptimized + debuginfo] target(s)");
+    }
+    cli_write_literal_stream(1, " in ");
+    cli_print_elapsed(raz_compiler_rt_monotonic_nanos() - started_nanos);
+    cli_write_literal_stream(1, "s\n");
+}
+
+fn cli_print_compile_status(i64 command, i64 detail, i64 detail_length) {
+    if (command <= 0) {
+        return;
+    }
+    if (command == 4 || command == 11 || command == 17) {
+        cli_print_status(2, detail, detail_length);
+    } else {
+        cli_print_status(1, detail, detail_length);
+    }
+}
+
+// Whether `offset` is the first byte of a line. Assembled-source markers are
+// written as whole lines, so this is what separates a real marker from the same
+// text appearing inside a string literal or a comment.
+fn cli_source_line_start(Source& input, i64 offset) -> bool {
+    return offset == 0 || source_byte(input, offset - 1) == 10;
+}
+
+fn cli_source_matches_literal(Source& input, i64 start, string expected) -> bool {
+    i64 length = compiler_literal_length(expected);
+    if (start < 0 || start + length > input.length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (source_byte(input, start + i) != compiler_literal_byte(expected, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_package_marker_name_matches(Source& input, i64 start, i64 length, i64 name, i64 name_length) -> bool {
+    if (length != name_length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        i64 value = source_byte(input, start + i);
+        i64 expected = raz_compiler_rt_arena_get(name, i);
+        if (value == 45 || value == 46 || value == 47 || value == 92) { value = 95; }
+        if (expected == 45 || expected == 46 || expected == 47 || expected == 92) { expected = 95; }
+        if (value != expected) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_find_package_identity(
+    Source& input,
+    i64 name,
+    i64 name_length,
+    i64 display_name,
+    i64 display_capacity,
+    i64 version,
+    i64 version_capacity,
+    i64&mut out_display_length,
+) -> i64 {
+    string prefix = "// __raz_package_version ";
+    i64 prefix_length = compiler_literal_length(prefix);
+    i64 pos = 0;
+    *out_display_length = -1;
+    while (pos + prefix_length < input.length) {
+        if (!cli_source_line_start(input, pos) || !cli_source_matches_literal(input, pos, prefix)) {
+            pos += 1;
+            continue;
+        }
+
+        i64 marker_name_start = pos + prefix_length;
+        i64 marker_name_end = marker_name_start;
+        while (marker_name_end < input.length && source_byte(input, marker_name_end) != 32 && source_byte(input, marker_name_end) != 10 && source_byte(input, marker_name_end) != 13) { marker_name_end += 1; }
+        i64 marker_name_length = marker_name_end - marker_name_start;
+        if (marker_name_end < input.length && source_byte(input, marker_name_end) == 32 && cli_package_marker_name_matches(input, marker_name_start, marker_name_length, name, name_length)) {
+            if (marker_name_length > display_capacity) { return -1; }
+            i64 i = 0;
+            while (i < marker_name_length) { raz_compiler_rt_arena_set(display_name, i, source_byte(input, marker_name_start + i)); i += 1; }
+            *out_display_length = marker_name_length;
+            i64 version_start = marker_name_end + 1;
+            i64 version_length = 0;
+            while (version_start + version_length < input.length && source_byte(input, version_start + version_length) != 10 && source_byte(input, version_start + version_length) != 13) {
+                if (version_length >= version_capacity) { return -1; }
+                raz_compiler_rt_arena_set(version, version_length, source_byte(input, version_start + version_length));
+                version_length += 1;
+            }
+            return version_length;
+        }
+        pos = marker_name_end + 1;
+    }
+    return -1;
+}
+
+fn cli_print_dependency_package_status(i64 command, Source& input, i64 manifest_path, i64 manifest_path_length, i64 name, i64 name_length) {
+    i64 kind = 1;
+    if (command == 4 || command == 11 || command == 17) { kind = 2; }
+    if (incremental_package_is_fresh(manifest_path, manifest_path_length, input, name, name_length)) { kind = 3; }
+
+    i64 display_name = raz_compiler_rt_arena_create(4096);
+    i64 version = raz_compiler_rt_arena_create(256);
+    i64 display_length = -1;
+    i64 version_length = -1;
+    if (display_name != 0 && version != 0) {
+        version_length = cli_find_package_identity(input, name, name_length, display_name, 4096, version, 256, &mut display_length);
+    }
+
+    // Every dependency that is part of this compilation gets one Cargo-style
+    // package line. Package-version provenance is emitted while the dependency
+    // graph is assembled, so normal package builds always take the first path:
+    //     Compiling dependency-name v1.2.3
+    // Keep the name-only fallback for malformed/direct assembled input so status
+    // reporting can never turn a compiler diagnostic into a CLI failure.
+    if (display_length > 0 && version_length > 0) {
+        cli_print_status_name_version(kind, display_name, display_length, version, version_length);
+    } else if (display_length > 0) {
+        cli_print_status_name_version(kind, display_name, display_length, 0, 0);
+    } else {
+        cli_print_status_name_version(kind, name, name_length, 0, 0);
+    }
+
+    if (display_name != 0) { raz_compiler_rt_arena_destroy(display_name); }
+    if (version != 0) { raz_compiler_rt_arena_destroy(version); }
+}
+
+fn cli_print_dependency_compile_statuses(
+    i64 command,
+    Source& input,
+    i64 manifest_path,
+    i64 manifest_path_length,
+) {
+    if (command <= 0 || input.bytes == 0 || input.length <= 0) { return; }
+    i64 seen = raz_compiler_rt_arena_create(256);
+    if (seen == 0) { return; }
+
+    // The assembled source also carries a marker for the root package. The root
+    // gets its own status line immediately after dependency statuses, so exclude
+    // that marker here rather than printing `Compiling <root>` twice.
+    i64 root_name = raz_compiler_rt_arena_create(4096);
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 root_name_length = -1;
+    if (root_name != 0 && manifest != 0 && manifest_path != 0 && manifest_path_length > 0) {
+        i64 manifest_length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536);
+        if (manifest_length > 0) {
+            root_name_length = manifest_package_name(manifest, manifest_length, root_name, 4096);
+        }
+    }
+
+    i64 seen_count = 0;
+    i64 pos = 0;
+    string prefix = "__raz_package ";
+    i64 prefix_length = compiler_literal_length(prefix);
+    while (pos + prefix_length < input.length) {
+        // The assembler writes this marker as its own line, so only a
+        // line-initial match is one. Without that anchor the scan also finds the
+        // marker spelled inside this file's own string literal and announces the
+        // remainder of that line as a package.
+        if (!cli_source_line_start(input, pos)) { pos += 1; continue; }
+
+        bool prefix_matches = true;
+        i64 j = 0;
+        while (j < prefix_length && prefix_matches) {
+            if (source_byte(input, pos + j) != compiler_literal_byte(prefix, j)) { prefix_matches = false; }
+            j += 1;
+        }
+        if (!prefix_matches) { pos += 1; continue; }
+        i64 start = pos + prefix_length;
+        i64 end = start;
+        while (end < input.length && source_byte(input, end) != 59 && source_byte(input, end) != 10) { end += 1; }
+        i64 length = end - start;
+        bool is_root = length > 0 && root_name_length > 0 &&
+            cli_package_marker_name_matches(input, start, length, root_name, root_name_length);
+        if (length > 0 && !is_root) {
+            i64 hash = 1469598103934665603;
+            i64 k = 0;
+            while (k < length) { hash = ((hash ^ source_byte(input, start + k)) * 1099511628211) % 281474976710597; k += 1; }
+            bool duplicate = false;
+            i64 si = 0;
+            while (si < seen_count) { if (raz_compiler_rt_arena_get(seen, si) == hash) { duplicate = true; } si += 1; }
+            if (!duplicate && seen_count < 256) {
+                raz_compiler_rt_arena_set(seen, seen_count, hash); seen_count += 1;
+                i64 name = raz_compiler_rt_arena_create(length);
+                if (name != 0) {
+                    k = 0; while (k < length) { raz_compiler_rt_arena_set(name, k, source_byte(input, start + k)); k += 1; }
+                    cli_print_dependency_package_status(command, input, manifest_path, manifest_path_length, name, length);
+                    raz_compiler_rt_arena_destroy(name);
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
+    if (root_name != 0) { raz_compiler_rt_arena_destroy(root_name); }
+    raz_compiler_rt_arena_destroy(seen);
+}
+
+fn cli_edit_distance(i64 value, i64 length, i64[]expected, i64 expected_length) -> i64 {
+    if (value == 0 || length < 0 || expected_length < 0 || length >= 32 || expected_length >= 32) {
+        return 99;
+    }
+
+    i64 previous[32];
+    i64 current[32];
+    i64 j = 0;
+
+    while (j <= expected_length) {
+        previous[j] = j;
+        j += 1;
+    }
+
+    i64 i = 1;
+
+    while (i <= length) {
+        current[0] = i;
+        j = 1;
+        while (j <= expected_length) {
+            i64 deletion = previous[j] + 1;
+            i64 insertion = current[j - 1] + 1;
+            i64 substitution = previous[j - 1];
+
+            if (raz_compiler_rt_arena_get(value, i - 1) != expected[j - 1]) {
+                substitution += 1;
+            }
+
+            i64 best = deletion;
+
+            if (insertion < best) {
+                best = insertion;
+            }
+            if (substitution < best) {
+                best = substitution;
+            }
+            current[j] = best;
+            j += 1;
+        }
+        j = 0;
+        while (j <= expected_length) {
+            previous[j] = current[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    return previous[expected_length];
+}
+
+fn cli_edit_distance_literal(i64 value, i64 length, string expected) -> i64 {
+    i64 expected_length = compiler_literal_length(expected);
+    if (value == 0 || length < 0 || expected_length < 0 || length >= 32 || expected_length >= 32) { return 99; }
+    i64 previous[32];
+    i64 current[32];
+    i64 j = 0;
+    while (j <= expected_length) { previous[j] = j; j += 1; }
+    i64 i = 1;
+    while (i <= length) {
+        current[0] = i;
+        j = 1;
+        while (j <= expected_length) {
+            i64 deletion = previous[j] + 1;
+            i64 insertion = current[j - 1] + 1;
+            i64 substitution = previous[j - 1];
+            if (raz_compiler_rt_arena_get(value, i - 1) != compiler_literal_byte(expected, j - 1)) { substitution += 1; }
+            i64 best = deletion;
+            if (insertion < best) { best = insertion; }
+            if (substitution < best) { best = substitution; }
+            current[j] = best;
+            j += 1;
+        }
+        j = 0;
+        while (j <= expected_length) { previous[j] = current[j]; j += 1; }
+        i += 1;
+    }
+    return previous[expected_length];
+}
+
+
+fn cli_write_command_name(i64 stream, i64 kind) {
+    if (kind == 1) {
+        
+
+        cli_write_literal_stream(stream, "help");
+    } else if (kind == 2) {
+        
+
+        cli_write_literal_stream(stream, "version");
+    } else if (kind == 3) {
+        
+
+        cli_write_literal_stream(stream, "build");
+    } else if (kind == 4) {
+        
+
+        cli_write_literal_stream(stream, "check");
+    } else if (kind == 5) {
+        
+
+        cli_write_literal_stream(stream, "forge");
+    } else if (kind == 6) {
+        
+
+        cli_write_literal_stream(stream, "llvm");
+    } else if (kind == 7) {
+        
+
+        cli_write_literal_stream(stream, "backends");
+    } else if (kind == 8) {
+        
+
+        cli_write_literal_stream(stream, "targets");
+    } else if (kind == 9) {
+        
+
+        cli_write_literal_stream(stream, "doctor");
+    } else if (kind == 10) {
+        
+
+        cli_write_literal_stream(stream, "emit");
+    } else if (kind == 11) {
+        
+
+        cli_write_literal_stream(stream, "profile");
+    } else if (kind == 12) {
+        
+
+        cli_write_literal_stream(stream, "run");
+    } else if (kind == 13) {
+        
+
+        cli_write_literal_stream(stream, "clean");
+    } else if (kind == 14) {
+        
+
+        cli_write_literal_stream(stream, "init");
+    } else if (kind == 15) {
+        
+
+        cli_write_literal_stream(stream, "new");
+    } else if (kind == 16) {
+        
+
+        cli_write_literal_stream(stream, "test");
+    } else if (kind == 17) {
+        
+
+        cli_write_literal_stream(stream, "lint");
+    } else if (kind == 18) {
+        
+
+        cli_write_literal_stream(stream, "fmt");
+    } else if (kind == 19) {
+        
+
+        cli_write_literal_stream(stream, "doc");
+    } else if (kind == 20) {
+        
+
+        cli_write_literal_stream(stream, "add");
+    } else if (kind == 21) {
+        
+
+        cli_write_literal_stream(stream, "remove");
+    } else if (kind == 22) {
+        
+
+        cli_write_literal_stream(stream, "update");
+    } else if (kind == 23) {
+        
+
+        cli_write_literal_stream(stream, "lock");
+    } else if (kind == 24) {
+        
+
+        cli_write_literal_stream(stream, "metadata");
+    } else if (kind == 25) {
+        
+
+        cli_write_literal_stream(stream, "graph");
+    } else if (kind == 26) {
+        
+
+        cli_write_literal_stream(stream, "registry");
+    } else if (kind == 27) {
+        
+
+        cli_write_literal_stream(stream, "pack");
+    } else if (kind == 28) {
+        
+
+        cli_write_literal_stream(stream, "publish");
+    } else if (kind == 29) {
+        
+
+        cli_write_literal_stream(stream, "keygen");
+    } else if (kind == 30) {
+        
+
+        cli_write_literal_stream(stream, "fetch");
+    } else if (kind == 31) {
+        
+
+        cli_write_literal_stream(stream, "search");
+    } else if (kind == 32) {
+        
+
+        cli_write_literal_stream(stream, "info");
+    } else if (kind == 33) {
+        
+
+        cli_write_literal_stream(stream, "outdated");
+    } else if (kind == 34) {
+        
+
+        cli_write_literal_stream(stream, "tree");
+    } else if (kind == 35) {
+        
+
+        cli_write_literal_stream(stream, "install");
+    } else if (kind == 36) {
+        
+
+        cli_write_literal_stream(stream, "uninstall");
+    } else if (kind == 37) {
+        
+
+        cli_write_literal_stream(stream, "vendor");
+    } else if (kind == 38) {
+        
+
+        cli_write_literal_stream(stream, "login");
+    } else if (kind == 39) {
+        
+
+        cli_write_literal_stream(stream, "logout");
+    } else if (kind == 40) {
+        
+
+        cli_write_literal_stream(stream, "bench");
+    } else if (kind == 41) {
+        
+
+        cli_write_literal_stream(stream, "cache");
+    } else if (kind == 42) {
+        cli_write_literal_stream(stream, "lsp");
+    } else if (kind == 43) {
+        cli_write_literal_stream(stream, "bindgen");
+    } else if (kind == 44) {
+        cli_write_literal_stream(stream, "c-header");
+    } else if (kind == 45) {
+        cli_write_literal_stream(stream, "dev");
+    } else if (kind == 46) {
+        cli_write_literal_stream(stream, "diagnostics");
+    } else if (kind == 47) {
+        cli_write_literal_stream(stream, "completions");
+    }
+}
+
+fn cli_print_command_suggestion(i64 value, i64 length) {
+    if (value == 0 || length <= 0 || length >= 32) {
+        return;
+    }
+
+    i64 best_kind = 0;
+    i64 best_distance = 99;
+    i64 distance = 99;
+    string candidate_1 = "help";
+
+    distance = cli_edit_distance_literal(value, length, candidate_1);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 1;
+    }
+
+    string candidate_2 = "version";
+
+    distance = cli_edit_distance_literal(value, length, candidate_2);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 2;
+    }
+
+    string candidate_3 = "build";
+
+    distance = cli_edit_distance_literal(value, length, candidate_3);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 3;
+    }
+
+    string candidate_4 = "check";
+
+    distance = cli_edit_distance_literal(value, length, candidate_4);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 4;
+    }
+
+    string candidate_5 = "forge";
+
+    distance = cli_edit_distance_literal(value, length, candidate_5);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 5;
+    }
+
+    string candidate_6 = "llvm";
+
+    distance = cli_edit_distance_literal(value, length, candidate_6);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 6;
+    }
+
+    string candidate_7 = "backends";
+
+    distance = cli_edit_distance_literal(value, length, candidate_7);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 7;
+    }
+
+    string candidate_8 = "targets";
+
+    distance = cli_edit_distance_literal(value, length, candidate_8);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 8;
+    }
+
+    string candidate_9 = "doctor";
+
+    distance = cli_edit_distance_literal(value, length, candidate_9);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 9;
+    }
+
+    string candidate_10 = "emit";
+
+    distance = cli_edit_distance_literal(value, length, candidate_10);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 10;
+    }
+
+    string candidate_11 = "profile";
+
+    distance = cli_edit_distance_literal(value, length, candidate_11);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 11;
+    }
+
+    string candidate_12 = "run";
+
+    distance = cli_edit_distance_literal(value, length, candidate_12);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 12;
+    }
+
+    string candidate_13 = "clean";
+
+    distance = cli_edit_distance_literal(value, length, candidate_13);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 13;
+    }
+
+    string candidate_14 = "init";
+
+    distance = cli_edit_distance_literal(value, length, candidate_14);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 14;
+    }
+
+    string candidate_15 = "new";
+
+    distance = cli_edit_distance_literal(value, length, candidate_15);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 15;
+    }
+
+    string candidate_16 = "test";
+
+    distance = cli_edit_distance_literal(value, length, candidate_16);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 16;
+    }
+
+    string candidate_17 = "lint";
+
+    distance = cli_edit_distance_literal(value, length, candidate_17);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 17;
+    }
+
+    string candidate_18 = "fmt";
+
+    distance = cli_edit_distance_literal(value, length, candidate_18);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 18;
+    }
+
+    string candidate_19 = "doc";
+
+    distance = cli_edit_distance_literal(value, length, candidate_19);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 19;
+    }
+
+    string candidate_20 = "add";
+
+    distance = cli_edit_distance_literal(value, length, candidate_20);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 20;
+    }
+
+    string candidate_21 = "remove";
+
+    distance = cli_edit_distance_literal(value, length, candidate_21);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 21;
+    }
+
+    string candidate_22 = "update";
+
+    distance = cli_edit_distance_literal(value, length, candidate_22);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 22;
+    }
+
+    string candidate_23 = "fetch";
+
+    distance = cli_edit_distance_literal(value, length, candidate_23);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 30;
+    }
+
+    string candidate_24 = "lock";
+
+    distance = cli_edit_distance_literal(value, length, candidate_24);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 23;
+    }
+
+    string candidate_25 = "metadata";
+
+    distance = cli_edit_distance_literal(value, length, candidate_25);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 24;
+    }
+
+    string candidate_26 = "graph";
+
+    distance = cli_edit_distance_literal(value, length, candidate_26);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 25;
+    }
+
+    string candidate_27 = "registry";
+
+    distance = cli_edit_distance_literal(value, length, candidate_27);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 26;
+    }
+
+    string candidate_28 = "pack";
+
+    distance = cli_edit_distance_literal(value, length, candidate_28);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 27;
+    }
+
+    string candidate_29 = "publish";
+
+    distance = cli_edit_distance_literal(value, length, candidate_29);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 28;
+    }
+
+    string candidate_30 = "keygen";
+
+    distance = cli_edit_distance_literal(value, length, candidate_30);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 29;
+    }
+
+    string candidate_31 = "search";
+
+    distance = cli_edit_distance_literal(value, length, candidate_31);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 31;
+    }
+
+    string candidate_32 = "info";
+
+    distance = cli_edit_distance_literal(value, length, candidate_32);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 32;
+    }
+
+    string candidate_33 = "outdated";
+
+    distance = cli_edit_distance_literal(value, length, candidate_33);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 33;
+    }
+
+    string candidate_34 = "tree";
+
+    distance = cli_edit_distance_literal(value, length, candidate_34);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 34;
+    }
+
+    string candidate_lsp = "lsp";
+
+    distance = cli_edit_distance_literal(value, length, candidate_lsp);
+    if (distance < best_distance) {
+        best_distance = distance;
+        best_kind = 42;
+    }
+
+    bool close = best_distance <= 1;
+
+    if (length >= 4 && best_distance <= 2) {
+        close = true;
+    }
+    if (length >= 8 && best_distance <= 3) {
+        close = true;
+    }
+    if (!close || best_kind <= 0) {
+        return;
+    }
+
+    
+    
+
+    cli_write_literal_stream(2, "  help: a similar command exists: '");
+    cli_write_command_name(2, best_kind);
+    cli_write_literal_stream(2, "'\n");
+}
+
+fn cli_print_unknown_command_at(i64 argc, i64 index) {
+    if (index >= argc) {
+        return;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(4096);
+
+    if (arg == 0) {
+        return;
+    }
+
+    i64 length = cli_load_arg(index, arg, 4096);
+
+    if (length > 0) {
+        
+        
+        
+
+        cli_write_literal_stream(2, "error: no such command: '");
+        cli_write_arena_stream(2, arg, length);
+        cli_write_literal_stream(2, "'\n");
+        cli_print_command_suggestion(arg, length);
+        cli_write_literal_stream(2, "  help: view all commands with 'raz --help'\n");
+    }
+    raz_compiler_rt_arena_destroy(arg);
+}
+
+fn cli_known_command_specific_option(i64 value, i64 length) -> bool {
+    if (cli_arg_equals_literal(value, length, "--iterations") || cli_arg_equals_literal(value, length, "--filter")) { return true; }
+    if (cli_arg_equals_literal(value, length, "--host") || cli_arg_equals_literal(value, length, "--port")) { return true; }
+    string iterations = "--iterations=";
+    string filter = "--filter=";
+    string host = "--host=";
+    string port = "--port=";
+    i64 i = 0;
+    if (length > 13) { bool matches = true; i = 0; while (i < 13) { if (raz_compiler_rt_arena_get(value,i) != compiler_literal_byte(iterations,i)) { matches = false; } i += 1; } if (matches) { return true; } }
+    if (length > 9) { bool matches = true; i = 0; while (i < 9) { if (raz_compiler_rt_arena_get(value,i) != compiler_literal_byte(filter,i)) { matches = false; } i += 1; } if (matches) { return true; } }
+    if (length > 7) { bool matches = true; i = 0; while (i < 7) { if (raz_compiler_rt_arena_get(value,i) != compiler_literal_byte(host,i)) { matches = false; } i += 1; } if (matches) { return true; } }
+    if (length > 7) { bool matches = true; i = 0; while (i < 7) { if (raz_compiler_rt_arena_get(value,i) != compiler_literal_byte(port,i)) { matches = false; } i += 1; } if (matches) { return true; } }
+    return false;
+}
+
+fn cli_print_option_not_valid_for_command(i64 value, i64 length, i64 command) {
+    cli_write_literal_stream(2, "error: option '");
+    cli_write_arena_stream(2, value, length);
+    cli_write_literal_stream(2, "' is not valid for command '");
+    cli_write_command_name(2, command);
+    cli_write_literal_stream(2, "'\n");
+    cli_write_literal_stream(2, "  help: run 'raz ");
+    cli_write_command_name(2, command);
+    cli_write_literal_stream(2, " --help' for usage\n");
+}
+
+fn cli_print_unknown_option(i64 value, i64 length) {
+    cli_write_literal_stream(2, "error: unexpected argument '");
+    cli_write_arena_stream(2, value, length);
+    cli_write_literal_stream(2, "'\n");
+    i64 best = 1000;
+    i64 kind = 0;
+    i64 d = cli_edit_distance_literal(value, length, "--release"); if (d < best) { best = d; kind = 1; }
+    d = cli_edit_distance_literal(value, length, "--profile"); if (d < best) { best = d; kind = 2; }
+    d = cli_edit_distance_literal(value, length, "--backend"); if (d < best) { best = d; kind = 3; }
+    d = cli_edit_distance_literal(value, length, "--diagnostic-format"); if (d < best) { best = d; kind = 4; }
+    d = cli_edit_distance_literal(value, length, "--color"); if (d < best) { best = d; kind = 5; }
+    d = cli_edit_distance_literal(value, length, "--features"); if (d < best) { best = d; kind = 6; }
+    d = cli_edit_distance_literal(value, length, "--force"); if (d < best) { best = d; kind = 7; }
+    bool close = best <= 1 || (length >= 8 && best <= 2);
+    if (close && kind > 0) {
+        cli_write_literal_stream(2, "  help: a similar option exists: '");
+        if (kind == 1) { cli_write_literal_stream(2, "--release"); }
+        else if (kind == 2) { cli_write_literal_stream(2, "--profile"); }
+        else if (kind == 3) { cli_write_literal_stream(2, "--backend"); }
+        else if (kind == 4) { cli_write_literal_stream(2, "--diagnostic-format"); }
+        else if (kind == 5) { cli_write_literal_stream(2, "--color"); }
+        else if (kind == 6) { cli_write_literal_stream(2, "--features"); }
+        else if (kind == 7) { cli_write_literal_stream(2, "--force"); }
+        cli_write_literal_stream(2, "'\n");
+    }
+    cli_write_literal_stream(2, "  help: run 'raz <command> --help' for usage\n");
+}
+
+fn cli_print_invalid_arguments() {
+    
+    
+
+    cli_write_literal_stream(2, "error: invalid command-line arguments\n");
+    cli_write_literal_stream(2, "  help: run 'raz <command> --help' for usage\n");
+}
+
+fn cli_print_missing_input() {
+    
+    
+
+    cli_write_literal_stream(2, "error: no input was provided and no raz.toml was found\n");
+    cli_write_literal_stream(2, "  help: pass a .rz file or run the command in a Raz project\n");
+}
+
+fn cli_print_dev_requires_web() {
+    cli_write_literal_stream(2, "error: raz dev requires a web project\n");
+    cli_write_literal_stream(2, "  help: set [build] target = \"web\" in raz.toml\n");
+}
+
+fn cli_print_missing_path(i64 path, i64 length) {
+    
+    
+
+    cli_write_literal_stream(2, "error: input path does not exist: '");
+    cli_write_arena_stream(2, path, length);
+    cli_write_literal_stream(2, "'\n");
+}
+
+fn cli_arg_starts_with_dash(i64 value, i64 length) -> bool {
+    return value != 0 && length > 0 && raz_compiler_rt_arena_get(value, 0) == 45;
+}
+
+fn cli_argument_starts_with_dash_at(i64 argc, i64 index) -> bool {
+    if (index >= argc) {
+        return false;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(64);
+
+    if (arg == 0) {
+        return false;
+    }
+
+    i64 length = cli_load_arg(index, arg, 64);
+    bool result = cli_arg_starts_with_dash(arg, length);
+
+    raz_compiler_rt_arena_destroy(arg);
+    return result;
+}
+
+fn cli_argument_looks_like_path(i64 argc, i64 index) -> bool {
+    if (index >= argc) {
+        return false;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(4096);
+
+    if (arg == 0) {
+        return false;
+    }
+
+    i64 length = cli_load_arg(index, arg, 4096);
+
+    if (length <= 0) {
+        raz_compiler_rt_arena_destroy(arg);
+        return false;
+    }
+    if (raz_compiler_rt_path_exists_ascii(arg, length) != 0) {
+        raz_compiler_rt_arena_destroy(arg);
+        return true;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        i64 ch = raz_compiler_rt_arena_get(arg, i);
+
+        if (ch == 46 || ch == 47 || ch == 92) {
+            raz_compiler_rt_arena_destroy(arg);
+            return true;
+        }
+        i += 1;
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    return false;
+}
+
+fn cli_write_packed(i64[]words, i64 word_count, i64 length) {
+    if (length <= 0 || word_count <= 0) {
+        return;
+    }
+
+    i64 buffer = raz_compiler_rt_arena_create(length);
+
+    if (buffer == 0) {
+        return;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        i64 word_index = i / 7;
+        i64 byte_index = i % 7;
+        i64 value = (words[word_index] >> (byte_index * 8)) & 255;
+
+        raz_compiler_rt_arena_set(buffer, i, value);
+        i += 1;
+    }
+    raz_compiler_rt_stdio_write_ascii(1, buffer, length);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn cli_error_color_enabled() -> bool {
+    i64 explicit = cli_explicit_color_mode();
+    if (explicit >= 0) { return explicit == 1; }
+    if (raz_rt_stdio_is_terminal(2) <= 0) {
+        return false;
+    }
+
+    i64 name = raz_compiler_rt_arena_create(8);
+    i64 value = raz_compiler_rt_arena_create(8);
+
+    if (name == 0 || value == 0) {
+        return true;
+    }
+
+    string chars = "NO_COLOR";
+    i64 i = 0;
+
+    while (i < 8) {
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(chars, i));
+        i += 1;
+    }
+
+    i64 found = raz_compiler_rt_env_get_ascii(name, 8, value, 8);
+
+    raz_compiler_rt_arena_destroy(name);
+    raz_compiler_rt_arena_destroy(value);
+    return found < 0;
+}
+
+fn cli_write_number(i64 stream, i64 value) {
+    i64 digits[24];
+    i64 count = 0;
+
+    if (value < 0) {
+        
+
+        cli_write_literal_stream(stream, "-");
+        value = -value;
+    }
+    if (value == 0) {
+        
+
+        cli_write_literal_stream(stream, "0");
+        return;
+    }
+    while (value > 0 && count < 24) {
+        digits[count] = 48 + (value % 10);
+        value /= 10;
+        count += 1;
+    }
+
+    i64 output[24];
+    i64 i = 0;
+
+    while (i < count) {
+        output[i] = digits[count - 1 - i];
+        i += 1;
+    }
+    cli_write_stream(stream, &output, count);
+}
+
+fn cli_frontend_diagnostic_message(DiagnosticCode code) -> i64 {
+    if (code == DiagnosticCode::InvalidByte) {
+        return 1;
+    }
+    if (code == DiagnosticCode::ExpectedToken) {
+        return 2;
+    }
+    if (code == DiagnosticCode::ExpectedIdentifier) {
+        return 3;
+    }
+    if (code == DiagnosticCode::TooManyItems) {
+        return 4;
+    }
+    if (code == DiagnosticCode::UnknownName) {
+        return 5;
+    }
+    if (code == DiagnosticCode::DuplicateName) {
+        return 6;
+    }
+    if (code == DiagnosticCode::UnknownType) {
+        return 7;
+    }
+    if (code == DiagnosticCode::WrongArgumentCount) {
+        return 8;
+    }
+    if (code == DiagnosticCode::MissingReturn) {
+        return 9;
+    }
+    if (code == DiagnosticCode::InvalidMove) {
+        return 10;
+    }
+    if (code == DiagnosticCode::UseAfterMove) {
+        return 11;
+    }
+    if (code == DiagnosticCode::BorrowConflict) {
+        return 12;
+    }
+    if (code == DiagnosticCode::AmbiguousName) {
+        return 13;
+    }
+    if (code == DiagnosticCode::UnreachablePattern) {
+        return 14;
+    }
+    if (code == DiagnosticCode::NonExhaustivePattern) {
+        return 15;
+    }
+    if (code == DiagnosticCode::DynTraitMethodUnavailable) {
+        return 16;
+    }
+    return 0;
+}
+
+fn cli_find_source_origin(
+    Source& input,
+    i64 offset,
+    i64 path,
+    i64 path_capacity,
+    i64&mut out_content_start,
+) -> i64 {
+    string prefix = "// __raz_source ";
+    i64 prefix_length = compiler_literal_length(prefix);
+    i64 pos = 0;
+    i64 found_length = -1;
+    *out_content_start = 0;
+    while (pos < input.length && pos <= offset) {
+        i64 line_start = pos;
+        i64 line_end = pos;
+        while (line_end < input.length && source_byte(input, line_end) != 10 && source_byte(input, line_end) != 13) { line_end += 1; }
+        if (line_start + prefix_length <= line_end && cli_source_matches_literal(input, line_start, prefix)) {
+            i64 value_start = line_start + prefix_length;
+            i64 value_length = line_end - value_start;
+            if (value_length > 0 && value_length <= path_capacity) {
+                i64 i = 0;
+                while (i < value_length) { raz_compiler_rt_arena_set(path, i, source_byte(input, value_start + i)); i += 1; }
+                found_length = value_length;
+                i64 next = line_end;
+                while (next < input.length && (source_byte(input, next) == 10 || source_byte(input, next) == 13)) { next += 1; }
+                *out_content_start = next;
+            }
+        }
+        pos = line_end;
+        while (pos < input.length && (source_byte(input, pos) == 10 || source_byte(input, pos) == 13)) { pos += 1; }
+    }
+    return found_length;
+}
+
+fn cli_source_local_line(Source& input, i64 content_start, i64 offset) -> i64 {
+    if (content_start < 0 || content_start > offset) { return 1; }
+    i64 line = 1;
+    i64 i = content_start;
+    while (i < offset && i < input.length) {
+        if (source_byte(input, i) == 10) { line += 1; }
+        i += 1;
+    }
+    return line;
+}
+
+fn cli_diagnostic_identifier_byte(i64 ch) -> bool {
+    return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+}
+
+fn cli_diagnostic_token_span(Source& input, i64 content_start, i64 offset, i64&mut out_start, i64&mut out_end) {
+    i64 cursor = offset;
+    if (cursor >= input.length) { cursor = input.length - 1; }
+    if (cursor < content_start) { cursor = content_start; }
+    while (cursor > content_start && !cli_diagnostic_identifier_byte(source_byte(input, cursor))) { cursor -= 1; }
+    if (!cli_diagnostic_identifier_byte(source_byte(input, cursor))) {
+        *out_start = offset;
+        *out_end = offset + 1;
+        return;
+    }
+    i64 end = cursor + 1;
+    i64 start = cursor;
+    while (start > content_start && cli_diagnostic_identifier_byte(source_byte(input, start - 1))) { start -= 1; }
+    *out_start = start;
+    *out_end = end;
+}
+
+fn cli_write_source_bytes(i64 stream, Source& input, i64 start, i64 end) {
+    i64 cursor = start;
+    while (cursor < end && cursor < input.length) {
+        i64 one[1] = [source_byte(input, cursor)];
+        cli_write_stream(stream, &one, 1);
+        cursor += 1;
+    }
+}
+
+fn cli_write_frontend_diagnostic_message(i64 stream, Source& input, i64 message_kind, i64 token_start, i64 token_end) {
+    if (message_kind == 1) { cli_write_literal_stream(stream, "invalid source byte"); }
+    else if (message_kind == 2) { cli_write_literal_stream(stream, "expected a different token"); }
+    else if (message_kind == 3) { cli_write_literal_stream(stream, "expected an identifier"); }
+    else if (message_kind == 4) { cli_write_literal_stream(stream, "too many items in this scope"); }
+    else if (message_kind == 5) {
+        cli_write_literal_stream(stream, "unknown name '");
+        cli_write_source_bytes(stream, input, token_start, token_end);
+        cli_write_literal_stream(stream, "'");
+    }
+    else if (message_kind == 6) { cli_write_literal_stream(stream, "duplicate name"); }
+    else if (message_kind == 7) {
+        cli_write_literal_stream(stream, "unknown type '");
+        cli_write_source_bytes(stream, input, token_start, token_end);
+        cli_write_literal_stream(stream, "'");
+    }
+    else if (message_kind == 8) { cli_write_literal_stream(stream, "wrong argument count"); }
+    else if (message_kind == 9) { cli_write_literal_stream(stream, "missing return value"); }
+    else if (message_kind == 10) { cli_write_literal_stream(stream, "invalid ownership move"); }
+    else if (message_kind == 11) { cli_write_literal_stream(stream, "use of a moved value"); }
+    else if (message_kind == 12) { cli_write_literal_stream(stream, "borrow conflict"); }
+    else if (message_kind == 13) { cli_write_literal_stream(stream, "ambiguous name"); }
+    else if (message_kind == 14) { cli_write_literal_stream(stream, "unreachable pattern"); }
+    else if (message_kind == 15) { cli_write_literal_stream(stream, "non-exhaustive pattern match"); }
+    else if (message_kind == 16) { cli_write_literal_stream(stream, "dynamic trait method has no dispatch implementation"); }
+    else { cli_write_literal_stream(stream, "compilation failed"); }
+}
+
+fn cli_write_frontend_diagnostic_code(i64 stream, i64 message_kind, i64 numeric) {
+    if (message_kind == 1) { cli_write_literal_stream(stream, "D0001"); return; }
+    if (message_kind == 2) { cli_write_literal_stream(stream, "D1001"); return; }
+    if (message_kind == 3) { cli_write_literal_stream(stream, "D1002"); return; }
+    if (message_kind == 5) { cli_write_literal_stream(stream, "D2008"); return; }
+    if (message_kind == 6) { cli_write_literal_stream(stream, "D2210"); return; }
+    if (message_kind == 9) { cli_write_literal_stream(stream, "D3001"); return; }
+    if (message_kind == 10) { cli_write_literal_stream(stream, "D2053"); return; }
+    if (message_kind == 11) { cli_write_literal_stream(stream, "D2054"); return; }
+    if (message_kind == 12) { cli_write_literal_stream(stream, "D2055"); return; }
+    if (message_kind == 13) { cli_write_literal_stream(stream, "D2211"); return; }
+    cli_write_literal_stream(stream, "E");
+    i64 zeros = 4;
+    if (numeric >= 10) { zeros = 3; }
+    i64 zi = 0;
+    while (zi < zeros) { cli_write_literal_stream(stream, "0"); zi += 1; }
+    cli_write_number(stream, numeric);
+}
+
+fn cli_write_json_arena_string(i64 stream, i64 value, i64 length) {
+    cli_write_literal_stream(stream, "\"");
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_compiler_rt_arena_get(value, i);
+        if (ch == 34) { cli_write_literal_stream(stream, "\\\""); }
+        else if (ch == 92) { cli_write_literal_stream(stream, "\\\\"); }
+        else if (ch == 10) { cli_write_literal_stream(stream, "\\n"); }
+        else if (ch == 13) { cli_write_literal_stream(stream, "\\r"); }
+        else if (ch == 9) { cli_write_literal_stream(stream, "\\t"); }
+        else if (ch >= 32) { i64 one[1] = [ch]; cli_write_stream(stream, &one, 1); }
+        i += 1;
+    }
+    cli_write_literal_stream(stream, "\"");
+}
+
+fn cli_source_has_package_marker(Source& input) -> bool {
+    string marker = "__raz_package ";
+    i64 marker_length = compiler_literal_length(marker);
+    i64 pos = 0;
+    while (pos + marker_length <= input.length) {
+        if (cli_source_line_start(input, pos) && cli_source_matches_literal(input, pos, marker)) { return true; }
+        pos += 1;
+    }
+    return false;
+}
+
+fn cli_render_frontend_diagnostic(Source& input, DiagnosticCode code, i64 offset) {
+    i64 message_kind = cli_frontend_diagnostic_message(code);
+    if (offset < 0) { offset = 0; }
+    if (offset > input.length) { offset = input.length; }
+
+    i64 source_path = raz_compiler_rt_arena_create(8192);
+    i64 source_content_start = 0;
+    i64 source_path_length = -1;
+    if (source_path != 0) { source_path_length = cli_find_source_origin(input, offset, source_path, 8192, &mut source_content_start); }
+
+    i64 diagnostic_start = offset;
+    i64 diagnostic_end = offset + 1;
+    if (message_kind == 5 || message_kind == 7 || message_kind == 13) {
+        cli_diagnostic_token_span(input, source_content_start, offset, &mut diagnostic_start, &mut diagnostic_end);
+    }
+    if (diagnostic_start < 0) { diagnostic_start = 0; }
+    if (diagnostic_end <= diagnostic_start) { diagnostic_end = diagnostic_start + 1; }
+    if (diagnostic_end > input.length) { diagnostic_end = input.length; }
+
+    i64 line = 1;
+    i64 column = 1;
+    i64 line_start = 0;
+    i64 i = 0;
+    while (i < diagnostic_start) {
+        if (source_byte(input, i) == 10) { line += 1; column = 1; line_start = i + 1; }
+        else { column += 1; }
+        i += 1;
+    }
+    i64 line_end = line_start;
+    while (line_end < input.length && source_byte(input, line_end) != 10 && source_byte(input, line_end) != 13) { line_end += 1; }
+    i64 display_line = line;
+    if (source_path_length > 0) { display_line = cli_source_local_line(input, source_content_start, diagnostic_start); }
+    i64 local_byte = diagnostic_start;
+    if (source_path_length > 0 && diagnostic_start >= source_content_start) { local_byte = diagnostic_start - source_content_start; }
+    i64 span = diagnostic_end - diagnostic_start;
+    i64 numeric = diagnostic_code_value(code);
+    i64 format = cli_diagnostic_format_kind();
+
+    if (format == 2) {
+        bool project = cli_source_has_package_marker(input);
+        if (project) { cli_write_literal_stream(1, "{\"schema\":\"raz-project-diagnostics-v1\",\"success\":false,\"reports\":[{\"file\":"); }
+        else { cli_write_literal_stream(1, "{\"schema\":\"raz-diagnostics-v1\",\"error_count\":1,\"diagnostics\":["); }
+        if (project) {
+            if (source_path_length > 0) { cli_write_json_arena_string(1, source_path, source_path_length); }
+            else { cli_write_literal_stream(1, "\"<input>\""); }
+            cli_write_literal_stream(1, ",\"error_count\":1,\"diagnostics\":[");
+        }
+        cli_write_literal_stream(1, "{\"severity\":\"error\",\"code\":\"");
+        cli_write_frontend_diagnostic_code(1, message_kind, numeric);
+        cli_write_literal_stream(1, "\",\"message\":\"");
+        cli_write_frontend_diagnostic_message(1, input, message_kind, diagnostic_start, diagnostic_end);
+        cli_write_literal_stream(1, "\",\"file\":");
+        if (source_path_length > 0) { cli_write_json_arena_string(1, source_path, source_path_length); }
+        else { cli_write_literal_stream(1, "\"<input>\""); }
+        cli_write_literal_stream(1, ",\"range\":{\"start\":{\"line\":"); cli_write_number(1, display_line - 1);
+        cli_write_literal_stream(1, ",\"character\":"); cli_write_number(1, column - 1);
+        cli_write_literal_stream(1, ",\"byte_offset\":"); cli_write_number(1, local_byte);
+        cli_write_literal_stream(1, "},\"end\":{\"line\":"); cli_write_number(1, display_line - 1);
+        cli_write_literal_stream(1, ",\"character\":"); cli_write_number(1, column - 1 + span);
+        cli_write_literal_stream(1, ",\"byte_offset\":"); cli_write_number(1, local_byte + span);
+        cli_write_literal_stream(1, "}}");
+        if (message_kind == 2) {
+            cli_write_literal_stream(1, ",\"fixes\":[{\"title\":\"Insert ';'\",\"replacement\":\";\",\"range\":{\"start\":{\"line\":");
+            cli_write_number(1, display_line - 1); cli_write_literal_stream(1, ",\"character\":"); cli_write_number(1, column - 1); cli_write_literal_stream(1, ",\"byte_offset\":"); cli_write_number(1, local_byte);
+            cli_write_literal_stream(1, "},\"end\":{\"line\":"); cli_write_number(1, display_line - 1); cli_write_literal_stream(1, ",\"character\":"); cli_write_number(1, column - 1); cli_write_literal_stream(1, ",\"byte_offset\":"); cli_write_number(1, local_byte); cli_write_literal_stream(1, "}}}]");
+        }
+        cli_write_literal_stream(1, "}");
+        if (project) { cli_write_literal_stream(1, "]}]}"); }
+        else { cli_write_literal_stream(1, "]}"); }
+        cli_write_literal_stream(1, "\n");
+        if (source_path != 0) { raz_compiler_rt_arena_destroy(source_path); }
+        return;
+    }
+
+    if (format == 1) {
+        if (source_path_length > 0) { cli_write_arena_stream(2, source_path, source_path_length); }
+        else { cli_write_literal_stream(2, "<input>"); }
+        cli_write_literal_stream(2, ":"); cli_write_number(2, display_line); cli_write_literal_stream(2, ":"); cli_write_number(2, column);
+        cli_write_literal_stream(2, ": error["); cli_write_frontend_diagnostic_code(2, message_kind, numeric); cli_write_literal_stream(2, "]: ");
+        cli_write_frontend_diagnostic_message(2, input, message_kind, diagnostic_start, diagnostic_end); cli_write_literal_stream(2, "\n");
+        if (source_path != 0) { raz_compiler_rt_arena_destroy(source_path); }
+        return;
+    }
+
+    bool color = cli_error_color_enabled();
+    if (color) { i64 red[7] = [27, 91, 49, 59, 51, 49, 109]; cli_write_stream(2, &red, 7); }
+    cli_write_literal_stream(2, "error["); cli_write_frontend_diagnostic_code(2, message_kind, numeric); cli_write_literal_stream(2, "]: ");
+    if (color) { i64 reset[4] = [27, 91, 48, 109]; cli_write_stream(2, &reset, 4); }
+    cli_write_frontend_diagnostic_message(2, input, message_kind, diagnostic_start, diagnostic_end);
+    cli_write_literal_stream(2, "\n  --> ");
+    if (source_path_length > 0) { cli_write_arena_stream(2, source_path, source_path_length); }
+    else { cli_write_literal_stream(2, "<input>"); }
+    cli_write_literal_stream(2, ":"); cli_write_number(2, display_line); cli_write_literal_stream(2, ":"); cli_write_number(2, column); cli_write_literal_stream(2, "\n   |\n");
+    cli_write_number(2, display_line); cli_write_literal_stream(2, " | ");
+    i64 cursor = line_start;
+    while (cursor < line_end) { i64 ch[1] = [source_byte(input, cursor)]; cli_write_stream(2, &ch, 1); cursor += 1; }
+    cli_write_literal_stream(2, "\n   | ");
+    i64 c = 1;
+    while (c < column) { cli_write_literal_stream(2, " "); c += 1; }
+    if (color) { i64 red2[7] = [27, 91, 49, 59, 51, 49, 109]; cli_write_stream(2, &red2, 7); }
+    cli_write_literal_stream(2, "^");
+    i64 marker = 1;
+    while (marker < span) { cli_write_literal_stream(2, "~"); marker += 1; }
+    if (color) { i64 reset2[4] = [27, 91, 48, 109]; cli_write_stream(2, &reset2, 4); }
+    cli_write_literal_stream(2, "\n");
+    if (message_kind == 5 || message_kind == 7 || message_kind == 13) { cli_write_literal_stream(2, "  = help: check spelling, imports, and namespace qualification\n"); }
+    else if (message_kind == 2) { cli_write_literal_stream(2, "  = help: check the token immediately before the highlighted location; it often determines what the parser expected here\n"); }
+    else if (message_kind == 16) {
+        cli_write_literal_stream(2, "  = note: the member exists on the receiver trait, but no concrete dispatch target is available in the resolved package graph\n");
+        cli_write_literal_stream(2, "  = help: run `raz update` to refresh compatible package versions; if resolution is unchanged, inspect the dependency version shown above\n");
+    }
+    if (source_path != 0) { raz_compiler_rt_arena_destroy(source_path); }
+}
+
+fn cli_arg_equals(i64 value, i64 length, i64[]expected, i64 expected_length) -> bool {
+    if (value == 0 || length != expected_length) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < expected_length) {
+        if (raz_compiler_rt_arena_get(value, i) != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_arg_equals_literal(i64 value, i64 length, string expected) -> bool {
+    i64 expected_length = compiler_literal_length(expected);
+    if (value == 0 || length != expected_length) { return false; }
+    i64 i = 0;
+    while (i < expected_length) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_load_arg(i64 index, i64 buffer, i64 capacity) -> i64 {
+    if (buffer == 0 || capacity <= 0) {
+        return -1;
+    }
+    return raz_compiler_rt_process_arg(index, buffer, capacity);
+}
+
+fn cli_command_kind(i64 value, i64 length) -> i64 {
+        if (cli_arg_equals_literal(value, length, "help")) {
+        return 1;
+    }
+
+        if (cli_arg_equals_literal(value, length, "--help")) {
+        return 1;
+    }
+
+        if (cli_arg_equals_literal(value, length, "-h")) {
+        return 1;
+    }
+
+        if (cli_arg_equals_literal(value, length, "version")) {
+        return 2;
+    }
+
+        if (cli_arg_equals_literal(value, length, "--version")) {
+        return 2;
+    }
+
+        if (cli_arg_equals_literal(value, length, "-V")) {
+        return 2;
+    }
+
+        if (cli_arg_equals_literal(value, length, "build")) {
+        return 3;
+    }
+
+        if (cli_arg_equals_literal(value, length, "check")) {
+        return 4;
+    }
+
+        if (cli_arg_equals_literal(value, length, "forge")) {
+        return 5;
+    }
+
+        if (cli_arg_equals_literal(value, length, "llvm")) {
+        return 6;
+    }
+
+        if (cli_arg_equals_literal(value, length, "backends")) {
+        return 7;
+    }
+
+        if (cli_arg_equals_literal(value, length, "targets")) {
+        return 8;
+    }
+
+        if (cli_arg_equals_literal(value, length, "doctor")) {
+        return 9;
+    }
+
+        if (cli_arg_equals_literal(value, length, "emit")) {
+        return 10;
+    }
+
+        if (cli_arg_equals_literal(value, length, "profile")) {
+        return 11;
+    }
+
+        if (cli_arg_equals_literal(value, length, "run")) {
+        return 12;
+    }
+
+        if (cli_arg_equals_literal(value, length, "clean")) {
+        return 13;
+    }
+
+        if (cli_arg_equals_literal(value, length, "init")) {
+        return 14;
+    }
+
+        if (cli_arg_equals_literal(value, length, "new")) {
+        return 15;
+    }
+
+        if (cli_arg_equals_literal(value, length, "test")) {
+        return 16;
+    }
+
+        if (cli_arg_equals_literal(value, length, "lint")) {
+        return 17;
+    }
+
+        if (cli_arg_equals_literal(value, length, "fmt")) {
+        return 18;
+    }
+
+        if (cli_arg_equals_literal(value, length, "doc")) {
+        return 19;
+    }
+
+        if (cli_arg_equals_literal(value, length, "add")) {
+        return 20;
+    }
+
+        if (cli_arg_equals_literal(value, length, "remove")) {
+        return 21;
+    }
+
+        if (cli_arg_equals_literal(value, length, "update")) {
+        return 22;
+    }
+
+        if (cli_arg_equals_literal(value, length, "fetch")) {
+        return 30;
+    }
+
+        if (cli_arg_equals_literal(value, length, "lock")) {
+        return 23;
+    }
+
+        if (cli_arg_equals_literal(value, length, "metadata")) {
+        return 24;
+    }
+
+        if (cli_arg_equals_literal(value, length, "graph")) {
+        return 25;
+    }
+
+        if (cli_arg_equals_literal(value, length, "registry")) {
+        return 26;
+    }
+
+        if (cli_arg_equals_literal(value, length, "pack")) {
+        return 27;
+    }
+
+        if (cli_arg_equals_literal(value, length, "publish")) {
+        return 28;
+    }
+
+        if (cli_arg_equals_literal(value, length, "keygen")) {
+        return 29;
+    }
+
+        if (cli_arg_equals_literal(value, length, "search")) {
+        return 31;
+    }
+
+        if (cli_arg_equals_literal(value, length, "info")) {
+        return 32;
+    }
+
+        if (cli_arg_equals_literal(value, length, "outdated")) {
+        return 33;
+    }
+
+        if (cli_arg_equals_literal(value, length, "tree")) {
+        return 34;
+    }
+
+        if (cli_arg_equals_literal(value, length, "install")) {
+        return 35;
+    }
+
+        if (cli_arg_equals_literal(value, length, "uninstall")) {
+        return 36;
+    }
+
+        if (cli_arg_equals_literal(value, length, "vendor")) {
+        return 37;
+    }
+
+        if (cli_arg_equals_literal(value, length, "login")) {
+        return 38;
+    }
+
+        if (cli_arg_equals_literal(value, length, "logout")) {
+        return 39;
+    }
+
+        if (cli_arg_equals_literal(value, length, "bench")) {
+        return 40;
+    }
+
+        if (cli_arg_equals_literal(value, length, "cache")) {
+        return 41;
+    }
+
+        if (cli_arg_equals_literal(value, length, "lsp")) {
+        return 42;
+    }
+
+        if (cli_arg_equals_literal(value, length, "bindgen")) {
+        return 43;
+    }
+
+        if (cli_arg_equals_literal(value, length, "c-header")) {
+        return 44;
+    }
+
+        if (cli_arg_equals_literal(value, length, "dev")) {
+        return 45;
+    }
+
+        if (cli_arg_equals_literal(value, length, "diagnostics")) {
+        return 46;
+    }
+
+        if (cli_arg_equals_literal(value, length, "completions")) {
+        return 47;
+    }
+    return 0;
+}
+
+fn cli_detect_command(i64 argc) -> i64 {
+    if (argc <= 1) {
+        return 1;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(4096);
+
+    if (arg == 0) {
+        return 0;
+    }
+
+    i64 length = cli_load_arg(1, arg, 4096);
+    i64 kind = 0;
+
+    if (length > 0) {
+        kind = cli_command_kind(arg, length);
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    return kind;
+}
+
+fn cli_command_help_requested(i64 argc, i64 command) -> bool {
+    if (command < 3 || argc <= 2) {
+        return false;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(64);
+
+    if (arg == 0) {
+        return false;
+    }
+
+            i64 index = 2;
+
+    while (index < argc) {
+        i64 length = cli_load_arg(index, arg, 64);
+
+        if (
+            length > 0 &&
+            (cli_arg_equals_literal(arg, length, "--help") || cli_arg_equals_literal(arg, length, "-h"))
+        ) {
+            raz_compiler_rt_arena_destroy(arg);
+            return true;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    return false;
+}
+
+fn cli_help_topic(i64 argc) -> i64 {
+    if (argc <= 2) {
+        return 0;
+    }
+
+    i64 arg = raz_compiler_rt_arena_create(64);
+
+    if (arg == 0) {
+        return 0;
+    }
+
+    i64 length = cli_load_arg(2, arg, 64);
+    i64 result = 0;
+
+    if (length > 0) {
+        result = cli_command_kind(arg, length);
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    return result;
+}
+
+fn cli_print_general_help() {
+    cli_write_literal("Raz 1.0.0\nHigh-performance native programming language compiler\n\n");
+    cli_write_literal("Usage:\n  raz <command> [options] [input] [output]\n\n");
+    cli_write_literal("Compiler commands:\n");
+    cli_write_literal("  build        Compile a package and its dependencies\n");
+    cli_write_literal("  check        Parse, resolve, and type-check without linking\n");
+    cli_write_literal("  run          Build and run an executable package\n");
+    cli_write_literal("  test         Discover and run test_ functions\n");
+    cli_write_literal("  bench        Run zero-argument bench_ functions\n");
+    cli_write_literal("  emit         Emit backend IR/object/executable artifacts\n");
+    cli_write_literal("  forge        Compile explicitly with the Forge backend\n");
+    cli_write_literal("  llvm         Compile explicitly with the LLVM backend\n");
+    cli_write_literal("  profile      Check and write semantic-query profiling data\n");
+    cli_write_literal("  backends     List compiler backends and capabilities\n");
+    cli_write_literal("  targets      List supported compilation targets\n\n");
+    cli_write_literal("Project tooling:\n");
+    cli_write_literal("  new          Create a new Raz project\n");
+    cli_write_literal("  init         Initialize an existing directory\n");
+    cli_write_literal("  clean        Remove generated build state\n");
+    cli_write_literal("  fmt          Format Raz source files/directories\n");
+    cli_write_literal("  lint         Statically validate Raz source\n");
+    cli_write_literal("  doc          Generate Markdown API documentation\n");
+    cli_write_literal("  dev          Build/serve a web project with live reload\n");
+    cli_write_literal("  lsp          Run the production language server over stdio\n");
+    cli_write_literal("  bindgen      Generate Raz FFI declarations from a C header\n");
+    cli_write_literal("  c-header     Generate a C header from public Raz C-ABI APIs\n\n");
+    cli_print_package_commands();
+    cli_write_literal("\nToolchain commands:\n");
+    cli_write_literal("  doctor       Diagnose compiler, linker, runtime, and project state\n");
+    cli_write_literal("  diagnostics  List stable diagnostic codes/categories\n");
+    cli_write_literal("  completions  Generate shell completion scripts\n");
+    cli_write_literal("  version      Show compiler/toolchain version\n");
+    cli_write_literal("  help         Show help for Raz or a command\n\n");
+    cli_write_literal("Global options:\n");
+    cli_write_literal("  --backend=forge|llvm|wasm|rxe  Select backend\n");
+    cli_write_literal("  --opt=0|1|2|3|s|z             Select optimization level\n");
+    cli_write_literal("  --release                      Use the release profile\n");
+    cli_write_literal("  -h, --help                     Show help\n");
+    cli_write_literal("  -V, --version                  Show version\n\n");
+    cli_write_literal("Examples:\n  raz new hello\n  raz run\n  raz build --release\n  raz check --workspace\n  raz completions powershell\n");
+}
+
+fn cli_print_project_commands() {
+    i64 words[65] = [32760384526971472, 31069370053518112, 32123469327659876, 9042521604779637, 29683799421886496, 28560293087896684, 32123763065692274, 9118698554027637, 30787916450984560, 32777976875589642, 9042521604759584, 33336520180581408, 9117624493437541, 32481171756447090, 27987473197981556, 9018690145053044, 9121975517930016, 23116270440292384, 31369502581091957, 28549323661926701, 27987404411401326, 27987473197981544, 9018690145053044, 9042883695438880, 23397745417003040, 30506377083642228, 29674038404086124, 27393371835490660, 27991871400910970, 33607045888346725, 17562969016515616, 32758185635029024, 33607045892612197, 32211432139477536, 9018694254815855, 9042883611879712, 20582995649896480, 29674038191483246, 27393371762877818, 28545999541641338, 30508287112410211, 9042521609888101, 31364004351844384, 29117685486871926, 32138863060153445, 31069038246328929, 28266697867796580, 28826396480577583, 9042428513510241, 9042521610284390, 31320826206756896, 27393372085906802, 27991871400910970, 32481138620899429, 32760384660792367, 9018689993667183, 9042522734027808, 20020045696475168, 28556934527676005, 31354135058140448, 9087808293596791, 32200436905897828, 9059078955363695, 32772479205076835, 658035];
+
+    cli_write_packed(&words, 65, 451);
+}
+
+fn cli_print_package_commands() {
+    cli_write_literal("Package commands:\n");
+    cli_write_literal("  add          Add/update a path, Git, or registry dependency\n");
+    cli_write_literal("  remove       Remove a dependency and refresh raz.lock\n");
+    cli_write_literal("  update       Re-resolve tracked registry dependencies\n");
+    cli_write_literal("  fetch        Fetch exact locked dependencies\n");
+    cli_write_literal("  lock         Write deterministic raz.lock\n");
+    cli_write_literal("  metadata     Print recursive package metadata\n");
+    cli_write_literal("  graph        Print the dependency graph\n");
+    cli_write_literal("  tree         Print the recursive dependency tree\n");
+    cli_write_literal("  search       Search official Raz packages\n");
+    cli_write_literal("  info         Show package versions and metadata\n");
+    cli_write_literal("  outdated     Show registry dependency upgrades\n");
+    cli_write_literal("  install      Install a package executable\n");
+    cli_write_literal("  uninstall    Remove an installed package executable\n");
+    cli_write_literal("  vendor       Vendor exact locked dependencies locally\n");
+    cli_write_literal("  pack         Create a deterministic .dpk archive\n");
+    cli_write_literal("  publish      Publish the current package\n");
+    cli_write_literal("  registry     Inspect/administer the package registry\n");
+    cli_write_literal("  login        Save registry credentials\n");
+    cli_write_literal("  logout       Remove saved registry credentials\n");
+    cli_write_literal("  keygen       Generate Ed25519 package-signing keys\n");
+    cli_write_literal("  cache        Inspect or clean the shared package cache\n");
+}
+
+fn cli_print_project_command_help(i64 command) {
+    if (command == 12) {
+        
+
+        cli_write_literal("Usage: raz run [options] <input>\nRuns main.\n");
+    } else if (command == 13) {
+        
+
+        cli_write_literal("Usage: raz clean\nRemoves the build directory.\n");
+    } else if (command == 14) {
+        
+
+        cli_write_literal("Usage: raz init\nCreates raz.toml and src/main.rz.\n");
+    } else if (command == 16) {
+        
+
+        cli_write_literal("Usage: raz test [--filter=<text>] <input>\nRuns zero-argument test_ functions and prints per-test results.\n");
+    } else if (command == 18) {
+        
+
+        cli_write_literal("Usage: raz fmt [--check] <file.rz>\nFormat Raz source.\n");
+    } else if (command == 19) {
+        
+
+        cli_write_literal("Usage: raz doc <file.rz> [output.md]\nGenerate API documentation.\n");
+    } else if (command == 20) {
+        
+
+        cli_write_literal("Usage: raz add <package>[@<constraint>] [--dev|--build|--optional|--target=<os>]\n       raz add <alias> <path|registry:name@constraint|git:url#commit> [--dev|--build|--optional|--target=<os>]\nAdd an official, registry, Git, or local dependency and rewrite raz.lock. Git revisions must be 40-character commit SHAs.\n");
+    } else if (command == 21) {
+        
+
+        cli_write_literal("Usage: raz remove <alias>\nRemove a dependency and rewrite raz.lock.\n");
+    } else if (command == 22) {
+        
+
+        cli_write_literal("Usage: raz update\nRe-resolve tracked registry constraints and update raz.lock.\n");
+    } else if (command == 23) {
+        
+
+        cli_write_literal("Usage: raz lock\nWrite the deterministic dependency lockfile.\n");
+    } else if (command == 24) {
+        
+
+        cli_write_literal("Usage: raz metadata\nPrint recursive package metadata.\n");
+    } else if (command == 25) {
+        
+
+        cli_write_literal("Usage: raz graph\nPrint the recursive dependency graph.\n");
+    } else if (command == 26) {
+        
+
+        cli_write_literal("Usage: raz registry <status|owner-add|owner-remove|yank|unyank> [package] [value]\nManage and inspect the GitHub-backed Raz registry.\n");
+    } else if (command == 27) {
+        
+
+        cli_write_literal("Usage: raz pack [output.dpk]\nCreate a deterministic Raz package archive.\n");
+    } else if (command == 28) {
+        
+
+        cli_write_literal("Usage: raz publish\nPublish the current package using RAZ_REGISTRY_URL or RAZ_REGISTRY_PUBLISH_DIR.\n");
+    } else if (command == 29) {
+        
+
+        cli_write_literal("Usage: raz keygen [prefix]\nGenerate an Ed25519 private/public package-signing key pair.\n");
+    } else if (command == 30) {
+        
+
+        cli_write_literal("Usage: raz fetch\nFetch the exact registry packages recorded in raz.lock without upgrading.\n");
+    } else if (command == 31) {
+        
+
+        cli_write_literal("Usage: raz search <query>\nSearch official package names, descriptions, and owners.\n");
+    } else if (command == 32) {
+        
+
+        cli_write_literal("Usage: raz info <package>\nShow a package's latest and published versions.\n");
+    } else if (command == 33) {
+        
+
+        cli_write_literal("Usage: raz outdated\nShow registry dependencies with newer published versions.\n");
+    } else if (command == 34) {
+        
+
+        cli_write_literal("Usage: raz tree\nPrint the recursive dependency tree.\n");
+    } else if (command == 35) {
+        
+
+        cli_write_literal("Usage: raz install [--force|--update] [--bin=<name>] <package>[@<constraint>]\n       raz install --list\nInstall and manage package executables from the official registry.\nPackages may expose additional Cargo-style [[bin]] entries selected with --bin=<name>.\n");
+    } else if (command == 36) {
+        
+
+        cli_write_literal("Usage: raz uninstall <package>\nRemove an installed package executable.\n");
+    } else if (command == 37) {
+        
+
+        cli_write_literal("Usage: raz vendor [--check]\nVendor exact locked registry and Git dependencies into ./vendor.\n");
+    } else if (command == 38) {
+        
+
+        cli_write_literal("Usage: raz login [token]\nSave a GitHub registry credential.\n");
+    } else if (command == 39) {
+        
+
+        cli_write_literal("Usage: raz logout\nRemove the saved registry credential.\n");
+    } else if (command == 40) {
+        
+
+        cli_write_literal("Usage: raz bench [--iterations=N] [input]\nRun zero-argument bench_ functions and report ns/op.\n");
+    } else if (command == 41) {
+        
+
+        cli_write_literal("Usage: raz cache [status|clean]\nInspect or clean the shared Raz registry/package cache.\n");
+    } else if (command == 42) {
+        
+
+        cli_write_literal("Usage: raz lsp\nRun the production Raz language server over stdio.\n");
+    } else if (command == 43) {
+        
+
+        cli_write_literal("Usage: raz bindgen <header.h> [--target-abi=windows|unix] [output.rz]\nGenerate Raz FFI declarations from a C header.\n");
+    } else if (command == 44) {
+        
+
+        cli_write_literal("Usage: raz c-header <source.rz> [output.h]\nGenerate a C header from explicit public Raz C-ABI declarations.\n");
+    } else if (command == 45) {
+        cli_write_literal("Usage: raz dev [--host=<host>] [--port=<port>] [raz.toml]\nBuild and serve a web project in development mode, watch for changes, and reload the browser.\n");
+    } else if (command == 46) {
+        cli_write_literal("Usage: raz diagnostics [--json]\nList stable diagnostic codes and categories.\n");
+    } else if (command == 47) {
+        cli_write_literal("Usage: raz completions <bash|zsh|fish|powershell>\nGenerate a shell completion script on stdout.\n");
+    } else {
+        cli_print_general_help();
+    }
+}
+
+fn cli_print_build_help() {
+    cli_write_literal("Compile a package and its dependencies.\n\n");
+    cli_write_literal("Usage:\n  raz build [path] [options]\n\n");
+    cli_write_literal("Package options:\n");
+    cli_write_literal("  --profile <debug|release>      Select a manifest build profile\n");
+    cli_write_literal("  --release                      Shorthand for --profile release\n");
+    cli_write_literal("  --force                        Rebuild instead of reusing incremental artifacts\n");
+    cli_write_literal("  --workspace                    Build every workspace member\n");
+    cli_write_literal("  --features=<a,b>               Enable named features\n");
+    cli_write_literal("  --all-features                 Enable all features\n");
+    cli_write_literal("  --no-default-features          Disable default features\n\n");
+    cli_write_literal("Backend options:\n");
+    cli_write_literal("  --backend=forge | --forge      Use Forge\n");
+    cli_write_literal("  --backend=llvm  | --llvm       Use LLVM\n");
+    cli_write_literal("  --opt=0|1|2|3|s|z             Optimization level\n");
+    cli_write_literal("  --target=<triple>              Select an explicit target\n\n");
+    cli_write_literal("Diagnostics/output:\n");
+    cli_write_literal("  --diagnostic-format=<format>   human, short, or json\n");
+    cli_write_literal("  --allow|--warn|--deny <code>   Apply ordered warning policy\n");
+    cli_write_literal("  --deny-warnings                Treat warnings as errors\n");
+    cli_write_literal("  --color=<auto|always|never>    Control terminal color\n");
+    cli_write_literal("  --quiet                        Suppress status output\n\n");
+    cli_write_literal("Project builds write executables under target/debug/bin; release builds use target/release/bin.\n");
+    cli_write_literal("For target=web, --release --analyze writes the finalized web bundle analysis.\n");
+}
+
+fn cli_print_check_help() {
+    i64 words[50] = [9071406455288661, 28543747603718514, 32774720870968163, 16924084343304041, 2883419674537577, 9056013494935888, 28559180746155378, 12777907700375596, 9056038995454051, 29400332743112559, 27977521709281385, 9117624493419627, 32758181191770486, 31358571609792613, 28539402214995061, 29681812081829152, 31612101930675823, 2879017215551860, 27973096986976288, 31356136278877547, 33333260451145586, 9042521604759661, 29674037867192352, 27410964021535076, 32419531693845347, 27981911270057328, 31084746153946912, 32758232798683936, 34186468321223273, 32211486677934090, 31856586002097775, 9134078652736885, 9042521604759584, 29680591081316384, 31645522563458420, 33057012281863273, 31369548539720293, 33904739824200038, 31293394250631796, 34957306567160944, 34476782605532210, 9042521604759584, 32762504994103328, 29675172247138080, 9128624044401018, 32758181058078061, 31358571609792609, 32767015867413621, 31352713240275316, 681316];
+
+    cli_write_packed(&words, 50, 346);
+}
+
+fn cli_print_forge_help() {
+    i64 words[57] = [9071406455288661, 32210631767253362, 32774720870966631, 16924084343304041, 9075869162172009, 32780223149076315, 29678487875029597, 30522959879759212, 9140705971233641, 29401080118143351, 32770297495167077, 32210494327515437, 30227092417308007, 22247562004426341, 16452466801996912, 31647437212885002, 14210300814310772, 9141874186793852, 9042521604759584, 29117744844644384, 30796721284915301, 31084746152966761, 2933932800961568, 32210631980294176, 29682834363737447, 9042521604777334, 9042521604759584, 32767015330521120, 29682834362884384, 28545943651509622, 12715989951738979, 32419535872225126, 32217290090312308, 34177693749437541, 23116270440292384, 9118741324722533, 33060542796166259, 32758222916183410, 33618032419239529, 9018638605054565, 28832984923450656, 28558101601152105, 9042523001809266, 9042521604759584, 28556968886476832, 32772462024684320, 32199702428541801, 29667501401972857, 27413163077953900, 32766919849959796, 12715991368036200, 31012160988671846, 9056013544682593, 32780217443772532, 9134094608004464, 20583293199216454, 667218];
+
+    cli_write_packed(&words, 57, 395);
+}
+
+fn cli_print_llvm_help() {
+    i64 words[212] = [9071406455288661, 33333258909016434, 29682898808021101, 29620982259084911, 25649675494584430, 26305220580767087, 30515229078012682, 29674102866649189, 33531228111268195, 28543820616987753, 27620064250055712, 13058274239406945, 32496518963726858, 9042427556818793, 17297969735085357, 9042522902260844, 9042521604759584, 9042521604759584, 28556655388618053, 21427748093654136, 9097673282770508, 30528358674949160, 12715989951719796, 27706857454398821, 9042521604759658, 9042521604759584, 31042649764929568, 30508288276393846, 9129743805279841, 9113991274655077, 9118758504522094, 2942720019161711, 29675153871675424, 9042819438427508, 9042521604759584, 9042521604759584, 30240376955150368, 29113287310516325, 30434960546474795, 9128562689535593, 27431120268523621, 27395474841758818, 31352777882298226, 2878995589195108, 32195298947047456, 32215949422912871, 9042651616407657, 9042521604759584, 28542713604612128, 30522895678840948, 28197169506814565, 34165589427713121, 27422078725813615, 9042651868655481, 31657435678646304, 21427782586427756, 32758179964999244, 33055139391348833, 27915694530103924, 30787898546419056, 9042521604767333, 9042521604759584, 32195161289138208, 24013622257935719, 28541316864417802, 17296853128541281, 12998617089204540, 9042521604767278, 29117684949983264, 32758185431430245, 32485535442629237, 31293394250631796, 34957306567160944, 34476782605532210, 9042521604759584, 29682898267283488, 31359670987417965, 30510856666882158, 28539117841162250, 9042521609434466, 9042521604759584, 9042521604759584, 32767015330521120, 9120953114387488, 27423411003616873, 9042428429298036, 31029796342082861, 29669722067136111, 9126412336659566, 9042521604759584, 29682610979367244, 29682898804172141, 31359670987417965, 2926231807664238, 30510838543360032, 31084746152960879, 30528358674949181, 29682834468994164, 9018621341760611, 28539402215828768, 17289156311870765, 32770348699510116, 35022109858952060, 35023248158909805, 9018629898264940, 29681769346051360, 17303514471229794, 32770348699510116, 31073729293936764, 33329995821484554, 9125321214009445, 32491047111389295, 32137819180763706, 17281494174428789, 9075817604804668, 9042521604759584, 34446952512888864, 30796721251775008, 29669648884637797, 32196352271148406, 12701695938753121, 32195291250256941, 17284822639586681, 17578341022396476, 21990370533449760, 30434917635159137, 9140731422859881, 9121975584777587, 9018690044715376, 17278178505338144, 32195291250256956, 9042522113533289, 9042521604759584, 28559167943953952, 32195291250256928, 12701695938356585, 32199659433323565, 28559167910591549, 9042521604767346, 22271845510160416, 28539376702219638, 13343047683957536, 12151147232062563, 32199706594665504, 29673813841027082, 17283714533649262, 9075864632451388, 9042521604759584, 29665254306750496, 9126364975163764, 9132979174402412, 31073768233726561, 12715989951738740, 17298008424085605, 30521766018904892, 9042521604759614, 33853001485525024, 29673759203028848, 30716392359684974, 27431034385691749, 30796415212986378, 32435856966053744, 9075834700852601, 9042521604759584, 31367337095471136, 30239221572727922, 32762616667793249, 9018612935386209, 30224910927080736, 31351944743435325, 9042521604767340, 9042521604759584, 30434943052371744, 9118693945208425, 32758181058078061, 30448969320499809, 28538298614640233, 31351944743435325, 9042521604767340, 31078023115579424, 9118676983688555, 28542640759662956, 27413442468343072, 27435310657462644, 2879017064362093, 30435007477719072, 28478644488599148, 33333259395164525, 30732876629876845, 9141830078589281, 2933961658495073, 30435007477719072, 32700769139258988, 33844567332057697, 31574899665352248, 31354147793481059, 27996260819366775, 32767015868247328, 32214730405998397, 13069247813857123, 13071476896856690, 32123469330801263, 30810980504074849, 32767015868247328, 12715991116571965, 28549272340166002, 33058326675812925, 30450310646953070, 13338667114324585, 34465490905162093, 33888247334592800, 2661];
+
+    cli_write_packed(&words, 212, 1479);
+}
+
+fn cli_print_emit_help() {
+    i64 words[52] = [9071406455288661, 29675153658634610, 29682898808021108, 29620982259084911, 16923951216554094, 17579496302736751, 27338757097997578, 31073759341404704, 28826396480577636, 32767057664959329, 29382388621864808, 9120923167190625, 31369505370630260, 31560813112554606, 28550371716984937, 29117744843196974, 27428555042994789, 9135195410473082, 28542713840676141, 13075896674969888, 31653245115988594, 2940546778559605, 28464682640744480, 28760119465765229, 12715991115461231, 31012160988671846, 29590492705027169, 34465491006615662, 32780223149076256, 21403138080796462, 9042427554649676, 29675153658634610, 33333259122057332, 29675153871675501, 9127554647342452, 32139225066401385, 33056217763881082, 9042428395531892, 29675153658634610, 33333259122057332, 29675153871675501, 29590513844698484, 34465491006615662, 32780223149076256, 9042428361338670, 29675153658634610, 33333259122057332, 29675153871675501, 29590492738305396, 34465491006615662, 32780223149076256, 44652061998];
+
+    cli_write_packed(&words, 52, 362);
+}
+
+fn cli_print_profile_help() {
+    i64 words[22] = [9071406455288661, 31369548321677682, 31343917113567590, 26304090986869872, 32780223047613472, 32686756085238334, 27423355231561064, 32200436637856878, 9117624566050415, 29680728524746337, 31645522563458420, 33057012281863273, 31369548539720293, 33904739824200038, 29684001904668276, 9135216751567222, 34447091025604468, 9125273902015264, 29667501401976109, 32199702429394284, 31077954401559913, 2865740666664304];
+
+    cli_write_packed(&words, 22, 154);
+}
+
+fn cli_print_backends() {
+    i64 words[44] = [30803243998798162, 27620223417608560, 32480047632442209, 28542713840667146, 27415658398490656, 33040462599449717, 9128597267967081, 9118758504522094, 28268879543492962, 9042521604759562, 28542713838575648, 28268861104212256, 30997931963148320, 31293636216452193, 28464656903662178, 31084746137364845, 9042853765082122, 32770297495167008, 24290737842448685, 30791961955344461, 9018685699421289, 9042521604759584, 9118758504522062, 13357294157455983, 27431120268523621, 29675153657261154, 32968230962819955, 9128562690057587, 27424510348392549, 29113287310516332, 12217147777114927, 27985248561405995, 23373462985335144, 33531206484454501, 12716264835806313, 28268879543492962, 27133092740163133, 27411018915258412, 30466799042915171, 27056972732659308, 32210631767253362, 32210331319166311, 30435007477735456, 11194302559852];
+
+    cli_write_packed(&words, 44, 307);
+}
+
+fn cli_print_targets() {
+    
+
+    cli_write_literal("Supported targets:\n  Forge native/object:\n    x86_64-pc-windows-msvc\n    x86_64-unknown-linux-gnu\n    aarch64-unknown-linux-gnu\n    arm64-apple-macos\n  LLVM native:\n    x86_64-pc-windows-msvc\n    x86_64-unknown-linux-gnu\n    aarch64-unknown-linux-gnu\n    arm64-apple-macos\n  Portable:\n    wasm32-unknown-unknown\n    rxe-v1\n\nForge supports deterministic x86-64 and AArch64 object generation; final native linking depends on the host runtime/linker support.\n");
+}
+
+fn cli_print_version() {
+    i64 words[15] = [13561587415277938, 29117744843206702, 28547047227531365, 29683936862561390, 21403567557276780, 9097673282770508, 32199698188692837, 32770297495167034, 24290737473349933, 27985248561406029, 28464407980368232, 30506424478299256, 13343047683957536, 12151147232062563, 10];
+
+    cli_write_packed(&words, 15, 99);
+}
+
+fn cli_print_command_help(i64 command) {
+    if (command == 3) {
+        cli_print_build_help();
+    } else if (command == 4) {
+        cli_print_check_help();
+    } else if (command == 5) {
+        cli_print_forge_help();
+    } else if (command == 6) {
+        cli_print_llvm_help();
+    } else if (command == 10) {
+        cli_print_emit_help();
+    } else if (command == 11) {
+        cli_print_profile_help();
+    } else if (command == 7) {
+        cli_print_backends();
+    } else if (command == 8) {
+        cli_print_targets();
+    } else if (command >= 12 && command <= 47) {
+        cli_print_project_command_help(command);
+    } else {
+        cli_print_general_help();
+    }
+    if (
+        command == 3 ||
+        command == 4 ||
+        command == 16 ||
+        command == 22 ||
+        command == 23 ||
+        command == 24 ||
+        command == 25 ||
+        command == 30 ||
+        command == 34
+    ) {
+        
+
+        cli_write_literal("\nWorkspace: add --workspace at the workspace root for build, check, test, update, fetch, lock, metadata, graph, or tree.\n");
+    }
+}
+
+fn cli_test_filter_option(i64 value, i64 length, i64 output, i64 capacity) -> i64 {
+    string prefix = "--filter=";
+
+    if (output == 0) {
+        return -1;
+    }
+    if (value == 0 || length < 9) {
+        return 0;
+    }
+
+    i64 i = 0;
+
+    while (i < 9) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) {
+            return 0;
+        }
+        i += 1;
+    }
+
+    i64 result_length = length - 9;
+
+    if (result_length <= 0 || result_length > capacity) {
+        return -1;
+    }
+    i = 0;
+    while (i < result_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(value, 9 + i));
+        i += 1;
+    }
+    return result_length;
+}
+
+fn cli_bench_iterations_option(i64 value, i64 length) -> i64 {
+    string prefix = "--iterations=";
+
+    if (value == 0 || length <= 13) {
+        return 0;
+    }
+
+    i64 i = 0;
+
+    while (i < 13) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) {
+            return 0;
+        }
+        i += 1;
+    }
+
+    i64 result = 0;
+
+    while (i < length) {
+        i64 ch = raz_compiler_rt_arena_get(value, i);
+
+        if (ch < 48 || ch > 57) {
+            return -1;
+        }
+        if (result > 1000000) {
+            return -1;
+        }
+        result = result * 10 + ch - 48;
+        i += 1;
+    }
+    if (result <= 0) {
+        return -1;
+    }
+    return result;
+}
+
+fn cli_dev_port_option(i64 value, i64 length) -> i64 {
+    string prefix = "--port=";
+    if (value == 0 || length <= 7) { return 0; }
+    i64 i = 0;
+    while (i < 7) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { return 0; }
+        i += 1;
+    }
+    i64 port = 0;
+    while (i < length) {
+        i64 byte = raz_compiler_rt_arena_get(value, i);
+        if (byte < 48 || byte > 57) { return -1; }
+        port = port * 10 + (byte - 48);
+        if (port > 65535) { return -1; }
+        i += 1;
+    }
+    if (port <= 0) { return -1; }
+    return port;
+}
+
+fn cli_dev_host_option(i64 value, i64 length, i64 output, i64 capacity) -> i64 {
+    string prefix = "--host=";
+    if (value == 0 || output == 0 || length <= 7) { return 0; }
+    i64 i = 0;
+    while (i < 7) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { return 0; }
+        i += 1;
+    }
+    i64 out_length = length - 7;
+    if (out_length <= 0 || out_length > capacity) { return -1; }
+    i64 j = 0;
+    while (j < out_length) {
+        i64 byte = raz_compiler_rt_arena_get(value, i + j);
+        if (byte <= 32 || byte == 127) { return -1; }
+        raz_compiler_rt_arena_set(output, j, byte);
+        j += 1;
+    }
+    return out_length;
+}
+
+fn cli_profile_option_consumed(i64 argc, i64 index, i64 value, i64 length, bool&mut release_profile) -> i64 {
+    if (length > 10) {
+        string prefix = "--profile=";
+        i64 i = 0;
+        bool matches = true;
+        while (i < 10) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { matches = false; }
+            i += 1;
+        }
+        if (matches) {
+            i64 mode = raz_compiler_rt_arena_create(32);
+            if (mode == 0) { return -1; }
+            i64 ml = length - 10;
+            i = 0;
+            while (i < ml) { raz_compiler_rt_arena_set(mode, i, raz_compiler_rt_arena_get(value, 10 + i)); i += 1; }
+            bool debug = cli_arg_equals_literal(mode, ml, "debug");
+            bool release = cli_arg_equals_literal(mode, ml, "release");
+            raz_compiler_rt_arena_destroy(mode);
+            if (!debug && !release) { return -1; }
+            *release_profile = release;
+            return 1;
+        }
+    }
+    if (cli_arg_equals_literal(value, length, "--profile")) {
+        if (index + 1 >= argc) {
+            cli_write_literal_stream(2, "error: option '--profile' requires a value\n");
+            return -1;
+        }
+        i64 mode = raz_compiler_rt_arena_create(32);
+        if (mode == 0) { return -1; }
+        i64 ml = raz_compiler_rt_process_arg(index + 1, mode, 32);
+        bool debug = cli_arg_equals_literal(mode, ml, "debug");
+        bool release = cli_arg_equals_literal(mode, ml, "release");
+        raz_compiler_rt_arena_destroy(mode);
+        if (!debug && !release) { return -1; }
+        *release_profile = release;
+        return 2;
+    }
+    return 0;
+}
+
+fn cli_force_option(i64 value, i64 length) -> bool {
+    return cli_arg_equals_literal(value, length, "--force");
+}
+
+fn cli_analyze_option(i64 value, i64 length) -> bool {
+    return cli_arg_equals_literal(value, length, "--analyze");
+}
+
+fn cli_release_option(i64 value, i64 length) -> bool {
+        return cli_arg_equals_literal(value, length, "--release");
+}
+
+fn cli_entry_override_option(i64 value, i64 length) -> bool {
+    if (value == 0 || length <= 8) {
+        return false;
+    }
+
+    string prefix = "--entry=";
+    i64 i = 0;
+
+    while (i < 8) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_all_features_option(i64 value, i64 length) -> bool {
+        return cli_arg_equals_literal(value, length, "--all-features");
+}
+
+fn cli_no_default_features_option(i64 value, i64 length) -> bool {
+        return cli_arg_equals_literal(value, length, "--no-default-features");
+}
+
+fn cli_features_option(i64 value, i64 length, i64 output, i64 capacity) -> i64 {
+    string prefix = "--features=";
+
+    if (output == 0) {
+        return -1;
+    }
+    if (length < 11) {
+        return 0;
+    }
+
+    i64 i = 0;
+
+    while (i < 11) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) {
+            return 0;
+        }
+        i += 1;
+    }
+
+    i64 out_length = length - 11;
+
+    if (out_length <= 0 || out_length > capacity) {
+        return -1;
+    }
+    i = 0;
+    while (i < out_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(value, 11 + i));
+        i += 1;
+    }
+    return out_length;
+}
+
+fn cli_backend_shortcut(i64 value, i64 length) -> i64 {
+        if (cli_arg_equals_literal(value, length, "--forge")) {
+        return 0;
+    }
+
+        if (cli_arg_equals_literal(value, length, "--llvm")) {
+        return 1;
+    }
+
+        if (cli_arg_equals_literal(value, length, "--wasm")) {
+        return 2;
+    }
+
+        if (cli_arg_equals_literal(value, length, "--rxe")) {
+        return 3;
+    }
+    return -1;
+}
+
+fn cli_tool_available(i64[]name, i64 length) -> bool {
+    i64 buffer = raz_compiler_rt_arena_create(length);
+
+    if (buffer == 0) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, name[i]);
+        i += 1;
+    }
+
+    bool result = raz_compiler_rt_tool_available(buffer, length) > 0;
+
+    raz_compiler_rt_arena_destroy(buffer);
+    return result;
+}
+
+fn cli_print_status_line(i64[]label, i64 label_length, bool ok) {
+    i64 buffer = raz_compiler_rt_arena_create(64);
+
+    if (buffer == 0) {
+        return;
+    }
+
+    i64 i = 0;
+
+    while (i < label_length) {
+        raz_compiler_rt_arena_set(buffer, i, label[i]);
+        i += 1;
+    }
+    while (i < 30) {
+        raz_compiler_rt_arena_set(buffer, i, 32);
+        i += 1;
+    }
+    if (ok) {
+        string word = "OK\n";
+        i64 j = 0;
+
+        while (j < 3) {
+            raz_compiler_rt_arena_set(buffer, i + j, compiler_literal_byte(word, j));
+            j += 1;
+        }
+        i += 3;
+    } else {
+        string word = "MISSING\n";
+        i64 j = 0;
+
+        while (j < 8) {
+            raz_compiler_rt_arena_set(buffer, i + j, compiler_literal_byte(word, j));
+            j += 1;
+        }
+        i += 8;
+    }
+    raz_compiler_rt_stdio_write_ascii(1, buffer, i);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+fn cli_tool_available_literal(string name) -> bool {
+    i64 length = compiler_literal_length(name);
+    i64 buffer = raz_compiler_rt_arena_create(length);
+    if (buffer == 0) { return false; }
+    i64 i = 0;
+    while (i < length) { raz_compiler_rt_arena_set(buffer, i, compiler_literal_byte(name, i)); i += 1; }
+    bool result = raz_compiler_rt_tool_available(buffer, length) > 0;
+    raz_compiler_rt_arena_destroy(buffer);
+    return result;
+}
+
+fn cli_print_tool_path_literal(string label, string tool) {
+    i64 label_length = compiler_literal_length(label);
+    i64 tool_length = compiler_literal_length(tool);
+    i64 name = raz_compiler_rt_arena_create(tool_length);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    if (name == 0 || path == 0) {
+        if (name != 0) { raz_compiler_rt_arena_destroy(name); }
+        if (path != 0) { raz_compiler_rt_arena_destroy(path); }
+        cli_print_status_line_literal(label, false);
+        return;
+    }
+    i64 i = 0;
+    while (i < tool_length) {
+        raz_compiler_rt_arena_set(name, i, compiler_literal_byte(tool, i));
+        i += 1;
+    }
+    i64 path_length = raz_compiler_rt_tool_resolve_ascii(name, tool_length, path, 8192);
+
+    i64 buffer = raz_compiler_rt_arena_create(64);
+    if (buffer != 0) {
+        i = 0;
+        while (i < label_length) { raz_compiler_rt_arena_set(buffer, i, compiler_literal_byte(label, i)); i += 1; }
+        while (i < 30) { raz_compiler_rt_arena_set(buffer, i, 32); i += 1; }
+        raz_compiler_rt_stdio_write_ascii(1, buffer, i);
+        raz_compiler_rt_arena_destroy(buffer);
+    }
+    if (path_length > 0) {
+        cli_status_color_begin();
+        cli_write_literal_stream(1, "OK");
+        cli_status_color_end();
+        cli_write_literal_stream(1, "  ");
+        cli_write_arena_stream(1, path, path_length);
+        cli_write_literal_stream(1, "\n");
+    } else {
+        cli_write_literal_stream(1, "MISSING\n");
+    }
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(name);
+}
+
+fn cli_print_runtime_path() {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    if (path == 0) { return; }
+    i64 length = raz_compiler_runtime_library_path_i64(path, 8192);
+    cli_write_literal("Raz runtime                   ");
+    if (length > 0) {
+        cli_status_color_begin();
+        cli_write_literal("OK");
+        cli_status_color_end();
+        cli_write_literal("  ");
+        cli_write_arena_stream(1, path, length);
+        cli_write_literal("\n");
+    } else {
+        cli_write_literal("MISSING\n");
+    }
+    raz_compiler_rt_arena_destroy(path);
+}
+
+fn cli_print_status_line_literal(string label, bool ok) {
+    i64 label_length = compiler_literal_length(label);
+    i64 buffer = raz_compiler_rt_arena_create(64);
+    if (buffer == 0) { return; }
+    i64 i = 0;
+    while (i < label_length) { raz_compiler_rt_arena_set(buffer, i, compiler_literal_byte(label, i)); i += 1; }
+    while (i < 30) { raz_compiler_rt_arena_set(buffer, i, 32); i += 1; }
+    string word = "MISSING\n";
+    i64 word_length = 8;
+    if (ok) { word = "OK\n"; word_length = 3; }
+    i64 j = 0;
+    while (j < word_length) { raz_compiler_rt_arena_set(buffer, i + j, compiler_literal_byte(word, j)); j += 1; }
+    i += word_length;
+    raz_compiler_rt_stdio_write_ascii(1, buffer, i);
+    raz_compiler_rt_arena_destroy(buffer);
+}
+
+
+fn cli_quiet_requested() -> bool {
+    if (cli_diagnostic_format_kind() == 2) { return true; }
+    i64 argc = raz_compiler_rt_process_argc();
+    i64 arg = raz_compiler_rt_arena_create(64);
+    if (arg == 0) { return false; }
+    i64 index = 1;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        if (length > 0 && cli_arg_equals_literal(arg, length, "--quiet")) {
+            raz_compiler_rt_arena_destroy(arg);
+            return true;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    return false;
+}
+
+// Returns 1 for forced color, 0 for forced no-color, and -1 for automatic.
+fn cli_explicit_color_mode() -> i64 {
+    i64 argc = raz_compiler_rt_process_argc();
+    i64 arg = raz_compiler_rt_arena_create(64);
+    i64 value = raz_compiler_rt_arena_create(64);
+    if (arg == 0 || value == 0) { return -1; }
+    i64 index = 1;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        if (length > 8) {
+            string prefix = "--color=";
+            bool matches = true;
+            i64 i = 0;
+            while (i < 8) {
+                if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(prefix, i)) { matches = false; }
+                i += 1;
+            }
+            if (matches) {
+                i64 vl = length - 8;
+                i = 0;
+                while (i < vl) { raz_compiler_rt_arena_set(value, i, raz_compiler_rt_arena_get(arg, 8 + i)); i += 1; }
+                bool on = cli_arg_equals_literal(value, vl, "always");
+                bool off = cli_arg_equals_literal(value, vl, "never");
+                raz_compiler_rt_arena_destroy(value);
+                raz_compiler_rt_arena_destroy(arg);
+                if (on) { return 1; }
+                if (off) { return 0; }
+                return -1;
+            }
+        }
+        if (length > 0 && cli_arg_equals_literal(arg, length, "--color") && index + 1 < argc) {
+            i64 vl = raz_compiler_rt_process_arg(index + 1, value, 64);
+            bool on = cli_arg_equals_literal(value, vl, "always");
+            bool off = cli_arg_equals_literal(value, vl, "never");
+            raz_compiler_rt_arena_destroy(value);
+            raz_compiler_rt_arena_destroy(arg);
+            if (on) { return 1; }
+            if (off) { return 0; }
+            return -1;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(value);
+    raz_compiler_rt_arena_destroy(arg);
+    return -1;
+}
+
+// Common output options are accepted by every shipping command. The return
+// value is the number of argv entries consumed, 0 for a non-global option, and
+// -1 for a malformed global option.
+fn cli_global_output_option_consumed(i64 argc, i64 index, i64 value, i64 length) -> i64 {
+    if (cli_arg_equals_literal(value, length, "--quiet")) { return 1; }
+    if (length > 8) {
+        string prefix = "--color=";
+        bool matches = true;
+        i64 i = 0;
+        while (i < 8) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { matches = false; }
+            i += 1;
+        }
+        if (matches) {
+            i64 mode = raz_compiler_rt_arena_create(32);
+            if (mode == 0) { return -1; }
+            i64 ml = length - 8;
+            i = 0;
+            while (i < ml) { raz_compiler_rt_arena_set(mode, i, raz_compiler_rt_arena_get(value, 8 + i)); i += 1; }
+            bool valid = cli_arg_equals_literal(mode, ml, "auto") || cli_arg_equals_literal(mode, ml, "always") || cli_arg_equals_literal(mode, ml, "never");
+            raz_compiler_rt_arena_destroy(mode);
+            if (valid) { return 1; }
+            return -1;
+        }
+    }
+    if (cli_arg_equals_literal(value, length, "--color")) {
+        if (index + 1 >= argc) { return -1; }
+        i64 mode = raz_compiler_rt_arena_create(32);
+        if (mode == 0) { return -1; }
+        i64 ml = raz_compiler_rt_process_arg(index + 1, mode, 32);
+        bool valid = cli_arg_equals_literal(mode, ml, "auto") || cli_arg_equals_literal(mode, ml, "always") || cli_arg_equals_literal(mode, ml, "never");
+        raz_compiler_rt_arena_destroy(mode);
+        if (valid) { return 2; }
+        return -1;
+    }
+    return 0;
+}
+
+fn cli_diagnostic_format_kind() -> i64 {
+    i64 argc = raz_compiler_rt_process_argc();
+    i64 arg = raz_compiler_rt_arena_create(64);
+    i64 value = raz_compiler_rt_arena_create(64);
+    if (arg == 0 || value == 0) { return 0; }
+    i64 index = 1;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        if (length > 20) {
+            string prefix = "--diagnostic-format=";
+            bool matches = true;
+            i64 i = 0;
+            while (i < 20) {
+                if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(prefix, i)) { matches = false; }
+                i += 1;
+            }
+            if (matches) {
+                i64 vl = length - 20;
+                i = 0;
+                while (i < vl) { raz_compiler_rt_arena_set(value, i, raz_compiler_rt_arena_get(arg, 20 + i)); i += 1; }
+                i64 kind = 0;
+                if (cli_arg_equals_literal(value, vl, "short")) { kind = 1; }
+                if (cli_arg_equals_literal(value, vl, "json")) { kind = 2; }
+                raz_compiler_rt_arena_destroy(value);
+                raz_compiler_rt_arena_destroy(arg);
+                return kind;
+            }
+        }
+        if (cli_arg_equals_literal(arg, length, "--diagnostic-format") && index + 1 < argc) {
+            i64 vl = raz_compiler_rt_process_arg(index + 1, value, 64);
+            i64 kind = 0;
+            if (cli_arg_equals_literal(value, vl, "short")) { kind = 1; }
+            if (cli_arg_equals_literal(value, vl, "json")) { kind = 2; }
+            raz_compiler_rt_arena_destroy(value);
+            raz_compiler_rt_arena_destroy(arg);
+            return kind;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(value);
+    raz_compiler_rt_arena_destroy(arg);
+    return 0;
+}
+
+fn cli_diagnostic_format_option_consumed(i64 argc, i64 index, i64 value, i64 length) -> i64 {
+    if (length > 20) {
+        string prefix = "--diagnostic-format=";
+        bool matches = true;
+        i64 i = 0;
+        while (i < 20) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) { matches = false; }
+            i += 1;
+        }
+        if (matches) {
+            i64 mode = raz_compiler_rt_arena_create(32);
+            if (mode == 0) { return -1; }
+            i64 ml = length - 20;
+            i = 0;
+            while (i < ml) { raz_compiler_rt_arena_set(mode, i, raz_compiler_rt_arena_get(value, 20 + i)); i += 1; }
+            bool valid = cli_arg_equals_literal(mode, ml, "human") || cli_arg_equals_literal(mode, ml, "short") || cli_arg_equals_literal(mode, ml, "json");
+            raz_compiler_rt_arena_destroy(mode);
+            if (valid) { return 1; }
+            return -1;
+        }
+    }
+    if (cli_arg_equals_literal(value, length, "--diagnostic-format")) {
+        if (index + 1 >= argc) { return -1; }
+        i64 mode = raz_compiler_rt_arena_create(32);
+        if (mode == 0) { return -1; }
+        i64 ml = raz_compiler_rt_process_arg(index + 1, mode, 32);
+        bool valid = cli_arg_equals_literal(mode, ml, "human") || cli_arg_equals_literal(mode, ml, "short") || cli_arg_equals_literal(mode, ml, "json");
+        raz_compiler_rt_arena_destroy(mode);
+        if (valid) { return 2; }
+        return -1;
+    }
+    return 0;
+}
+
+
+fn cli_warning_policy_target_matches(i64 value, i64 length) -> bool {
+    return cli_arg_equals_literal(value, length, "D2052") ||
+        cli_arg_equals_literal(value, length, "semantic") ||
+        cli_arg_equals_literal(value, length, "warnings");
+}
+
+// Warning policy follows command-line order. 0=allow, 1=warn, 2=deny.
+fn cli_d2052_warning_policy() -> i64 {
+    i64 argc = raz_compiler_rt_process_argc();
+    i64 arg = raz_compiler_rt_arena_create(64);
+    i64 target = raz_compiler_rt_arena_create(64);
+    if (arg == 0 || target == 0) { return 1; }
+    i64 policy = 1;
+    i64 index = 1;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        if (cli_arg_equals_literal(arg, length, "--deny-warnings")) {
+            policy = 2;
+            index += 1;
+            continue;
+        }
+        bool allow = cli_arg_equals_literal(arg, length, "--allow");
+        bool warn = cli_arg_equals_literal(arg, length, "--warn");
+        bool deny = cli_arg_equals_literal(arg, length, "--deny");
+        if ((allow || warn || deny) && index + 1 < argc) {
+            i64 target_length = raz_compiler_rt_process_arg(index + 1, target, 64);
+            if (cli_warning_policy_target_matches(target, target_length)) {
+                if (allow) { policy = 0; }
+                else if (warn) { policy = 1; }
+                else { policy = 2; }
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    raz_compiler_rt_arena_destroy(target);
+    raz_compiler_rt_arena_destroy(arg);
+    return policy;
+}
+
+// Return argv entries consumed by a warning policy option, or -1 when a policy
+// flag is missing its code/category argument.
+fn cli_warning_policy_option_consumed(i64 argc, i64 index, i64 value, i64 length) -> i64 {
+    if (cli_arg_equals_literal(value, length, "--deny-warnings")) { return 1; }
+    if (
+        cli_arg_equals_literal(value, length, "--allow") ||
+        cli_arg_equals_literal(value, length, "--warn") ||
+        cli_arg_equals_literal(value, length, "--deny")
+    ) {
+        if (index + 1 >= argc) { return -1; }
+        i64 target = raz_compiler_rt_arena_create(64);
+        if (target == 0) { return -1; }
+        i64 target_length = raz_compiler_rt_process_arg(index + 1, target, 64);
+        bool valid = target_length > 0 && !cli_arg_starts_with_dash(target, target_length);
+        raz_compiler_rt_arena_destroy(target);
+        if (!valid) { return -1; }
+        return 2;
+    }
+    return 0;
+}
+
+fn cli_copy_identifier_byte(i64 ch) -> bool {
+    return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+}
+
+fn cli_source_matches_at(Source& input, i64 offset, string literal) -> bool {
+    i64 length = compiler_literal_length(literal);
+    if (offset < 0 || offset + length > input.length) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (source_byte(input, offset + i) != compiler_literal_byte(literal, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_copy_type_prefix_length(Source& input, i64 offset) -> i64 {
+    if (cli_source_matches_at(input, offset, "bool ")) { return 5; }
+    if (cli_source_matches_at(input, offset, "char ")) { return 5; }
+    if (cli_source_matches_at(input, offset, "i8 ")) { return 3; }
+    if (cli_source_matches_at(input, offset, "u8 ")) { return 3; }
+    if (cli_source_matches_at(input, offset, "i16 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "u16 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "i32 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "u32 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "i64 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "u64 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "isize ")) { return 6; }
+    if (cli_source_matches_at(input, offset, "usize ")) { return 6; }
+    if (cli_source_matches_at(input, offset, "f32 ")) { return 4; }
+    if (cli_source_matches_at(input, offset, "f64 ")) { return 4; }
+    return 0;
+}
+
+fn cli_name_matches(Source& input, i64 left, i64 left_end, i64 right, i64 right_end) -> bool {
+    i64 left_length = left_end - left;
+    if (left_length <= 0 || left_length != right_end - right) { return false; }
+    i64 i = 0;
+    while (i < left_length) {
+        if (source_byte(input, left + i) != source_byte(input, right + i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn cli_copy_name_declared_before(Source& input, i64 name_start, i64 name_end, i64 before) -> bool {
+    i64 pos = 0;
+    bool line_comment = false;
+    bool block_comment = false;
+    bool string_literal = false;
+    bool char_literal = false;
+    bool escaped = false;
+    while (pos < before) {
+        i64 ch = source_byte(input, pos);
+        i64 next = -1;
+        if (pos + 1 < before) { next = source_byte(input, pos + 1); }
+        if (line_comment) { if (ch == 10) { line_comment = false; } pos += 1; continue; }
+        if (block_comment) { if (ch == 42 && next == 47) { block_comment = false; pos += 2; } else { pos += 1; } continue; }
+        if (string_literal) {
+            if (!escaped && ch == 34) { string_literal = false; }
+            escaped = !escaped && ch == 92;
+            if (ch != 92) { escaped = false; }
+            pos += 1;
+            continue;
+        }
+        if (char_literal) {
+            if (!escaped && ch == 39) { char_literal = false; }
+            escaped = !escaped && ch == 92;
+            if (ch != 92) { escaped = false; }
+            pos += 1;
+            continue;
+        }
+        if (ch == 47 && next == 47) { line_comment = true; pos += 2; continue; }
+        if (ch == 47 && next == 42) { block_comment = true; pos += 2; continue; }
+        if (ch == 34) { string_literal = true; escaped = false; pos += 1; continue; }
+        if (ch == 39) { char_literal = true; escaped = false; pos += 1; continue; }
+        i64 type_length = cli_copy_type_prefix_length(input, pos);
+        if (type_length > 0) {
+            i64 declared_start = pos + type_length;
+            i64 declared_end = declared_start;
+            while (declared_end < before && cli_copy_identifier_byte(source_byte(input, declared_end))) { declared_end += 1; }
+            if (cli_name_matches(input, declared_start, declared_end, name_start, name_end)) { return true; }
+        }
+        pos += 1;
+    }
+    return false;
+}
+
+fn cli_find_copy_move(Source& input, i64&mut move_offset, i64&mut name_start, i64&mut name_end) -> bool {
+    i64 pos = 0;
+    bool line_comment = false;
+    bool block_comment = false;
+    bool string_literal = false;
+    bool char_literal = false;
+    bool escaped = false;
+    while (pos + 4 < input.length) {
+        i64 ch = source_byte(input, pos);
+        i64 next = -1;
+        if (pos + 1 < input.length) { next = source_byte(input, pos + 1); }
+        if (line_comment) { if (ch == 10) { line_comment = false; } pos += 1; continue; }
+        if (block_comment) { if (ch == 42 && next == 47) { block_comment = false; pos += 2; } else { pos += 1; } continue; }
+        if (string_literal) {
+            if (!escaped && ch == 34) { string_literal = false; }
+            escaped = !escaped && ch == 92;
+            if (ch != 92) { escaped = false; }
+            pos += 1;
+            continue;
+        }
+        if (char_literal) {
+            if (!escaped && ch == 39) { char_literal = false; }
+            escaped = !escaped && ch == 92;
+            if (ch != 92) { escaped = false; }
+            pos += 1;
+            continue;
+        }
+        if (ch == 47 && next == 47) { line_comment = true; pos += 2; continue; }
+        if (ch == 47 && next == 42) { block_comment = true; pos += 2; continue; }
+        if (ch == 34) { string_literal = true; escaped = false; pos += 1; continue; }
+        if (ch == 39) { char_literal = true; escaped = false; pos += 1; continue; }
+
+        bool boundary = pos == 0 || !cli_copy_identifier_byte(source_byte(input, pos - 1));
+        if (boundary && cli_source_matches_at(input, pos, "move")) {
+            i64 after = pos + 4;
+            if (after < input.length && !cli_copy_identifier_byte(source_byte(input, after))) {
+                while (after < input.length && (source_byte(input, after) == 32 || source_byte(input, after) == 9)) { after += 1; }
+                i64 end = after;
+                while (end < input.length && cli_copy_identifier_byte(source_byte(input, end))) { end += 1; }
+                if (end > after && cli_copy_name_declared_before(input, after, end, pos)) {
+                    *move_offset = pos;
+                    *name_start = after;
+                    *name_end = end;
+                    return true;
+                }
+            }
+        }
+        pos += 1;
+    }
+    return false;
+}
+
+// Emit the Copy-move compatibility lint. Returns true when policy escalates it
+// to an error and compilation must stop.
+fn cli_emit_copy_move_warning(Source& input) -> bool {
+    i64 move_offset = 0;
+    i64 name_start = 0;
+    i64 name_end = 0;
+    if (!cli_find_copy_move(input, &mut move_offset, &mut name_start, &mut name_end)) { return false; }
+    i64 policy = cli_d2052_warning_policy();
+    if (policy == 0) { return false; }
+
+    i64 source_path = raz_compiler_rt_arena_create(8192);
+    i64 content_start = 0;
+    i64 path_length = -1;
+    if (source_path != 0) { path_length = cli_find_source_origin(input, move_offset, source_path, 8192, &mut content_start); }
+    i64 line = cli_source_local_line(input, content_start, move_offset);
+    i64 column = 1;
+    i64 cursor = move_offset;
+    while (cursor > content_start && source_byte(input, cursor - 1) != 10) { column += 1; cursor -= 1; }
+
+    if (path_length > 0) { cli_write_arena_stream(2, source_path, path_length); }
+    else { cli_write_literal_stream(2, "<input>"); }
+    cli_write_literal_stream(2, ":"); cli_write_number(2, line);
+    cli_write_literal_stream(2, ":"); cli_write_number(2, column);
+    if (policy == 2) { cli_write_literal_stream(2, ": error[D2052]: moving Copy value '"); }
+    else { cli_write_literal_stream(2, ": warning[D2052]: moving Copy value '"); }
+    cli_write_source_bytes(2, input, name_start, name_end);
+    cli_write_literal_stream(2, "' is equivalent to copying it\n");
+    if (source_path != 0) { raz_compiler_rt_arena_destroy(source_path); }
+    return policy == 2;
+}
+
+fn cli_print_diagnostic_catalog_json() {
+    cli_write_literal("{\"schema\":\"raz-diagnostic-catalog-v1\",\"categories\":[{\"name\":\"lexer\"},{\"name\":\"parser\"},{\"name\":\"semantic\"},{\"name\":\"lowering\"},{\"name\":\"backend\"}],\"codes\":[\"D0001\",\"D1001\",\"D1002\",\"D2008\",\"D2052\",\"D2053\",\"D2054\",\"D2055\",\"D2210\",\"D2211\",\"D3001\"]}\n");
+}
+
+fn cli_diagnostics_command(i64 argc) -> i64 {
+    bool json = false;
+    i64 arg = raz_compiler_rt_arena_create(64);
+    if (arg == 0) { return 40; }
+    i64 index = 2;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        i64 global = cli_global_output_option_consumed(argc, index, arg, length);
+        if (global < 0) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { index += global; continue; }
+        if (cli_arg_equals_literal(arg, length, "--json")) { json = true; index += 1; continue; }
+        i64 diagnostic = cli_diagnostic_format_option_consumed(argc, index, arg, length);
+        if (diagnostic < 0) { raz_compiler_rt_arena_destroy(arg); cli_print_invalid_arguments(); return 2; }
+        if (diagnostic > 0) { json = cli_diagnostic_format_kind() == 2; index += diagnostic; continue; }
+        cli_print_unknown_option(arg, length);
+        raz_compiler_rt_arena_destroy(arg);
+        return 2;
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    if (json) { cli_print_diagnostic_catalog_json(); return 0; }
+    cli_write_literal("Raz diagnostic catalog\n  lexer: D0000-D0999\n  parser: D1000-D1999\n  semantic: D2000-D2999\n  lowering: D3000-D3999\n  backend: D4000-D4999\n  Copy-move warning: D2052\n");
+    return 0;
+}
+
+fn cli_print_completion_commands(string prefix, string suffix) {
+    cli_write_literal(prefix);
+    cli_write_literal("build check run test bench clean new init fmt lint doc add remove update fetch lock metadata graph tree registry pack publish keygen search info outdated install uninstall vendor login logout cache lsp bindgen c-header dev backends targets doctor diagnostics completions version help");
+    cli_write_literal(suffix);
+}
+
+fn cli_completions_command(i64 argc) -> i64 {
+    i64 shell = raz_compiler_rt_arena_create(64);
+    if (shell == 0) { return 40; }
+    i64 shell_length = 0;
+    i64 index = 2;
+    while (index < argc) {
+        i64 arg = raz_compiler_rt_arena_create(64);
+        if (arg == 0) { raz_compiler_rt_arena_destroy(shell); return 40; }
+        i64 length = raz_compiler_rt_process_arg(index, arg, 64);
+        i64 global = cli_global_output_option_consumed(argc, index, arg, length);
+        if (global < 0) { raz_compiler_rt_arena_destroy(arg); raz_compiler_rt_arena_destroy(shell); cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { raz_compiler_rt_arena_destroy(arg); index += global; continue; }
+        if (shell_length != 0) { raz_compiler_rt_arena_destroy(arg); raz_compiler_rt_arena_destroy(shell); cli_print_invalid_arguments(); return 2; }
+        shell_length = length;
+        i64 i = 0; while (i < length) { raz_compiler_rt_arena_set(shell, i, raz_compiler_rt_arena_get(arg, i)); i += 1; }
+        raz_compiler_rt_arena_destroy(arg);
+        index += 1;
+    }
+    if (shell_length <= 0) { raz_compiler_rt_arena_destroy(shell); cli_print_invalid_arguments(); return 2; }
+    if (cli_arg_equals_literal(shell, shell_length, "bash")) {
+        cli_write_literal("_raz_complete() {\n  local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n  COMPREPLY=( $(compgen -W \"");
+        cli_print_completion_commands("", "\" -- \"$cur\") )\n}\ncomplete -F _raz_complete raz razc razup\n");
+    } else if (cli_arg_equals_literal(shell, shell_length, "zsh")) {
+        cli_write_literal("#compdef raz razc razup\nlocal -a commands\ncommands=(");
+        cli_print_completion_commands("", ")\n_describe 'command' commands\n");
+    } else if (cli_arg_equals_literal(shell, shell_length, "fish")) {
+        cli_print_completion_commands("complete -c raz -f -a '", "'\n");
+    } else if (cli_arg_equals_literal(shell, shell_length, "powershell") || cli_arg_equals_literal(shell, shell_length, "pwsh")) {
+        cli_write_literal("Register-ArgumentCompleter -Native -CommandName raz,razc,razup -ScriptBlock { param($wordToComplete,$commandAst,$cursorPosition) @('");
+        cli_print_completion_commands("", "') -split ' ' | Where-Object { $_ -like \"$wordToComplete*\" } }\n");
+    } else {
+        raz_compiler_rt_arena_destroy(shell);
+        cli_write_literal_stream(2, "error: unsupported shell; expected bash, zsh, fish, or powershell\n");
+        return 2;
+    }
+    raz_compiler_rt_arena_destroy(shell);
+    return 0;
+}
+
+fn cli_doctor_project_report(i64 root, i64 root_length) -> i64 {
+    if (root == 0 || root_length <= 0) { return 55; }
+    i64 manifest = raz_compiler_rt_arena_create(root_length + 16);
+    i64 report_dir = raz_compiler_rt_arena_create(root_length + 32);
+    i64 report = raz_compiler_rt_arena_create(root_length + 48);
+    if (manifest == 0 || report_dir == 0 || report == 0) { return 40; }
+    i64 i = 0;
+    while (i < root_length) {
+        i64 ch = raz_compiler_rt_arena_get(root, i);
+        raz_compiler_rt_arena_set(manifest, i, ch);
+        raz_compiler_rt_arena_set(report_dir, i, ch);
+        raz_compiler_rt_arena_set(report, i, ch);
+        i += 1;
+    }
+    string manifest_suffix = "/raz.toml";
+    string dir_suffix = "/target/doctor";
+    string report_suffix = "/target/doctor/doctor.json";
+    i = 0; while (i < 9) { raz_compiler_rt_arena_set(manifest, root_length + i, compiler_literal_byte(manifest_suffix, i)); i += 1; }
+    i = 0; while (i < 14) { raz_compiler_rt_arena_set(report_dir, root_length + i, compiler_literal_byte(dir_suffix, i)); i += 1; }
+    i = 0; while (i < 26) { raz_compiler_rt_arena_set(report, root_length + i, compiler_literal_byte(report_suffix, i)); i += 1; }
+    bool valid = raz_compiler_rt_path_exists_ascii(manifest, root_length + 9) != 0;
+    if (!valid) {
+        cli_write_literal_stream(2, "error: Project manifest was not found\n");
+        return 2;
+    }
+    if (raz_compiler_rt_create_dir_ascii(report_dir, root_length + 14) != 0) { return 56; }
+    string body = "{\"schema\":\"raz-doctor-v1\",\"toolchain\":\"ready\",\"project\":\"ready\"}\n";
+    i64 body_length = compiler_literal_length(body);
+    i64 bytes = raz_compiler_rt_arena_create(body_length);
+    if (bytes == 0) { return 40; }
+    i = 0; while (i < body_length) { raz_compiler_rt_arena_set(bytes, i, compiler_literal_byte(body, i)); i += 1; }
+    if (raz_compiler_rt_write_ascii(report, root_length + 26, bytes, body_length) < 0) { return 56; }
+    cli_write_literal("Project                       ");
+    cli_status_color_begin(); cli_write_literal("OK"); cli_status_color_end(); cli_write_literal("\n");
+    cli_write_literal("Report                        "); cli_write_arena_stream(1, report, root_length + 26); cli_write_literal("\n");
+    raz_compiler_rt_arena_destroy(bytes);
+    raz_compiler_rt_arena_destroy(report);
+    raz_compiler_rt_arena_destroy(report_dir);
+    raz_compiler_rt_arena_destroy(manifest);
+    return 0;
+}
+
+fn cli_doctor_command(i64 argc) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 root_length = 0;
+    i64 arg = raz_compiler_rt_arena_create(4096);
+    if (root == 0 || arg == 0) { return 40; }
+    i64 index = 2;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 4096);
+        i64 global = cli_global_output_option_consumed(argc, index, arg, length);
+        if (global < 0) { cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { index += global; continue; }
+        if (cli_arg_starts_with_dash(arg, length) || root_length > 0) { cli_print_unknown_option(arg, length); return 2; }
+        root_length = length;
+        i64 i = 0; while (i < length) { raz_compiler_rt_arena_set(root, i, raz_compiler_rt_arena_get(arg, i)); i += 1; }
+        index += 1;
+    }
+    cli_write_literal("Checking Raz toolchain\n");
+    cli_print_status_line_literal("Raz compiler", true);
+    cli_print_status_line_literal("Forge backend", true);
+    cli_print_status_line_literal("Linker (ObLink)", true);
+    cli_print_runtime_path();
+    cli_print_tool_path_literal("clang (LLVM object)", "clang");
+    cli_print_tool_path_literal("clang++ (LLVM link)", "clang++");
+    if (root_length > 0) {
+        i64 status = cli_doctor_project_report(root, root_length);
+        if (status != 0) { return status; }
+    }
+    cli_write_literal("Raz toolchain is ready\n");
+    raz_compiler_rt_arena_destroy(arg);
+    raz_compiler_rt_arena_destroy(root);
+    return 0;
+}
+
+fn cli_print_doctor() {
+    
+
+    cli_write_literal("Raz toolchain diagnostics\n");
+
+    string compiler_label = "Raz compiler";
+
+    cli_print_status_line_literal(compiler_label, true);
+
+    string forge_label = "Forge backend";
+
+    cli_print_status_line_literal(forge_label, true);
+
+    string llvm_label = "LLVM backend";
+
+    cli_print_status_line_literal(llvm_label, true);
+
+    cli_print_runtime_path();
+    cli_print_tool_path_literal("clang (LLVM object)", "clang");
+    cli_print_tool_path_literal("clang++ (LLVM link)", "clang++");
+
+    i64 platform = raz_compiler_rt_host_platform();
+    if (platform == 1) {
+        cli_print_tool_path_literal("clang-cl (link fallback)", "clang-cl");
+    }
+
+    if (platform == 1) {
+        
+
+        cli_write_literal("Host: Windows\n");
+    } else if (platform == 2) {
+        
+
+        cli_write_literal("Host: Linux\n");
+    } else if (platform == 3) {
+        
+
+        cli_write_literal("Host: macOS\n");
+    } else {
+        
+
+        cli_write_literal("Host: unknown\n");
+    }
+}
+
+fn cli_write_text(i64[]text, i64 length) {
+    cli_write(text, length);
+}
+
+fn cli_run_shell(i64[]command, i64 length) -> i64 {
+    i64 buffer = raz_compiler_rt_arena_create(length);
+
+    if (buffer == 0) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(buffer, i, command[i]);
+        i += 1;
+    }
+
+    i64 result = raz_compiler_rt_process_run_ascii(buffer, length);
+
+    raz_compiler_rt_arena_destroy(buffer);
+    return result;
+}
+
+fn cli_print_project_source_failure() {
+    
+
+    cli_write_literal_stream(2, "error: could not assemble project sources or locked dependencies\n");
+}
+
+fn cli_print_native_path_failure() {
+    
+
+    cli_write_literal_stream(2, "error: could not prepare target output paths\n");
+}
+
+fn cli_print_cross_target_runtime_required() {
+    
+
+    cli_write_literal_stream(2, "error: cross-target LLVM executable emission requires --runtime=<target-runtime>; pass target sysroot/linker flags with --link-arg as needed\n");
+}
+
+fn cli_print_backend_emit_failure() {
+    
+
+    cli_write_literal_stream(2, "error: backend did not produce the requested output\n");
+}
+
+fn cli_print_native_link_failure() {
+    cli_write_literal_stream(2, "error: native link did not produce the executable\n");
+    if (raz_compiler_rt_host_platform() == 1) {
+        cli_write_literal_stream(2, "  help: run `raz doctor` to inspect ObLink/LLVM discovery; set RAZ_EXTERNAL_LINKER only when overriding automatic detection\n");
+    }
+}
+
+fn cli_clean_project() -> i64 {
+    i64 path = raz_compiler_rt_arena_create(16);
+
+    if (path == 0) {
+        return 40;
+    }
+    // target/ is the single canonical root for every rebuildable project-local
+    // artifact: native outputs, incremental state, registry acceleration rows,
+    // Git materializations, and publish staging. Removing it is a complete clean.
+
+    string target = "target";
+    i64 i = 0;
+
+    while (i < 6) {
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(target, i));
+        i += 1;
+    }
+    raz_compiler_rt_remove_path_ascii(path, 6);
+    // Remove the pre-R19 project-local generated-state directory as migration
+    // cleanup. Durable dependency intent remains in raz.toml / raz.lock (and the
+    // commit-pinned Git tracking file), so the next build can rehydrate safely.
+
+    string legacy = ".raz";
+
+    i = 0;
+    while (i < 4) {
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(legacy, i));
+        i += 1;
+    }
+    raz_compiler_rt_remove_path_ascii(path, 4);
+
+    string build = "build";
+
+    i = 0;
+    while (i < 5) {
+        raz_compiler_rt_arena_set(path, i, compiler_literal_byte(build, i));
+        i += 1;
+    }
+    raz_compiler_rt_remove_path_ascii(path, 5);
+    raz_compiler_rt_arena_destroy(path);
+
+    string msg = "Removed target/, legacy .raz/, and build/ artifacts";
+
+    cli_write_literal(msg);
+
+    cli_write_literal("\n");
+    return 0;
+}
+
+
+fn cli_project_manifest_append_literal(i64 output, i64 cursor, string text) -> i64 {
+    i64 length = compiler_literal_length(text);
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, cursor + i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    return cursor + length;
+}
+
+fn cli_project_package_name(i64 root, i64 root_length, i64 output, i64 capacity) -> i64 {
+    i64 start = root_length;
+    while (start > 0) {
+        i64 ch = raz_compiler_rt_arena_get(root, start - 1);
+        if (ch == 47 || ch == 92) { break; }
+        start -= 1;
+    }
+    if (start >= root_length) { start = 0; }
+    i64 length = root_length - start;
+    bool dot = length == 1 && raz_compiler_rt_arena_get(root, start) == 46;
+    bool dotdot = length == 2 && raz_compiler_rt_arena_get(root, start) == 46 && raz_compiler_rt_arena_get(root, start + 1) == 46;
+    if (length <= 0 || dot || dotdot) {
+        string fallback = "raz-app";
+        i64 i = 0;
+        while (i < 7 && i < capacity) { raz_compiler_rt_arena_set(output, i, compiler_literal_byte(fallback, i)); i += 1; }
+        return i;
+    }
+    if (length > capacity) { length = capacity; }
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_compiler_rt_arena_get(root, start + i);
+        bool valid = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 45 || ch == 95;
+        if (!valid) { ch = 45; }
+        raz_compiler_rt_arena_set(output, i, ch);
+        i += 1;
+    }
+    return length;
+}
+
+fn cli_create_project_files(i64 root, i64 root_length, bool web_target) -> i64 {
+    if (root == 0 || root_length <= 0) {
+        return 55;
+    }
+
+    i64 command = raz_compiler_rt_arena_create(8192);
+
+    if (command == 0) {
+        return 40;
+    }
+
+    i64 cursor = 0;
+
+    if (raz_compiler_rt_host_platform() == 1) {
+        string pre = "cmd /c mkdir \"";
+        i64 i = 0;
+
+        while (i < 14) {
+            raz_compiler_rt_arena_set(command, cursor, compiler_literal_byte(pre, i));
+            cursor += 1;
+            i += 1;
+        }
+        i = 0;
+        while (i < root_length) {
+            raz_compiler_rt_arena_set(command, cursor, raz_compiler_rt_arena_get(root, i));
+            cursor += 1;
+            i += 1;
+        }
+
+        string suf = "\\src\"";
+
+        i = 0;
+        while (i < 5) {
+            raz_compiler_rt_arena_set(command, cursor, compiler_literal_byte(suf, i));
+            cursor += 1;
+            i += 1;
+        }
+    } else {
+        string pre = "mkdir -p '";
+        i64 i = 0;
+
+        while (i < 10) {
+            raz_compiler_rt_arena_set(command, cursor, compiler_literal_byte(pre, i));
+            cursor += 1;
+            i += 1;
+        }
+        i = 0;
+        while (i < root_length) {
+            raz_compiler_rt_arena_set(command, cursor, raz_compiler_rt_arena_get(root, i));
+            cursor += 1;
+            i += 1;
+        }
+
+        string suf = "/src'";
+
+        i = 0;
+        while (i < 5) {
+            raz_compiler_rt_arena_set(command, cursor, compiler_literal_byte(suf, i));
+            cursor += 1;
+            i += 1;
+        }
+    }
+    if (raz_compiler_rt_process_run_ascii(command, cursor) != 0) {
+        raz_compiler_rt_arena_destroy(command);
+        return 56;
+    }
+    raz_compiler_rt_arena_destroy(command);
+
+    i64 manifest_path = raz_compiler_rt_arena_create(root_length + 16);
+    i64 source_path = raz_compiler_rt_arena_create(root_length + 20);
+
+    if (manifest_path == 0 || source_path == 0) {
+        return 40;
+    }
+
+    i64 i = 0;
+
+    while (i < root_length) {
+        i64 b = raz_compiler_rt_arena_get(root, i);
+
+        raz_compiler_rt_arena_set(manifest_path, i, b);
+        raz_compiler_rt_arena_set(source_path, i, b);
+        i += 1;
+    }
+
+    string mp = "/raz.toml";
+
+    i = 0;
+    while (i < 9) {
+        raz_compiler_rt_arena_set(manifest_path, root_length + i, compiler_literal_byte(mp, i));
+        i += 1;
+    }
+
+    string sp = "/src/main.rz";
+
+    i = 0;
+    while (i < 12) {
+        raz_compiler_rt_arena_set(source_path, root_length + i, compiler_literal_byte(sp, i));
+        i += 1;
+    }
+
+    i64 package_name = raz_compiler_rt_arena_create(256);
+    i64 manifest_data = raz_compiler_rt_arena_create(2048);
+    if (package_name == 0 || manifest_data == 0) { return 40; }
+    i64 package_name_length = cli_project_package_name(root, root_length, package_name, 255);
+    i64 manifest_size = 0;
+    manifest_size = cli_project_manifest_append_literal(manifest_data, manifest_size, "[package]\nname = \"");
+    i = 0;
+    while (i < package_name_length) {
+        raz_compiler_rt_arena_set(manifest_data, manifest_size, raz_compiler_rt_arena_get(package_name, i));
+        manifest_size += 1;
+        i += 1;
+    }
+    if (web_target) {
+        manifest_size = cli_project_manifest_append_literal(manifest_data, manifest_size, "\"\nversion = \"0.1.0\"\nkind = \"executable\"\nsource = \"src\"\nentry = \"src/main.rz\"\n\n[build]\ntarget = \"web\"\n\n[web]\ntitle = \"My Raz Site\"\n\n[dependencies]\nweb = \"raz:web\"\n\n[profile.debug]\noptimization = 0\ndebug = true\nincremental = true\n\n[profile.release]\noptimization = 3\ndebug = false\nincremental = true\n");
+    } else {
+        manifest_size = cli_project_manifest_append_literal(manifest_data, manifest_size, "\"\nversion = \"0.1.0\"\nkind = \"executable\"\nsource = \"src\"\nentry = \"src/main.rz\"\n\n[dependencies]\n\n[dev-dependencies]\n\n[features]\ndefault = []\n");
+    }
+    string source = "fn main() -> i64 {\n    return 0;\n}\n";
+    if (web_target) {
+        source = "import web;\nimport web::ui;\n\nfn main() -> i64 {\n    Page page = Page::new(\"My Raz Site\");\n    page.description(\"A fast static website built with Raz.\");\n    page.icon(\"/favicon.svg\");\n    page.stylesheet(\"/styles.css\");\n\n    Component content = main_component();\n    content.class_name(\"page\");\n    content.h1(\"Hello from Raz\");\n    content.p(\"Reusable Raz components compile to ordinary HTML and CSS when they do not need browser behavior.\");\n    content.css_class(\"page\", \"width: min(72rem, calc(100% - 2rem)); margin: 0 auto; padding: 6rem 0;\");\n\n    if (!page.component(&mut content)) { return 1; }\n    if (!page.write_route(\"/\")) { return 1; }\n    return 0;\n}\n";
+    }
+    i64 source_size = compiler_literal_length(source);
+    i64 source_data = raz_compiler_rt_arena_create(source_size);
+    if (source_data == 0) { return 40; }
+    if (raz_compiler_rt_write_ascii(manifest_path, root_length + 9, manifest_data, manifest_size) < 0) { return 56; }
+    i = 0;
+    while (i < source_size) { raz_compiler_rt_arena_set(source_data, i, compiler_literal_byte(source, i)); i += 1; }
+    if (raz_compiler_rt_write_ascii(source_path, root_length + 12, source_data, source_size) < 0) { return 56; }
+    raz_compiler_rt_arena_destroy(package_name);
+
+    if (web_target) {
+        i64 public_path = raz_compiler_rt_arena_create(root_length + 24);
+        i64 css_path = raz_compiler_rt_arena_create(root_length + 32);
+        i64 favicon_path = raz_compiler_rt_arena_create(root_length + 32);
+        if (public_path == 0 || css_path == 0 || favicon_path == 0) { return 40; }
+        i = 0;
+        while (i < root_length) {
+            i64 b = raz_compiler_rt_arena_get(root, i);
+            raz_compiler_rt_arena_set(public_path, i, b);
+            raz_compiler_rt_arena_set(css_path, i, b);
+            raz_compiler_rt_arena_set(favicon_path, i, b);
+            i += 1;
+        }
+        string public_suffix = "/public";
+        i = 0; while (i < 7) { raz_compiler_rt_arena_set(public_path, root_length + i, compiler_literal_byte(public_suffix, i)); i += 1; }
+        if (raz_compiler_rt_create_dir_ascii(public_path, root_length + 7) != 0) { return 56; }
+
+        string css_suffix = "/public/styles.css";
+        i = 0; while (i < 18) { raz_compiler_rt_arena_set(css_path, root_length + i, compiler_literal_byte(css_suffix, i)); i += 1; }
+        string css = ":root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #111827; background: #ffffff; }\n* { box-sizing: border-box; }\nbody { margin: 0; }\n.site-header, .page { width: min(72rem, calc(100% - 2rem)); margin: 0 auto; }\n.site-header { padding: 1.25rem 0; }\n.nav { display: flex; gap: 1rem; }\n.hero { padding: 6rem 0; }\nh1 { font-size: clamp(2.5rem, 8vw, 5.5rem); line-height: .95; margin: 0 0 1.5rem; }\np { max-width: 48rem; font-size: 1.125rem; line-height: 1.7; }\na { color: inherit; }\n";
+        i64 css_size = compiler_literal_length(css);
+        i64 css_data = raz_compiler_rt_arena_create(css_size);
+        if (css_data == 0) { return 40; }
+        i = 0; while (i < css_size) { raz_compiler_rt_arena_set(css_data, i, compiler_literal_byte(css, i)); i += 1; }
+        if (raz_compiler_rt_write_ascii(css_path, root_length + 18, css_data, css_size) < 0) { return 56; }
+
+        string favicon_suffix = "/public/favicon.svg";
+        i = 0; while (i < 19) { raz_compiler_rt_arena_set(favicon_path, root_length + i, compiler_literal_byte(favicon_suffix, i)); i += 1; }
+        string favicon = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><rect width=\"64\" height=\"64\" rx=\"14\" fill=\"#111827\"/><path d=\"M17 47V17h15c9 0 15 5 15 13 0 6-3 10-8 12l9 5H37l-8-4h-2v4H17zm10-13h5c3 0 5-1 5-4s-2-4-5-4h-5v8z\" fill=\"white\"/></svg>\n";
+        i64 favicon_size = compiler_literal_length(favicon);
+        i64 favicon_data = raz_compiler_rt_arena_create(favicon_size);
+        if (favicon_data == 0) { return 40; }
+        i = 0; while (i < favicon_size) { raz_compiler_rt_arena_set(favicon_data, i, compiler_literal_byte(favicon, i)); i += 1; }
+        if (raz_compiler_rt_write_ascii(favicon_path, root_length + 19, favicon_data, favicon_size) < 0) { return 56; }
+
+        raz_compiler_rt_arena_destroy(public_path);
+        raz_compiler_rt_arena_destroy(css_path);
+        raz_compiler_rt_arena_destroy(favicon_path);
+        raz_compiler_rt_arena_destroy(css_data);
+        raz_compiler_rt_arena_destroy(favicon_data);
+    }
+    raz_compiler_rt_arena_destroy(manifest_path);
+    raz_compiler_rt_arena_destroy(source_path);
+    raz_compiler_rt_arena_destroy(manifest_data);
+    raz_compiler_rt_arena_destroy(source_data);
+    return 0;
+}
+
+fn cli_init_project(i64 argc) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 arg = raz_compiler_rt_arena_create(4096);
+    if (root == 0 || arg == 0) { return 40; }
+    i64 root_length = 0;
+    i64 index = 2;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 4096);
+        i64 global = cli_global_output_option_consumed(argc, index, arg, length);
+        if (global < 0) { cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { index += global; continue; }
+        if (cli_arg_starts_with_dash(arg, length) || root_length > 0) {
+            cli_print_unknown_option(arg, length);
+            return 2;
+        }
+        root_length = length;
+        i64 i = 0;
+        while (i < length) { raz_compiler_rt_arena_set(root, i, raz_compiler_rt_arena_get(arg, i)); i += 1; }
+        index += 1;
+    }
+    if (root_length == 0) { raz_compiler_rt_arena_set(root, 0, 46); root_length = 1; }
+    i64 result = cli_create_project_files(root, root_length, false);
+    if (result == 0 && !cli_quiet_requested()) {
+        cli_write_literal("Initialized ");
+        cli_write_arena_stream(1, root, root_length);
+        cli_write_literal("\n");
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    raz_compiler_rt_arena_destroy(root);
+    return result;
+}
+
+fn cli_new_project(i64 argc) -> i64 {
+    bool web_target = false;
+    i64 root = raz_compiler_rt_arena_create(4096);
+    i64 arg = raz_compiler_rt_arena_create(4096);
+    if (root == 0 || arg == 0) { return 40; }
+    i64 root_length = 0;
+    i64 index = 2;
+    while (index < argc) {
+        i64 length = raz_compiler_rt_process_arg(index, arg, 4096);
+        i64 global = cli_global_output_option_consumed(argc, index, arg, length);
+        if (global < 0) { cli_print_invalid_arguments(); return 2; }
+        if (global > 0) { index += global; continue; }
+        if (cli_arg_equals_literal(arg, length, "--web")) { web_target = true; index += 1; continue; }
+        if (cli_arg_equals_literal(arg, length, "--target")) {
+            if (index + 1 >= argc) { cli_print_invalid_arguments(); return 2; }
+            i64 target = raz_compiler_rt_arena_create(64);
+            if (target == 0) { return 40; }
+            i64 target_length = raz_compiler_rt_process_arg(index + 1, target, 64);
+            bool is_web = cli_arg_equals_literal(target, target_length, "web");
+            raz_compiler_rt_arena_destroy(target);
+            if (!is_web) { cli_print_invalid_arguments(); return 2; }
+            web_target = true;
+            index += 2;
+            continue;
+        }
+        if (cli_arg_starts_with_dash(arg, length) || root_length > 0) {
+            cli_print_unknown_option(arg, length);
+            return 2;
+        }
+        root_length = length;
+        i64 i = 0;
+        while (i < length) { raz_compiler_rt_arena_set(root, i, raz_compiler_rt_arena_get(arg, i)); i += 1; }
+        index += 1;
+    }
+    if (root_length <= 0) { cli_print_invalid_arguments(); return 2; }
+    i64 result = cli_create_project_files(root, root_length, web_target);
+    if (result == 0 && !cli_quiet_requested()) {
+        cli_write_literal("Created ");
+        cli_write_arena_stream(1, root, root_length);
+        cli_write_literal("\n");
+    }
+    raz_compiler_rt_arena_destroy(arg);
+    raz_compiler_rt_arena_destroy(root);
+    return result;
+}
+
+fn cli_run_output(i64 output, i64 output_length) -> i64 {
+    if (output == 0 || output_length <= 0) {
+        return 55;
+    }
+
+    i64 command = raz_compiler_rt_arena_create(output_length + 4);
+
+    if (command == 0) {
+        return 40;
+    }
+
+    i64 cursor = 0;
+
+    if (raz_compiler_rt_host_platform() != 1 && raz_compiler_rt_arena_get(output, 0) != 47) {
+        raz_compiler_rt_arena_set(command, cursor, 46);
+        cursor += 1;
+        raz_compiler_rt_arena_set(command, cursor, 47);
+        cursor += 1;
+    }
+
+    i64 i = 0;
+
+    while (i < output_length) {
+        raz_compiler_rt_arena_set(command, cursor, raz_compiler_rt_arena_get(output, i));
+        cursor += 1;
+        i += 1;
+    }
+
+    i64 status = raz_compiler_rt_process_run_ascii(command, cursor);
+
+    raz_compiler_rt_arena_destroy(command);
+    return status;
+}

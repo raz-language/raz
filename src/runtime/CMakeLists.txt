@@ -9,6 +9,7 @@ add_library(raz_runtime STATIC
   core.cpp
   files_process.cpp
   network.cpp
+  web_dev.cpp
   platform_threads_crypto.cpp
 )
 add_library(Raz::runtime ALIAS raz_runtime)
@@ -21,7 +22,6 @@ set_target_properties(raz_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Those entries can exist on Windows even when no usable library pair was found.
 set(RAZ_RUNTIME_OPENSSL_ENABLED OFF CACHE INTERNAL
   "Whether raz_runtime was compiled with OpenSSL support" FORCE)
-set(_raz_runtime_link_deps "")
 
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
@@ -30,21 +30,43 @@ if(OpenSSL_FOUND)
   target_compile_definitions(raz_runtime PRIVATE RAZ_HAVE_OPENSSL=1)
   target_link_libraries(raz_runtime PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
-  # The recursive compiler stages are linked outside CMake by the portable
-  # bootstrap driver. Export the exact linker inputs selected by CMake so that
-  # driver never has to guess package-specific cache keys. TARGET_LINKER_FILE
-  # is intentional: for a Windows DLL-backed OpenSSL install, TARGET_FILE is
-  # the runtime DLL while the link step needs its import .lib.
-  set(_raz_runtime_link_deps
-    "$<TARGET_LINKER_FILE:OpenSSL::SSL>\n$<TARGET_LINKER_FILE:OpenSSL::Crypto>\n")
+  # Bootstrap runs after the host CMake configure has completed and therefore
+  # cannot rely on directory-scoped imported targets.  Persist Raz-owned linker
+  # paths instead of depending on FindOpenSSL's implementation-detail cache
+  # variables, which are not guaranteed to exist for every Windows discovery
+  # path (for example config-package/vcpkg based installations).
+  function(raz_runtime_record_imported_link_file target output_var)
+    set(resolved "")
+    foreach(property
+        IMPORTED_IMPLIB_RELEASE IMPORTED_LOCATION_RELEASE
+        IMPORTED_IMPLIB_RELWITHDEBINFO IMPORTED_LOCATION_RELWITHDEBINFO
+        IMPORTED_IMPLIB_MINSIZEREL IMPORTED_LOCATION_MINSIZEREL
+        IMPORTED_IMPLIB_DEBUG IMPORTED_LOCATION_DEBUG
+        IMPORTED_IMPLIB IMPORTED_LOCATION)
+      get_target_property(candidate ${target} ${property})
+      if(candidate AND NOT candidate MATCHES "-NOTFOUND$")
+        set(resolved "${candidate}")
+        break()
+      endif()
+    endforeach()
+    set(${output_var} "${resolved}" PARENT_SCOPE)
+  endfunction()
+
+  set(raz_runtime_ssl_link_file "${OPENSSL_SSL_LIBRARY}")
+  if(NOT raz_runtime_ssl_link_file)
+    raz_runtime_record_imported_link_file(OpenSSL::SSL raz_runtime_ssl_link_file)
+  endif()
+  set(raz_runtime_crypto_link_file "${OPENSSL_CRYPTO_LIBRARY}")
+  if(NOT raz_runtime_crypto_link_file)
+    raz_runtime_record_imported_link_file(OpenSSL::Crypto raz_runtime_crypto_link_file)
+  endif()
+
+  set(RAZ_RUNTIME_OPENSSL_SSL_LIBRARY "${raz_runtime_ssl_link_file}" CACHE FILEPATH
+    "OpenSSL SSL linker file used by raz_runtime" FORCE)
+  set(RAZ_RUNTIME_OPENSSL_CRYPTO_LIBRARY "${raz_runtime_crypto_link_file}" CACHE FILEPATH
+    "OpenSSL Crypto linker file used by raz_runtime" FORCE)
 endif()
 
-# Always generate the manifest, including the OpenSSL-disabled case. This makes
-# stale/missing manifests distinguishable from a legitimate zero-dependency
-# runtime and gives every bootstrap generation one deterministic contract.
-file(GENERATE
-  OUTPUT "${CMAKE_BINARY_DIR}/raz-runtime-link-deps.txt"
-  CONTENT "${_raz_runtime_link_deps}")
 
 if(WIN32)
   # Prevent legacy Windows SDK min/max macros from corrupting std::min,
@@ -61,7 +83,7 @@ if(MSVC)
   # host compiler defaults.  Bounds/ownership safety is enforced by Raz and
   # explicit runtime checks; this switch only removes the host C++ stack-cookie
   # ABI edge from these boundary objects.
-  target_compile_options(raz_runtime PRIVATE /W4 /permissive- /GS-)
+  target_compile_options(raz_runtime PRIVATE /W4 /permissive- /GS- /Gy /Gw)
   if(RAZ_ENABLE_WERROR)
     target_compile_options(raz_runtime PRIVATE /WX)
   endif()

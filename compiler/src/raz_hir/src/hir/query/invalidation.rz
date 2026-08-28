@@ -1,0 +1,358 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::query::invalidation;
+
+public import raz_hir::core::types;
+
+fn hir_query_input_fingerprint_mix(i64 fingerprint, i64 value) -> i64 {
+    i64 mixed = (fingerprint * 131 + value + 4099) % 281474976710597;
+
+    if (mixed < 0) {
+        mixed = 0 - mixed;
+    }
+    return mixed;
+}
+
+fn hir_query_kind_trait_impl() -> i64 {
+    return 1;
+}
+
+fn hir_query_kind_trait_bound() -> i64 {
+    return 2;
+}
+
+fn hir_query_kind_method() -> i64 {
+    return 3;
+}
+
+fn hir_query_kind_associated_type() -> i64 {
+    return 4;
+}
+
+fn hir_query_kind_layout() -> i64 {
+    return 5;
+}
+
+fn hir_query_kind_monomorphization() -> i64 {
+    return 6;
+}
+
+fn hir_query_kind_field_offset() -> i64 {
+    return 7;
+}
+
+fn hir_query_hash(i64 kind, i64 a, i64 b, i64 c) -> i64 {
+    i64 hash = (kind + 17) % 281474976710597;
+
+    hash = (hash * 131 + a + 4099) % 281474976710597;
+    hash = (hash * 131 + b + 8191) % 281474976710597;
+    hash = (hash * 131 + c + 16381) % 281474976710597;
+    if (hash < 0) {
+        hash = 0 - hash;
+    }
+    return hash;
+}
+
+fn hir_query_slot(i64 kind, i64 a, i64 b, i64 c) -> i64 {
+    return hir_query_hash(kind, a, b, c) % 4096;
+}
+
+fn hir_query_enqueue_invalidation(HirBuilder&mut builder, i64 hash, i64 kind, i64 a, i64 b, i64 c) {
+    // A direct-mapped cache can hold at most 4096 live keys. Each slot is marked
+    // at most once per propagation wave, so the worklist cannot exceed this
+    // capacity unless the cache representation itself changes.
+    if (builder.queries.query_invalidation_count >= 4096) {
+        return;
+    }
+
+    i64 index = builder.queries.query_invalidation_count;
+
+    raz_compiler_rt_arena_set_unchecked(builder.queries.query_invalidation_hashes, index, hash);
+    raz_compiler_rt_arena_set_unchecked(builder.queries.query_invalidation_kinds, index, kind);
+    raz_compiler_rt_arena_set_unchecked(builder.queries.query_invalidation_a, index, a);
+    raz_compiler_rt_arena_set_unchecked(builder.queries.query_invalidation_b, index, b);
+    raz_compiler_rt_arena_set_unchecked(builder.queries.query_invalidation_c, index, c);
+    builder.queries.query_invalidation_count += 1;
+}
+
+fn hir_query_mark_invalidation_hashed(
+    HirBuilder&mut builder,
+    i64 hash,
+    i64 kind,
+    i64 a,
+    i64 b,
+    i64 c,
+) -> bool {
+    i64 slot = hash % 4096;
+    i64 state = raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_states, slot);
+
+    if (
+        state != 0 &&
+        state != -1 &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_hashes, slot) == hash &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_kinds, slot) == kind &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_a, slot) == a &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_b, slot) == b &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_c, slot) == c
+    ) {
+        raz_compiler_rt_arena_set_unchecked(builder.queries.query_cache_states, slot, -1);
+        hir_query_enqueue_invalidation(builder, hash, kind, a, b, c);
+        builder.queries.query_invalidation_total += 1;
+        return true;
+    }
+    return false;
+}
+
+fn hir_query_mark_invalidation(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
+    return hir_query_mark_invalidation_hashed(builder, hir_query_hash(kind, a, b, c), kind, a, b, c);
+}
+
+fn hir_query_dependency_child_same(
+    HirBuilder&mut builder,
+    i64 dependency,
+    i64 hash,
+    i64 kind,
+    i64 a,
+    i64 b,
+    i64 c,
+) -> bool {
+    return (
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_child_hashes, dependency) == hash &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_child_kinds, dependency) == kind &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_child_a, dependency) == a &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_child_b, dependency) == b &&
+        raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_child_c, dependency) == c
+    );
+}
+
+fn hir_query_propagate_invalidations(HirBuilder&mut builder) {
+    i64 cursor = 0;
+
+    // Worklist traversal over a reverse dependency index. Newly marked parents
+    // append to the same worklist, giving transitive propagation in one pass
+    // without repeatedly scanning unrelated dependency edges.
+    while (cursor < builder.queries.query_invalidation_count) {
+        i64 hash = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_hashes, cursor);
+        i64 kind = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_kinds, cursor);
+        i64 a = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_a, cursor);
+        i64 b = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_b, cursor);
+        i64 c = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_c, cursor);
+        i64 bucket = hash % 32768;
+        i64 link = raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_buckets, bucket);
+
+        while (link > 0) {
+            i64 dependency = link - 1;
+
+            if (hir_query_dependency_child_same(builder, dependency, hash, kind, a, b, c)) {
+                hir_query_mark_invalidation_hashed(
+                    builder,
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_parent_hashes, dependency),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_parent_kinds, dependency),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_parent_a, dependency),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_parent_b, dependency),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_parent_c, dependency),
+                );
+            }
+            link = raz_compiler_rt_arena_get_unchecked(builder.queries.query_dependency_next, dependency);
+        }
+        cursor += 1;
+    }
+    // Clear exactly the cache entries touched by this wave. The old fixed-point
+    // implementation swept the complete cache even when only one query changed.
+    cursor = 0;
+    while (cursor < builder.queries.query_invalidation_count) {
+        i64 hash = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_hashes, cursor);
+        i64 kind = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_kinds, cursor);
+        i64 a = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_a, cursor);
+        i64 b = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_b, cursor);
+        i64 c = raz_compiler_rt_arena_get_unchecked(builder.queries.query_invalidation_c, cursor);
+        i64 slot = hash % 4096;
+
+        if (
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_states, slot) == -1 &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_hashes, slot) == hash &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_kinds, slot) == kind &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_a, slot) == a &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_b, slot) == b &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_c, slot) == c
+        ) {
+            raz_compiler_rt_arena_set_unchecked(builder.queries.query_cache_states, slot, 0);
+        }
+        cursor += 1;
+    }
+    builder.queries.query_invalidation_count = 0;
+}
+
+fn hir_query_invalidate_exact(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) {
+    builder.queries.query_invalidation_count = 0;
+    if (!hir_query_mark_invalidation(builder, kind, a, b, c)) {
+        return;
+    }
+    hir_query_propagate_invalidations(builder);
+}
+
+fn hir_query_mark_kind(HirBuilder&mut builder, i64 kind) -> bool {
+    i64 slot = 0;
+    bool changed = false;
+
+    while (slot < 4096) {
+        if (
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_states, slot) != 0 &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_states, slot) != -1 &&
+            raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_kinds, slot) == kind
+        ) {
+            if (
+                hir_query_mark_invalidation_hashed(
+                    builder,
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_hashes, slot),
+                    kind,
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_a, slot),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_b, slot),
+                    raz_compiler_rt_arena_get_unchecked(builder.queries.query_cache_c, slot),
+                )
+            ) {
+                changed = true;
+            }
+        }
+        slot += 1;
+    }
+    return changed;
+}
+
+fn hir_query_invalidate_kind_transitive(HirBuilder&mut builder, i64 kind) {
+    builder.queries.query_invalidation_count = 0;
+    if (hir_query_mark_kind(builder, kind)) {
+        hir_query_propagate_invalidations(builder);
+    }
+}
+
+fn hir_query_input_traits_fingerprint(HirBuilder&mut builder) -> i64 {
+    i64 fingerprint = builder.module.trait_count + 1;
+
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.trait_impl_count);
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_trait_impl_count);
+    return fingerprint;
+}
+
+fn hir_query_input_methods_fingerprint(HirBuilder&mut builder) -> i64 {
+    i64 fingerprint = builder.module.inherent_method_count + 1;
+
+    return hir_query_input_fingerprint_mix(fingerprint, builder.module.function_count);
+}
+
+fn hir_query_input_aggregates_fingerprint(HirBuilder&mut builder) -> i64 {
+    i64 fingerprint = builder.module.struct_count + 1;
+
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.enum_count);
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.struct_field_count);
+    return fingerprint;
+}
+
+fn hir_query_input_generics_fingerprint(HirBuilder&mut builder) -> i64 {
+    i64 fingerprint = builder.module.generic_function_count + 1;
+
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_struct_count);
+    fingerprint = hir_query_input_fingerprint_mix(fingerprint, builder.module.generic_enum_count);
+    return fingerprint;
+}
+
+fn hir_query_input_functions_fingerprint(HirBuilder&mut builder) -> i64 {
+    return builder.module.function_count + 1;
+}
+
+fn hir_query_input_associated_fingerprint(HirBuilder&mut builder) -> i64 {
+    i64 fingerprint = builder.module.trait_associated_type_count + 1;
+
+    return hir_query_input_fingerprint_mix(fingerprint, builder.module.trait_associated_const_count);
+}
+
+fn hir_query_sync_inputs(HirBuilder&mut builder) {
+    i64 traits = hir_query_input_traits_fingerprint(builder);
+    i64 methods = hir_query_input_methods_fingerprint(builder);
+    i64 aggregates = hir_query_input_aggregates_fingerprint(builder);
+    i64 generics = hir_query_input_generics_fingerprint(builder);
+    i64 functions = hir_query_input_functions_fingerprint(builder);
+    i64 associated = hir_query_input_associated_fingerprint(builder);
+
+    if (builder.queries.query_input_traits_fingerprint < 0) {
+        builder.queries.query_input_traits_fingerprint = traits;
+        builder.queries.query_input_methods_fingerprint = methods;
+        builder.queries.query_input_aggregates_fingerprint = aggregates;
+        builder.queries.query_input_generics_fingerprint = generics;
+        builder.queries.query_input_functions_fingerprint = functions;
+        builder.queries.query_input_associated_fingerprint = associated;
+        return;
+    }
+
+    bool changed = false;
+    bool invalidated = false;
+
+    // Batch all semantic-input changes into one invalidation wave. A parser or
+    // lowering step can advance several input fingerprints together; propagating
+    // after each kind separately only revisits the same parent chains.
+    builder.queries.query_invalidation_count = 0;
+    if (builder.queries.query_input_traits_fingerprint != traits) {
+        builder.queries.query_input_traits_fingerprint = traits;
+        if (hir_query_mark_kind(builder, hir_query_kind_trait_impl())) {
+            invalidated = true;
+        }
+        if (hir_query_mark_kind(builder, hir_query_kind_trait_bound())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (builder.queries.query_input_methods_fingerprint != methods) {
+        builder.queries.query_input_methods_fingerprint = methods;
+        if (hir_query_mark_kind(builder, hir_query_kind_method())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (builder.queries.query_input_aggregates_fingerprint != aggregates) {
+        builder.queries.query_input_aggregates_fingerprint = aggregates;
+        if (hir_query_mark_kind(builder, hir_query_kind_layout())) {
+            invalidated = true;
+        }
+        if (hir_query_mark_kind(builder, hir_query_kind_field_offset())) {
+            invalidated = true;
+        }
+        if (hir_query_mark_kind(builder, hir_query_kind_trait_impl())) {
+            invalidated = true;
+        }
+        if (hir_query_mark_kind(builder, hir_query_kind_trait_bound())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (builder.queries.query_input_generics_fingerprint != generics) {
+        builder.queries.query_input_generics_fingerprint = generics;
+        if (hir_query_mark_kind(builder, hir_query_kind_monomorphization())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (builder.queries.query_input_functions_fingerprint != functions) {
+        builder.queries.query_input_functions_fingerprint = functions;
+        if (hir_query_mark_kind(builder, hir_query_kind_method())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (builder.queries.query_input_associated_fingerprint != associated) {
+        builder.queries.query_input_associated_fingerprint = associated;
+        if (hir_query_mark_kind(builder, hir_query_kind_associated_type())) {
+            invalidated = true;
+        }
+        changed = true;
+    }
+    if (invalidated) {
+        hir_query_propagate_invalidations(builder);
+    }
+    if (changed) {
+        builder.queries.query_revision += 1;
+        if (builder.queries.query_revision <= 0) {
+            builder.queries.query_revision = 1;
+        }
+    }
+}
