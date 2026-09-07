@@ -67,6 +67,7 @@ fn inspect_event() {
     web::set_value("field", "seen");
     web::exists("field");
     web::blur("field");
+    web::click("field");
     event.stop_propagation();
     i64 timer = set_timeout("delayed", 5);
     if (timer < 0) { clear_timeout(timer); }

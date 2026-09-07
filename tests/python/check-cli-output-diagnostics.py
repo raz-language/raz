@@ -194,6 +194,34 @@ def main() -> int:
         print("cli-output-diagnostics: FAIL: ordered warning override did not suppress D2052", file=sys.stderr)
         return 1
 
+    # D2052 is lexical pre-HIR guidance, so its Copy inference must stay local
+    # to the function containing the move. A primitive with the same name in
+    # an earlier function/module must not classify a later owned value as Copy.
+    owned_move_source = work / "owned-move.rz"
+    owned_move_source.write_text(
+        "struct Owned {\n"
+        "    i64 field;\n"
+        "}\n\n"
+        "fn seed() -> i64 {\n"
+        "    i64 value = 7;\n"
+        "    return value;\n"
+        "}\n\n"
+        "fn transfer() -> Owned {\n"
+        "    Owned value = Owned { field: 9 };\n"
+        "    return move value;\n"
+        "}\n\n"
+        "fn main() -> i64 {\n"
+        "    Owned moved = transfer();\n"
+        "    return moved.field + seed();\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    owned_move = run([args.razc, "--check", str(owned_move_source)], env=env, expect=0)
+    if "D2052" in owned_move.stderr:
+        print("cli-output-diagnostics: FAIL: D2052 leaked across function scope onto owned move", file=sys.stderr)
+        print(owned_move.stderr, file=sys.stderr)
+        return 1
+
     catalog = run([args.raz, "diagnostics", "--diagnostic-format", "json"], expect=0)
     catalog_json = json.loads(catalog.stdout)
     if catalog_json.get("schema") != "raz-diagnostic-catalog-v1" or "D2052" not in catalog_json.get("codes", []):
@@ -214,6 +242,12 @@ def main() -> int:
     if "\x1b[" not in colored.stdout:
         print("cli-output-diagnostics: FAIL: --color always did not emit ANSI styling", file=sys.stderr)
         return 1
+
+    trailing_options = run([
+        args.raz, "build", str(project), "--release", "--backend=forge",
+        "--force", "--color", "never",
+    ])
+    require(trailing_options.stdout, "Finished `release` profile", "options after project path")
 
     quiet = run([args.raz, "build", str(project), "--quiet", "--color", "never"])
     if quiet.stdout.strip() or quiet.stderr.strip():

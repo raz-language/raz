@@ -10,6 +10,12 @@ target = "web"
 web = "raz:web"
 ```
 
+## Library layout
+
+`src/lib.rz` is intentionally a thin public facade. `src/page.rz` now owns only the `Page` model and constructors; page behavior is split across `src/page_head.rz`, `src/page_body.rz`, `src/page_forms.rz`, `src/page_interactivity.rz`, and `src/page_output.rz`. Shared escaping/name validation, generated browser host glue, CSS emission, and route helpers remain in `src/html_support.rz`, `src/client_host.rz`, `src/page_css.rz`, and `src/routes.rz`. Browser-standard wrappers remain under `std/`.
+
+The component layer under `ui/` follows the same rule: `ui/ui.rz` is only the `web::ui` namespace facade. Runtime types/globals live in `ui/core.rz`, reactive state in `ui/state.rz`, buffer/HTML rendering support in `ui/render.rz`, element construction/methods in `ui/elements.rz`, component/style behavior in `ui/components.rz`, interactive routing in `ui/routing.rz`, and HTTP/JSON/resource support in `ui/http.rz`. New implementation logic should go to the owning module rather than back into either facade file.
+
 ## Static-first pages
 
 Ordinary `Page` code writes normal HTML that can be deployed to any static host. Text and attribute values are escaped by default.
@@ -121,6 +127,8 @@ StateString name = card.state_string("name", "Raz");
 
 The same local names can be reused by another component key without sharing slots. This keeps reusable components self-contained while preserving Raz Web's direct-binding fast path for state that only updates text or form controls.
 
+The generated component loader is usage-driven too. Compiler codegen walks the optimized call graph reachable from `main` and independently retains only the reactive helper groups needed for event delegation, bound-state fast updates, routing, HTTP/resources, scoped subtree synchronization, and `raw_js`. A component with no rerender source uses a direct initial HTML publish and does not carry the keyed DOM patcher. Analysis failure is conservative and retains the complete runtime.
+
 ## Full HTML authoring surface
 
 `Page` covers the common document, semantic, text, list, table, form, media, accessibility, and SVG vocabulary directly. Static authoring remains escaped and runtime-free.
@@ -178,7 +186,9 @@ Static-first pages can split independent browser handler graphs into on-demand W
 page.lazy_wasm_on_click("open-editor", "editor", "open_editor");
 ```
 
-Handlers assigned to the same chunk are emitted together; functions reachable only from those handlers stay in that chunk. The current qualified backend supports one lazy Raz-WASM chunk per static-first build (with any number of handlers in it); a second distinct chunk is rejected rather than silently merged. A lazy-only page does not emit `app.wasm`. Release builds fingerprint chunks under `assets/chunks/` and rewrite the generated loader automatically. Use normal `on(...)` when a handler belongs in the eagerly loaded main browser module.
+Handlers assigned to the same chunk are emitted together; functions reachable only from those handlers stay in that chunk. The qualified backend supports multiple independent lazy Raz-WASM chunks per static-first build. Handlers assigned to the same chunk are emitted together, while functions reachable only from those handlers stay in that chunk. A lazy-only page does not emit `app.wasm`. Release builds fingerprint chunks under `assets/chunks/` and rewrite the generated loader automatically. Use normal `on(...)` when a handler belongs in the eagerly loaded main browser module.
+
+Release runtime links are subpath-safe: nested route HTML walks back to the single `dist/assets/` directory, while the fingerprinted JavaScript uses sibling-relative URLs for `app.wasm` and lazy chunks. No generated release URL assumes that the site is mounted at `/`.
 
 ## Reactive values
 
@@ -201,3 +211,5 @@ interactive components, `child_when(...)`, `child_unless(...)`, and their keyed
 variants combine conditional composition with structural dependency tracking,
 so toggling the condition can rerender the owning component boundary rather
 than conservatively rebuilding the whole page.
+
+Release analysis supports enforceable `[web.budget]` byte ceilings for finalized output.

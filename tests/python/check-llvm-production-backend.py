@@ -10,8 +10,8 @@ sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parents[2]
 target = (root / 'compiler/src/raz_codegen_llvm/src/llvm/target.rz').read_text(encoding='utf-8')
 llvm = (root / 'compiler/src/raz_codegen_llvm/src/llvm/codegen.rz').read_text(encoding='utf-8')
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
-backend = (root / 'compiler/src/raz_driver/src/backend.rz').read_text(encoding='utf-8')
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text(encoding='utf-8')
+backend = (root / 'compiler/src/raz_driver/src/driver/backend.rz').read_text(encoding='utf-8')
 runtime_root = root / 'src/runtime'
 runtime = '\n'.join(p.read_text(encoding='utf-8') for p in sorted(runtime_root.glob('*.cpp')))
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
@@ -75,7 +75,7 @@ if 'LlvmTargetOptions& llvm_options' not in backend:
     raise SystemExit('llvm-production-backend: FAIL backend dispatch does not carry target options')
 if 'std::int64_t raz_rt_process_run' not in runtime:
     raise SystemExit('llvm-production-backend: FAIL generic process runtime primitive missing')
-if 'fn raz_compiler_rt_process_run_ascii' not in (root / 'compiler/src/raz_lexer/src/lexer.rz').read_text(encoding='utf-8'):
+if 'fn raz_compiler_rt_process_run_ascii' not in (root / 'compiler/src/raz_lexer/src/lexer/lexer.rz').read_text(encoding='utf-8'):
     raise SystemExit('llvm-production-backend: FAIL Raz-side process adapter missing')
 
 

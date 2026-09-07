@@ -7,8 +7,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MAIN = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
-CLI = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+MAIN = (ROOT / "compiler/src/raz_driver/src/driver/compiler_main.rz").read_text(encoding="utf-8")
+CLI = (ROOT / "compiler/src/raz_driver/src/driver/cli.rz").read_text(encoding="utf-8")
 
 checks = {
     "production driver finds exact argument separator": "fn cli_argument_separator_index(i64 argc) -> i64" in CLI,

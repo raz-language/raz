@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from web_source import web_codegen_source
 import re
 import sys
 sys.dont_write_bytecode = True
@@ -57,9 +58,9 @@ if duplicate_externs:
 # Bootstrap-visible host filesystem primitives must be owned by the lowest
 # shared compiler package. Frozen Stage-0 does not reliably resolve a symbol
 # that is declared only in a backend package and re-exported through raz_driver.
-lexer_source = (root / 'compiler' / 'src' / 'raz_lexer' / 'src' / 'lexer.rz').read_text(encoding='utf-8')
-web_source = (root / 'compiler' / 'src' / 'raz_codegen_web' / 'src' / 'web' / 'codegen.rz').read_text(encoding='utf-8')
-host_source = (root / 'compiler' / 'src' / 'raz_driver' / 'src' / 'host_support.rz').read_text(encoding='utf-8')
+lexer_source = (root / 'compiler' / 'src' / 'raz_lexer' / 'src' / 'lexer' / 'lexer.rz').read_text(encoding='utf-8')
+web_source = web_codegen_source(root)
+host_source = (root / 'compiler' / 'src' / 'raz_driver' / 'src' / 'driver' / 'host_support.rz').read_text(encoding='utf-8')
 bootstrap_shared = 'public extern fn raz_rt_create_dir_one(usize path, i64 length) -> i64;'
 bootstrap_errors = []
 if bootstrap_shared not in lexer_source:

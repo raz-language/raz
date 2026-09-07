@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-transport = (ROOT / 'compiler/src/raz_driver/src/registry_transport.rz').read_text(encoding='utf-8')
+transport = (ROOT / 'compiler/src/raz_driver/src/driver/registry_transport.rz').read_text(encoding='utf-8')
 runtime = (ROOT / 'src/runtime/runtime_internal.hpp').read_text(encoding='utf-8')
 cmake = (ROOT / 'src/runtime/CMakeLists.txt').read_text(encoding='utf-8')
 bootstrap = (ROOT / 'tools/bootstrap.py').read_text(encoding='utf-8')

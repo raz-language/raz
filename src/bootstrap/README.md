@@ -8,8 +8,10 @@ Native Stage-0 code is compatibility-pinned and limited to the source contract r
 
 ## Stage-0 cache
 
-The native Stage-0 toolchain is built once into the selected CMake build directory and then reused verbatim by later bootstrap runs. A normal `bootstrap.bat` / `bootstrap.sh` does not reconfigure or rebuild C++ Stage 0 when the complete cached artifact set is present. This keeps the common self-host cycle focused on the Raz-written compiler.
+The native Stage-0 toolchain is built once into the selected CMake build directory and then reused by later bootstrap runs. A normal `bootstrap.bat` / `bootstrap.sh` does not reconfigure or rebuild C++ Stage 0 when the complete cached artifact set is present. This keeps the common self-host cycle focused on the Raz-written compiler.
 
-Use `--rebuild-stage0` when intentionally changing Stage-0 C++ sources. `-Clean` removes both the cached Stage-0 build and bootstrap qualification state, so the next run constructs Stage 0 again.
+CMake/Ninja metadata itself remains workspace-local because it contains absolute source/build paths. Raz therefore stages the runtime, Forge bridge, Forge archive, optional runtime provider libraries, and ObLink beside the Stage-0 compiler and records a location-independent source digest. After a packaged workspace is moved, bootstrap can reuse that portable Stage-0 artifact set without trusting or rewriting stale CMake paths. If the native sources changed, the digest invalidates the portable set and Stage 0 is regenerated normally.
+
+Use `--rebuild-stage0` when intentionally forcing Stage-0 regeneration. `-Clean` removes both the cached Stage-0 build and bootstrap qualification state, so the next run constructs Stage 0 again.
 
 Release qualification verifies this boundary with `tests/data/host-compiler-contract.sha256`.

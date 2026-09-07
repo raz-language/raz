@@ -23,6 +23,68 @@ All notable user-visible changes to Raz are documented here.
 - Build/check output now has an explicit Cargo-style package identity contract: every dependency actually compiled is announced as `Compiling <name> v<version>` / `Checking <name> v<version>` before the root package, while fully restored artifact-cache builds remain `Fresh` rather than claiming recompilation.
 
 - Fixed the Forge O2 self-host regression that could miscompile installed-project native path preparation. SCCP now treats unmodelled result-producing operations (including calls) as overdefined instead of lattice-bottom binary expressions, and comparison folds preserve their `i1` result type. Release bootstrap now runs the self-hosted compiler against fresh debug/release native projects and verifies canonical `target/<profile>/{obj,bin}` output plus execution.
+- Fixed a Forge x86-64 miscompile of any function whose stack frame exceeds one
+  page. The prologue lowered `rsp` with a single unprobed `sub`, stepping over
+  the guard page that both Windows and Linux use to grow a thread stack on
+  demand, so the first access into the new frame faulted on reserved memory
+  (`0xC0000005` / exit 3221225477). Large frames now walk down a page at a time
+  and touch each page they claim. This was the root cause of the `raz help`
+  faults and of the `web-routing` self-host gate crashing before it could emit
+  `app.wasm`.
+- Fixed Stage-0 misparsing `for value in 0..limit {` as a struct literal: it
+  read the loop body's brace as the initializer of a `limit { ... }` value and
+  then failed on the first statement. `for` is, with `match`, one of the two
+  unparenthesized headers in the grammar, but unlike `match` its iterable may
+  legitimately be a struct literal (`for v in Counter { start: 0 } { ... }`).
+  The production compiler tells the two apart by resolving the name to a struct,
+  which Stage-0's syntactic parser cannot do, so it now inspects what the brace
+  contains. Both forms parse. Host-compiler contract repinned accordingly.
+- Production-CLI tests now run against the bootstrapped compiler. 54 CTest cases
+  drove `raz_host` -- Stage-0's `raz` -- while asserting production commands
+  that Stage-0 refuses by design ("Stage-0 does not provide production command
+  'run'"), so they failed by construction. They use the bootstrapped compiler
+  when it exists and fall back to Stage-0 otherwise.
+- `raz test` can now allocate. The MIR interpreter dispatches externs through a
+  fixed table and answered anything outside it with 0, so a test calling
+  `raz_rt_alloc` saw a null pointer and failed with an unexplained status while
+  the same code succeeded when run as a program. Allocation, deallocation, raw
+  byte stores, and stdout/stderr writes are now modelled.
+- Argument type mismatches report as `D2046: argument does not match the
+  parameter type`, located at the offending argument. They previously surfaced
+  as `D1001: expected a different token` pointing past the end of the statement,
+  because the shared failure path reports at whatever token the builder has
+  reached and signature checks run only after the whole call is parsed. Stage-0
+  already reported this condition as D2046; the two compilers now agree.
+- Fixed helper-process launching on Windows. `CreateProcess` completes a partial
+  `lpApplicationName` against the current drive and directory and never consults
+  the search path, so a tool the availability probe had already found on PATH was
+  unreachable unless it happened to sit in the working directory. Both spawn
+  helpers now resolve the program through the same lookup the probe uses. This is
+  why `razup install` could not unpack a toolchain: it launches `tar.exe`, which
+  was only found when razup ran from the directory containing it.
+- Fixed `tools/bootstrap.py --verify-reproducibility`, which raised
+  `NameError: name 'compile_env' is not defined` as soon as the verification
+  generation began. The reproducibility generation now passes the same
+  environment as the first self-host generation it is compared against.
+- Applied the same guard-page fix to the Forge AArch64 backend. Its prologue
+  lowered `sp` in chunks of at most 4095 bytes -- an immediate-encoding limit,
+  not a probe -- and never touched the pages it claimed, so any frame larger
+  than a page skipped the guard exactly as x86-64 did. Large frames now walk
+  down in 16-byte-aligned steps below the smallest AArch64 page size, touching
+  each page with `ldr xzr, [sp]`; frames of a page or less still emit a single
+  `sub`.
+- Fixed a bootstrap failure that only appeared on the second and later runs
+  reusing a cached Stage-0 build. Support archives are staged into the profile's
+  `lib/` directory, which sits inside the tree Stage-0 artifact discovery walks,
+  so a staged run rediscovered its own copy as the source and asked the OS to
+  copy `raz_runtime.lib` onto itself (`WinError 32`). Discovery now skips the
+  staging directory when a canonical build output exists, and staging treats a
+  same-file copy as the no-op it is. This also unfreezes the staged runtime
+  archive, which previously kept whatever was staged first even after a rebuild.
+- Made bootstrap-final promotion survive a locked or read-only qualification
+  tree: the old sequence swallowed `rmtree` failures and then guaranteed the
+  following rename would fail with `WinError 5`. Set `RAZ_BOOTSTRAP_TRACEBACK=1`
+  to get a full traceback out of a bootstrap failure.
 - Fixed the C bindgen carrier type for inline anonymous struct/union fields.
   Alignment 4 and 2 emitted `u64` while still dividing the aggregate size by 4
   and 2, so `struct { int x; int y; }` became `u64[2]` instead of `u32[2]`.

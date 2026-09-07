@@ -142,7 +142,7 @@ fn main() -> i64 {
 ]=])
 
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result
   OUTPUT_VARIABLE build_output
   ERROR_VARIABLE build_error)
@@ -151,9 +151,9 @@ if(NOT build_result EQUAL 0)
 endif()
 
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/error_resources_runtime.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/error_resources_runtime.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/error_resources_runtime")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/error_resources_runtime")
 endif()
 if(NOT EXISTS "${runtime_exe}")
   message(FATAL_ERROR "Runtime executable was not produced: ${runtime_exe}")

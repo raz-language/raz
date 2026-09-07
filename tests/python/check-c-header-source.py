@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
-s=(ROOT/'compiler/src/raz_driver/src/c_header.rz').read_text(encoding='utf-8')
+s=(ROOT/'compiler/src/raz_driver/src/driver/c_header.rz').read_text(encoding='utf-8')
 d=(ROOT/'compiler/src/raz_hir/src/hir/semantic/declarations.rz').read_text(encoding='utf-8')
-c=(ROOT/'compiler/src/raz_driver/src/commands.rz').read_text(encoding='utf-8')
+c=(ROOT/'compiler/src/raz_driver/src/driver/commands.rz').read_text(encoding='utf-8')
 w=(ROOT/'compiler/src/raz_codegen_forge/src/forge/writer.rz').read_text(encoding='utf-8')
 checks={
  'production c-header module':'fn c_header_command(' in s,

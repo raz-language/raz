@@ -1,0 +1,177 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::registry_index;
+
+import frontend::parser;
+import raz_driver::package_support;
+public import raz_driver::registry_semver;
+public import raz_driver::registry_support;
+
+public fn registry_ascii_fold(i64 value) -> i64 {
+    if (value >= 65 && value <= 90) {
+        return value + 32;
+    }
+    return value;
+}
+
+public fn registry_contains_folded(i64 data, i64 start, i64 length, i64 query, i64 query_length) -> bool {
+    if (query_length <= 0) {
+        return true;
+    }
+    if (query_length> length) {
+        return false;
+    }
+
+    i64 offset = 0;
+
+    while (offset + query_length <= length) {
+        bool same = true;
+        i64 i = 0;
+
+        while (i < query_length) {
+            if (
+                registry_ascii_fold(
+                    raz_compiler_rt_arena_get(data, start + offset + i),
+                ) != registry_ascii_fold(raz_compiler_rt_arena_get(query, i))
+            ) {
+                same = false;
+            }
+            i += 1;
+        }
+        if (same) {
+            return true;
+        }
+        offset += 1;
+    }
+    return false;
+}
+
+public fn registry_version_greater(i64 a, i64 as_, i64 al, i64 b, i64 bs, i64 bl) -> bool {
+    i64 a0 = 0;
+    i64 a1 = 0;
+    i64 a2 = 0;
+    i64 b0 = 0;
+    i64 b1 = 0;
+    i64 b2 = 0;
+
+    if (!registry_parse_semver(a, as_, al, &mut a0, &mut a1, &mut a2)) {
+        return false;
+    }
+    if (!registry_parse_semver(b, bs, bl, &mut b0, &mut b1, &mut b2)) {
+        return true;
+    }
+    return registry_semver_compare(a0, a1, a2, b0, b1, b2)> 0;
+}
+
+public fn registry_latest_index_version(
+    i64 data,
+    i64 length,
+    i64 name,
+    i64 name_length,
+    i64 constraint,
+    i64 constraint_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    bool found = false;
+    i64 best_start = 0;
+    i64 best_length = 0;
+    i64 cursor = 0;
+
+    while (cursor < length) {
+        i64 start = cursor;
+
+        while (
+            cursor < length &&
+            raz_compiler_rt_arena_get(data, cursor) != 10 &&
+            raz_compiler_rt_arena_get(data, cursor) != 13
+        ) {
+            cursor += 1;
+        }
+
+        i64 end = cursor;
+
+        while (
+            cursor < length &&
+            (raz_compiler_rt_arena_get(data, cursor) == 10 || raz_compiler_rt_arena_get(data, cursor) == 13)
+        ) {
+            cursor += 1;
+        }
+
+        i64 ns = 0;
+        i64 nl = 0;
+        i64 vs = 0;
+        i64 vl = 0;
+
+        if (
+            registry_token(data, start, end, 0, &mut ns, &mut nl) &&
+            registry_token(data, start, end, 1, &mut vs, &mut vl) &&
+            registry_bytes_equal(data, ns, nl, name, 0, name_length) &&
+            registry_constraint_matches(data, vs, vl, constraint, constraint_length)
+        ) {
+            if (!found || registry_version_greater(data, vs, vl, data, best_start, best_length)) {
+                found = true;
+                best_start = vs;
+                best_length = vl;
+            }
+        }
+    }
+    if (!found || best_length> capacity) {
+        return -1;
+    }
+
+    i64 i = 0;
+
+    while (i < best_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(data, best_start + i));
+        i += 1;
+    }
+    return best_length;
+}
+
+public fn registry_name_seen_before(i64 data, i64 before, i64 name_start, i64 name_length) -> bool {
+    i64 cursor = 0;
+
+    while (cursor < before) {
+        i64 start = cursor;
+
+        while (
+            cursor < before &&
+            raz_compiler_rt_arena_get(data, cursor) != 10 &&
+            raz_compiler_rt_arena_get(data, cursor) != 13
+        ) {
+            cursor += 1;
+        }
+
+        i64 end = cursor;
+
+        while (
+            cursor < before &&
+            (raz_compiler_rt_arena_get(data, cursor) == 10 || raz_compiler_rt_arena_get(data, cursor) == 13)
+        ) {
+            cursor += 1;
+        }
+
+        i64 ns = 0;
+        i64 nl = 0;
+
+        if (
+            registry_token(data, start, end, 0, &mut ns, &mut nl) &&
+            registry_bytes_equal(data, ns, nl, data, name_start, name_length)
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+public fn registry_print_name_version(i64 name, i64 name_start, i64 name_length, i64 version, i64 version_length) {
+    cli_write_arena(name, name_length);
+
+    cli_write_literal("@");
+    cli_write_arena(version, version_length);
+
+    cli_write_literal("\n");
+}
+

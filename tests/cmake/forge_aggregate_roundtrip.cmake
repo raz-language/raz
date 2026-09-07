@@ -40,7 +40,7 @@ fn main() -> i64 {
 }
 ]=])
 execute_process(
-  COMMAND "${RAZ}" run "${WORK}" --target test-host --force
+  COMMAND "${RAZ}" run "${WORK}" --force
   RESULT_VARIABLE result
   OUTPUT_VARIABLE output
   ERROR_VARIABLE error)

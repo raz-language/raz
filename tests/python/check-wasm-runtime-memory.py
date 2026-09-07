@@ -34,7 +34,7 @@ for symbol in [
     'slot = (slot + 1) & (capacity - 1)',
 ]:
     assert symbol in m, symbol
-assert 'wasm_memory_prepare_strings(source, mir)' in c
+assert 'wasm_memory_prepare_strings(source, hir, mir)' in c
 assert 'wasm_memory_release_strings();' in c
 for symbol in ['allocate_zeroed','allocate_zeroed_aligned','allocate_zeroed_array<T>','raz_rt_fill(pointer, 0']:
     assert symbol in b, symbol

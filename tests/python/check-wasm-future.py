@@ -8,10 +8,11 @@ root = Path(__file__).resolve().parents[2]
 future = (root / 'compiler/src/raz_codegen_wasm/src/wasm/runtime_future.rz').read_text(encoding='utf-8')
 codegen = (root / 'compiler/src/raz_codegen_wasm/src/wasm/codegen.rz').read_text(encoding='utf-8')
 wasi = (root / 'compiler/src/raz_codegen_wasm/src/wasm/wasi.rz').read_text(encoding='utf-8')
+host = (root / 'compiler/src/raz_codegen_wasm/src/wasm/host_support.rz').read_text(encoding='utf-8')
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 assert 'src/raz_codegen_wasm/src/wasm/runtime_future.rz' in order
-assert 'public import raz_compiler_backend::wasm::runtime_future;' in codegen
+assert 'public import raz_codegen_wasm::runtime_future;' in codegen
 assert 'wasm_future_runtime_function_supported(source, hir, function_index)' in codegen
 assert 'wasm_future_runtime_emit_body(&mut section, source, hir, function_index)' in codegen
 for name in [
@@ -38,4 +39,6 @@ for marker in [
 ]:
     assert marker in future, f'missing future ABI marker: {marker}'
 assert 'fn wasm_wasi_emit_poll_delay_local' in wasi
+assert 'wasm_host_name_is_literal' in host
+assert 'wasm_host_name_is_literal' in future
 print('wasm-future: PASS (shared async frame ABI + complete/cancel/status/result/wait/destroy + explicit unsupported native continuation callbacks)')

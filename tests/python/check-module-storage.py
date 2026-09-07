@@ -7,7 +7,7 @@ import re
 root = Path(__file__).resolve().parents[2]
 files = {
     'model': root / 'compiler/src/raz_hir/src/hir/core/model.rz',
-    'lexer': root / 'compiler/src/raz_lexer/src/lexer.rz',
+    'lexer': root / 'compiler/src/raz_lexer/src/lexer/lexer.rz',
     'decl': root / 'compiler/src/raz_hir/src/hir/semantic/declarations.rz',
     'expr': root / 'compiler/src/raz_hir/src/hir/semantic/expressions.rz',
     'stmt': root / 'compiler/src/raz_hir/src/hir/semantic/statements.rz',

@@ -9,7 +9,7 @@ COMPILER = ROOT / "compiler"
 SRC = COMPILER / "src"
 EXPECTED = (
     "raz_lexer", "raz_parser", "raz_query", "raz_hir", "raz_mir", "raz_mir_opt", "raz_borrowck",
-    "raz_codegen_forge", "raz_codegen_llvm", "raz_codegen_wasm",
+    "raz_codegen_common", "raz_codegen_forge", "raz_codegen_llvm", "raz_codegen_wasm",
     "raz_codegen_rxe", "raz_codegen_web", "raz_driver",
 )
 def fail(message: str) -> None:
@@ -29,11 +29,17 @@ for name in EXPECTED:
     text=manifest.read_text(encoding="utf-8")
     if 'source = "src"' not in text or 'entry = "src/lib.rz"' not in text:
         fail(f"invalid package source layout: {manifest.relative_to(ROOT)}")
+    top_level_impl = sorted(p.name for p in (package / "src").glob("*.rz") if p.name != "lib.rz")
+    if top_level_impl:
+        fail(f"compiler package implementation escaped nested source folder: {name}: {top_level_impl}")
+    all_sources = list((package / "src").rglob("*.rz"))
+    if len(all_sources) > 1 and not any(p.parent != package / "src" for p in all_sources if p.name != "lib.rz"):
+        fail(f"compiler package has implementation sources but no nested source folder: {name}")
 # Project loading must stop root recursive discovery at nested package manifests.
-project=(SRC/"raz_driver/src/project.rz").read_text(encoding="utf-8")
+project=(SRC/"raz_driver/src/driver/project.rz").read_text(encoding="utf-8")
 for marker in ("fn project_path_crosses_nested_package(", "fn project_filter_nested_package_sources("):
     if marker not in project: fail(f"project loader missing nested-package boundary: {marker}")
 bootstrap=(ROOT/"tools/bootstrap.py").read_text(encoding="utf-8")
-for marker in ('source_root = root / "src"', 'compiler_project / "src" / "raz_driver"'):
+for marker in ('source_root = ROOT / "compiler" / "src"', 'compiler_project / "src" / "raz_driver"'):
     if marker not in bootstrap: fail(f"bootstrap is not aligned with compiler/src: {marker}")
 print("compiler source/package layout: PASS (all compiler packages under compiler/src)")

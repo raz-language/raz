@@ -1,0 +1,147 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::web_host_prune;
+
+public import raz_driver::path;
+import raz_driver::web_bundle;
+import web::browser_host_js;
+
+// Static-first pages write a marker per browser host binding. After every main
+// and lazy Wasm chunk has reported its imports, this module removes bindings
+// that are unreachable from the complete browser bundle.
+
+fn web_prune_browser_host_file(
+    i64 path,
+    i64 path_length,
+    i64 import_mask,
+    i64 import_mask_high,
+) -> bool {
+    if (path == 0 || path_length <= 0 || raz_compiler_rt_path_exists_ascii(path, path_length) == 0) { return true; }
+
+    i64 input = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 output = raz_compiler_rt_arena_create_width(16777216, 1);
+    if (input == 0 || output == 0) {
+        if (input != 0) { raz_compiler_rt_arena_destroy(input); }
+        if (output != 0) { raz_compiler_rt_arena_destroy(output); }
+        return false;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(path, path_length, input, 16777216);
+    if (length < 0) {
+        raz_compiler_rt_arena_destroy(input);
+        raz_compiler_rt_arena_destroy(output);
+        return false;
+    }
+
+    string marker = "/*raz-web-import:";
+    i64 marker_length = compiler_literal_length(marker);
+    i64 cursor = 0;
+    i64 written = 0;
+    bool saw_marker = false;
+    bool valid = true;
+
+    while (cursor < length && valid) {
+        i64 line_start = cursor;
+        i64 line_end = cursor;
+        while (line_end < length && raz_compiler_rt_arena_get(input, line_end) != 10) { line_end += 1; }
+        bool marked = line_end - line_start > marker_length + 3;
+        i64 i = 0;
+        while (marked && i < marker_length) {
+            if (raz_compiler_rt_arena_get(input, line_start + i) != compiler_literal_byte(marker, i)) { marked = false; }
+            i += 1;
+        }
+
+        i64 copy_start = line_start;
+        bool keep = true;
+        if (marked) {
+            saw_marker = true;
+            i64 p = line_start + marker_length;
+            i64 logical_import = 0;
+            bool digit = false;
+            while (p < line_end) {
+                i64 ch = raz_compiler_rt_arena_get(input, p);
+                if (ch < 48 || ch > 57) { break; }
+                digit = true;
+                logical_import = logical_import * 10 + (ch - 48);
+                p += 1;
+            }
+            if (!digit || p + 1 >= line_end || raz_compiler_rt_arena_get(input, p) != 42 || raz_compiler_rt_arena_get(input, p + 1) != 47) {
+                valid = false;
+            } else {
+                copy_start = p + 2;
+                keep = web_browser_import_enabled(import_mask, import_mask_high, logical_import);
+            }
+        }
+
+        if (valid && keep) {
+            i = copy_start;
+            while (i < line_end) {
+                if (written >= 16777216) { valid = false; }
+                else { raz_compiler_rt_arena_set(output, written, raz_compiler_rt_arena_get(input, i)); written += 1; }
+                i += 1;
+            }
+            if (valid && line_end < length) {
+                if (written >= 16777216) { valid = false; }
+                else { raz_compiler_rt_arena_set(output, written, 10); written += 1; }
+            }
+        }
+        cursor = line_end + 1;
+    }
+
+    bool ok = valid;
+    if (ok && saw_marker) {
+        ok = raz_compiler_rt_write_ascii(path, path_length, output, written) == written;
+    }
+    raz_compiler_rt_arena_destroy(input);
+    raz_compiler_rt_arena_destroy(output);
+    return ok;
+}
+
+/// Remove unused static-page browser host bindings after all route-local Wasm
+/// modules have been emitted. Every route can own a sibling app.js, so pruning
+/// walks the complete dist tree rather than assuming only dist/app.js exists.
+/// Exact-basename matching keeps public files such as assets/myapp.js out of the
+/// compiler-generated host path.
+public fn web_bundle_prune_browser_host(
+    i64 dist_path,
+    i64 dist_path_length,
+    i64 import_mask,
+    i64 import_mask_high,
+) -> bool {
+    if (dist_path == 0 || dist_path_length <= 0) { return false; }
+
+    i64 files = raz_compiler_rt_arena_create_width(4194304, 1);
+    i64 relative = raz_compiler_rt_arena_create(8192);
+    i64 full = raz_compiler_rt_arena_create(8192);
+    if (files == 0 || relative == 0 || full == 0) {
+        if (files != 0) { raz_compiler_rt_arena_destroy(files); }
+        if (relative != 0) { raz_compiler_rt_arena_destroy(relative); }
+        if (full != 0) { raz_compiler_rt_arena_destroy(full); }
+        return false;
+    }
+
+    i64 files_length = raz_compiler_rt_tree_list_ascii(dist_path, dist_path_length, files, 4194304);
+    bool ok = files_length >= 0;
+    i64 line_start = 0;
+    while (ok && line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_basename(files, line_start, line_length, "app.js")) {
+            i64 i = 0;
+            while (i < line_length) {
+                raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i));
+                i += 1;
+            }
+            i64 full_length = path_join(dist_path, dist_path_length, relative, line_length, full, 8192);
+            ok = full_length > 0 && web_prune_browser_host_file(full, full_length, import_mask, import_mask_high);
+        }
+        line_start = line_end + 1;
+    }
+
+    raz_compiler_rt_arena_destroy(files);
+    raz_compiler_rt_arena_destroy(relative);
+    raz_compiler_rt_arena_destroy(full);
+    return ok;
+}

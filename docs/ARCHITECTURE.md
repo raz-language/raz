@@ -57,7 +57,7 @@ Textual Forge IR remains available for diagnostics, inspection, compatibility, a
 
 ## LLVM backend
 
-The LLVM backend is implemented under `compiler/src/raz_codegen_llvm/src/llvm/` and consumes the same MIR as Forge. It emits LLVM IR and uses the configured LLVM/Clang toolchain for native object or executable production.
+The LLVM backend is implemented under `compiler/src/raz_codegen_llvm/src/llvm/` and consumes the same MIR as Forge. Forge and LLVM are sibling backends: shared text-buffering, native symbol identity, entry-point discovery, and backend-neutral async-MIR capability queries live in `raz_codegen_common`; LLVM does not import Forge implementation code. It emits LLVM IR and uses the configured LLVM/Clang toolchain for native object or executable production.
 
 Target triples, CPU/features, optimization, LTO, relocation/code models, visibility, libraries, and linker options are compiler configuration rather than language semantics. LLVM does not silently fall back to Forge.
 

@@ -23,7 +23,7 @@ def main() -> int:
     project = work / 'component-state'
     shutil.copytree(ROOT / 'tests/examples/web/component-state', project, ignore=shutil.ignore_patterns('target', 'dist'))
 
-    ui = (ROOT / 'library/web/ui/ui.rz').read_text(encoding='utf-8')
+    ui = '\n'.join(p.read_text(encoding='utf-8') for p in sorted((ROOT / 'library/web/ui').glob('*.rz')))
     required = [
         'fn state_scoped_hash(i64 scope, string key) -> i64',
         'public fn state_i64_scoped(i64 scope, string key, i64 initial) -> StateI64',

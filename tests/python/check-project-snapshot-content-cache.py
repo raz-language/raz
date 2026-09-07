@@ -6,8 +6,8 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-INC = (ROOT / "compiler/src/raz_driver/src/incremental.rz").read_text(encoding="utf-8")
-PROJECT = (ROOT / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8")
+INC = (ROOT / "compiler/src/raz_driver/src/driver/incremental.rz").read_text(encoding="utf-8")
+PROJECT = (ROOT / "compiler/src/raz_driver/src/driver/project.rz").read_text(encoding="utf-8")
 PERF = (ROOT / "docs/PERFORMANCE.md").read_text(encoding="utf-8")
 
 checks = {

@@ -4,10 +4,14 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-package = (ROOT / 'compiler/src/raz_driver/src/package.rz').read_text(encoding='utf-8')
-registry = (ROOT / 'compiler/src/raz_driver/src/registry.rz').read_text(encoding='utf-8')
-project = (ROOT / 'compiler/src/raz_driver/src/project.rz').read_text(encoding='utf-8')
-incremental = (ROOT / 'compiler/src/raz_driver/src/incremental.rz').read_text(encoding='utf-8')
+package = (ROOT / 'compiler/src/raz_driver/src/driver/package.rz').read_text(encoding='utf-8')
+registry = (ROOT / 'compiler/src/raz_driver/src/driver/registry.rz').read_text(encoding='utf-8')
+resolver = (ROOT / 'compiler/src/raz_driver/src/driver/registry_resolver.rz').read_text(encoding='utf-8')
+registry_all = registry + '\n' + resolver
+registry_semver = (ROOT / 'compiler/src/raz_driver/src/driver/registry_semver.rz').read_text(encoding='utf-8')
+registry_state = (ROOT / 'compiler/src/raz_driver/src/driver/registry_state.rz').read_text(encoding='utf-8')
+project = (ROOT / 'compiler/src/raz_driver/src/driver/project.rz').read_text(encoding='utf-8')
+incremental = (ROOT / 'compiler/src/raz_driver/src/driver/incremental.rz').read_text(encoding='utf-8')
 
 checks = {
     'root raz.toml lock path uses exact 10-byte length': 'package_lock_collect(\n        mp,\n        10,' in package,
@@ -23,21 +27,21 @@ checks = {
     'tree metadata traversal preserves path dependency fallback': package.count('if (drl <= 0) {') >= 2 and 'drl = path_join(root, root_length, dep, dl, dep_root, 8192);' in package,
     'build constraint validation resolves registry alias through verified store cache': 'i64 rl = registry_cached_root(alias, alias_length, root, 8192);' in registry,
     'build constraint validation preserves local path dependency fallback': 'i64 dl = registry_root_dependency_path(alias, alias_length, dependency, 8192);' in registry and 'rl = path_join(root, 1, dependency, dl, manifest_path, 8192);' in registry,
-    'semver greater-equal remains inclusive': 'if (mode == 3) {\n        return cmp >= 0;' in registry,
+    'semver greater-equal remains inclusive': 'if (mode == 3) {\n        return cmp >= 0;' in registry_semver,
     'project cache records sibling lockfile input': 'fn project_record_lock_input(' in project and 'project_record_input(state, lock_path, lock_length)' in project,
     'lockfile path join uses arena handle rather than array reference': 'i64 lock_name = raz_compiler_rt_arena_create(8);' in project and 'path_join(root, root_length, lock_name, 8, lock_path, 8192)' in project and '&lock_name' not in project,
     'project assembly records lockfile after manifest root resolution': '!project_record_lock_input(state, root, root_length)' in project,
     'lockfile input is optional for path-only projects': 'raz_compiler_rt_path_exists_ascii(lock_path, lock_length) == 0' in project,
     'incremental cache schema invalidates pre-target-layout caches': 'fn incremental_cache_schema() -> i64 {\n    return 8;\n}' in incremental,
-    'project package cache lives directly under target': 'string bytes = "target/raz.cache";' in registry,
-    'project registry tracking lives directly under target': 'string bytes = "target/raz.registry";' in registry,
-    'legacy package-manager state is migrated on first access': 'fn registry_project_state_prepare(' in registry and 'raz_compiler_rt_copy_file_ascii(r16, r16_length, output, length)' in registry and 'raz_compiler_rt_copy_file_ascii(root_legacy, root_length, output, length)' in registry,
+    'project package cache lives directly under target': 'string bytes = "target/raz.cache";' in registry_state,
+    'project registry tracking lives directly under target': 'string bytes = "target/raz.registry";' in registry_state,
+    'legacy package-manager state is migrated on first access': 'fn registry_project_state_prepare(' in registry_state and 'raz_compiler_rt_copy_file_ascii(r16, r16_length, output, length)' in registry_state and 'raz_compiler_rt_copy_file_ascii(root_legacy, root_length, output, length)' in registry_state,
     'package lock cache lookup uses canonical project-state helper': 'registry_project_state_prepare(0, path, 20)' in registry,
     'Git materializations live under target': 'string parent_bytes = "./target/git";' in package,
     'ordinary build preflight rehydrates Git cache': 'status = package_git_fetch_tracked();' in registry,
-    'locked registry packages reuse shared store before index lookup': registry.find('registry_store_path(checksum, checksum_length, locked_store, 8192)') < registry.find('registry_resolve_mode(\n        name,\n        name_length,\n        version,'),
+    'locked registry packages reuse shared store before index lookup': registry_all.find('registry_store_path(checksum, checksum_length, locked_store, 8192)') < registry_all.find('registry_resolve_mode(\n        name,\n        name_length,\n        version,'),
     'offline locked build avoids registry index when shared store is present': 'if (registry_offline()) {\n        return 64;' in registry,
-    'registry state path ownership is centralized outside project assembly': 'fn project_registry_cache_path(' not in project and 'fn registry_project_state_prepare(' in registry,
+    'registry state path ownership is centralized outside project assembly': 'fn project_registry_cache_path(' not in project and 'fn registry_project_state_prepare(' in registry_state and 'fn registry_project_state_prepare(' not in registry,
 }
 failed=[name for name,ok in checks.items() if not ok]
 if failed:

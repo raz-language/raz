@@ -1,0 +1,69 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::page_css;
+
+import alloc::string;
+import web::build::fs;
+
+extern fn raz_rt_load_u8(usize address) -> i64;
+extern fn raz_rt_cstr_len(string value) -> i64;
+
+fn string_contains(String& haystack, String& needle) -> bool {
+    i64 haystack_length = haystack.len();
+    i64 needle_length = needle.len();
+    if (needle_length == 0) { return true; }
+    if (needle_length > haystack_length) { return false; }
+    usize haystack_data = haystack.as_ptr();
+    usize needle_data = needle.as_ptr();
+    i64 start = 0;
+    while (start + needle_length <= haystack_length) {
+        i64 i = 0;
+        bool same = true;
+        while (i < needle_length) {
+            if (raz_rt_load_u8(haystack_data + start + i) != raz_rt_load_u8(needle_data + i)) {
+                same = false;
+                break;
+            }
+            i += 1;
+        }
+        if (same) { return true; }
+        start += 1;
+    }
+    return false;
+}
+
+public fn append_css_rule(String&mut css, string prefix, string name, string selector, string declarations) -> bool {
+    String rule = String::with_capacity(raz_rt_cstr_len(prefix) + raz_rt_cstr_len(name) + raz_rt_cstr_len(selector) + raz_rt_cstr_len(declarations) + 24);
+    if (!rule.push_str(prefix)) { return false; }
+    if (raz_rt_cstr_len(name) > 0 && !rule.push_str(name)) { return false; }
+    if (raz_rt_cstr_len(selector) > 0 && !rule.push_str(selector)) { return false; }
+    if (!rule.push_str(" { ") || !rule.push_str(declarations) || !rule.push_str(" }\n")) { return false; }
+    if (string_contains(&css, &rule)) { return true; }
+    return css.push_string(&rule);
+}
+
+public fn write_css_for_path(String& css, String& html_path) -> bool {
+    usize data = html_path.as_ptr();
+    i64 length = html_path.len();
+    i64 slash = -1;
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 47 || ch == 92) { slash = i; }
+        i += 1;
+    }
+
+    String css_path = String::with_capacity(length + 16);
+    i = 0;
+    while (i <= slash) {
+        if (!css_path.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    if (!css_path.push_str("app.css")) { return false; }
+    if (css.len() == 0) {
+        return web::build::fs::remove_file_if_present(&css_path);
+    }
+    return web::build::fs::write_string(&css_path, &css);
+}
+

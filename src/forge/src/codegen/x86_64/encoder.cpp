@@ -814,6 +814,45 @@ void emit_adjust_rsp(Buffer& out, bool subtract, std::uint32_t amount) {
     out.i32(static_cast<std::int32_t>(amount));
 }
 
+// Both Windows and Linux grow a thread stack on demand through a guard page
+// directly below the committed region. Moving rsp down by more than one page in
+// a single instruction steps over that guard, so the next access faults on
+// reserved-but-uncommitted memory instead of extending the stack. A frame
+// larger than a page therefore has to walk down and touch each page it claims.
+//
+// r11 is volatile and carries no incoming value in either ABI, so the walk can
+// use it as its counter.
+inline constexpr std::uint32_t stack_probe_page = 4096U;
+
+void emit_stack_frame_allocation(Buffer& out, std::uint32_t frame_size) {
+    if (frame_size == 0) return;
+    if (frame_size <= stack_probe_page) {
+        emit_adjust_rsp(out, true, frame_size);
+        return;
+    }
+
+    const std::uint32_t pages = frame_size / stack_probe_page;
+    const std::uint32_t remainder = frame_size % stack_probe_page;
+
+    // mov r11d, pages
+    out.byte(0x41); out.byte(0xBB); out.i32(static_cast<std::int32_t>(pages));
+
+    const auto loop_start = out.size();
+    // sub rsp, 4096
+    out.byte(0x48); out.byte(0x81); out.byte(0xEC); out.i32(static_cast<std::int32_t>(stack_probe_page));
+    // or qword ptr [rsp], 0   -- touch the page without disturbing its contents
+    out.byte(0x48); out.byte(0x83); out.byte(0x0C); out.byte(0x24); out.byte(0x00);
+    // sub r11d, 1
+    out.byte(0x41); out.byte(0x83); out.byte(0xEB); out.byte(0x01);
+    // jnz loop_start
+    out.byte(0x75);
+    const auto branch_end = out.size() + 1U;
+    out.byte(static_cast<std::uint8_t>(static_cast<std::int8_t>(
+        static_cast<std::ptrdiff_t>(loop_start) - static_cast<std::ptrdiff_t>(branch_end))));
+
+    emit_adjust_rsp(out, true, remainder);
+}
+
 Register physical_register(machine::PhysicalRegister physical) {
     switch (physical) {
     case machine::PhysicalRegister::r8d: return Register::r8d;
@@ -2406,9 +2445,7 @@ EncodedFunction encode_function(const machine::Function& source_function, Abi ab
         out.byte(0x55);
         out.byte(0x48); out.byte(0x89); out.byte(0xE5);
     }
-    if (encoded_frame_size != 0) {
-        out.byte(0x48); out.byte(0x81); out.byte(0xEC); out.i32(static_cast<std::int32_t>(encoded_frame_size));
-    }
+    emit_stack_frame_allocation(out, encoded_frame_size);
     if (capture_r8) emit_store_stack64(out, Register::r8d, r8_capture_offset);
     if (capture_r9) emit_store_stack64(out, Register::r9d, r9_capture_offset);
     for (const auto reg : callee_saved) emit_push_physical(out, reg);

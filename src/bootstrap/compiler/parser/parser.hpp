@@ -77,6 +77,10 @@ class Parser final {
   std::vector<Token> tokens_;
   std::size_t position_ = 0;
   bool allow_struct_literal_ = true;
+  // Set while parsing a `for ... in` iterable, where a following '{' may open
+  // either a struct literal or the loop body.
+  bool struct_literal_requires_fields_ = false;
+  [[nodiscard]] bool brace_opens_struct_fields() const noexcept;
 };
 
 }  // namespace raz::compiler

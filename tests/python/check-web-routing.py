@@ -23,7 +23,56 @@ def build_fixture(raz: Path, source: Path, dest: Path, env: dict[str, str]) -> t
         shutil.rmtree(dest)
     shutil.copytree(source, dest)
     result = run([str(raz), "build", "--release", "--forge-native", "--forge-structured-only"], dest, env)
-    return result.returncode == 0, result.stdout
+    output = result.stdout
+    if result.returncode != 0:
+        output += f"\nweb-routing: child build exit code {result.returncode}\n"
+        dist = dest / "dist"
+        assets = dist / "assets"
+        probes = [
+            ("dist", dist),
+            ("app.wasm", assets / "app.wasm"),
+            ("app.js", assets / "app.js"),
+            ("app.css", assets / "app.css"),
+            ("index.html", dist / "index.html"),
+        ]
+        output += "web-routing: partial reactive artifact state:\n"
+        for label, probe in probes:
+            output += f"  {label}: {'present' if probe.exists() else 'missing'}\n"
+        fingerprinted = sorted(p.name for p in assets.glob("app.*.*")) if assets.is_dir() else []
+        if fingerprinted:
+            output += "  fingerprinted: " + ", ".join(fingerprinted) + "\n"
+    elif "warning[D2052]" in output:
+        output += "\nweb-routing: redundant Copy-move warning leaked from the web dependency graph\n"
+        return False, output
+    return result.returncode == 0, output
+
+
+def read_uleb32(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data) and shift <= 35:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            return value, offset
+        shift += 7
+    raise ValueError("invalid u32 LEB128")
+
+
+def wasm_code_section_payload_size(path: Path) -> int:
+    data = path.read_bytes()
+    if len(data) < 8 or data[:4] != b"\x00asm":
+        raise ValueError("not a WebAssembly module")
+    offset = 8
+    while offset < len(data):
+        section_id = data[offset]
+        offset += 1
+        payload_size, payload_start = read_uleb32(data, offset)
+        if section_id == 10:
+            return payload_size
+        offset = payload_start + payload_size
+    raise ValueError("WebAssembly code section missing")
 
 
 def main() -> int:
@@ -40,11 +89,15 @@ def main() -> int:
 
     env = os.environ.copy()
     env["RAZ_HOME"] = str(ROOT)
+    # Keep the successful qualification on the exact normal compiler path.
+    # Phase tracing is enabled only for a diagnostic rerun after a child failure;
+    # instrumentation must never change allocator/runtime behavior of the gate.
     runtime = ROOT / "build/release/src/runtime/libraz_runtime.a"
     if runtime.is_file():
         env["RAZ_RUNTIME_LIBRARY"] = str(runtime)
 
     static_work = work / "static"
+    print("web-routing: building static routing fixture", flush=True)
     ok, output = build_fixture(raz, STATIC, static_work, env)
     if not ok:
         print(output)
@@ -79,9 +132,16 @@ def main() -> int:
         return 1
 
     reactive_work = work / "reactive"
+    print("web-routing: building reactive routing fixture", flush=True)
     ok, output = build_fixture(raz, REACTIVE, reactive_work, env)
     if not ok:
+        diagnostic_env = env.copy()
+        diagnostic_env["RAZ_COMPILER_PHASE_TRACE"] = "1"
+        diagnostic_work = work / "reactive-diagnostic"
+        _, diagnostic_output = build_fixture(raz, REACTIVE, diagnostic_work, diagnostic_env)
         print(output)
+        print("web-routing: diagnostic rerun with compiler phase tracing:")
+        print(diagnostic_output)
         return 1
     js_candidates = sorted((reactive_work / "dist/assets").glob("app.*.js"))
     wasm_candidates = sorted((reactive_work / "dist/assets").glob("app.*.wasm"))
@@ -102,6 +162,14 @@ def main() -> int:
         print("web-routing: generated WebAssembly failed engine validation")
         print(validate.stdout)
         return 1
+    try:
+        code_payload_size = wasm_code_section_payload_size(wasm)
+    except ValueError as exc:
+        print(f"web-routing: could not inspect generated WebAssembly code section: {exc}")
+        return 1
+    if code_payload_size <= 65536:
+        print(f"web-routing: routing fixture no longer exercises >64KiB Wasm code-section growth ({code_payload_size} bytes)")
+        return 1
     js_text = js.read_text(encoding="utf-8")
     required_js = ["setRoute(browserRoute())", "popstate", "data-raz-nav", "history.pushState"]
     missing_js = [item for item in required_js if item not in js_text]
@@ -112,6 +180,9 @@ def main() -> int:
         return 1
 
     web_lib = (ROOT / "library/web/src/lib.rz").read_text(encoding="utf-8")
+    web_page = "\n".join((ROOT / f"library/web/src/{name}").read_text(encoding="utf-8") for name in ("page.rz", "page_output.rz"))
+    web_routes = (ROOT / "library/web/src/routes.rz").read_text(encoding="utf-8")
+    web_static = web_lib + "\n" + web_page + "\n" + web_routes
     required_static_api = [
         "public fn route_path(string pattern) -> String",
         "public fn route_bind(String&mut path, string name, string value) -> bool",
@@ -120,14 +191,14 @@ def main() -> int:
         "public fn write_component_route_path(String& route, string title",
         "if (first == 58 || first == 42) { return false; }",
     ]
-    missing_static_api = [item for item in required_static_api if item not in web_lib]
+    missing_static_api = [item for item in required_static_api if item not in web_static]
     if missing_static_api:
         print("web-routing: static prerender API invariant missing:")
         for item in missing_static_api:
             print("  ", item)
         return 1
 
-    ui = (ROOT / "library/web/ui/ui.rz").read_text(encoding="utf-8")
+    ui = '\n'.join(p.read_text(encoding='utf-8') for p in sorted((ROOT / 'library/web/ui').glob('*.rz')))
     required_api = [
         "public fn route_match(string pattern) -> bool",
         "public fn route_param(string pattern, string name) -> String",

@@ -1,0 +1,144 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_common::writer;
+
+public import mir::interpreter;
+
+// Backend-neutral growable byte/text writer. Backends own their encoding and
+// lowering semantics; this package owns only deterministic buffering utilities.
+public struct CodegenWriter {
+    i64 data;
+    i64 capacity;
+    i64 length;
+    bool failed;
+}
+
+public fn codegen_writer_init_capacity(CodegenWriter&mut out, i64 initial_capacity) {
+    out.capacity = initial_capacity;
+    if (out.capacity < 256) { out.capacity = 256; }
+    out.data = raz_compiler_rt_arena_create(out.capacity);
+    out.length = 0;
+    out.failed = out.data == 0;
+}
+
+public fn codegen_writer_init(CodegenWriter&mut out) {
+    codegen_writer_init_capacity(out, 8388608);
+}
+
+public fn codegen_writer_destroy(CodegenWriter&mut out) {
+    if (out.data != 0) { raz_compiler_rt_arena_destroy(out.data); }
+    out.data = 0;
+    out.capacity = 0;
+    out.length = 0;
+}
+
+/// Ensures `additional` cells can be appended. Growth uses the compiler arena's
+/// realloc path so native self-hosts can extend in place and never expose a
+/// separate allocate/copy/free lifetime transition to the writer reference.
+public fn codegen_writer_reserve(CodegenWriter&mut out, i64 additional) -> bool {
+    if (out.failed || additional < 0) { return false; }
+    if (additional == 0) { return true; }
+    if (out.length > 9223372036854775807 - additional) {
+        out.failed = true;
+        return false;
+    }
+    i64 required = out.length + additional;
+    if (required <= out.capacity) { return true; }
+
+    i64 next_capacity = out.capacity;
+    if (next_capacity < 256) { next_capacity = 256; }
+    while (next_capacity < required) {
+        if (next_capacity > 4611686018427387903) {
+            next_capacity = required;
+        } else {
+            next_capacity *= 2;
+        }
+        if (next_capacity < required && next_capacity <= out.capacity) {
+            out.failed = true;
+            return false;
+        }
+    }
+
+    i64 next_data = raz_compiler_rt_arena_resize(out.data, next_capacity);
+    if (next_data == 0) {
+        out.failed = true;
+        return false;
+    }
+    out.data = next_data;
+    out.capacity = next_capacity;
+    return true;
+}
+
+/// Appends an already-materialized writer in one arena copy. This is both
+/// faster than thousands of `put` calls and guarantees capacity cannot change
+/// while the source writer is being read.
+public fn codegen_writer_append(CodegenWriter&mut out, CodegenWriter& source) -> bool {
+    if (out.failed || source.failed || source.length < 0) { return false; }
+    if (source.length == 0) { return true; }
+    if (!codegen_writer_reserve(out, source.length)) { return false; }
+    if (raz_compiler_rt_arena_copy(out.data, out.length, source.data, 0, source.length) != source.length) {
+        out.failed = true;
+        return false;
+    }
+    out.length += source.length;
+    return true;
+}
+
+public fn codegen_writer_put(CodegenWriter&mut out, i64 code) {
+    if (out.failed) { return; }
+    if (!codegen_writer_reserve(out, 1)) { return; }
+    raz_compiler_rt_arena_set_unchecked(out.data, out.length, code);
+    out.length += 1;
+}
+
+public fn codegen_writer_literal(CodegenWriter&mut out, string data) {
+    i64 i = 0;
+    i64 length = compiler_literal_length(data);
+    while (i < length) {
+        codegen_writer_put(out, compiler_literal_byte(data, i));
+        i += 1;
+    }
+}
+
+public fn codegen_writer_space(CodegenWriter&mut out) { codegen_writer_put(out, 32); }
+public fn codegen_writer_newline(CodegenWriter&mut out) { codegen_writer_put(out, 10); }
+
+public fn codegen_writer_decimal(CodegenWriter&mut out, i64 value) {
+    if (value == (-9223372036854775807 - 1)) {
+        codegen_writer_literal(out, "-9223372036854775808");
+        return;
+    }
+    if (value == 0) { codegen_writer_put(out, 48); return; }
+    i64 remaining = value;
+    if (remaining < 0) { codegen_writer_put(out, 45); remaining = 0 - remaining; }
+    i64 digits[24];
+    i64 count = 0;
+    while (remaining > 0) {
+        i64 quotient = compiler_div_nonnegative(remaining, 10);
+        digits[count] = remaining - quotient * 10;
+        count += 1;
+        remaining = quotient;
+    }
+    while (count > 0) {
+        count -= 1;
+        codegen_writer_put(out, 48 + digits[count]);
+    }
+}
+
+public fn writer_text(CodegenWriter&mut out, Source& source, i64 offset, i64 length) {
+    i64 i = 0;
+    while (i < length) {
+        codegen_writer_put(out, source_byte(source, offset + i));
+        i += 1;
+    }
+}
+
+public fn writer_i32(CodegenWriter&mut out) {
+    codegen_writer_put(out, 105); codegen_writer_put(out, 51); codegen_writer_put(out, 50);
+}
+
+public fn writer_i64(CodegenWriter&mut out) {
+    codegen_writer_put(out, 105); codegen_writer_put(out, 54); codegen_writer_put(out, 52);
+}
+

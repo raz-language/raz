@@ -152,6 +152,43 @@ fn main() -> i64 {
 }
 '''
 
+    web_route_binding = r'''// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+import alloc::string;
+import web;
+
+fn main() -> i64 {
+    String blog = web::route_path("/blog/:year/:slug");
+    if (!web::route_bind(&mut blog, "year", "2026")) {
+        return 1;
+    }
+    if (!web::route_bind(&mut blog, "slug", "hello")) {
+        return 2;
+    }
+    if (!blog.as_str().equals("/blog/2026/hello")) {
+        return 3;
+    }
+
+    String docs = web::route_path("/docs/*path");
+    if (!web::route_bind_splat(&mut docs, "path", "guides/install")) {
+        return 4;
+    }
+    if (!docs.as_str().equals("/docs/guides/install")) {
+        return 5;
+    }
+
+    String unsafe_path = web::route_path("/docs/*path");
+    if (web::route_bind_splat(&mut unsafe_path, "path", "../escape")) {
+        return 6;
+    }
+    if (!unsafe_path.as_str().equals("/docs/*path")) {
+        return 7;
+    }
+    return 0;
+}
+'''
+
     hash_map_remove = r'''// Copyright 2026 Mario Vinciguerra
 // SPDX-License-Identifier: Apache-2.0
 
@@ -195,8 +232,9 @@ fn main() -> i64 {
     work_root.mkdir(parents=True, exist_ok=True)
     run_case(raz, work_root, "aggregate_reference_assignment", ["alloc"], aggregate_assignment)
     run_case(raz, work_root, "aggregate_globals", [], aggregate_globals)
+    run_case(raz, work_root, "web_route_binding", ["web"], web_route_binding)
     run_case(raz, work_root, "hash_map_string_remove", ["alloc", "core", "collections"], hash_map_remove)
-    print("production-runtime-regressions: PASS (aggregate reference assignment + aggregate globals + HashMap<String,String> removal/destruction/missing-pointer lookup)")
+    print("production-runtime-regressions: PASS (aggregate reference assignment + aggregate globals + web route binding ownership + HashMap<String,String> removal/destruction/missing-pointer lookup)")
     return 0
 
 

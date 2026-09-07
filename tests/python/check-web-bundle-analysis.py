@@ -31,6 +31,13 @@ def main() -> int:
     env["RAZ_HOME"] = str(ROOT)
     raz = str(Path(args.raz).resolve())
 
+    manifest = work / "raz.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        + "\n[web.budget]\ntotal = 100000000\nhtml = 100000000\ncss = 100000000\njavascript = 100000000\nwasm = 100000000\nmetadata = 100000000\nassets = 100000000\n",
+        encoding="utf-8",
+    )
+
     result = run([raz, "build", "--release", "--analyze"], work, env)
     if result.returncode != 0:
         print(result.stdout)
@@ -51,6 +58,9 @@ def main() -> int:
     if "Logical asset map:" not in report or "assets/app.css" not in report or "assets/app.js" not in report or "assets/app.wasm" not in report:
         print("web-bundle-analysis: logical-to-fingerprinted asset map missing")
         return 1
+    if "Budgets:" not in report or "javascript:" not in report or "EXCEEDED" in report:
+        print("web-bundle-analysis: passing [web.budget] report missing or unexpectedly exceeded")
+        return 1
 
     dist = work / "dist"
     deployable_total = sum(p.stat().st_size for p in dist.rglob("*") if p.is_file())
@@ -61,6 +71,27 @@ def main() -> int:
         return 1
     if (dist / "web-bundle-analysis.txt").exists():
         print("web-bundle-analysis: analysis report leaked into deployable dist tree")
+        return 1
+
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("javascript = 100000000", "javascript = 1"),
+        encoding="utf-8",
+    )
+    over_budget = run([raz, "build", "--release", "--analyze"], work, env)
+    over_report = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
+    if over_budget.returncode == 0 or "Web bundle budget exceeded." not in over_budget.stdout or "javascript:" not in over_report or "EXCEEDED" not in over_report:
+        print("web-bundle-analysis: javascript budget overflow was not enforced")
+        print(over_budget.stdout)
+        return 1
+
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("javascript = 1", 'javascript = "invalid"'),
+        encoding="utf-8",
+    )
+    malformed = run([raz, "build", "--release", "--analyze"], work, env)
+    if malformed.returncode == 0 or "invalid [web.budget] byte value for javascript" not in malformed.stdout:
+        print("web-bundle-analysis: malformed budget was not rejected")
+        print(malformed.stdout)
         return 1
 
     invalid = run([raz, "build", "--analyze"], work, env)

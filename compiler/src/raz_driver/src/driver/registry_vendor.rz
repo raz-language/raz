@@ -1,0 +1,331 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::registry_vendor;
+
+public import raz_driver::registry_install;
+import raz_driver::package;
+
+// Vendoring materializes the exact locked dependency graph into the project.
+// Registry packages retain their content-addressed directory names and pinned
+// Git checkouts are mirrored under vendor/git.  The .raz-vendor marker makes
+// normal builds prefer this tree and turns dependency hydration into a local
+// integrity check rather than a network/cache operation.
+fn registry_vendor_literal(string bytes) -> i64 {
+    i64 length = compiler_literal_length(bytes);
+    i64 output = raz_compiler_rt_arena_create(length);
+
+    if (output == 0) {
+        return 0;
+    }
+
+    i64 i = 0;
+
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(bytes, i));
+        i += 1;
+    }
+    return output;
+}
+
+fn registry_vendor_marker_write() -> i64 {
+    i64 path = registry_vendor_literal("./.raz-vendor");
+    i64 body = registry_vendor_literal("RAZVENDOR1\n");
+
+    if (path == 0 || body == 0) {
+        return 40;
+    }
+
+    i64 written = raz_compiler_rt_write_ascii(path, 13, body, 11);
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(body);
+    if (written == 11) {
+        return 0;
+    }
+    return 56;
+}
+
+fn registry_vendor_marker_remove() {
+    i64 path = registry_vendor_literal("./.raz-vendor");
+
+    if (path == 0) {
+        return;
+    }
+    if (raz_compiler_rt_path_exists_ascii(path, 13) != 0) {
+        raz_compiler_rt_remove_path_ascii(path, 13);
+    }
+    raz_compiler_rt_arena_destroy(path);
+}
+
+fn registry_vendor_copy_locked_entry(i64 checksum, i64 checksum_length) -> i64 {
+    i64 source = raz_compiler_rt_arena_create(8192);
+    i64 destination = raz_compiler_rt_arena_create(8192);
+
+    if (source == 0 || destination == 0) {
+        return 40;
+    }
+
+    i64 sl = registry_store_path(checksum, checksum_length, source, 8192);
+    i64 dl = registry_vendor_path(checksum, checksum_length, destination, 8192);
+
+    if (sl <= 0 || dl <= 0 || !registry_store_verify(source, sl, checksum, checksum_length)) {
+        return 78;
+    }
+    if (raz_compiler_rt_copy_tree_ascii(source, sl, destination, dl) != 0) {
+        return 56;
+    }
+    if (!registry_store_verify(destination, dl, checksum, checksum_length)) {
+        return 78;
+    }
+    raz_compiler_rt_arena_destroy(source);
+    raz_compiler_rt_arena_destroy(destination);
+    return 0;
+}
+
+fn registry_vendor_copy_lock_data(i64 data, i64 length) -> i64 {
+    i64 checksum = raz_compiler_rt_arena_create(128);
+    i64 source = raz_compiler_rt_arena_create(64);
+
+    if (data == 0 || length < 0 || checksum == 0 || source == 0) {
+        return 40;
+    }
+
+    i64 checksum_length = 0;
+    bool registry_source = false;
+    i64 pos = 0;
+
+    while (pos < length) {
+        i64 start = pos;
+
+        while (
+            pos < length &&
+            raz_compiler_rt_arena_get(data, pos) != 10 &&
+            raz_compiler_rt_arena_get(data, pos) != 13
+        ) {
+            pos += 1;
+        }
+
+        i64 end = pos;
+
+        while (
+            pos < length &&
+            (raz_compiler_rt_arena_get(data, pos) == 10 || raz_compiler_rt_arena_get(data, pos) == 13)
+        ) {
+            pos += 1;
+        }
+
+        string package_header = "[[package]]";
+        bool header = end - start == 11;
+        i64 i = 0;
+
+        while (header && i < 11) {
+            if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(package_header, i)) {
+                header = false;
+            }
+            i += 1;
+        }
+        if (header) {
+            if (registry_source) {
+                i64 status = registry_vendor_copy_locked_entry(checksum, checksum_length);
+
+                if (status != 0) {
+                    return status;
+                }
+            }
+            checksum_length = 0;
+            registry_source = false;
+            continue;
+        }
+
+        i64 equal = start;
+
+        while (equal < end && raz_compiler_rt_arena_get(data, equal) != 61) {
+            equal += 1;
+        }
+        if (equal >= end) {
+            continue;
+        }
+
+        if (registry_lock_key_equals_literal(data, start, equal, "checksum")) {
+            checksum_length = copy_quoted_value(data, equal + 1, end, checksum, 128);
+        } else if (registry_lock_key_equals_literal(data, start, equal, "source")) {
+            i64 sl = copy_quoted_value(data, equal + 1, end, source, 64);
+            string expected = "registry";
+
+            registry_source = sl == 8;
+            i = 0;
+            while (registry_source && i < 8) {
+                if (raz_compiler_rt_arena_get(source, i) != compiler_literal_byte(expected, i)) {
+                    registry_source = false;
+                }
+                i += 1;
+            }
+        }
+    }
+    if (registry_source) {
+        i64 status = registry_vendor_copy_locked_entry(checksum, checksum_length);
+
+        if (status != 0) {
+            return status;
+        }
+    }
+    raz_compiler_rt_arena_destroy(checksum);
+    raz_compiler_rt_arena_destroy(source);
+    return 0;
+}
+
+fn registry_vendor_copy_git() -> i64 {
+    i64 source = registry_vendor_literal("./target/git");
+    i64 destination = registry_vendor_literal("./vendor/git");
+
+    if (source == 0 || destination == 0) {
+        return 40;
+    }
+    if (raz_compiler_rt_path_exists_ascii(source, 12) == 0) {
+        raz_compiler_rt_arena_destroy(source);
+        raz_compiler_rt_arena_destroy(destination);
+        return 0;
+    }
+
+    i64 copy_status = raz_compiler_rt_copy_tree_ascii(source, 12, destination, 12);
+
+    raz_compiler_rt_arena_destroy(source);
+    raz_compiler_rt_arena_destroy(destination);
+    if (copy_status == 0) {
+        return 0;
+    }
+    return 56;
+}
+
+fn package_vendor_check() -> i64 {
+    if (!registry_vendor_active()) {
+        return 78;
+    }
+    i64 path = registry_vendor_literal("./raz.lock");
+    i64 data = raz_compiler_rt_arena_create(2097152);
+
+    if (path == 0 || data == 0) {
+        return 40;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(path, 10, data, 2097152);
+
+    if (length < 0) {
+        return 57;
+    }
+
+    i64 status = registry_vendor_verify_lock_data(data, length);
+
+    if (status == 0) {
+        status = package_git_vendor_verify_tracked();
+    }
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(data);
+    return status;
+}
+
+fn package_vendor_command(i64 argc) -> i64 {
+    bool check_only = false;
+
+    if (argc == 3) {
+        i64 arg = raz_compiler_rt_arena_create(64);
+
+        if (arg == 0) {
+            return 40;
+        }
+
+        i64 al = raz_compiler_rt_process_arg(2, arg, 64);
+        string check = "--check";
+
+        check_only = al == 7;
+
+        i64 i = 0;
+
+        while (check_only && i < 7) {
+            if (raz_compiler_rt_arena_get(arg, i) != compiler_literal_byte(check, i)) {
+                check_only = false;
+            }
+            i += 1;
+        }
+        raz_compiler_rt_arena_destroy(arg);
+        if (!check_only) {
+            return 55;
+        }
+    } else if (argc != 2) {
+        return 55;
+    }
+    if (check_only) {
+        return package_vendor_check();
+    }
+    registry_vendor_marker_remove();
+    i64 lock_path = registry_vendor_literal("./raz.lock");
+    i64 probe = raz_compiler_rt_arena_create(1);
+
+    if (lock_path == 0 || probe == 0) {
+        return 40;
+    }
+
+    bool has_lock = raz_compiler_rt_read_ascii(lock_path, 10, probe, 1) >= 0;
+
+    raz_compiler_rt_arena_destroy(probe);
+
+    i64 status = 0;
+
+    if (has_lock) {
+        status = package_registry_fetch_command();
+    } else {
+        status = package_registry_update_command();
+    }
+    if (status != 0) {
+        return status;
+    }
+    i64 vendor = registry_vendor_literal("./vendor");
+    i64 registry_dir = registry_vendor_literal("./vendor/registry");
+    i64 git_dir = registry_vendor_literal("./vendor/git");
+
+    if (vendor == 0 || registry_dir == 0 || git_dir == 0) {
+        return 40;
+    }
+    if (raz_compiler_rt_path_exists_ascii(vendor, 8) != 0) {
+        raz_compiler_rt_remove_path_ascii(vendor, 8);
+    }
+    if (
+        raz_compiler_rt_create_dir_ascii(registry_dir, 17) != 0 ||
+        raz_compiler_rt_create_dir_ascii(git_dir, 12) != 0
+    ) {
+        return 56;
+    }
+
+    i64 data = raz_compiler_rt_arena_create(2097152);
+
+    if (data == 0) {
+        return 40;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(lock_path, 10, data, 2097152);
+
+    if (length < 0) {
+        return 57;
+    }
+    status = registry_vendor_copy_lock_data(data, length);
+    if (status == 0) {
+        status = registry_vendor_copy_git();
+    }
+    if (status == 0) {
+        status = registry_vendor_marker_write();
+    }
+    if (status == 0) {
+        status = package_vendor_check();
+    }
+    raz_compiler_rt_arena_destroy(lock_path);
+    raz_compiler_rt_arena_destroy(vendor);
+    raz_compiler_rt_arena_destroy(registry_dir);
+    raz_compiler_rt_arena_destroy(git_dir);
+    raz_compiler_rt_arena_destroy(data);
+    if (status == 0) {
+
+        cli_write_literal("Vendored locked dependencies into ./vendor\n");
+    }
+    return status;
+}

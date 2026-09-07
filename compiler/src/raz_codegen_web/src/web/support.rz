@@ -1,0 +1,189 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_web::support;
+
+public import common::writer;
+
+extern fn raz_rt_file_size(usize path, i64 length) -> i64;
+
+// Small browser-bundle filesystem/text helpers. Keep the actual web compiler
+// orchestration and JavaScript runtime emission in their own modules.
+
+public fn web_path_dirname(i64 path, i64 length, i64 output, i64 capacity) -> i64 {
+    if (path == 0 || output == 0 || length <= 0 || capacity <= 0) { return -1; }
+    i64 end = length;
+    while (
+        end > 0 &&
+        raz_compiler_rt_arena_get(path, end - 1) != 47 &&
+        raz_compiler_rt_arena_get(path, end - 1) != 92
+    ) {
+        end -= 1;
+    }
+    if (end == 0) {
+        raz_compiler_rt_arena_set(output, 0, 46);
+        return 1;
+    }
+    i64 count = end - 1;
+    if (count <= 0) { count = 1; }
+    if (count > capacity) { return -1; }
+    i64 i = 0;
+    while (i < count) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(path, i));
+        i += 1;
+    }
+    return count;
+}
+
+fn web_path_join(i64 left, i64 left_length, i64 right, i64 right_length, i64 output, i64 capacity) -> i64 {
+    if (left == 0 || right == 0 || output == 0 || left_length <= 0 || right_length <= 0) { return -1; }
+    bool slash = raz_compiler_rt_arena_get(left, left_length - 1) != 47 && raz_compiler_rt_arena_get(left, left_length - 1) != 92;
+    i64 needed = left_length + right_length;
+    if (slash) { needed += 1; }
+    if (needed > capacity) { return -1; }
+    i64 i = 0;
+    while (i < left_length) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(left, i));
+        i += 1;
+    }
+    i64 cursor = left_length;
+    if (slash) {
+        raz_compiler_rt_arena_set(output, cursor, 47);
+        cursor += 1;
+    }
+    i = 0;
+    while (i < right_length) {
+        raz_compiler_rt_arena_set(output, cursor + i, raz_compiler_rt_arena_get(right, i));
+        i += 1;
+    }
+    return cursor + right_length;
+}
+
+public fn web_create_dir_ascii(i64 path, i64 path_length) -> i64 {
+    usize bytes = compiler_ascii_pack(path, 0, path_length);
+    if (path_length > 0 && bytes == 0) { return -1; }
+    i64 result = raz_rt_create_dir_one(bytes, path_length);
+    if (bytes != 0) { raz_rt_dealloc_aligned(bytes, 8); }
+    // Existing directories are success for artifact emission.
+    if (result == 1 || result == 0) { return 0; }
+    return result;
+}
+
+fn web_copy_literal(i64 output, i64 capacity, string text) -> i64 {
+    if (output == 0 || capacity <= 0) { return -1; }
+    i64 length = compiler_literal_length(text);
+    if (length > capacity) { return -1; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(text, i));
+        i += 1;
+    }
+    return length;
+}
+
+public fn web_join_literal(i64 left, i64 left_length, string right_text, i64 output, i64 capacity) -> i64 {
+    i64 right_length = compiler_literal_length(right_text);
+    i64 right = raz_compiler_rt_arena_create(right_length);
+    if (right == 0) { return -1; }
+    i64 copied = web_copy_literal(right, right_length, right_text);
+    if (copied != right_length) {
+        raz_compiler_rt_arena_destroy(right);
+        return -1;
+    }
+    i64 result = web_path_join(left, left_length, right, right_length, output, capacity);
+    raz_compiler_rt_arena_destroy(right);
+    return result;
+}
+
+fn web_writer_html_escaped_arena(CodegenWriter&mut out, i64 data, i64 length) {
+    i64 i = 0;
+    while (i < length) {
+        i64 value = raz_compiler_rt_arena_get(data, i);
+        if (value == 38) { codegen_writer_literal(out, "&amp;"); }
+        else if (value == 60) { codegen_writer_literal(out, "&lt;"); }
+        else if (value == 62) { codegen_writer_literal(out, "&gt;"); }
+        else if (value == 34) { codegen_writer_literal(out, "&quot;"); }
+        else { codegen_writer_put(out, value); }
+        i += 1;
+    }
+}
+
+public fn web_append_file(CodegenWriter&mut out, i64 path, i64 path_length) -> bool {
+    if (path == 0 || path_length <= 0) { return true; }
+    usize packed = compiler_ascii_pack(path, 0, path_length);
+    if (packed == 0) { return false; }
+    i64 size = raz_rt_file_size(packed, path_length);
+    raz_rt_dealloc_aligned(packed, 8);
+    if (size < 0 || size > 16777216) { return false; }
+    if (size == 0) { return true; }
+    i64 data = raz_compiler_rt_arena_create(size);
+    if (data == 0) { return false; }
+    i64 read = raz_compiler_rt_read_ascii(path, path_length, data, size);
+    if (read != size) { raz_compiler_rt_arena_destroy(data); return false; }
+    i64 i = 0;
+    while (i < read) { codegen_writer_put(out, raz_compiler_rt_arena_get(data, i)); i += 1; }
+    raz_compiler_rt_arena_destroy(data);
+    return !out.failed;
+}
+
+public fn web_copy_text_file(i64 source, i64 source_length, i64 destination, i64 destination_length) -> bool {
+    if (source == 0 || source_length <= 0) { return false; }
+    CodegenWriter out;
+    codegen_writer_init_capacity(&mut out, 65536);
+    if (out.failed) { return false; }
+    bool ok = web_append_file(&mut out, source, source_length);
+    if (ok) { ok = raz_compiler_rt_write_ascii(destination, destination_length, out.data, out.length) == out.length; }
+    codegen_writer_destroy(&mut out);
+    return ok;
+}
+
+public fn web_write_index(i64 path, i64 path_length, i64 title, i64 title_length) -> bool {
+    CodegenWriter out;
+    codegen_writer_init_capacity(&mut out, 4096);
+    if (out.failed) { return false; }
+    codegen_writer_literal(&mut out, "<!doctype html>\n");
+    codegen_writer_literal(&mut out, "<html lang=\"en\">\n<head>\n");
+    codegen_writer_literal(&mut out, "  <meta charset=\"utf-8\">\n");
+    codegen_writer_literal(&mut out, "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    codegen_writer_literal(&mut out, "  <title>");
+    web_writer_html_escaped_arena(&mut out, title, title_length);
+    codegen_writer_literal(&mut out, "</title>\n");
+    codegen_writer_literal(&mut out, "  <link rel=\"stylesheet\" href=\"./assets/app.css\">\n");
+    codegen_writer_literal(&mut out, "</head>\n<body>\n");
+    codegen_writer_literal(&mut out, "  <div id=\"app\" data-raz-root></div>\n");
+    codegen_writer_literal(&mut out, "  <script type=\"module\" src=\"./assets/app.js\"></script>\n");
+    codegen_writer_literal(&mut out, "</body>\n</html>\n");
+    bool ok = !out.failed && raz_compiler_rt_write_ascii(path, path_length, out.data, out.length) == out.length;
+    codegen_writer_destroy(&mut out);
+    return ok;
+}
+
+public fn web_write_css(i64 path, i64 path_length, i64 extra_path, i64 extra_path_length) -> bool {
+    CodegenWriter out;
+    codegen_writer_init_capacity(&mut out, 4096);
+    if (out.failed) { return false; }
+    codegen_writer_literal(&mut out, "html, body { margin: 0; min-height: 100%; }\n");
+    codegen_writer_literal(&mut out, "#app[data-raz-root] { min-height: 100vh; }\n");
+    if (extra_path_length > 0) { codegen_writer_literal(&mut out, "\n/* User CSS from raz.toml [web].css */\n"); if (!web_append_file(&mut out, extra_path, extra_path_length)) { codegen_writer_destroy(&mut out); return false; } codegen_writer_literal(&mut out, "\n"); }
+    bool ok = !out.failed && raz_compiler_rt_write_ascii(path, path_length, out.data, out.length) == out.length;
+    codegen_writer_destroy(&mut out);
+    return ok;
+}
+
+public fn web_compact_generated_js(CodegenWriter&mut output, CodegenWriter& input) -> bool {
+    i64 cursor = 0;
+    while (cursor < input.length) {
+        i64 line_start = cursor;
+        while (cursor < input.length && raz_compiler_rt_arena_get(input.data, cursor) != 10) { cursor += 1; }
+        i64 line_end = cursor;
+        while (line_start < line_end && (raz_compiler_rt_arena_get(input.data, line_start) == 32 || raz_compiler_rt_arena_get(input.data, line_start) == 9)) { line_start += 1; }
+        while (line_end > line_start && (raz_compiler_rt_arena_get(input.data, line_end - 1) == 32 || raz_compiler_rt_arena_get(input.data, line_end - 1) == 9 || raz_compiler_rt_arena_get(input.data, line_end - 1) == 13)) { line_end -= 1; }
+        bool comment = line_end - line_start >= 2 && raz_compiler_rt_arena_get(input.data, line_start) == 47 && raz_compiler_rt_arena_get(input.data, line_start + 1) == 47;
+        if (!comment) {
+            i64 i = line_start;
+            while (i < line_end) { codegen_writer_put(output, raz_compiler_rt_arena_get(input.data, i)); i += 1; }
+        }
+        if (cursor < input.length) { cursor += 1; }
+    }
+    return !output.failed;
+}

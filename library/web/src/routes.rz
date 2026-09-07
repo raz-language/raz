@@ -1,0 +1,199 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::routes;
+
+import alloc::string;
+import web::build::fs;
+import web::html_support;
+
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+extern fn raz_rt_load_u8(usize address) -> i64;
+
+fn static_route_segment_forbidden(usize data, i64 start, i64 length) -> bool {
+    if (length == 1 && raz_rt_load_u8(data + start) == 46) { return true; }
+    if (length == 2 && raz_rt_load_u8(data + start) == 46 && raz_rt_load_u8(data + start + 1) == 46) { return true; }
+    return false;
+}
+
+fn static_route_valid(string route) -> bool {
+    i64 length = raz_rt_cstr_len(route);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(route);
+    if (raz_rt_load_u8(data) != 47) { return false; }
+    if (length == 1) { return true; }
+    i64 segment_start = 1;
+    i64 i = 1;
+    while (i <= length) {
+        i64 ch = 47;
+        if (i < length) { ch = raz_rt_load_u8(data + i); }
+        if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+        if (ch == 47) {
+            i64 segment_length = i - segment_start;
+            if (segment_length <= 0 || static_route_segment_forbidden(data, segment_start, segment_length)) { return false; }
+            segment_start = i + 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+public fn static_route_output(string route, String&mut output) -> bool {
+    if (!static_route_valid(route)) { return false; }
+    if (!output.push_str("dist")) { return false; }
+    i64 length = raz_rt_cstr_len(route);
+    if (length > 1 && !output.push_str(route)) { return false; }
+    if (!web::build::fs::create_dir_all(output.as_ptr(), output.len())) { return false; }
+    return output.push_str("/index.html");
+}
+
+fn route_name_byte(i64 ch) -> bool {
+    if (ch >= 48 && ch <= 57) { return true; }
+    if (ch >= 65 && ch <= 90) { return true; }
+    if (ch >= 97 && ch <= 122) { return true; }
+    return ch == 45 || ch == 95;
+}
+
+fn route_name_valid(string name) -> bool {
+    i64 length = raz_rt_cstr_len(name);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < length) {
+        if (!route_name_byte(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_value_valid(string value, bool splat) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    if (length <= 0) { return false; }
+    usize data = raz_rt_cstr_ptr(value);
+    i64 start = 0;
+    i64 i = 0;
+    while (i <= length) {
+        bool boundary = i == length;
+        i64 ch = 0;
+        if (!boundary) {
+            ch = raz_rt_load_u8(data + i);
+            if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+            boundary = ch == 47;
+        }
+        if (!boundary) { i += 1; continue; }
+        if (!splat && i != length) { return false; }
+        i64 segment_length = i - start;
+        if (segment_length <= 0 || static_route_segment_forbidden(data, start, segment_length)) { return false; }
+        start = i + 1;
+        i += 1;
+    }
+    return true;
+}
+
+fn static_route_marker_matches(usize data, i64 start, i64 length, i64 marker, string name) -> bool {
+    if (length <= 1 || raz_rt_load_u8(data + start) != marker) { return false; }
+    i64 name_length = raz_rt_cstr_len(name);
+    if (length - 1 != name_length) { return false; }
+    usize name_data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < name_length) {
+        if (raz_rt_load_u8(data + start + 1 + i) != raz_rt_load_u8(name_data + i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Copies a route pattern into an owned build-time path. Dynamic `:name` and
+/// final `*name` segments can then be bound with route_bind/route_bind_splat.
+public fn route_path(string pattern) -> String {
+    return String::from(pattern);
+}
+
+public fn route_bind_value(String&mut path, string name, string value, bool splat) -> bool {
+    if (!route_name_valid(name) || !static_route_value_valid(value, splat)) { return false; }
+    i64 length = path.len();
+    usize data = path.as_ptr();
+    i64 value_length = raz_rt_cstr_len(value);
+    usize value_data = raz_rt_cstr_ptr(value);
+    i64 i = 0;
+    while (i < length) {
+        if (raz_rt_load_u8(data + i) == 47) {
+            i64 start = i + 1;
+            i64 end = start;
+            while (end < length && raz_rt_load_u8(data + end) != 47) { end += 1; }
+            i64 marker = 58;
+            if (splat) { marker = 42; }
+            if (static_route_marker_matches(data, start, end - start, marker, name)) {
+                // Replace the marker in-place instead of assigning a second owned
+                // String through the caller's mutable reference. Besides avoiding
+                // an allocation for the common equal/smaller case, this keeps the
+                // route substitution free of aggregate replacement/destructor
+                // ordering and is safe even when the replacement aliases `path`.
+                return replace_range_bytes(path, start, end - start, value_data, value_length);
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+public fn route_bind(String&mut path, string name, string value) -> bool {
+    return route_bind_value(path, name, value, false);
+}
+
+public fn route_bind_splat(String&mut path, string name, string value) -> bool {
+    return route_bind_value(path, name, value, true);
+}
+
+fn static_route_string_valid(String& route) -> bool {
+    i64 length = route.len();
+    if (length <= 0) { return false; }
+    usize data = route.as_ptr();
+    if (raz_rt_load_u8(data) != 47) { return false; }
+    if (length == 1) { return true; }
+    i64 segment_start = 1;
+    i64 i = 1;
+    while (i <= length) {
+        i64 ch = 47;
+        if (i < length) { ch = raz_rt_load_u8(data + i); }
+        if (ch == 92 || ch == 63 || ch == 35 || ch == 0) { return false; }
+        if (ch == 47) {
+            i64 segment_length = i - segment_start;
+            if (segment_length <= 0 || static_route_segment_forbidden(data, segment_start, segment_length)) { return false; }
+            i64 first = raz_rt_load_u8(data + segment_start);
+            if (first == 58 || first == 42) { return false; }
+            segment_start = i + 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+public fn static_route_output_string(String& route, String&mut output) -> bool {
+    if (!static_route_string_valid(route)) { return false; }
+    if (!output.push_str("dist")) { return false; }
+    if (route.len() > 1 && !output.push_string(route)) { return false; }
+    if (!web::build::fs::create_dir_all(output.as_ptr(), output.len())) { return false; }
+    return output.push_str("/index.html");
+}
+
+/// Emits a host-independent redirect page at a static route. The generated
+/// document uses a standards-based meta refresh plus a normal fallback link;
+/// it intentionally requires no JavaScript or WebAssembly.
+public fn write_redirect(string route, string target) -> bool {
+    String path = String::new();
+    if (!static_route_output(route, &mut path)) { return false; }
+    String document = String::with_capacity(512 + raz_rt_cstr_len(target) * 2);
+    if (!document.push_str("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0;url=")) { return false; }
+    if (!web::html_support::append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\">\n<link rel=\"canonical\" href=\"")) { return false; }
+    if (!web::html_support::append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\"></head><body><p>Redirecting to <a href=\"")) { return false; }
+    if (!web::html_support::append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("\">")) { return false; }
+    if (!web::html_support::append_escaped_to(&mut document, target)) { return false; }
+    if (!document.push_str("</a>.</p></body></html>\n")) { return false; }
+    return web::build::fs::write_string(&path, &document);
+}
+

@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-inc = (root / "compiler/src/raz_driver/src/incremental.rz").read_text()
+inc = (root / "compiler/src/raz_driver/src/driver/incremental.rz").read_text()
 required = [
     "/mir.units", "RAZMIRUNITS 2\\n", "fn incremental_persist_mir_units(",
     "mir.function_count", "mir.instruction_count", "mir.function_module_ids",

@@ -1,0 +1,517 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::expression_operators;
+
+public import raz_hir::semantic::reflection;
+import raz_hir::semantic::statements;
+
+// Cast and binary-operator precedence lowering. Core primary-expression
+// dispatch remains in expressions.rz; this module owns the precedence ladder.
+fn hir_parse_cast(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 value = -1;
+
+    if (!hir_parse_primary(builder, &mut value)) {
+        return false;
+    }
+    if (builder.allow_moved_name == 0 && raz_compiler_rt_arena_get(builder.module.node_kinds, value) != 39) {
+        i64 root_kind = 0;
+        i64 root_index = -1;
+        i64 path = 0;
+
+        if (
+            hir_node_path(builder, value, &mut root_kind, &mut root_index, &mut path) &&
+            hir_path_is_moved(builder, root_kind, root_index, path)
+        ) {
+            // Whole-value availability is finalized by the CFG ownership pass.
+            if (!hir_root_is_whole_moved(builder, root_kind, root_index)) {
+                hir_fail(builder, DiagnosticCode::UseAfterMove);
+                return false;
+            }
+        }
+    }
+    while (
+        builder.current.kind == TokenKind::Identifier &&
+        token_is_as(&builder.scan.input, &builder.current)
+    ) {
+        hir_advance(builder);
+
+        i64 target_structure = -1;
+        i64 target_type = 0;
+        i64 target_reference = 0;
+        i64 target_slice = 0;
+        i64 target_slice_mutable = 0;
+
+        if (
+            !hir_parse_type_spec(
+                builder,
+                &mut target_structure,
+                &mut target_type,
+                &mut target_reference,
+                &mut target_slice,
+                &mut target_slice_mutable,
+            )
+        ) {
+            return false;
+        }
+        if (target_slice != 0 || target_reference == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+
+        i64 source_type = raz_compiler_rt_arena_get(builder.module.node_types, value);
+        i64 source_structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, value);
+        i64 source_reference = raz_compiler_rt_arena_get(builder.module.node_references, value);
+        bool source_borrow = source_reference == 1;
+        bool source_raw = source_reference == 2 || source_reference == 3;
+        bool target_raw = target_reference == 2 || target_reference == 3;
+
+        bool source_word =
+            source_reference == 0 &&
+            source_structure < 0 &&
+            (source_type == 0 || source_type == 8 || source_type == 9);
+        bool target_word =
+            target_reference == 0 &&
+            target_structure < 0 &&
+            (target_type == 0 || target_type == 8 || target_type == 9);
+        // Taking the numeric address of an existing borrow does not itself
+        // dereference raw memory, so it is safe.  This is the systems-level
+        // bridge used by FFI, atomics, buffers, and native package APIs.
+        bool borrow_address_cast = source_borrow && target_word;
+        bool raw_cast =
+            (source_raw && target_raw) ||
+            (source_raw && target_word) ||
+            (target_raw && source_word);
+        if (borrow_address_cast) {
+            // Keep the borrow's lifetime/ownership checks, but lower the value
+            // as its machine-word address below.
+        } else if (raw_cast) {
+            if (builder.unsafe_depth == 0) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        } else {
+            if (
+                source_reference != 0 ||
+                target_reference != 0 ||
+                source_structure >= 0 ||
+                target_structure >= 0 ||
+                !primitive_cast_supported(source_type, target_type)
+            ) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        }
+
+        i64 source_storage_type = source_type;
+
+        if (source_reference != 0) {
+            source_storage_type = 12;
+        }
+
+        i64 target_storage_type = target_type;
+
+        if (target_reference != 0) {
+            target_storage_type = 12;
+        }
+        if (
+            source_storage_type != target_storage_type ||
+            source_reference != target_reference ||
+            source_structure != target_structure
+        ) {
+            i64 converted = -1;
+
+            if (!hir_add_node(builder, 31, value, source_storage_type, 0, 0, &mut converted)) {
+                return false;
+            }
+            hir_set_node_type(builder, converted, target_type);
+            raz_compiler_rt_arena_set(builder.module.node_type_structs, converted, target_structure);
+            raz_compiler_rt_arena_set(builder.module.node_references, converted, target_reference);
+
+            i64 target_mutable = 0;
+
+            if (target_reference == 3) {
+                target_mutable = 1;
+            }
+            raz_compiler_rt_arena_set(builder.module.node_reference_mutable, converted, target_mutable);
+            value = converted;
+        }
+    }
+    *out = value;
+    return true;
+}
+
+fn hir_parse_product(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_cast(builder, &mut left)) {
+        return false;
+    }
+    while (
+        builder.current.kind == TokenKind::Star ||
+        builder.current.kind == TokenKind::Slash ||
+        builder.current.kind == TokenKind::Percent
+    ) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_cast(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 kind = 7;
+
+        if (operation == TokenKind::Slash) {
+            kind = 8;
+        } else if (operation == TokenKind::Percent) {
+            kind = 23;
+        }
+
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (operation == TokenKind::Percent && result_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, kind, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_sum(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_product(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::Plus || builder.current.kind == TokenKind::Minus) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_product(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 kind = 5;
+
+        if (operation == TokenKind::Minus) {
+            kind = 6;
+        }
+
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, kind, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_shift(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_sum(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::LessLess || builder.current.kind == TokenKind::GreaterGreater) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_sum(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 kind = 27;
+
+        if (operation == TokenKind::GreaterGreater) {
+            kind = 28;
+        }
+
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (result_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, kind, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_relational(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_shift(builder, &mut left)) {
+        return false;
+    }
+    while (
+        builder.current.kind == TokenKind::Less ||
+        builder.current.kind == TokenKind::LessEqual ||
+        builder.current.kind == TokenKind::Greater ||
+        builder.current.kind == TokenKind::GreaterEqual
+    ) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_shift(builder, &mut right)) {
+            return false;
+        }
+
+        i64 kind = 11;
+
+        if (operation == TokenKind::LessEqual) {
+            kind = 12;
+        } else if (operation == TokenKind::Greater) {
+            kind = 13;
+        } else if (operation == TokenKind::GreaterEqual) {
+            kind = 14;
+        }
+
+        i64 combined = -1;
+        i64 input_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (input_type < 0) {
+            return false;
+        }
+        if (input_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, kind, left, right, input_type, 0, &mut combined)) {
+            return false;
+        }
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_equality(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_relational(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::EqualEqual || builder.current.kind == TokenKind::BangEqual) {
+        TokenKind operation = builder.current.kind;
+
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_relational(builder, &mut right)) {
+            return false;
+        }
+
+        i64 kind = 9;
+
+        if (operation == TokenKind::BangEqual) {
+            kind = 10;
+        }
+
+        i64 combined = -1;
+        i64 input_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (input_type < 0) {
+            return false;
+        }
+        if (!hir_add_node(builder, kind, left, right, input_type, 0, &mut combined)) {
+            return false;
+        }
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_bit_and(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_equality(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::Ampersand) {
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_equality(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (result_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, 24, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_bit_xor(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_bit_and(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::Caret) {
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_bit_and(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (result_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, 26, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_bit_or(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_bit_xor(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::Pipe) {
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_bit_xor(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+        i64 result_type = hir_binary_type(builder, &mut left, &mut right);
+
+        if (result_type < 0) {
+            return false;
+        }
+        if (result_type == 12) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (result_type == 1) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, 25, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        hir_set_node_type(builder, combined, result_type);
+        left = combined;
+    }
+    *out = left;
+    return true;
+}
+
+fn hir_parse_logical_and(HirBuilder&mut builder, i64&mut out) -> bool {
+    i64 left = -1;
+
+    if (!hir_parse_bit_or(builder, &mut left)) {
+        return false;
+    }
+    while (builder.current.kind == TokenKind::AmpAmp) {
+        hir_advance(builder);
+
+        i64 right = -1;
+
+        if (!hir_parse_bit_or(builder, &mut right)) {
+            return false;
+        }
+
+        i64 combined = -1;
+
+        if (!hir_add_node(builder, 19, left, right, 0, 0, &mut combined)) {
+            return false;
+        }
+        left = combined;
+    }
+    *out = left;
+    return true;
+}

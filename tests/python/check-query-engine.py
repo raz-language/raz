@@ -16,7 +16,7 @@ resolution = (root / 'compiler/src/raz_hir/src/hir/query/resolution.rz').read_te
 traits = (root / 'compiler/src/raz_hir/src/hir/generics/type_instantiation.rz').read_text(encoding='utf-8')
 reflection = (root / 'compiler/src/raz_hir/src/hir/semantic/reflection.rz').read_text(encoding='utf-8')
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
-lexer = (root / 'compiler/src/raz_lexer/src/lexer.rz').read_text(encoding='utf-8')
+lexer = (root / 'compiler/src/raz_lexer/src/lexer/lexer.rz').read_text(encoding='utf-8')
 
 checks = {
     'unified query storage lives in HirQueryContext owned by HirBuilder': all(x in model for x in [

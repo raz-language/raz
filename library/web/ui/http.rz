@@ -1,0 +1,914 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+import alloc::string;
+
+fn ensure_http_records() -> bool {
+    if (web_http_records != 0) { return true; }
+    i64 bytes = WEB_HTTP_CAPACITY * WEB_HTTP_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_http_records = next;
+    return true;
+}
+
+fn http_record(i64 slot) -> usize { return web_http_records + slot * WEB_HTTP_RECORD_BYTES; }
+
+fn http_find_or_create(string url, i64 method, i64 initial_state) -> HttpRequest {
+    if (!ensure_http_records()) { return HttpRequest { slot: -1 }; }
+    i64 hash = (state_key_hash(url) * 7 + method) % 281474976710597;
+    if (hash == 0) { hash = method; }
+    i64 slot = 0;
+    while (slot < WEB_HTTP_CAPACITY) {
+        usize record = http_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == hash && raw_i64_get(record, 64) == method) { return HttpRequest { slot: slot }; }
+        if (stored_hash == 0) {
+            i64 length = raz_rt_cstr_len(url);
+            usize data = 0;
+            if (length > 0) {
+                data = raz_rt_alloc(length);
+                if (data == 0) { return HttpRequest { slot: -1 }; }
+                raz_rt_copy(data, raz_rt_cstr_ptr(url), length);
+            }
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, initial_state);
+            raw_i64_set(record, 16, (data)as i64);
+            raw_i64_set(record, 24, length);
+            raw_i64_set(record, 32, 0);
+            raw_i64_set(record, 40, 0);
+            raw_i64_set(record, 48, 0);
+            raw_i64_set(record, 56, 0);
+            raw_i64_set(record, 64, method);
+            raw_i64_set(record, 72, 0);
+            raw_i64_set(record, 80, 0);
+            raw_i64_set(record, 88, 0);
+            raw_i64_set(record, 96, 0);
+            return HttpRequest { slot: slot };
+        }
+        slot += 1;
+    }
+    return HttpRequest { slot: -1 };
+}
+
+public fn http_get(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_GET, WEB_HTTP_PENDING);
+}
+
+// Create a reusable POST resource. It remains idle until a form/action queues
+// a body, so merely rendering a form never performs a network side effect.
+public fn http_post(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_POST, WEB_HTTP_IDLE);
+}
+
+fn http_prepare_text_body(HttpRequest& request, string body) -> bool {
+    if (!request.valid() || web_http_records == 0) { return false; }
+    usize record = http_record(request.slot);
+    i64 method = raw_i64_get(record, 64);
+    if (method == WEB_HTTP_GET) { return false; }
+    i64 length = raz_rt_cstr_len(body);
+    usize data = 0;
+    if (length > 0) {
+        data = raz_rt_alloc(length);
+        if (data == 0) { return false; }
+        raz_rt_copy(data, raz_rt_cstr_ptr(body), length);
+    }
+    usize old_body = raw_i64_get(record, 72)as usize;
+    usize old_response = raw_i64_get(record, 40)as usize;
+    if (old_body != 0) { raz_rt_dealloc(old_body); }
+    if (old_response != 0) { raz_rt_dealloc(old_response); }
+    raw_i64_set(record, 32, 0);
+    raw_i64_set(record, 40, 0);
+    raw_i64_set(record, 48, 0);
+    raw_i64_set(record, 72, (data)as i64);
+    raw_i64_set(record, 80, length);
+    raw_i64_set(record, 8, WEB_HTTP_PENDING);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    return true;
+}
+
+public fn http_post_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_POST, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_put_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_PUT, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_patch_text(string url, string body) -> HttpRequest {
+    HttpRequest request = http_find_or_create(url, WEB_HTTP_PATCH, WEB_HTTP_IDLE);
+    http_prepare_text_body(&request, body);
+    return request;
+}
+
+public fn http_delete(string url) -> HttpRequest {
+    return http_find_or_create(url, WEB_HTTP_DELETE, WEB_HTTP_PENDING);
+}
+
+fn http_prepare_post_string(i64 request_slot, i64 state_slot) -> bool {
+    if (request_slot < 0 || request_slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return false; }
+    if (state_slot < 0 || state_slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = http_record(request_slot);
+    if (raw_i64_get(record, 64) != WEB_HTTP_POST) { return false; }
+    usize source = state_string_data(state_slot);
+    i64 length = state_string_length(state_slot);
+    usize body = 0;
+    if (length > 0) {
+        body = raz_rt_alloc(length);
+        if (body == 0) { return false; }
+        raz_rt_copy(body, source, length);
+    }
+    usize old_body = raw_i64_get(record, 72)as usize;
+    usize old_response = raw_i64_get(record, 40)as usize;
+    if (old_body != 0) { raz_rt_dealloc(old_body); }
+    if (old_response != 0) { raz_rt_dealloc(old_response); }
+    raw_i64_set(record, 32, 0);
+    raw_i64_set(record, 40, 0);
+    raw_i64_set(record, 48, 0);
+    raw_i64_set(record, 72, (body)as i64);
+    raw_i64_set(record, 80, length);
+    raw_i64_set(record, 8, WEB_HTTP_PENDING);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    return true;
+}
+
+fn json_space(i64 byte) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13;
+}
+
+fn json_byte(usize data, i64 index) -> i64 {
+    unsafe { return (*((data + index)as u8*const))as i64; }
+}
+
+fn json_skip_space(usize data, i64 length, i64 index) -> i64 {
+    i64 next = index;
+    while (next < length && json_space(json_byte(data, next))) { next += 1; }
+    return next;
+}
+
+fn json_key_matches(usize data, i64 start, i64 end, string key) -> bool {
+    i64 key_length = raz_rt_cstr_len(key);
+    if (end - start != key_length) { return false; }
+    i64 index = 0;
+    while (index < key_length) {
+        if (json_byte(data, start + index) != literal_byte(key, index)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+// Allocation-free typed JSON views for browser resources. Objects/arrays are
+// retained as slices into the Raz-owned HTTP response, so nested decoding does
+// not build a JavaScript object graph or duplicate response storage.
+fn json_scan_value(usize data, i64 length, i64 start) -> JsonSlice {
+    i64 index = json_skip_space(data, length, start);
+    if (index >= length) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    i64 first = json_byte(data, index);
+    if (first == 34) {
+        i64 value_start = index + 1;
+        i64 cursor = value_start;
+        bool previous_escape = false;
+        while (cursor < length) {
+            i64 byte = json_byte(data, cursor);
+            if (byte < 32) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+            if (byte == 34 && !previous_escape) {
+                return JsonSlice { data: data + value_start, length: cursor - value_start, kind: 1, found: true };
+            }
+            if (previous_escape) {
+                if (!(byte == 34 || byte == 92 || byte == 47 || byte == 98 || byte == 102 || byte == 110 || byte == 114 || byte == 116 || byte == 117)) {
+                    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+                }
+                if (byte == 117) {
+                    if (json_u16(data, length, cursor + 1) < 0) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+                    cursor += 4;
+                }
+                previous_escape = false;
+            } else if (byte == 92) {
+                previous_escape = true;
+            }
+            cursor += 1;
+        }
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    if (first == 123 || first == 91) {
+        i64 open = first;
+        i64 close = 125;
+        i64 kind = 3;
+        if (open == 91) { close = 93; kind = 4; }
+        i64 depth = 0;
+        i64 cursor = index;
+        bool in_string = false;
+        bool escaped = false;
+        while (cursor < length) {
+            i64 byte = json_byte(data, cursor);
+            if (in_string) {
+                if (escaped) { escaped = false; }
+                else if (byte == 92) { escaped = true; }
+                else if (byte == 34) { in_string = false; }
+            } else {
+                if (byte == 34) { in_string = true; }
+                else if (byte == open) { depth += 1; }
+                else if (byte == close) {
+                    depth -= 1;
+                    if (depth == 0) { return JsonSlice { data: data + index, length: cursor - index + 1, kind: kind, found: true }; }
+                }
+            }
+            cursor += 1;
+        }
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    i64 cursor = index;
+    while (cursor < length) {
+        i64 byte = json_byte(data, cursor);
+        if (byte == 44 || byte == 125 || byte == 93 || json_space(byte)) { break; }
+        cursor += 1;
+    }
+    if (cursor <= index) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    return JsonSlice { data: data + index, length: cursor - index, kind: 2, found: true };
+}
+
+fn json_find_in_object(usize data, i64 length, string key) -> JsonSlice {
+    i64 index = json_skip_space(data, length, 0);
+    if (index >= length || json_byte(data, index) != 123) { return JsonSlice { data: 0, length: 0, kind: 0, found: false }; }
+    index += 1;
+    while (index < length) {
+        index = json_skip_space(data, length, index);
+        if (index < length && json_byte(data, index) == 125) { break; }
+        if (index >= length || json_byte(data, index) != 34) { break; }
+        i64 key_start = index + 1;
+        i64 key_end = key_start;
+        bool key_escape = false;
+        while (key_end < length && json_byte(data, key_end) != 34) {
+            if (json_byte(data, key_end) == 92) { key_escape = true; }
+            key_end += 1;
+        }
+        if (key_end >= length) { break; }
+        bool matches = !key_escape && json_key_matches(data, key_start, key_end, key);
+        index = json_skip_space(data, length, key_end + 1);
+        if (index >= length || json_byte(data, index) != 58) { break; }
+        JsonSlice value = json_scan_value(data, length, index + 1);
+        if (!value.found) { break; }
+        if (matches) { return value; }
+        i64 value_end = (value.data - data)as i64 + value.length;
+        if (value.kind == 1) { value_end += 1; }
+        index = json_skip_space(data, length, value_end);
+        if (index < length && json_byte(data, index) == 44) { index += 1; }
+    }
+    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+}
+
+fn json_find(HttpRequest& request, string key) -> JsonSlice {
+    if (!request.done() || request.data() == 0 || request.length() <= 0) {
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    return json_find_in_object(request.data(), request.length(), key);
+}
+
+fn json_array_item(JsonArray& array, i64 wanted) -> JsonSlice {
+    if (!array.found || wanted < 0 || array.length < 2 || json_byte(array.data, 0) != 91) {
+        return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+    }
+    i64 index = 1;
+    i64 item = 0;
+    while (index < array.length) {
+        index = json_skip_space(array.data, array.length, index);
+        if (index >= array.length || json_byte(array.data, index) == 93) { break; }
+        JsonSlice value = json_scan_value(array.data, array.length, index);
+        if (!value.found) { break; }
+        if (item == wanted) { return value; }
+        i64 value_end = (value.data - array.data)as i64 + value.length;
+        if (value.kind == 1) { value_end += 1; }
+        index = json_skip_space(array.data, array.length, value_end);
+        if (index < array.length && json_byte(array.data, index) == 44) { index += 1; }
+        item += 1;
+    }
+    return JsonSlice { data: 0, length: 0, kind: 0, found: false };
+}
+
+fn json_parse_i64(JsonSlice& slice) -> JsonI64 {
+    if (!slice.found || slice.kind != 2 || slice.length <= 0) { return JsonI64 { value: 0, found: false }; }
+    i64 index = 0;
+    bool negative = false;
+    if (json_byte(slice.data, 0) == 45) { negative = true; index = 1; }
+    if (index >= slice.length) { return JsonI64 { value: 0, found: false }; }
+    i64 value = 0;
+    while (index < slice.length) {
+        i64 byte = json_byte(slice.data, index);
+        if (byte < 48 || byte > 57) { return JsonI64 { value: 0, found: false }; }
+        value = value * 10 + (byte - 48);
+        index += 1;
+    }
+    if (negative) { value = -value; }
+    return JsonI64 { value: value, found: true };
+}
+
+fn json_parse_bool(JsonSlice& slice) -> JsonBool {
+    if (!slice.found || slice.kind != 2) { return JsonBool { value: false, found: false }; }
+    if (slice.length == 4 && json_byte(slice.data, 0) == 116 && json_byte(slice.data, 1) == 114 && json_byte(slice.data, 2) == 117 && json_byte(slice.data, 3) == 101) {
+        return JsonBool { value: true, found: true };
+    }
+    if (slice.length == 5 && json_byte(slice.data, 0) == 102 && json_byte(slice.data, 1) == 97 && json_byte(slice.data, 2) == 108 && json_byte(slice.data, 3) == 115 && json_byte(slice.data, 4) == 101) {
+        return JsonBool { value: false, found: true };
+    }
+    return JsonBool { value: false, found: false };
+}
+
+fn json_parse_f64(JsonSlice& slice) -> JsonF64 {
+    if (!slice.found || slice.kind != 2 || slice.length <= 0) { return JsonF64 { value: 0.0, found: false }; }
+    i64 index = 0;
+    bool negative = false;
+    if (json_byte(slice.data, index) == 45) { negative = true; index += 1; }
+    if (index >= slice.length) { return JsonF64 { value: 0.0, found: false }; }
+    f64 value = 0.0;
+    i64 digits = 0;
+    while (index < slice.length) {
+        i64 byte = json_byte(slice.data, index);
+        if (byte < 48 || byte > 57) { break; }
+        value = value * 10.0 + ((byte - 48)as f64);
+        digits += 1;
+        index += 1;
+    }
+    if (digits == 0) { return JsonF64 { value: 0.0, found: false }; }
+    if (index < slice.length && json_byte(slice.data, index) == 46) {
+        index += 1;
+        i64 fractional_digits = 0;
+        f64 scale = 0.1;
+        while (index < slice.length) {
+            i64 byte = json_byte(slice.data, index);
+            if (byte < 48 || byte > 57) { break; }
+            value = value + ((byte - 48)as f64) * scale;
+            scale = scale * 0.1;
+            fractional_digits += 1;
+            index += 1;
+        }
+        if (fractional_digits == 0) { return JsonF64 { value: 0.0, found: false }; }
+    }
+    if (index < slice.length && (json_byte(slice.data, index) == 101 || json_byte(slice.data, index) == 69)) {
+        index += 1;
+        bool exponent_negative = false;
+        if (index < slice.length && (json_byte(slice.data, index) == 43 || json_byte(slice.data, index) == 45)) {
+            exponent_negative = json_byte(slice.data, index) == 45;
+            index += 1;
+        }
+        i64 exponent = 0;
+        i64 exponent_digits = 0;
+        while (index < slice.length) {
+            i64 byte = json_byte(slice.data, index);
+            if (byte < 48 || byte > 57) { break; }
+            exponent = exponent * 10 + (byte - 48);
+            exponent_digits += 1;
+            index += 1;
+        }
+        if (exponent_digits == 0 || exponent > 308) { return JsonF64 { value: 0.0, found: false }; }
+        while (exponent > 0) {
+            if (exponent_negative) { value = value / 10.0; } else { value = value * 10.0; }
+            exponent -= 1;
+        }
+    }
+    if (index != slice.length) { return JsonF64 { value: 0.0, found: false }; }
+    if (negative) { value = -value; }
+    return JsonF64 { value: value, found: true };
+}
+
+fn json_parse_null(JsonSlice& slice) -> JsonNull {
+    if (!slice.found || slice.kind != 2 || slice.length != 4) { return JsonNull { found: false }; }
+    bool ok = json_byte(slice.data, 0) == 110 && json_byte(slice.data, 1) == 117 && json_byte(slice.data, 2) == 108 && json_byte(slice.data, 3) == 108;
+    return JsonNull { found: ok };
+}
+
+public fn json_string_none() -> JsonString { return JsonString { data: 0, length: 0, found: false }; }
+public fn json_i64_none() -> JsonI64 { return JsonI64 { value: 0, found: false }; }
+public fn json_bool_none() -> JsonBool { return JsonBool { value: false, found: false }; }
+public fn json_f64_none() -> JsonF64 { return JsonF64 { value: 0.0, found: false }; }
+public fn json_null_none() -> JsonNull { return JsonNull { found: false }; }
+public fn json_object_none() -> JsonObject { return JsonObject { data: 0, length: 0, found: false }; }
+public fn json_array_none() -> JsonArray { return JsonArray { data: 0, length: 0, found: false }; }
+
+public fn resource<T>(HttpRequest& request, T initial) -> Resource<T> {
+    return Resource<T> { request_slot: request.slot, value: move initial, decoded_version: -1, decoded: false, failed: false };
+}
+
+impl<T> Resource<T> {
+    fn valid(Resource<T>& self) -> bool { return self.request_slot >= 0 && self.request_slot < WEB_HTTP_CAPACITY; }
+    fn loading(Resource<T>& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.request_slot), 8);
+        return state == WEB_HTTP_PENDING || state == WEB_HTTP_INFLIGHT;
+    }
+    fn ready(Resource<T>& self) -> bool { return self.decoded && !self.failed; }
+    fn failed(Resource<T>& self) -> bool { return self.failed; }
+    fn status(Resource<T>& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.request_slot), 32);
+    }
+    /// Observe this async resource through a component boundary. The HTTP
+    /// request slot is registered as a structural dependency of that scope, so
+    /// completion/failure can rerender the smallest owning component.
+    fn loading_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.request_loading(&request);
+    }
+    fn done_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.request_done(&request);
+    }
+    fn ready_in(Resource<T>& self, Component& owner) -> bool {
+        if (!self.done_in(owner)) { return false; }
+        return self.ready();
+    }
+    fn failed_in(Resource<T>& self, Component& owner) -> bool {
+        if (!self.done_in(owner)) { return false; }
+        return self.failed();
+    }
+    fn changed_in(Resource<T>& self, Component& owner) -> bool {
+        HttpRequest request = HttpRequest { slot: self.request_slot };
+        return owner.effect_request(&request);
+    }
+    fn value(Resource<T>& self) -> T& { return & self.value; }
+}
+
+public fn resource_refresh<T: JsonDecode>(Resource<T>&mut resource) -> bool {
+    if (!resource.valid() || web_http_records == 0) { resource.failed = true; return false; }
+    HttpRequest request = HttpRequest { slot: resource.request_slot };
+    if (!request.done()) { return false; }
+    i64 version = raw_i64_get(http_record(resource.request_slot), 56);
+    if (!request.ok()) {
+        resource.failed = true;
+        resource.decoded = false;
+        resource.decoded_version = version;
+        return false;
+    }
+    if (resource.decoded && !resource.failed && resource.decoded_version == version) { return true; }
+    if (!resource.value.decode(&request)) {
+        resource.failed = true;
+        resource.decoded = false;
+        resource.decoded_version = version;
+        return false;
+    }
+    resource.failed = false;
+    resource.decoded = true;
+    resource.decoded_version = version;
+    return true;
+}
+
+impl JsonString {
+    fn valid(JsonString& self) -> bool { return self.found; }
+    fn data(JsonString& self) -> usize { return self.data; }
+    fn length(JsonString& self) -> i64 { return self.length; }
+}
+
+impl JsonI64 {
+    fn valid(JsonI64& self) -> bool { return self.found; }
+    fn get(JsonI64& self) -> i64 { return self.value; }
+}
+
+impl JsonBool {
+    fn valid(JsonBool& self) -> bool { return self.found; }
+    fn get(JsonBool& self) -> bool { return self.value; }
+}
+
+impl JsonF64 {
+    fn valid(JsonF64& self) -> bool { return self.found; }
+    fn get(JsonF64& self) -> f64 { return self.value; }
+}
+
+impl JsonNull {
+    fn valid(JsonNull& self) -> bool { return self.found; }
+}
+
+
+impl JsonObject {
+    fn valid(JsonObject& self) -> bool { return self.found; }
+    fn json_string(JsonObject& self, string key) -> JsonString {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 1) { return json_string_none(); }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_i64(JsonObject& self, string key) -> JsonI64 {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_i64(&slice);
+    }
+    fn json_bool(JsonObject& self, string key) -> JsonBool {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_bool(&slice);
+    }
+    fn json_f64(JsonObject& self, string key) -> JsonF64 {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_f64(&slice);
+    }
+    fn json_null(JsonObject& self, string key) -> JsonNull {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        return json_parse_null(&slice);
+    }
+    fn json_object(JsonObject& self, string key) -> JsonObject {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_array(JsonObject& self, string key) -> JsonArray {
+        JsonSlice slice = json_find_in_object(self.data, self.length, key);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl JsonArray {
+    fn valid(JsonArray& self) -> bool { return self.found; }
+    fn count(JsonArray& self) -> i64 {
+        if (!self.found) { return 0; }
+        i64 count = 0;
+        while (json_array_item(self, count).found) { count += 1; }
+        return count;
+    }
+    fn json_string(JsonArray& self, i64 index) -> JsonString {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 1) { return json_string_none(); }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_i64(JsonArray& self, i64 index) -> JsonI64 {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_i64(&slice);
+    }
+    fn json_bool(JsonArray& self, i64 index) -> JsonBool {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_bool(&slice);
+    }
+    fn json_f64(JsonArray& self, i64 index) -> JsonF64 {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_f64(&slice);
+    }
+    fn json_null(JsonArray& self, i64 index) -> JsonNull {
+        JsonSlice slice = json_array_item(self, index);
+        return json_parse_null(&slice);
+    }
+    fn json_object(JsonArray& self, i64 index) -> JsonObject {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    fn json_array(JsonArray& self, i64 index) -> JsonArray {
+        JsonSlice slice = json_array_item(self, index);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl HttpRequest {
+    public fn valid(HttpRequest& self) -> bool { return self.slot >= 0 && self.slot < WEB_HTTP_CAPACITY; }
+    public fn loading(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.slot), 8);
+        return state == WEB_HTTP_PENDING || state == WEB_HTTP_INFLIGHT;
+    }
+    public fn done(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return false; }
+        i64 state = raw_i64_get(http_record(self.slot), 8);
+        return state == WEB_HTTP_COMPLETE || state == WEB_HTTP_FAILED;
+    }
+    public fn failed(HttpRequest& self) -> bool {
+        if (!self.valid() || web_http_records == 0) { return true; }
+        return raw_i64_get(http_record(self.slot), 8) == WEB_HTTP_FAILED;
+    }
+    public fn ok(HttpRequest& self) -> bool {
+        if (!self.done()) { return false; }
+        i64 status = raw_i64_get(http_record(self.slot), 32);
+        return status >= 200 && status < 300;
+    }
+    public fn status(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 32);
+    }
+    public fn informational(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 100 && code < 200; }
+    public fn successful(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 200 && code < 300; }
+    public fn redirected(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 300 && code < 400; }
+    public fn client_error(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 400 && code < 500; }
+    public fn server_error(HttpRequest& self) -> bool { i64 code = self.status(); return code >= 500 && code < 600; }
+    public fn length(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 48);
+    }
+    public fn data(HttpRequest& self) -> usize {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 40)as usize;
+    }
+    public fn method(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 64);
+    }
+    public fn body_data(HttpRequest& self) -> usize {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 72)as usize;
+    }
+    public fn body_length(HttpRequest& self) -> i64 {
+        if (!self.valid() || web_http_records == 0) { return 0; }
+        return raw_i64_get(http_record(self.slot), 80);
+    }
+    public fn json_string(HttpRequest& self, string key) -> JsonString {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 1) { return JsonString { data: 0, length: 0, found: false }; }
+        return JsonString { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_i64(HttpRequest& self, string key) -> JsonI64 {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_i64(&slice);
+    }
+    public fn json_bool(HttpRequest& self, string key) -> JsonBool {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_bool(&slice);
+    }
+    public fn json_f64(HttpRequest& self, string key) -> JsonF64 {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_f64(&slice);
+    }
+    public fn json_null(HttpRequest& self, string key) -> JsonNull {
+        JsonSlice slice = json_find(self, key);
+        return json_parse_null(&slice);
+    }
+    public fn json_object(HttpRequest& self, string key) -> JsonObject {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_array(HttpRequest& self, string key) -> JsonArray {
+        JsonSlice slice = json_find(self, key);
+        if (!slice.found || slice.kind != 4) { return json_array_none(); }
+        return JsonArray { data: slice.data, length: slice.length, found: true };
+    }
+    public fn json_root(HttpRequest& self) -> JsonObject {
+        if (!self.done() || self.data() == 0 || self.length() <= 0) { return json_object_none(); }
+        JsonSlice slice = json_scan_value(self.data(), self.length(), 0);
+        if (!slice.found || slice.kind != 3) { return json_object_none(); }
+        return JsonObject { data: slice.data, length: slice.length, found: true };
+    }
+}
+
+impl Element {
+    fn text_json(Element&mut self, JsonString& value) -> bool {
+        if (tag_is_void(self.tag) || !value.valid()) { return false; }
+        return append_json_string_html(&mut self.children, value.data(), value.length());
+    }
+    fn text_http(Element&mut self, HttpRequest& request) -> bool {
+        if (tag_is_void(self.tag) || !request.valid()) { return false; }
+        return append_escaped_bytes(&mut self.children, request.data(), request.length());
+    }
+}
+
+impl Component {
+    fn json_text(Component&mut self, Tag tag, string prefix, JsonString& value) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(prefix) || !child.text_json(value) || !self.root.child(&mut child)) { self.failed = true; return false; }
+        return true;
+    }
+    fn http_text(Component&mut self, Tag tag, string prefix, HttpRequest& request) -> bool {
+        Element child = element(tag);
+        child.component_scope = self.component_scope;
+        if (!child.text(prefix) || !child.text_http(request) || !self.root.child(&mut child)) {
+            self.failed = true;
+            return false;
+        }
+        return true;
+    }
+}
+
+public fn http_request_valid(HttpRequest& request) -> bool { return request.valid(); }
+public fn http_request_loading(HttpRequest& request) -> bool { return request.loading(); }
+public fn http_request_done(HttpRequest& request) -> bool { return request.done(); }
+public fn http_request_failed(HttpRequest& request) -> bool { return request.failed(); }
+public fn http_request_ok(HttpRequest& request) -> bool { return request.ok(); }
+public fn http_request_status(HttpRequest& request) -> i64 { return request.status(); }
+public fn http_request_text(HttpRequest& request) -> String {
+    if (!request.done() || request.data() == 0 || request.length() <= 0) { return String::new(); }
+    String value = String::with_capacity(request.length());
+    if (!alloc::string::resize(&mut value, request.length(), 0)) { return String::new(); }
+    raz_rt_copy(value.as_ptr(), request.data(), request.length());
+    return value;
+}
+
+// Host-side async fetch queue ABI. pending_next marks the returned request as
+// in-flight so repeated browser pumps cannot issue the same request twice.
+public fn raz_web_http_pending_next(i64 after_slot) -> i64 {
+    if (web_http_records == 0) { return 0; }
+    i64 slot = after_slot;
+    if (slot < 0) { slot = 0; }
+    while (slot < WEB_HTTP_CAPACITY) {
+        usize record = http_record(slot);
+        if (raw_i64_get(record, 8) == WEB_HTTP_PENDING) {
+            raw_i64_set(record, 8, WEB_HTTP_INFLIGHT);
+            return slot + 1;
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+public fn raz_web_http_url_ptr(i64 request_id) -> usize {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 16)as usize;
+}
+public fn raz_web_http_url_len(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 24);
+}
+public fn raz_web_http_method(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 64);
+}
+public fn raz_web_http_body_ptr(i64 request_id) -> usize {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 72)as usize;
+}
+public fn raz_web_http_body_len(i64 request_id) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0) { return 0; }
+    return raw_i64_get(http_record(slot), 80);
+}
+public fn raz_web_http_complete(i64 request_id, i64 status, usize data, i64 length) -> i64 {
+    i64 slot = request_id - 1;
+    if (slot < 0 || slot >= WEB_HTTP_CAPACITY || web_http_records == 0 || length < 0) { return -1; }
+    usize record = http_record(slot);
+    usize next = 0;
+    if (length > 0) {
+        if (data == 0) { return -1; }
+        next = raz_rt_alloc(length);
+        if (next == 0) { return -1; }
+        raz_rt_copy(next, data, length);
+    }
+    usize old = raw_i64_get(record, 40)as usize;
+    if (old != 0) { raz_rt_dealloc(old); }
+    raw_i64_set(record, 32, status);
+    raw_i64_set(record, 40, (next)as i64);
+    raw_i64_set(record, 48, length);
+    raw_i64_set(record, 56, raw_i64_get(record, 56) + 1);
+    if (status >= 200 && status < 600) { raw_i64_set(record, 8, WEB_HTTP_COMPLETE); }
+    else { raw_i64_set(record, 8, WEB_HTTP_FAILED); }
+    return 1;
+}
+
+// Generic host scratch allocation lets the browser copy UTF-8 route, input,
+// and fetch bytes into Wasm without exposing allocator internals to JS.
+public fn raz_web_host_alloc(i64 size) -> usize { return raz_rt_alloc(size); }
+public fn raz_web_host_free(usize pointer) { if (pointer != 0) { raz_rt_dealloc(pointer); } }
+
+// Generic reactive event dispatcher. The browser host invokes this, then calls
+// main() again to render the updated Raz state. Applications only need to bind
+// actions to StateI64/StateBool; they no longer need to hand-write an exported
+// event switch for routine reactive UI.
+public fn raz_web_dispatch(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    i64 slot = raw_i64_get(record, 8);
+    i64 argument = raw_i64_get(record, 16);
+    if (kind == WEB_ACTION_ADD_I64) {
+        if (!state_add(slot, argument)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SET_I64) {
+        if (!state_replace(slot, argument)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_TOGGLE_BOOL) {
+        i64 next = 0;
+        if (state_value(slot) == 0) { next = 1; }
+        if (!state_replace(slot, next)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SET_BOOL) {
+        i64 next = 0;
+        if (argument != 0) { next = 1; }
+        if (!state_replace(slot, next)) { return -1; }
+        return state_value(slot);
+    }
+    if (kind == WEB_ACTION_SUBMIT_STRING) {
+        if (!http_prepare_post_string(argument, slot)) { return -1; }
+        return 1;
+    }
+    if (kind == WEB_ACTION_SUBMIT_STRING_MIN) {
+        i64 request_slot = argument % WEB_HTTP_CAPACITY;
+        i64 minimum = argument / WEB_HTTP_CAPACITY;
+        if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return -1; }
+        usize state = state_record(slot);
+        if (state_string_length(slot) < minimum) {
+            raw_i64_set(state, 16, -1);
+            raw_i64_set(state, 24, raw_i64_get(state, 24) + 1);
+            return 0;
+        }
+        raw_i64_set(state, 16, 1);
+        if (!http_prepare_post_string(request_slot, slot)) { return -1; }
+        return 1;
+    }
+    return -1;
+}
+
+public fn raz_web_dispatch_text(i64 event_id, usize data, i64 length) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_STRING) { return -1; }
+    if (!state_replace_string(raw_i64_get(record, 8), data, length)) { return -1; }
+    return 1;
+}
+
+public fn raz_web_dispatch_bool(i64 event_id, bool value) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_BOOL_INPUT) { return -1; }
+    i64 next = 0;
+    if (value) { next = 1; }
+    if (!state_replace(raw_i64_get(record, 8), next)) { return -1; }
+    return next;
+}
+
+public fn raz_web_dispatch_i64(i64 event_id, i64 value) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    if (raw_i64_get(record, 0) != WEB_ACTION_SET_I64_INPUT) { return -1; }
+    if (!state_replace(raw_i64_get(record, 8), value)) { return -1; }
+    return value;
+}
+
+// The browser can skip main()/HTML reconciliation when an event only changes
+// explicitly bound state and no Raz code read that state structurally during
+// the current render. Non-state actions remain conservative.
+public fn raz_web_event_state_slot(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    return raw_i64_get(record, 8);
+}
+
+public fn raz_web_event_requires_render(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return 1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    if (kind == WEB_ACTION_SUBMIT_STRING || kind == WEB_ACTION_SUBMIT_STRING_MIN) { return 1; }
+    i64 slot = raw_i64_get(record, 8);
+    if (state_requires_render(slot)) { return 1; }
+    return 0;
+}
+
+// Returns a positive keyed component scope when this structural event can be
+// rerendered locally, 0 for direct-bound events, and -1 when the page-level
+// render is required. Local rendering is permitted only for a single matching
+// structural owner; mixed/page dependencies remain conservative.
+public fn raz_web_event_render_scope(i64 event_id) -> i64 {
+    if (event_id <= 0 || event_id > web_event_count || web_event_records == 0) { return -1; }
+    usize record = web_event_records + (event_id - 1) * WEB_EVENT_RECORD_BYTES;
+    i64 kind = raw_i64_get(record, 0);
+    if (kind == WEB_ACTION_SUBMIT_STRING || kind == WEB_ACTION_SUBMIT_STRING_MIN) { return -1; }
+    i64 slot = raw_i64_get(record, 8);
+    if (!state_requires_render(slot)) { return 0; }
+    i64 event_scope = raw_i64_get(record, 24);
+    if (event_scope <= 0) { return -1; }
+    if (state_structural_scope(slot) != event_scope) { return -1; }
+    return event_scope;
+}
+
+// Route/HTTP host transitions use the same scoped structural ownership model
+// as state events. 0 means nobody currently depends on the value, a positive
+// value is a component-local rerender scope, and -1 requires page main().
+public fn raz_web_route_render_scope() -> i64 {
+    if (web_route_structural_owner == 0) { return 0; }
+    if (web_route_structural_owner < 0 || web_route_structural_owner == 1) { return -1; }
+    return web_route_structural_owner - 1;
+}
+
+public fn raz_web_http_render_scope(i64 request_id) -> i64 {
+    return http_structural_scope(request_id - 1);
+}
+
+// Stable browser ABI consumed by compiler/backend/web/codegen.rz.
+public fn raz_web_revision() -> i64 { return web_revision; }
+public fn raz_web_structure_revision() -> i64 { return web_structure_revision; }
+public fn raz_web_state_i64(i64 slot) -> i64 { return state_value(slot); }
+public fn raz_web_derived_i64(i64 id) -> i64 { return derived_value(id); }
+public fn raz_web_state_bool(i64 slot) -> i64 {
+    if (state_value(slot) != 0) { return 1; }
+    return 0;
+}
+public fn raz_web_state_string_ptr(i64 slot) -> usize { return state_string_data(slot); }
+public fn raz_web_state_string_len(i64 slot) -> i64 { return state_string_length(slot); }
+public fn raz_web_component_revision() -> i64 { return web_component_revision; }
+public fn raz_web_component_scope() -> i64 { return web_component_scope; }
+public fn raz_web_component_html_ptr() -> usize { return web_component_html_data; }
+public fn raz_web_component_html_len() -> i64 { return web_component_html_length; }
+public fn raz_web_component_css_ptr() -> usize { return web_component_css_data; }
+public fn raz_web_component_css_len() -> i64 { return web_component_css_length; }
+public fn raz_web_html_ptr() -> usize { return web_html_data; }
+public fn raz_web_html_len() -> i64 { return web_html_length; }
+public fn raz_web_css_ptr() -> usize { return web_css_data; }
+public fn raz_web_css_len() -> i64 { return web_css_length; }
+public fn raz_web_title_ptr() -> usize { return web_title_data; }
+public fn raz_web_title_len() -> i64 { return web_title_length; }
+public fn raz_web_js_ptr() -> usize { return web_js_data; }
+public fn raz_web_js_len() -> i64 { return web_js_length; }

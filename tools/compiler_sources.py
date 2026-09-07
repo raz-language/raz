@@ -22,14 +22,26 @@ _IMPORT_RE = re.compile(r"(?m)^\s*(?:public\s+)?import\s+([A-Za-z_][A-Za-z0-9_]*
 
 def _module_graph(root: Path | None = None) -> tuple[dict[str, Path], dict[str, set[str]]]:
     compiler_root = (root / "compiler") if root is not None else COMPILER_ROOT
-    source_roots = [compiler_root / "src"]
+    source_root = compiler_root / "src"
     namespace_to_path: dict[str, Path] = {}
     raw_imports: dict[str, set[str]] = {}
 
+    # ``compiler/src`` contains the root executable entry and nested path
+    # dependency packages.  Discover only that canonical layout; never absorb
+    # obsolete flat compiler trees that happen to be siblings of the ``raz_*``
+    # package directories.
     paths: list[Path] = []
-    for source_root in source_roots:
-        if source_root.is_dir():
-            paths.extend(source_root.rglob("*.rz"))
+    entry = source_root / "main.rz"
+    if entry.is_file():
+        paths.append(entry)
+    if source_root.is_dir():
+        for package_root in sorted(source_root.iterdir()):
+            if (
+                package_root.is_dir()
+                and package_root.name.startswith("raz_")
+                and (package_root / "raz.toml").is_file()
+            ):
+                paths.extend(package_root.rglob("*.rz"))
 
     for path in sorted(paths):
         text = path.read_text(encoding="utf-8")

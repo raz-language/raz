@@ -16,7 +16,7 @@ move = (root / 'compiler/src/raz_borrowck/src/borrowck/move_state.rz').read_text
 drops = (root / 'compiler/src/raz_borrowck/src/borrowck/drops.rz').read_text(encoding='utf-8')
 remap = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/remap.rz').read_text(encoding='utf-8')
 pipeline = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/pipeline.rz').read_text(encoding='utf-8')
-driver = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+driver = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text(encoding='utf-8')
 
 checks = {
     'MIR owns non-executable ownership-event metadata': all(x in model for x in [

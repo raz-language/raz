@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from web_source import web_codegen_source, web_bundle_source
 
 ROOT = Path(__file__).resolve().parents[2]
-ui = (ROOT / 'library' / 'web' / 'ui' / 'ui.rz').read_text(encoding='utf-8')
-codegen = (ROOT / 'compiler' / 'src' / 'raz_codegen_web' / 'src' / 'web' / 'codegen.rz').read_text(encoding='utf-8')
+ui = '\n'.join(p.read_text(encoding='utf-8') for p in sorted((ROOT / 'library' / 'web' / 'ui').glob('*.rz')))
+codegen = web_codegen_source(ROOT)
 
 checks = {
     'event exposes changed state slot': 'public fn raz_web_event_state_slot(i64 event_id) -> i64' in ui,

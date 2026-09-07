@@ -1,0 +1,201 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::expression_support;
+
+public import raz_hir::semantic::reflection;
+import raz_hir::semantic::statements;
+
+// Shared primary-expression helpers: primitive associated constants and
+// postfix field/method chains on immediate temporaries.
+fn hir_primitive_integer_constant(
+    HirBuilder&mut builder,
+    i64 type_offset,
+    i64 type_length,
+    i64 name_offset,
+    i64 name_length,
+    i64&mut out_type,
+    i64&mut out_value,
+) -> bool {
+    if (!token_is_numeric_type(&builder.scan.input, type_offset, type_length)) {
+        return false;
+    }
+
+    i64 type_kind = primitive_type_kind(&builder.scan.input, type_offset, type_length);
+
+    if (!primitive_type_is_integer(type_kind)) {
+        return false;
+    }
+    bool is_max =
+        name_length == 3 &&
+        source_byte(&builder.scan.input, name_offset) == 77 &&
+        source_byte(&builder.scan.input, name_offset + 1) == 65 &&
+        source_byte(&builder.scan.input, name_offset + 2) == 88;
+    bool is_min =
+        name_length == 3 &&
+        source_byte(&builder.scan.input, name_offset) == 77 &&
+        source_byte(&builder.scan.input, name_offset + 1) == 73 &&
+        source_byte(&builder.scan.input, name_offset + 2) == 78;
+    if (!is_max && !is_min) {
+        return false;
+    }
+
+    i64 width = primitive_type_width(type_kind);
+    bool unsigned_type = primitive_type_is_unsigned(type_kind);
+
+    if (is_min) {
+        if (unsigned_type) {
+            *out_value = 0;
+        } else if (width == 8) {
+            *out_value = -128;
+        } else if (width == 16) {
+            *out_value = -32768;
+        } else if (width == 32) {
+            *out_value = -2147483648;
+        } else {
+            *out_value = -9223372036854775807;
+            *out_value -= 1;
+        }
+        *out_type = type_kind;
+        return true;
+    }
+    if (width == 8) {
+        if (unsigned_type) {
+            *out_value = 255;
+        } else {
+            *out_value = 127;
+        }
+    } else if (width == 16) {
+        if (unsigned_type) {
+            *out_value = 65535;
+        } else {
+            *out_value = 32767;
+        }
+    } else if (width == 32) {
+        if (unsigned_type) {
+            *out_value = 4294967295;
+        } else {
+            *out_value = 2147483647;
+        }
+    } else {
+        // HIR scalar constants are stored in an i64 arena slot. Signed 64-bit
+        // MAX is therefore directly representable; u64::MAX is deliberately
+        // left to a future wide-constant representation rather than silently
+        // truncating it here.
+        if (unsigned_type) {
+            return false;
+        }
+        *out_value = 9223372036854775807;
+    }
+    *out_type = type_kind;
+    return true;
+}
+
+fn hir_parse_temporary_method_chain(HirBuilder&mut builder, i64 base, i64&mut out) -> bool {
+    // Literal and other immediate scalar primaries used to return before the
+    // normal postfix loop. Keep method syntax uniform for `"text".trim()` and
+    // `42.method()`; MIR materializes temporary storage for `&self` as needed.
+    while (builder.current.kind == TokenKind::Dot || builder.current.kind == TokenKind::ColonColon) {
+        hir_advance(builder);
+        if (builder.current.kind != TokenKind::Identifier) {
+            hir_fail(builder, DiagnosticCode::ExpectedIdentifier);
+            return false;
+        }
+
+        Lexer member_scan = builder.scan;
+        Token member_next;
+
+        next_token(&mut member_scan, &mut member_next);
+
+        i64 structure = raz_compiler_rt_arena_get(builder.module.node_type_structs, base);
+        i64 base_type = raz_compiler_rt_arena_get(builder.module.node_types, base);
+
+        if (member_next.kind != TokenKind::LeftParen) {
+            if (structure < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 field = hir_find_struct_field(
+                builder,
+                structure,
+                builder.current.offset,
+                builder.current.length
+            );
+            if (field < 0) {
+                hir_fail(builder, DiagnosticCode::UnknownName);
+                return false;
+            }
+            i64 member = -1;
+
+            if (!hir_add_node(builder, 16, base, field, 0, 0, &mut member)) {
+                return false;
+            }
+            raz_compiler_rt_arena_set(
+                builder.module.node_type_structs,
+                member,
+                hir_struct_field_type(builder, structure, field),
+            );
+            i64 field_metadata =
+                raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure) + field;
+            hir_set_node_type(
+                builder,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_types, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_references,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_references, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_slices,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_slice_mutable,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_metadata),
+            );
+            raz_compiler_rt_arena_set(
+                builder.module.node_array_extents,
+                member,
+                raz_compiler_rt_arena_get(builder.module.struct_field_array_extents, field_metadata),
+            );
+            base = member;
+            hir_advance(builder);
+            continue;
+        }
+
+        i64 method_target = structure;
+
+        if (structure < 0 && hir_type_is_enum(base_type)) {
+            method_target = -2 - hir_type_enum_index(base_type);
+        } else if (structure < 0) {
+            method_target = hir_scalar_method_target(base_type);
+        }
+        i64 method = hir_find_inherent_method(
+            builder,
+            method_target,
+            builder.current.offset,
+            builder.current.length
+        );
+        if (method < 0 || raz_compiler_rt_arena_get(builder.module.inherent_method_receivers, method) == 0) {
+            hir_fail(builder, DiagnosticCode::UnknownName);
+            return false;
+        }
+
+        i64 target = raz_compiler_rt_arena_get(builder.module.inherent_method_functions, method);
+
+        hir_advance(builder);
+
+        i64 called = -1;
+
+        if (!hir_parse_inherent_call(builder, target, base, 1, &mut called)) {
+            return false;
+        }
+        base = called;
+    }
+    *out = base;
+    return true;
+}

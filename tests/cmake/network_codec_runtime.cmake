@@ -183,15 +183,15 @@ fn main() -> i64 {
     alloc::box::deallocate(host); alloc::box::deallocate(payload); return 0;
 }
 ]=])
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Network/codec build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passl_network_codec.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passl_network_codec.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passl_network_codec")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passl_network_codec")
 endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm "${runtime_exe}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)

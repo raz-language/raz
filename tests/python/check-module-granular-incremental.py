@@ -12,8 +12,8 @@ comptime = (root / 'compiler/src/raz_hir/src/hir/semantic/comptime.rz').read_tex
 mir_model = (root / 'compiler/src/raz_mir/src/mir/core/model.rz').read_text()
 mir_builder = (root / 'compiler/src/raz_mir/src/mir/core/builder.rz').read_text()
 lowering = (root / 'compiler/src/raz_mir/src/mir/lowering.rz').read_text()
-inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/driver/incremental.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 
 checks = {
     'stable module ordinal replaces source-offset identity':

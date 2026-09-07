@@ -31,6 +31,10 @@ def main() -> int:
 
     env = os.environ.copy()
     env["RAZ_HOME"] = str(ROOT)
+    # Captured-only compiler phase telemetry. Successful qualification remains
+    # quiet, while a Windows crash reports whether runtime analysis and the
+    # reactive emitter were entered/completed.
+    env["RAZ_COMPILER_PHASE_TRACE"] = "1"
     runtime_library = ROOT / "build" / "release" / "src" / "runtime" / "libraz_runtime.a"
     if runtime_library.is_file():
         env["RAZ_RUNTIME_LIBRARY"] = str(runtime_library)
@@ -41,8 +45,8 @@ def main() -> int:
 
     manifest = (project / "raz.toml").read_text(encoding="utf-8")
     source = (project / "src" / "main.rz").read_text(encoding="utf-8")
-    if 'kind = "web"' not in manifest or '[web]' not in manifest or 'web = "raz:web"' not in manifest:
-        print("web-reactive: fixture is missing advanced web manifest/dependency")
+    if 'kind = "executable"' not in manifest or '[build]' not in manifest or 'target = "web"' not in manifest or '[web]' not in manifest or 'web = "raz:web"' not in manifest:
+        print("web-reactive: fixture is missing canonical web target/dependency")
         return 1
     if "import web::ui;" not in source or "fn main() -> Component" not in source:
         print("web-reactive: fixture does not use the reactive Component API")
@@ -51,6 +55,21 @@ def main() -> int:
     built = run([str(raz), "build", "--release", "raz.toml"], project, env)
     if built.returncode != 0:
         print(built.stdout)
+        print(f"web-reactive: child build exit code {built.returncode}")
+        dist = project / "dist"
+        assets = dist / "assets"
+        print("web-reactive: partial artifact state:")
+        for label, probe in (
+            ("dist", dist),
+            ("app.wasm", assets / "app.wasm"),
+            ("app.js", assets / "app.js"),
+            ("app.css", assets / "app.css"),
+            ("index.html", dist / "index.html"),
+        ):
+            print(f"  {label}: {'present' if probe.exists() else 'missing'}")
+        fingerprinted = sorted(p.name for p in assets.glob("app.*.*")) if assets.is_dir() else []
+        if fingerprinted:
+            print("  fingerprinted: " + ", ".join(fingerprinted))
         return 1
 
     index = project / "dist" / "index.html"

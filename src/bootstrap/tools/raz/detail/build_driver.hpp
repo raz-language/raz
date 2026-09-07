@@ -668,6 +668,87 @@ int execute_shell_command(const std::string& command) {
 #endif
 }
 
+std::filesystem::path staged_toolchain_library(std::string_view primary,
+                                                 std::string_view alternate = {}) {
+  if (g_self_executable.empty()) return {};
+  std::error_code ec;
+  const auto self = std::filesystem::absolute(g_self_executable, ec);
+  const auto executable = ec ? g_self_executable : self;
+  const auto lib = executable.parent_path().parent_path() / "lib";
+  const auto first = lib / std::string(primary);
+  if (std::filesystem::is_regular_file(first)) return first;
+  if (!alternate.empty()) {
+    const auto second = lib / std::string(alternate);
+    if (std::filesystem::is_regular_file(second)) return second;
+  }
+  return {};
+}
+
+std::filesystem::path stage0_runtime_library() {
+#if defined(_WIN32)
+  if (auto staged = staged_toolchain_library("raz_runtime.lib", "libraz_runtime.a"); !staged.empty()) return staged;
+#else
+  if (auto staged = staged_toolchain_library("libraz_runtime.a"); !staged.empty()) return staged;
+#endif
+#ifdef RAZ_RUNTIME_LIBRARY_PATH
+  const std::filesystem::path configured(RAZ_RUNTIME_LIBRARY_PATH);
+  if (std::filesystem::is_regular_file(configured)) return configured;
+#endif
+  return {};
+}
+
+std::filesystem::path stage0_forge_bridge_library() {
+#if defined(_WIN32)
+  if (auto staged = staged_toolchain_library("raz_forge_bridge.lib", "libraz_forge_bridge.a"); !staged.empty()) return staged;
+#else
+  if (auto staged = staged_toolchain_library("libraz_forge_bridge.a"); !staged.empty()) return staged;
+#endif
+#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
+  const std::filesystem::path configured(RAZ_FORGE_BRIDGE_LIBRARY_PATH);
+  if (std::filesystem::is_regular_file(configured)) return configured;
+#endif
+  return {};
+}
+
+std::filesystem::path stage0_forge_library() {
+#if defined(_WIN32)
+  if (auto staged = staged_toolchain_library("forge.lib", "libforge.a"); !staged.empty()) return staged;
+#else
+  if (auto staged = staged_toolchain_library("libforge.a"); !staged.empty()) return staged;
+#endif
+#ifdef RAZ_FORGE_LIBRARY_PATH
+  const std::filesystem::path configured(RAZ_FORGE_LIBRARY_PATH);
+  if (std::filesystem::is_regular_file(configured)) return configured;
+#endif
+  return {};
+}
+
+std::filesystem::path stage0_ssl_library() {
+#if defined(_WIN32)
+  if (auto staged = staged_toolchain_library("raz_runtime_ssl.lib", "raz_runtime_ssl.a"); !staged.empty()) return staged;
+#else
+  if (auto staged = staged_toolchain_library("libraz_runtime_ssl.a", "libraz_runtime_ssl.so"); !staged.empty()) return staged;
+#endif
+#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
+  const std::filesystem::path configured(RAZ_OPENSSL_SSL_LIBRARY_PATH);
+  if (std::filesystem::is_regular_file(configured)) return configured;
+#endif
+  return {};
+}
+
+std::filesystem::path stage0_crypto_library() {
+#if defined(_WIN32)
+  if (auto staged = staged_toolchain_library("raz_runtime_crypto.lib", "raz_runtime_crypto.a"); !staged.empty()) return staged;
+#else
+  if (auto staged = staged_toolchain_library("libraz_runtime_crypto.a", "libraz_runtime_crypto.so"); !staged.empty()) return staged;
+#endif
+#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
+  const std::filesystem::path configured(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH);
+  if (std::filesystem::is_regular_file(configured)) return configured;
+#endif
+  return {};
+}
+
 std::string native_linker() {
   const std::string configured = environment_value("RAZ_LINKER");
   if (!configured.empty()) return configured;
@@ -963,6 +1044,11 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
                                 const std::vector<std::string>& native_libraries = {},
                                 const std::vector<std::filesystem::path>& native_library_paths = {}) {
   const std::string linker = native_linker();
+  const auto runtime_library = stage0_runtime_library();
+  const auto forge_bridge_library = stage0_forge_bridge_library();
+  const auto forge_library = stage0_forge_library();
+  const auto ssl_library = stage0_ssl_library();
+  const auto crypto_library = stage0_crypto_library();
   std::ostringstream command;
 #if defined(_WIN32)
   if (oblink_driver(linker)) {
@@ -972,27 +1058,17 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
     // paths/libraries rather than silently dropping them as the old baseline did.
     for (const auto& path : native_library_paths) command << "-L " << shell_quote(path) << ' ';
     for (const auto& library : native_libraries) command << "-l " << shell_quote(std::filesystem::path(library)) << ' ';
-#ifdef RAZ_RUNTIME_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
-#endif
+    if (!runtime_library.empty()) command << shell_quote(runtime_library) << ' ';
     if (compiler_link_artifact(output)) {
-#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_FORGE_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
-#endif
+      if (!forge_bridge_library.empty()) command << shell_quote(forge_bridge_library) << ' ';
+      if (!forge_library.empty()) command << shell_quote(forge_library) << ' ';
     }
     // raz_runtime.lib is compiled against OpenSSL when it is available, so any
     // image that pulls a runtime member may need libssl/libcrypto. The MSVC and
     // POSIX branches already pass these; omitting them here left every ObLink
     // link of a runtime-using program failing on EVP_* symbols.
-#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
-#endif
+    if (!ssl_library.empty()) command << shell_quote(ssl_library) << ' ';
+    if (!crypto_library.empty()) command << shell_quote(crypto_library) << ' ';
     // CMake records these as transitive runtime dependencies, but a static .lib
     // cannot carry the final PE import table. Ask ObLink to resolve the standard
     // Windows import libraries through the VS/SDK LIB search path.
@@ -1007,23 +1083,13 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
     for (const auto& input : inputs) command << shell_quote(input) << ' ';
     for (const auto& path : native_library_paths) command << "/LIBPATH:" << shell_quote(path) << ' ';
     for (const auto& library : native_libraries) command << shell_quote(std::filesystem::path(library + ".lib")) << ' ';
-#ifdef RAZ_RUNTIME_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
-#endif
+    if (!runtime_library.empty()) command << shell_quote(runtime_library) << ' ';
     if (compiler_link_artifact(output)) {
-#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_FORGE_LIBRARY_PATH
-      command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
-#endif
+      if (!forge_bridge_library.empty()) command << shell_quote(forge_bridge_library) << ' ';
+      if (!forge_library.empty()) command << shell_quote(forge_library) << ' ';
     }
-#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
-#endif
+    if (!ssl_library.empty()) command << shell_quote(ssl_library) << ' ';
+    if (!crypto_library.empty()) command << shell_quote(crypto_library) << ' ';
     command << "ws2_32.lib bcrypt.lib crypt32.lib /Fe:" << shell_quote(output);
     if (!shared) {
       // The self-hosted compiler recursively walks large syntax/HIR trees and
@@ -1044,23 +1110,13 @@ std::string native_link_command(const std::vector<std::filesystem::path>& inputs
   for (const auto& input : inputs) command << shell_quote(input) << ' ';
   for (const auto& path : native_library_paths) command << "-L" << shell_quote(path) << ' ';
   for (const auto& library : native_libraries) command << "-l" << shell_quote(std::filesystem::path(library)) << ' ';
-#ifdef RAZ_RUNTIME_LIBRARY_PATH
-  command << shell_quote(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH)) << ' ';
-#endif
+  if (!runtime_library.empty()) command << shell_quote(runtime_library) << ' ';
   if (compiler_link_artifact(output)) {
-#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_FORGE_LIBRARY_PATH
-    command << shell_quote(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH)) << ' ';
-#endif
+    if (!forge_bridge_library.empty()) command << shell_quote(forge_bridge_library) << ' ';
+    if (!forge_library.empty()) command << shell_quote(forge_library) << ' ';
   }
-#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-  command << shell_quote(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH)) << ' ';
-#endif
-#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-  command << shell_quote(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH)) << ' ';
-#endif
+  if (!ssl_library.empty()) command << shell_quote(ssl_library) << ' ';
+  if (!crypto_library.empty()) command << shell_quote(crypto_library) << ' ';
 #if defined(_WIN32)
   command << "-lws2_32 -lbcrypt -lcrypt32 ";
 #else
@@ -1723,21 +1779,11 @@ bool build_aggregate_native_artifact(const ProjectGraph& graph, const Options& o
   auto link_hash = hash_text("raz-aggregate-link-v4");
   link_hash = hash_text(aggregate_command, link_hash);
   link_hash = file_content_fingerprint(object, link_hash, link_input_cache);
-#ifdef RAZ_RUNTIME_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_FORGE_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
+  if (const auto path = stage0_runtime_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_forge_bridge_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_forge_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_ssl_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_crypto_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
   const auto link_fingerprint = hex(link_hash);
   write_link_input_cache(link_input_state_path, link_input_cache);
   const auto link_state_path = aggregate_state_root / "link.fingerprint";
@@ -1891,21 +1937,11 @@ bool build_native_artifact(const ProjectGraph& graph, const Options& options, co
   for (const auto& fingerprint : object_fingerprints) link_hash = hash_text(fingerprint, link_hash);
   for (std::size_t index = objects.size(); index < link_inputs.size(); ++index)
     link_hash = file_content_fingerprint(link_inputs[index], link_hash, link_input_cache);
-#ifdef RAZ_RUNTIME_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_RUNTIME_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_FORGE_BRIDGE_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_FORGE_BRIDGE_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_FORGE_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_FORGE_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_OPENSSL_SSL_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_OPENSSL_SSL_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
-#ifdef RAZ_OPENSSL_CRYPTO_LIBRARY_PATH
-  link_hash = file_content_fingerprint(std::filesystem::path(RAZ_OPENSSL_CRYPTO_LIBRARY_PATH), link_hash, link_input_cache);
-#endif
+  if (const auto path = stage0_runtime_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_forge_bridge_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_forge_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_ssl_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
+  if (const auto path = stage0_crypto_library(); !path.empty()) link_hash = file_content_fingerprint(path, link_hash, link_input_cache);
   const auto link_fingerprint = hex(link_hash);
   write_link_input_cache(link_input_state_path, link_input_cache);
   const auto link_fingerprint_path = native_state_root / "link.fingerprint";

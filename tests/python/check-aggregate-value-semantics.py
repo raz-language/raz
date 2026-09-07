@@ -5,7 +5,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-LOWERING = ROOT / "compiler" / "src" / "mir" / "lowering.rz"
+LOWERING = ROOT / "compiler" / "src" / "raz_mir" / "src" / "mir" / "lowering.rz"
 text = LOWERING.read_text(encoding="utf-8")
 
 needle = "storage = lower_hir_copy_structure(hir, out, structure, source);"

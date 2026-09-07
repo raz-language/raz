@@ -1,0 +1,151 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::client_host;
+
+import alloc::string;
+import web::build::fs;
+import web::html_support;
+
+extern fn raz_rt_load_u8(usize address) -> i64;
+
+public fn client_element_lookup(String&mut output, string local_name, string id) -> bool {
+    if (!output.push_str("const ") || !output.push_str(local_name) || !output.push_str(" = document.getElementById('") || !web::html_support::append_js_string_to(output, id)) { return false; }
+    return output.push_str("');\n");
+}
+
+public fn write_client_for_path(String& client, String& browser_roots, String& browser_chunks, String& html_path) -> bool {
+    usize data = html_path.as_ptr();
+    i64 length = html_path.len();
+    i64 slash = -1;
+    i64 i = 0;
+    while (i < length) {
+        i64 ch = raz_rt_load_u8(data + i);
+        if (ch == 47 || ch == 92) { slash = i; }
+        i += 1;
+    }
+
+    String script_path = String::with_capacity(length + 16);
+    i = 0;
+    while (i <= slash) {
+        if (!script_path.push(raz_rt_load_u8(data + i))) { return false; }
+        i += 1;
+    }
+    if (!script_path.push_str("app.js")) { return false; }
+    if (client.len() == 0) {
+        return web::build::fs::remove_file_if_present(&script_path);
+    }
+
+    // Client-only module loading is deliberately independent from the Raz WASM
+    // host. A page that only lazy-loads an ES module must not pay for app.wasm.
+    if (browser_roots.len() == 0 && browser_chunks.len() == 0) {
+        String client_only = String::with_capacity(client.len() + 256);
+        if (!client_only.push_str("// Generated Raz Web lazy-module loader.\n") ||
+            !client_only.push_string(&client)) { return false; }
+        return web::build::fs::write_string(&script_path, &client_only);
+    }
+
+    String script = String::with_capacity(client.len() + 6144);
+    if (!script.push_str("// Generated Raz Web host shim. Application logic lives in app.wasm.\n")) { return false; }
+    if (!script.push_str("let rzMemory = null;\nlet rzCurrentEvent = null;\nlet rz = null;\nconst rzDecoder = new TextDecoder();\nconst rzEncoder = new TextEncoder();\nconst rzUse = (exports) => { rz = exports; rzMemory = exports.memory; return exports; };\n")) { return false; }
+    if (!script.push_str("const rzCstr = (ptr) => { const bytes = new Uint8Array(rzMemory.buffer); const start = Number(ptr); let end = start; while (end < bytes.length && bytes[end] !== 0) end++; return rzDecoder.decode(bytes.subarray(start, end)); };\n")) { return false; }
+    if (!script.push_str("const rzImports = { raz_web: {\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:24*/dom_set_text: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:25*/dom_set_text_i64: (idPtr, value) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = value.toString(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:26*/dom_toggle_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.toggle(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:27*/dom_set_text_ptr: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:28*/dom_set_text_i64_ptr: (idPtr, value) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.textContent = value.toString(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:29*/dom_toggle_class_ptr: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.toggle(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:30*/event_value_length: () => { const value = rzCurrentEvent && rzCurrentEvent.target && 'value' in rzCurrentEvent.target ? String(rzCurrentEvent.target.value) : ''; return BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:31*/event_value_write: (outPtr, capacity) => { const value = rzCurrentEvent && rzCurrentEvent.target && 'value' in rzCurrentEvent.target ? String(rzCurrentEvent.target.value) : ''; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:32*/event_key_length: () => { const key = rzCurrentEvent && typeof rzCurrentEvent.key === 'string' ? rzCurrentEvent.key : ''; return BigInt(rzEncoder.encode(key).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:33*/event_key_write: (outPtr, capacity) => { const key = rzCurrentEvent && typeof rzCurrentEvent.key === 'string' ? rzCurrentEvent.key : ''; const bytes = rzEncoder.encode(key); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:34*/event_checked: () => rzCurrentEvent && rzCurrentEvent.target && !!rzCurrentEvent.target.checked ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:35*/event_prevent_default: () => { if (!rzCurrentEvent) return 0n; rzCurrentEvent.preventDefault(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:56*/event_code_length: () => { const value = rzCurrentEvent && typeof rzCurrentEvent.code === 'string' ? rzCurrentEvent.code : ''; return BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:57*/event_code_write: (outPtr, capacity) => { const value = rzCurrentEvent && typeof rzCurrentEvent.code === 'string' ? rzCurrentEvent.code : ''; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:58*/event_repeat: () => rzCurrentEvent && rzCurrentEvent.repeat ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:59*/event_alt_key: () => rzCurrentEvent && rzCurrentEvent.altKey ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:60*/event_ctrl_key: () => rzCurrentEvent && rzCurrentEvent.ctrlKey ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:61*/event_shift_key: () => rzCurrentEvent && rzCurrentEvent.shiftKey ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:62*/event_meta_key: () => rzCurrentEvent && rzCurrentEvent.metaKey ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:63*/event_button: () => BigInt(rzCurrentEvent && Number.isInteger(rzCurrentEvent.button) ? rzCurrentEvent.button : -1),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:64*/event_client_x: () => BigInt(Math.trunc(rzCurrentEvent && Number.isFinite(rzCurrentEvent.clientX) ? rzCurrentEvent.clientX : 0)),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:65*/event_client_y: () => BigInt(Math.trunc(rzCurrentEvent && Number.isFinite(rzCurrentEvent.clientY) ? rzCurrentEvent.clientY : 0)),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:66*/event_stop_propagation: () => { if (!rzCurrentEvent) return 0n; rzCurrentEvent.stopPropagation(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:36*/dom_set_attribute: (idPtr, namePtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.setAttribute(rzCstr(namePtr), rzCstr(valuePtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:37*/dom_remove_attribute: (idPtr, namePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.removeAttribute(rzCstr(namePtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:38*/dom_add_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.add(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:39*/dom_remove_class: (idPtr, classPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.classList.remove(rzCstr(classPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:40*/dom_focus: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return 0n; el.focus(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:67*/dom_set_value: (idPtr, valuePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !('value' in el)) return 0n; el.value = rzCstr(valuePtr); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:68*/dom_blur: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || typeof el.blur !== 'function') return 0n; el.blur(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:69*/dom_click: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || typeof el.click !== 'function') return 0n; el.click(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:70*/dom_exists: (idPtr) => document.getElementById(rzCstr(idPtr)) ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:87*/dom_value_length: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !('value' in el)) return -1n; return BigInt(rzEncoder.encode(String(el.value)).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:88*/dom_value_write: (idPtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el || !('value' in el)) return -1n; const b = rzEncoder.encode(String(el.value)); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:89*/dom_text_length: (idPtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; return BigInt(rzEncoder.encode(el.textContent || '').length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:90*/dom_text_write: (idPtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const b = rzEncoder.encode(el.textContent || ''); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:91*/dom_attribute_length: (idPtr, namePtr) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const v = el.getAttribute(rzCstr(namePtr)); return v === null ? -1n : BigInt(rzEncoder.encode(v).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:92*/dom_attribute_write: (idPtr, namePtr, outPtr, cap) => { const el = document.getElementById(rzCstr(idPtr)); if (!el) return -1n; const v = el.getAttribute(rzCstr(namePtr)); if (v === null) return -1n; const b = rzEncoder.encode(v); const n = Math.min(b.length, Number(cap)); if (n) new Uint8Array(rzMemory.buffer, Number(outPtr), n).set(b.subarray(0,n)); return BigInt(n); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:71*/timer_set_timeout: (handlerPtr, delay) => { const name = rzCstr(handlerPtr); const owner = rz; const id = setTimeout(() => { const fn = owner && owner[name]; if (typeof fn === 'function') { rzUse(owner); fn(); } }, Math.max(0, Number(delay))); return BigInt(id); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:72*/timer_clear_timeout: (id) => { clearTimeout(Number(id)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:80*/timer_set_interval: (handlerPtr, delay) => { const name = rzCstr(handlerPtr); const owner = rz; const id = setInterval(() => { const fn = owner && owner[name]; if (typeof fn === 'function') { rzUse(owner); fn(); } }, Math.max(1, Number(delay))); return BigInt(id); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:81*/timer_clear_interval: (id) => { clearInterval(Number(id)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:41*/storage_set: (keyPtr, valuePtr) => { try { localStorage.setItem(rzCstr(keyPtr), rzCstr(valuePtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:42*/storage_remove: (keyPtr) => { try { localStorage.removeItem(rzCstr(keyPtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:43*/storage_clear: () => { try { localStorage.clear(); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:44*/storage_value_length: (keyPtr) => { const value = localStorage.getItem(rzCstr(keyPtr)); return value === null ? -1n : BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:45*/storage_value_write: (keyPtr, outPtr, capacity) => { const value = localStorage.getItem(rzCstr(keyPtr)); if (value === null) return -1n; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:82*/session_storage_set: (keyPtr, valuePtr) => { try { sessionStorage.setItem(rzCstr(keyPtr), rzCstr(valuePtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:83*/session_storage_remove: (keyPtr) => { try { sessionStorage.removeItem(rzCstr(keyPtr)); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:84*/session_storage_clear: () => { try { sessionStorage.clear(); return 1n; } catch (_) { return 0n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:85*/session_storage_value_length: (keyPtr) => { const value = sessionStorage.getItem(rzCstr(keyPtr)); return value === null ? -1n : BigInt(rzEncoder.encode(value).length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:86*/session_storage_value_write: (keyPtr, outPtr, capacity) => { const value = sessionStorage.getItem(rzCstr(keyPtr)); if (value === null) return -1n; const bytes = rzEncoder.encode(value); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:46*/location_href_length: () => BigInt(rzEncoder.encode(location.href).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:47*/location_href_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.href); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0, count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:93*/location_origin_length: () => BigInt(rzEncoder.encode(location.origin).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:94*/location_origin_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.origin); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:95*/location_pathname_length: () => BigInt(rzEncoder.encode(location.pathname).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:96*/location_pathname_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.pathname); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:97*/location_search_length: () => BigInt(rzEncoder.encode(location.search).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:98*/location_search_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.search); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:99*/location_hash_length: () => BigInt(rzEncoder.encode(location.hash).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:100*/location_hash_write: (outPtr, capacity) => { const bytes = rzEncoder.encode(location.hash); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:48*/location_assign: (urlPtr) => { location.assign(rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:49*/location_replace: (urlPtr) => { location.replace(rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:50*/location_reload: () => { location.reload(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:73*/url_query_value_length: (namePtr) => { const p = new URLSearchParams(location.search); const key = rzCstr(namePtr); if (!p.has(key)) return -1n; return BigInt(rzEncoder.encode(p.get(key) || '').length); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:74*/url_query_value_write: (namePtr, outPtr, capacity) => { const p = new URLSearchParams(location.search); const key = rzCstr(namePtr); if (!p.has(key)) return -1n; const bytes = rzEncoder.encode(p.get(key) || ''); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:79*/url_query_has: (namePtr) => new URLSearchParams(location.search).has(rzCstr(namePtr)) ? 1n : 0n,\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:75*/url_encode_length: (valuePtr) => BigInt(rzEncoder.encode(encodeURIComponent(rzCstr(valuePtr))).length),\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:76*/url_encode_write: (valuePtr, outPtr, capacity) => { const bytes = rzEncoder.encode(encodeURIComponent(rzCstr(valuePtr))); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:77*/url_decode_length: (valuePtr) => { try { return BigInt(rzEncoder.encode(decodeURIComponent(rzCstr(valuePtr))).length); } catch (_) { return -1n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:78*/url_decode_write: (valuePtr, outPtr, capacity) => { try { const bytes = rzEncoder.encode(decodeURIComponent(rzCstr(valuePtr))); const count = Math.min(bytes.length, Number(capacity)); if (count > 0) new Uint8Array(rzMemory.buffer, Number(outPtr), count).set(bytes.subarray(0,count)); return BigInt(count); } catch (_) { return -1n; } },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:51*/history_push: (urlPtr) => { history.pushState(null, '', rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:52*/history_replace: (urlPtr) => { history.replaceState(null, '', rzCstr(urlPtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:53*/history_back: () => { history.back(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:54*/history_forward: () => { history.forward(); return 1n; },\n")) { return false; }
+    if (!script.push_str("/*raz-web-import:55*/clipboard_write: (valuePtr) => { if (!navigator.clipboard) return 0n; void navigator.clipboard.writeText(rzCstr(valuePtr)); return 1n; },\n")) { return false; }
+    if (!script.push_str("} };\nconst rzLoadWasm = async (url) => { const response = await fetch(url); const bytes = await response.arrayBuffer(); const { instance } = await WebAssembly.instantiate(bytes, rzImports); return instance.exports; };\n")) { return false; }
+    if (browser_roots.len() > 0) {
+        if (!script.push_str("const rzMain = await rzLoadWasm('/app.wasm');\nrzUse(rzMain);\n")) { return false; }
+    }
+    if (!script.push_string(&client)) { return false; }
+    if (!web::build::fs::write_string(&script_path, &script)) { return false; }
+
+    // The native/static generator is authoritative about whether browser code
+    // exists. The compiler consumes this private marker after generation and
+    // emits app.wasm only when at least one route actually bound an event.
+    bool ok = true;
+    if (browser_roots.len() > 0) {
+        String marker_path = String::from("dist/.raz-wasm-required");
+        ok = web::build::fs::append_string(&marker_path, &browser_roots);
+    }
+    if (ok && browser_chunks.len() > 0) {
+        String chunks_path = String::from("dist/.raz-wasm-chunks");
+        ok = web::build::fs::append_string(&chunks_path, &browser_chunks);
+    }
+    return ok;
+}
+

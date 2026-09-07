@@ -231,6 +231,7 @@ std::int64_t raz_rt_copy_file(const char* from, std::int64_t from_length,
 void* raz_rt_file_open(const char* path, std::int64_t length, std::int64_t flags) {
   const auto value = view_text(path, length);
   if (value.empty()) { raz_set_last_error(EINVAL); return nullptr; }
+  const auto native_path = native_filesystem_path(value);
   const bool read = (flags & 1) != 0;
   const bool write = (flags & 2) != 0;
   const bool append = (flags & 4) != 0;
@@ -257,7 +258,7 @@ void* raz_rt_file_open(const char* path, std::int64_t length, std::int64_t flags
     if (read && write) open_flags |= _O_RDWR;
     else if (write) open_flags |= _O_WRONLY;
     else open_flags |= _O_RDONLY;
-    const int descriptor = _open(value.c_str(), open_flags, _S_IREAD | _S_IWRITE);
+    const int descriptor = _wopen(native_path.c_str(), open_flags, _S_IREAD | _S_IWRITE);
     if (descriptor < 0) { raz_set_errno_error(); return nullptr; }
     std::FILE* file = _fdopen(descriptor, read && write ? "r+b" : (write ? "wb" : "rb"));
     if (file == nullptr) { _close(descriptor); raz_set_errno_error(); return nullptr; }
@@ -267,7 +268,7 @@ void* raz_rt_file_open(const char* path, std::int64_t length, std::int64_t flags
     if (read && write) open_flags |= O_RDWR;
     else if (write) open_flags |= O_WRONLY;
     else open_flags |= O_RDONLY;
-    const int descriptor = ::open(value.c_str(), open_flags, 0666);
+    const int descriptor = ::open(native_path.c_str(), open_flags, 0666);
     if (descriptor < 0) { raz_set_errno_error(); return nullptr; }
     std::FILE* file = ::fdopen(descriptor, read && write ? "r+b" : (write ? "wb" : "rb"));
     if (file == nullptr) { ::close(descriptor); raz_set_errno_error(); return nullptr; }
@@ -276,8 +277,8 @@ void* raz_rt_file_open(const char* path, std::int64_t length, std::int64_t flags
     return file;
   }
 
-  std::FILE* file = std::fopen(value.c_str(), mode);
-  if (file == nullptr && create && read && write) file = std::fopen(value.c_str(), "w+b");
+  std::FILE* file = native_fopen(native_path, mode);
+  if (file == nullptr && create && read && write) file = native_fopen(native_path, "w+b");
   if (file == nullptr) raz_set_errno_error();
   else raz_clear_last_error();
   return file;
@@ -363,7 +364,7 @@ std::int64_t raz_rt_read_ascii_i64(const std::int64_t* path_codes, std::int64_t 
   if (path_codes == nullptr || data_codes == nullptr || path_length < 0 || capacity < 0) return -1;
   std::string path; path.reserve(static_cast<std::size_t>(path_length));
   for (std::int64_t i = 0; i < path_length; ++i) path.push_back(static_cast<char>(path_codes[i] & 0xff));
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(native_filesystem_path(path), std::ios::binary);
   if (!input) return -1;
   std::int64_t count = 0;
   char byte = 0;
@@ -381,7 +382,7 @@ std::int64_t raz_rt_write_ascii_i64(const std::int64_t* path_codes, std::int64_t
   for (std::int64_t i = 0; i < path_length; ++i) path.push_back(static_cast<char>(path_codes[i] & 0xff));
   std::vector<char> bytes; bytes.reserve(static_cast<std::size_t>(size));
   for (std::int64_t i = 0; i < size; ++i) bytes.push_back(static_cast<char>(data_codes[i] & 0xff));
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream output(native_filesystem_path(path), std::ios::binary | std::ios::trunc);
   if (!output) return -1;
   output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   return output ? size : -1;
@@ -514,6 +515,12 @@ void raz_rt_dir_close(void* raw_handle) {
   delete static_cast<RazDirectoryIterator*>(raw_handle);
 }
 
+// Defined in platform_threads_crypto.cpp. CreateProcess will not search PATH
+// for a partial application name, so both spawn helpers resolve the program
+// through the same lookup the tool-availability probe uses.
+extern "C" std::int64_t raz_rt_tool_resolve(const char* data, std::int64_t length,
+                                            char* output, std::int64_t capacity);
+
 std::int64_t raz_rt_process_run_argv(const char* program, std::int64_t program_length,
                                       const char* blob, std::int64_t blob_length,
                                       std::int64_t argument_count) {
@@ -562,7 +569,17 @@ std::int64_t raz_rt_process_run_argv(const char* program, std::int64_t program_l
   mutable_command.push_back('\0');
   STARTUPINFOA startup{}; startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  if (!CreateProcessA(executable.c_str(), mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process)) {
+  // CreateProcess completes a partial lpApplicationName against the current
+  // drive and directory only -- it does not use the search path. A helper such
+  // as tar.exe is therefore invisible unless it happens to sit in the caller's
+  // working directory, even though the availability probe found it on PATH.
+  std::string application = executable;
+  char resolved_program[32768]{};
+  if (raz_rt_tool_resolve(executable.c_str(), static_cast<std::int64_t>(executable.size()),
+                          resolved_program, static_cast<std::int64_t>(sizeof(resolved_program))) > 0) {
+    application = resolved_program;
+  }
+  if (!CreateProcessA(application.c_str(), mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process)) {
     raz_set_last_error(static_cast<std::int64_t>(GetLastError())); return -1;
   }
 
@@ -648,7 +665,17 @@ std::int64_t raz_rt_process_run_argv_cwd(const char* program, std::int64_t progr
   mutable_command.push_back('\0');
   STARTUPINFOA startup{}; startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  if (!CreateProcessA(executable.c_str(), mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+  // CreateProcess completes a partial lpApplicationName against the current
+  // drive and directory only -- it does not use the search path. A helper such
+  // as tar.exe is therefore invisible unless it happens to sit in the caller's
+  // working directory, even though the availability probe found it on PATH.
+  std::string application = executable;
+  char resolved_program[32768]{};
+  if (raz_rt_tool_resolve(executable.c_str(), static_cast<std::int64_t>(executable.size()),
+                          resolved_program, static_cast<std::int64_t>(sizeof(resolved_program))) > 0) {
+    application = resolved_program;
+  }
+  if (!CreateProcessA(application.c_str(), mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr,
                       cwd.c_str(), &startup, &process)) {
     raz_set_last_error(static_cast<std::int64_t>(GetLastError())); return -1;
   }
@@ -772,7 +799,17 @@ std::int64_t raz_rt_stdio_is_terminal(std::int64_t stream) {
 
 std::int64_t raz_rt_process_run(const char* command, std::int64_t length) {
   const auto value = view_text(command, length);
-  return value.empty() ? -1 : static_cast<std::int64_t>(std::system(value.c_str()));
+  if (value.empty()) return -1;
+#if defined(_WIN32)
+  // cmd.exe applies special first/last-quote stripping to /C command strings.
+  // A command beginning with a quoted executable such as
+  // "C:\\Program Files\\LLVM\\bin\\clang++.exe" would otherwise be
+  // truncated to C:\\Program.  Wrap the complete command, matching the
+  // already-proven Forge bridge launch path.
+  return static_cast<std::int64_t>(std::system((std::string("\"") + value + "\"").c_str()));
+#else
+  return static_cast<std::int64_t>(std::system(value.c_str()));
+#endif
 }
 
 

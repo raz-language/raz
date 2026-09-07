@@ -72,15 +72,15 @@ fn main() -> i64 {
 ]=])
 
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}/consumer" --target test-host --force
+  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}/consumer" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Cross-package error API failed to build:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/consumer/target/test-host/debug/error_cross_consumer.exe")
+  set(runtime_exe "${WORK_ROOT}/consumer/target/debug/bin/error_cross_consumer.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/consumer/target/test-host/debug/error_cross_consumer")
+  set(runtime_exe "${WORK_ROOT}/consumer/target/debug/bin/error_cross_consumer")
 endif()
 execute_process(
   COMMAND "${runtime_exe}"

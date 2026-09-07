@@ -84,15 +84,15 @@ fn main() -> i64 {
 }
 ]=])
 
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}/consumer" --target test-host --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}/consumer" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Cross-package codec build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/consumer/target/test-host/debug/wireconsumer.exe")
+  set(runtime_exe "${WORK_ROOT}/consumer/target/debug/bin/wireconsumer.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/consumer/target/test-host/debug/wireconsumer")
+  set(runtime_exe "${WORK_ROOT}/consumer/target/debug/bin/wireconsumer")
 endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm "${runtime_exe}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)

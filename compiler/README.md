@@ -6,6 +6,8 @@ The layout follows the same broad architectural idea as rustc: one compiler tree
 
 `compiler/src/main.rz` is intentionally tiny. It delegates to `raz_driver`, while the compiler implementation lives in sibling `raz_*` packages.
 
+Compiler package directories are **source-only**. Generated `target/` trees must never live under `compiler/src/raz_*`; package and bootstrap caches belong in the repository-level `target/` or `build/` trees so source discovery and archives cannot depend on stale generated state.
+
 ## Package layout
 
 ```text
@@ -19,6 +21,7 @@ compiler/
     raz_mir/                # HIR -> MIR + ownership facts + analysis/verification
     raz_mir_opt/            # canonical MIR optimization transforms + pass policy
     raz_borrowck/           # move/loan/reborrow/drop legality over canonical MIR
+    raz_codegen_common/     # backend-neutral writer, ABI symbols, and MIR capability queries
     raz_codegen_forge/      # Forge native backend
     raz_codegen_llvm/       # LLVM IR/native integration
     raz_codegen_wasm/       # WebAssembly backend
@@ -59,6 +62,23 @@ The C++ Stage-0 compiler is frozen compatibility machinery. It predates some of 
 
 That compatibility package is never canonical source. The first Raz-owned self-host generation compiles the real `raz_hir`, `raz_mir`, `raz_mir_opt`, and `raz_borrowck` packages independently.
 
+## Driver internal ownership
+
+`raz_driver` remains one compiler package, but its project-build implementation is split by responsibility rather than accumulated in one monolithic module:
+
+```text
+raz_driver/src/
+  project.rz               # manifests, dependency graph, deterministic source assembly
+  project_native.rz        # native paths, package-unit cache/object emission, final link
+  project_web_manifest.rz  # target=web/package web fields and output/public paths
+```
+
+The split intentionally keeps package/API boundaries stable. Native artifact policy and web-manifest interpretation must not drift back into `project.rz`; `check-driver-project-layout.py` pins this ownership contract. Further driver decomposition should follow the same rule: extract cohesive subsystems behind narrow APIs before considering additional compiler packages.
+
+Registry internals follow the same ownership rule. Semantic-version parsing/constraints live in `registry_semver.rz`, shared record/token helpers in `registry_support.rz`, index/version-selection helpers in `registry_index.rz`, project registry-state paths in `registry_state.rz`, manifest tracking/spec persistence in `registry_tracking.rz`, and verified constraint/lock hydration plus cache writes in `registry_resolver.rz`; `registry.rz` remains the orchestration layer for update, fetch, vendor, publish, and CLI workflows. `check-driver-registry-layout.py` prevents those extracted responsibilities from drifting back into the orchestration module.
+
+CLI internals are also split by responsibility. `cli_support.rz` owns shared stdout/argv primitives, `cli_help.rz` owns command recognition, suggestions, help topics, and CLI-facing argument errors, while `cli.rz` retains build/run execution, diagnostics, project creation, and completion/status policy. `check-driver-cli-layout.py` pins that boundary so help/command-table growth does not turn the execution module back into a monolith.
+
 ## Native build artifacts
 
 Package/module objects under:
@@ -72,3 +92,21 @@ are the canonical native object layout. `target/<profile>/obj/<package>.o` / `.o
 ## Source ordering
 
 Compiler packages use semantic module discovery and explicit imports. No compiler `source-order.txt` is retained. Bootstrap discovers the canonical package manifests and `.rz` sources directly, and `src/main.rz` remains the executable entry point.
+
+### Backend dependency rule
+
+Backends are siblings: Forge, LLVM, Wasm, and RXE may depend on `raz_codegen_common`, frontend/HIR/MIR packages, and runtime ABI declarations, but never on one another. `raz_codegen_web` is an application-target orchestrator and may explicitly consume Wasm. Native symbol identity, main discovery, async-MIR capability queries, and generic text buffering belong to `raz_codegen_common` rather than to Forge or LLVM.
+
+HIR statement lowering is split by semantic responsibility. `semantic/statement_support.rz` owns generic block/statement construction and lexical block capture, `semantic/match_statements.rz` owns match-pattern parsing, ownership checks, exhaustiveness, and match HIR emission, while `semantic/statements.rz` remains the dispatcher for locals, assignments, defer/unsafe, loops, and block statement control flow. `check-hir-statement-layout.py` pins this ownership boundary.
+Compile-time HIR semantics are split by responsibility. `semantic/comptime_eval.rz` owns deterministic constexpr/comptime evaluation, mutable comptime value materialization, block execution, and constant folding; `semantic/comptime.rz` owns parsing/orchestration, attributes, predeclaration, generic materialization, closure finalization, and incremental HIR build coordination. `check-hir-comptime-layout.py` pins this ownership boundary.
+Ownership HIR semantics are split into three focused layers. `semantic/ownership_paths.rz` owns ownership-path projection, partial-move identity, predrop bookkeeping, and move-state mutation; `semantic/ownership_flow.rz` owns path-sensitive move-state propagation across branches, loops, blocks, and root statements; `semantic/ownership.rz` retains name/borrow/reference validation, coercions, trait/inherent calls, closure capture semantics, and reference-return validation. `check-hir-ownership-layout.py` pins this boundary.
+Expression HIR lowering is layered as well. `semantic/expression_support.rz` owns primitive associated constants and immediate temporary member/method chaining; `semantic/expression_operators.rz` owns casts and the binary-operator precedence ladder; `semantic/expression_calls.rz` owns call signature validation, argument coercion, closure capture materialization, effect/unsafe checks, and direct/indirect call HIR emission; `semantic/expression_postfix.rz` owns member/method projection, enum postfix properties/payloads, propagation, and typed index-result/effect validation; `semantic/expressions.rz` remains the core primary-expression, recursive argument/index parsing, literal, and final expression dispatcher. `check-hir-expression-layout.py` pins this boundary.
+
+
+### WASM host-layer ownership
+
+The WASM backend keeps platform host adapters separated by responsibility. `wasm/wasi.rz` owns WASI preview1/runtime adaptation, `wasm/browser_host.rz` owns the `raz_web` browser import ABI and wrapper lowering, and `wasm/host_support.rz` owns host-neutral runtime-symbol matching shared by browser, WASI, and future lowering. Browser imports must not be added directly to `wasi.rz`.
+
+### WASM WASI filesystem ownership
+
+The WASM backend keeps host concerns layered. `wasm/wasi.rz` owns Preview1 process, stdio, environment, clock/random, sleep, and higher-level filesystem orchestration. `wasm/wasi_filesystem.rz` owns preopen discovery/path routing and the core file descriptor/path adapters (open/close/seek/tell/flush/eof/stat/exists). `wasm/wasi_support.rz` owns the tiny shared errno/memory helpers used across WASI adapters. Browser ABI lowering remains isolated in `wasm/browser_host.rz`.

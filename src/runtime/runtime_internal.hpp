@@ -117,6 +117,40 @@ inline void raz_set_socket_error() {
 #endif
 }
 
+// Raz keeps compiler/project paths in a portable canonical form using '/'.
+// Convert that representation at the runtime I/O boundary instead of relying
+// on each CRT/iostream implementation to interpret foreign separators the same
+// way.  In C++20 the legacy filesystem UTF-8 helper is deprecated by the MSVC STL, so
+// construct from a char8_t string directly while preserving Raz's UTF-8 bytes.
+inline std::filesystem::path native_filesystem_path(const std::string& text) {
+#if defined(_WIN32)
+  std::u8string utf8;
+  utf8.reserve(text.size());
+  for (const unsigned char byte : text) {
+    utf8.push_back(static_cast<char8_t>(byte));
+  }
+  auto path = std::filesystem::path(utf8);
+  path.make_preferred();
+  return path;
+#else
+  return std::filesystem::path(text);
+#endif
+}
+
+inline std::FILE* native_fopen(const std::filesystem::path& path, const char* mode) {
+#if defined(_WIN32)
+  wchar_t wide_mode[8]{};
+  std::size_t index = 0;
+  while (mode[index] != '\0' && index + 1 < std::size(wide_mode)) {
+    wide_mode[index] = static_cast<wchar_t>(static_cast<unsigned char>(mode[index]));
+    ++index;
+  }
+  return _wfopen(path.c_str(), wide_mode);
+#else
+  return std::fopen(path.c_str(), mode);
+#endif
+}
+
 #if defined(_WIN32)
 using Socket = SOCKET;
 constexpr Socket invalid_socket = INVALID_SOCKET;

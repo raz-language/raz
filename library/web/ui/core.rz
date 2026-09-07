@@ -1,0 +1,327 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+import alloc::string;
+
+extern fn raz_rt_alloc(i64 size) -> usize;
+extern fn raz_rt_dealloc(usize pointer);
+extern fn raz_rt_copy(usize destination, usize source, i64 size);
+extern fn raz_rt_cstr_len(string value) -> i64;
+extern fn raz_rt_cstr_ptr(string value) -> usize;
+extern fn raz_rt_load_u8(usize address) -> i64;
+
+public enum Tag {
+    // Wrapper-free composition node. Fragment renders only its children and
+    // never appears in the emitted HTML or structural stream.
+    Fragment,
+    Div,
+    Main,
+    Section,
+    Header,
+    Footer,
+    Nav,
+    Article,
+    Aside,
+    Figure,
+    Figcaption,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    P,
+    Span,
+    Small,
+    Strong,
+    Em,
+    Code,
+    Pre,
+    Blockquote,
+    Br,
+    Hr,
+    Button,
+    A,
+    Ul,
+    Ol,
+    Li,
+    Dl,
+    Dt,
+    Dd,
+    Form,
+    Label,
+    Input,
+    Textarea,
+    Select,
+    Option,
+    Details,
+    Summary,
+    Table,
+    Thead,
+    Tbody,
+    Tr,
+    Th,
+    Td,
+    Img,
+    Video,
+    Audio,
+    Source,
+}
+
+public enum InputType {
+    Text,
+    Email,
+    Password,
+    Number,
+    Search,
+    Url,
+    Tel,
+    Date,
+    Checkbox,
+    Radio,
+    File,
+    Hidden,
+    Submit,
+    Button,
+    Reset,
+    Color,
+    Range,
+    Month,
+    Week,
+    Time,
+    DateTimeLocal,
+}
+
+struct Buffer {
+    usize data;
+    i64 length;
+    i64 capacity;
+}
+
+public struct StateI64 {
+    i64 slot;
+}
+
+public struct StateBool {
+    i64 slot;
+}
+
+public struct StateString {
+    i64 slot;
+}
+
+// Derived scalar values are lightweight dependency records. They do not own
+// application state: each record points at source StateI64 slots and can be
+// recomputed by the browser directly through the Wasm ABI when all sources are
+// bound-only. A structural get() promotes the source states conservatively.
+public struct DerivedI64 {
+    i64 id;
+}
+
+public struct DerivedBool {
+    i64 id;
+}
+
+public struct HttpRequest {
+    i64 slot;
+}
+
+public struct JsonString {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+public struct JsonI64 {
+    i64 value;
+    bool found;
+}
+
+public struct JsonBool {
+    bool value;
+    bool found;
+}
+
+public struct JsonF64 {
+    f64 value;
+    bool found;
+}
+
+public struct JsonNull {
+    bool found;
+}
+
+public struct JsonObject {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+public struct JsonArray {
+    usize data;
+    i64 length;
+    bool found;
+}
+
+// User-defined response models implement JsonDecode and can then be wrapped in
+// Resource<T>. The resource tracks the underlying HTTP response generation and
+// decodes at most once per completed response, keeping browser transport and
+// application models fully on the Raz side of the Wasm boundary.
+public trait JsonDecode {
+    fn decode(Self&mut self, HttpRequest& request) -> bool;
+}
+
+public struct Resource<T> {
+    i64 request_slot;
+    T value;
+    i64 decoded_version;
+    bool decoded;
+    bool failed;
+}
+
+struct JsonSlice {
+    usize data;
+    i64 length;
+    i64 kind;
+    bool found;
+}
+
+public struct Element {
+    Tag tag;
+    // Zero is the page scope. Positive values identify keyed component
+    // rerender boundaries and are copied into descendant event bindings.
+    i64 component_scope;
+    Buffer attributes;
+    Buffer children;
+    // A parallel structural representation masks values from explicitly bound
+    // state. If this exact byte sequence is unchanged across renders, the
+    // browser can update those bindings directly without parsing/morphing HTML.
+    Buffer shape_attributes;
+    Buffer shape_children;
+}
+
+public struct StyleSheet {
+    Buffer css;
+}
+
+public struct Component {
+    Element root;
+    StyleSheet styles;
+    Buffer scripts;
+    i64 component_scope;
+    bool failed;
+}
+
+// Browser-visible document buffers. The generated web host reads these through
+// stable exports after _start and again after an event dispatcher rerenders.
+global mut usize web_html_data = 0;
+global mut i64 web_html_length = 0;
+global mut usize web_css_data = 0;
+global mut i64 web_css_length = 0;
+global mut usize web_title_data = 0;
+global mut i64 web_title_length = 0;
+global mut usize web_js_data = 0;
+global mut i64 web_js_length = 0;
+global mut i64 web_revision = 0;
+global mut usize web_shape_data = 0;
+global mut i64 web_shape_length = 0;
+global mut i64 web_structure_revision = 0;
+// Component-local render output. A positive component scope can publish only
+// its keyed subtree here, letting the browser patch that boundary without
+// rerunning or replacing the page-level document.
+global mut usize web_component_html_data = 0;
+global mut i64 web_component_html_length = 0;
+global mut usize web_component_css_data = 0;
+global mut i64 web_component_css_length = 0;
+global mut i64 web_component_scope = 0;
+global mut i64 web_component_revision = 0;
+
+// Small browser-resident reactive store. State is keyed by the developer's
+// stable string name instead of render order, so moving a state declaration in
+// a component does not silently retarget another value. Records are four i64s:
+// key hash, kind, value, and per-state version. Event records are three i64s:
+// action kind, state slot, and action argument. The tables live for the Wasm
+// instance lifetime and are reclaimed when the page unloads with the instance.
+const i64 WEB_STATE_CAPACITY = 512;
+const i64 WEB_STATE_RECORD_BYTES = 64;
+const i64 WEB_EVENT_CAPACITY = 1024;
+const i64 WEB_EVENT_RECORD_BYTES = 32;
+const i64 WEB_STATE_I64 = 1;
+const i64 WEB_STATE_BOOL = 2;
+const i64 WEB_ACTION_ADD_I64 = 1;
+const i64 WEB_ACTION_SET_I64 = 2;
+const i64 WEB_ACTION_TOGGLE_BOOL = 3;
+const i64 WEB_ACTION_SET_BOOL = 4;
+const i64 WEB_ACTION_SET_STRING = 5;
+const i64 WEB_ACTION_SUBMIT_STRING = 6;
+const i64 WEB_ACTION_SUBMIT_STRING_MIN = 7;
+const i64 WEB_ACTION_SET_BOOL_INPUT = 8;
+const i64 WEB_ACTION_SET_I64_INPUT = 9;
+const i64 WEB_STATE_STRING = 3;
+const i64 WEB_STATE_DEP_BOUND = 1;
+const i64 WEB_STATE_DEP_STRUCTURAL = 2;
+
+const i64 WEB_DERIVED_CAPACITY = 128;
+const i64 WEB_DERIVED_RECORD_BYTES = 32;
+const i64 WEB_DERIVED_ADD = 1;
+const i64 WEB_DERIVED_SUB = 2;
+const i64 WEB_DERIVED_MUL_CONST = 3;
+const i64 WEB_DERIVED_EQ = 4;
+const i64 WEB_DERIVED_NE = 5;
+const i64 WEB_DERIVED_LT = 6;
+const i64 WEB_DERIVED_LTE = 7;
+const i64 WEB_DERIVED_GT = 8;
+const i64 WEB_DERIVED_GTE = 9;
+const i64 WEB_DERIVED_EQ_CONST = 10;
+const i64 WEB_DERIVED_NE_CONST = 11;
+const i64 WEB_DERIVED_LT_CONST = 12;
+const i64 WEB_DERIVED_LTE_CONST = 13;
+const i64 WEB_DERIVED_GT_CONST = 14;
+const i64 WEB_DERIVED_GTE_CONST = 15;
+const i64 WEB_DERIVED_ADD_CONST = 16;
+const i64 WEB_DERIVED_SUB_CONST = 17;
+
+const i64 WEB_EFFECT_CAPACITY = 512;
+const i64 WEB_EFFECT_RECORD_BYTES = 32;
+const i64 WEB_EFFECT_STATE = 1;
+const i64 WEB_EFFECT_HTTP = 2;
+const i64 WEB_EFFECT_RENDER = 3;
+
+const i64 WEB_HTTP_CAPACITY = 32;
+const i64 WEB_HTTP_RECORD_BYTES = 104;
+// Retained component props are compiler-managed snapshots used only for local
+// rerenders. The first ABI supports flat Copy structs whose fields occupy one
+// Wasm aggregate slot each. Records are scope, data pointer, and slot count.
+const i64 WEB_COMPONENT_PROPS_CAPACITY = 64;
+const i64 WEB_COMPONENT_PROPS_RECORD_BYTES = 24;
+const i64 WEB_HTTP_IDLE = 0;
+const i64 WEB_HTTP_PENDING = 1;
+const i64 WEB_HTTP_INFLIGHT = 2;
+const i64 WEB_HTTP_COMPLETE = 3;
+const i64 WEB_HTTP_FAILED = 4;
+const i64 WEB_HTTP_GET = 1;
+const i64 WEB_HTTP_POST = 2;
+const i64 WEB_HTTP_PUT = 3;
+const i64 WEB_HTTP_PATCH = 4;
+const i64 WEB_HTTP_DELETE = 5;
+
+global mut usize web_state_records = 0;
+global mut usize web_event_records = 0;
+global mut i64 web_event_count = 0;
+global mut usize web_derived_records = 0;
+global mut i64 web_derived_count = 0;
+
+global mut usize web_effect_records = 0;
+global mut i64 web_render_generation = 0;
+
+// Browser route and fetch state are owned by the Wasm instance. JavaScript is
+// only the transport bridge to History/fetch and never owns application state.
+global mut usize web_route_data = 0;
+global mut i64 web_route_length = 0;
+// Structural route reads use the same owner marker convention as state: 0 =
+// unobserved, scope+1 = one owner, -1 = mixed owners.
+global mut i64 web_route_structural_owner = 0;
+global mut usize web_http_records = 0;
+global mut usize web_component_props_records = 0;

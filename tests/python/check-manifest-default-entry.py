@@ -5,7 +5,7 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-project = (root / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8")
+project = (root / "compiler/src/raz_driver/src/driver/project.rz").read_text(encoding="utf-8")
 host = (root / "src/bootstrap/compiler/project/project.hpp").read_text(encoding="utf-8")
 
 expected = "src/main.rz"

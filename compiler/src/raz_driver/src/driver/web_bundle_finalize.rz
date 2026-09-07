@@ -1,0 +1,391 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::web_bundle_finalize;
+
+public import raz_driver::web_bundle;
+
+// Release finalization owns content-addressed naming, reference rewrites,
+// manifest emission, and removal of canonical pre-fingerprint assets.
+
+// Build a generated reference while keeping the rewrite match anchored to its
+// surrounding syntax. Rewriting a bare `app.js`/`app.wasm` substring can alter
+// user-authored text or raw JavaScript that merely mentions the same filename.
+fn web_bundle_wrap_reference(
+    i64 output,
+    i64 capacity,
+    string prefix,
+    i64 value,
+    i64 value_length,
+    string suffix,
+) -> i64 {
+    if (output == 0 || capacity <= 0 || value == 0 || value_length < 0) { return -1; }
+    i64 prefix_length = compiler_literal_length(prefix);
+    i64 suffix_length = compiler_literal_length(suffix);
+    if (prefix_length + value_length + suffix_length > capacity) { return -1; }
+    i64 cursor = 0;
+    i64 i = 0;
+    while (i < prefix_length) {
+        raz_compiler_rt_arena_set(output, cursor, compiler_literal_byte(prefix, i));
+        cursor += 1;
+        i += 1;
+    }
+    i = 0;
+    while (i < value_length) {
+        raz_compiler_rt_arena_set(output, cursor, raz_compiler_rt_arena_get(value, i));
+        cursor += 1;
+        i += 1;
+    }
+    i = 0;
+    while (i < suffix_length) {
+        raz_compiler_rt_arena_set(output, cursor, compiler_literal_byte(suffix, i));
+        cursor += 1;
+        i += 1;
+    }
+    return cursor;
+}
+
+public fn web_bundle_finalize_dist(i64 dist, i64 dist_length, bool release_profile) -> bool {
+    if (dist == 0 || dist_length <= 0) { return false; }
+    if (!release_profile) { return true; }
+
+    i64 files = raz_compiler_rt_arena_create_width(4194304, 1);
+    i64 relative = raz_compiler_rt_arena_create(8192);
+    i64 full = raz_compiler_rt_arena_create(8192);
+    i64 sibling = raz_compiler_rt_arena_create(8192);
+    i64 directory = raz_compiler_rt_arena_create(8192);
+    i64 assets = raz_compiler_rt_arena_create(8192);
+    i64 hashed = raz_compiler_rt_arena_create(256);
+    i64 replacement = raz_compiler_rt_arena_create(512);
+    i64 wrapped_replacement = raz_compiler_rt_arena_create(1024);
+    i64 manifest_value = raz_compiler_rt_arena_create(512);
+    i64 literal_name = raz_compiler_rt_arena_create(32);
+    i64 manifest = raz_compiler_rt_arena_create_width(1048576, 1);
+    i64 manifest_path = raz_compiler_rt_arena_create(8192);
+    if (files == 0 || relative == 0 || full == 0 || sibling == 0 || directory == 0 || assets == 0 || hashed == 0 || replacement == 0 || wrapped_replacement == 0 || manifest_value == 0 || literal_name == 0 || manifest == 0 || manifest_path == 0) { return false; }
+
+    i64 assets_name_length = web_bundle_make_literal(literal_name, 32, "assets");
+    i64 assets_length = path_join(dist, dist_length, literal_name, assets_name_length, assets, 8192);
+    if (assets_length <= 0 || raz_compiler_rt_create_dir_ascii(assets, assets_length) != 0) { return false; }
+
+    i64 files_length = raz_compiler_rt_tree_list_ascii(dist, dist_length, files, 4194304);
+    if (files_length < 0) { return false; }
+
+    // Public files are stable by default. Files explicitly placed under
+    // public/assets/ opt into the release content-addressed pipeline. Binary
+    // assets are fingerprinted first so CSS/JS can be rewritten before their
+    // own content hashes are computed.
+    i64 public_replacement = raz_compiler_rt_arena_create(8192);
+    if (public_replacement == 0) { return false; }
+    i64 public_phase = 0;
+    while (public_phase < 2) {
+        i64 public_line_start = 0;
+        while (public_line_start < files_length) {
+            i64 public_line_end = public_line_start;
+            while (public_line_end < files_length && raz_compiler_rt_arena_get(files, public_line_end) != 10) { public_line_end += 1; }
+            i64 public_line_length = public_line_end - public_line_start;
+            bool under_assets = web_bundle_line_has_prefix(files, public_line_start, public_line_length, "assets/");
+            bool generated = web_bundle_line_has_basename(files, public_line_start, public_line_length, "app.js") || web_bundle_line_has_basename(files, public_line_start, public_line_length, "app.css") || web_bundle_line_has_basename(files, public_line_start, public_line_length, "app.wasm");
+            bool text_asset = web_bundle_line_is_text_asset(files, public_line_start, public_line_length);
+            bool selected = under_assets && !generated && ((public_phase == 0 && !text_asset) || (public_phase == 1 && text_asset));
+            if (selected) {
+                i64 i = 0; while (i < public_line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, public_line_start + i)); i += 1; }
+                i64 fl = path_join(dist, dist_length, relative, public_line_length, full, 8192);
+                bool css_asset = web_bundle_line_has_suffix(files, public_line_start, public_line_length, ".css");
+                i64 hashed_length = web_bundle_write_public_asset(full, fl, relative, public_line_length, css_asset, hashed, 256);
+                if (hashed_length <= 0) { return false; }
+                i64 replacement_length = web_bundle_public_asset_replacement(relative, public_line_length, hashed, hashed_length, public_replacement, 8192);
+                if (replacement_length <= 0 || !web_bundle_rewrite_text_tree(dist, dist_length, files, files_length, relative, public_line_length, public_replacement, replacement_length)) { return false; }
+            }
+            public_line_start = public_line_end + 1;
+        }
+        public_phase += 1;
+    }
+
+    // 1. Fingerprint WASM first into the one release asset directory. JS
+    // fingerprints must include the final WASM URL.
+    i64 line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_basename(files, line_start, line_length, "app.wasm")) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            if (web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "wasm", false, hashed, 256) <= 0) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+
+    // 2. Rewrite each canonical JS module to the fingerprinted WASM, then
+    // fingerprint the final JS bytes into dist/assets/. Relative WASM imports
+    // remain sibling-relative because both shipped files live in assets/.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_basename(files, line_start, line_length, "app.js")) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            i64 dl = path_dirname(full, fl, directory, 8192);
+            i64 wasm_name_length = web_bundle_make_literal(literal_name, 32, "app.wasm");
+            i64 sibling_length = path_join(directory, dl, literal_name, wasm_name_length, sibling, 8192);
+            i64 hashed_length = 0;
+            if (sibling_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, sibling_length) != 0) {
+                hashed_length = web_bundle_write_fingerprinted(sibling, sibling_length, assets, assets_length, "app", "wasm", false, hashed, 256);
+            } else {
+                i64 root_wasm_length = path_join(dist, dist_length, literal_name, wasm_name_length, sibling, 8192);
+                if (root_wasm_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, root_wasm_length) != 0) {
+                    hashed_length = web_bundle_write_fingerprinted(sibling, root_wasm_length, assets, assets_length, "app", "wasm", false, hashed, 256);
+                } else {
+                    i64 canonical_assets_wasm = path_join(assets, assets_length, literal_name, wasm_name_length, sibling, 8192);
+                    if (canonical_assets_wasm > 0 && raz_compiler_rt_path_exists_ascii(sibling, canonical_assets_wasm) != 0) {
+                        hashed_length = web_bundle_write_fingerprinted(sibling, canonical_assets_wasm, assets, assets_length, "app", "wasm", false, hashed, 256);
+                    }
+                }
+            }
+            if (hashed_length > 0) {
+                i64 r = 0;
+                raz_compiler_rt_arena_set(replacement, r, 46); r += 1;
+                raz_compiler_rt_arena_set(replacement, r, 47); r += 1;
+                i = 0; while (i < hashed_length) { raz_compiler_rt_arena_set(replacement, r, raz_compiler_rt_arena_get(hashed, i)); r += 1; i += 1; }
+                // Anchor rewrites to the exact compiler-generated loader
+                // expressions. User raw JavaScript may legitimately contain a
+                // string such as "/app.wasm" and must remain byte-for-byte intact.
+                i64 wrapped_length = web_bundle_wrap_reference(
+                    wrapped_replacement, 1024, "new URL('", replacement, r, "', import.meta.url)"
+                );
+                if (wrapped_length <= 0 || !web_bundle_rewrite_file(
+                    full, fl, "new URL('./app.wasm', import.meta.url)", wrapped_replacement, wrapped_length
+                )) { return false; }
+
+                // Static generators use /app.wasm in debug so every nested route
+                // reaches the one root module. Release moves this JS into
+                // dist/assets beside the fingerprinted Wasm, so normalize that
+                // generated loader call to the same sibling-relative URL used
+                // by reactive bundles. This keeps subpath deployments portable.
+                wrapped_length = web_bundle_wrap_reference(
+                    wrapped_replacement, 1024, "rzLoadWasm('", replacement, r, "')"
+                );
+                if (wrapped_length <= 0 || !web_bundle_rewrite_file(
+                    full, fl, "rzLoadWasm('/app.wasm')", wrapped_replacement, wrapped_length
+                )) { return false; }
+            }
+            // Lazy Raz-Wasm chunks are origin-rooted in debug because route-local
+            // app.js files can live at arbitrary depths. Release relocates every
+            // generated app.js into dist/assets, so normalize only the generated
+            // rzLoadWasm chunk prefix to a sibling-relative chunks/ URL.
+            i64 chunk_prefix_length = web_bundle_make_literal(replacement, 512, "rzLoadWasm('./chunks/");
+            if (chunk_prefix_length <= 0 || !web_bundle_rewrite_file(full, fl, "rzLoadWasm('/assets/chunks/", replacement, chunk_prefix_length)) { return false; }
+            if (web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "js", false, hashed, 256) <= 0) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+
+    // 3. Minify generated CSS before fingerprinting it into dist/assets/.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_basename(files, line_start, line_length, "app.css")) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            if (web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "css", true, hashed, 256) <= 0) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+
+    // 4. Rewrite HTML to the centralized fingerprinted assets. The target URL
+    // is page-relative, not origin-relative: a route such as
+    // docs/guides/index.html must reference ../../assets/app.<hash>.js so the
+    // bundle also works when deployed below an origin subpath. Rewrites use the
+    // exact compiler-authored canonical URLs instead of the bare app.js/app.css
+    // substrings, so public names such as myapp.js are never corrupted.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_suffix(files, line_start, line_length, ".html")) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            i64 dl = path_dirname(full, fl, directory, 8192);
+            i64 root_prefix_length = web_bundle_html_root_prefix(relative, line_length, replacement, 512);
+            if (root_prefix_length <= 0) { return false; }
+
+            i64 hashed_length = 0;
+            i64 js_name_length = web_bundle_make_literal(literal_name, 32, "app.js");
+            i64 sibling_length = path_join(directory, dl, literal_name, js_name_length, sibling, 8192);
+            if (sibling_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, sibling_length) != 0) {
+                hashed_length = web_bundle_write_fingerprinted(sibling, sibling_length, assets, assets_length, "app", "js", false, hashed, 256);
+            } else {
+                sibling_length = path_join(assets, assets_length, literal_name, js_name_length, sibling, 8192);
+                if (sibling_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, sibling_length) != 0) {
+                    hashed_length = web_bundle_write_fingerprinted(sibling, sibling_length, assets, assets_length, "app", "js", false, hashed, 256);
+                }
+            }
+            if (hashed_length > 0) {
+                i64 r = root_prefix_length;
+                i64 asset_literal_length = web_bundle_make_literal(literal_name, 32, "assets");
+                i = 0; while (i < asset_literal_length) { raz_compiler_rt_arena_set(replacement, r, raz_compiler_rt_arena_get(literal_name, i)); r += 1; i += 1; }
+                raz_compiler_rt_arena_set(replacement, r, 47); r += 1;
+                i = 0; while (i < hashed_length) { raz_compiler_rt_arena_set(replacement, r, raz_compiler_rt_arena_get(hashed, i)); r += 1; i += 1; }
+                // Rewrite only exact script src attributes. A developer link or
+                // text node containing /app.js is user content, not a generated
+                // runtime reference.
+                i64 wrapped_length = web_bundle_wrap_reference(
+                    wrapped_replacement, 1024, "src=\"", replacement, r, "\""
+                );
+                if (wrapped_length <= 0) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "src=\"./assets/app.js\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "src=\"/assets/app.js\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "src=\"./app.js\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "src=\"/app.js\"", wrapped_replacement, wrapped_length)) { return false; }
+            }
+
+            i64 css_name_length = web_bundle_make_literal(literal_name, 32, "app.css");
+            dl = path_dirname(full, fl, directory, 8192);
+            sibling_length = path_join(directory, dl, literal_name, css_name_length, sibling, 8192);
+            if (sibling_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, sibling_length) != 0) {
+                hashed_length = web_bundle_write_fingerprinted(sibling, sibling_length, assets, assets_length, "app", "css", true, hashed, 256);
+            } else {
+                sibling_length = path_join(assets, assets_length, literal_name, css_name_length, sibling, 8192);
+                if (sibling_length > 0 && raz_compiler_rt_path_exists_ascii(sibling, sibling_length) != 0) {
+                    hashed_length = web_bundle_write_fingerprinted(sibling, sibling_length, assets, assets_length, "app", "css", true, hashed, 256);
+                } else { hashed_length = 0; }
+            }
+            if (hashed_length > 0) {
+                i64 r = root_prefix_length;
+                i64 asset_literal_length = web_bundle_make_literal(literal_name, 32, "assets");
+                i = 0; while (i < asset_literal_length) { raz_compiler_rt_arena_set(replacement, r, raz_compiler_rt_arena_get(literal_name, i)); r += 1; i += 1; }
+                raz_compiler_rt_arena_set(replacement, r, 47); r += 1;
+                i = 0; while (i < hashed_length) { raz_compiler_rt_arena_set(replacement, r, raz_compiler_rt_arena_get(hashed, i)); r += 1; i += 1; }
+                i64 wrapped_length = web_bundle_wrap_reference(
+                    wrapped_replacement, 1024, "href=\"", replacement, r, "\""
+                );
+                if (wrapped_length <= 0) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "href=\"./assets/app.css\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "href=\"/assets/app.css\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "href=\"./app.css\"", wrapped_replacement, wrapped_length)) { return false; }
+                if (!web_bundle_rewrite_file(full, fl, "href=\"/app.css\"", wrapped_replacement, wrapped_length)) { return false; }
+            }
+        }
+        line_start = line_end + 1;
+    }
+
+    // 5. Deterministic manifest from the original sorted canonical asset list.
+    // Every shipped generated runtime asset now lives under `assets/`.
+    i64 manifest_cursor = 0;
+    raz_compiler_rt_arena_set(manifest, manifest_cursor, 123); manifest_cursor += 1;
+    raz_compiler_rt_arena_set(manifest, manifest_cursor, 10); manifest_cursor += 1;
+    bool first_manifest = true;
+    // Public content-addressed assets participate in the same deterministic
+    // manifest as generated runtime assets. The original logical path is the
+    // key; the final fingerprinted relative path is the value.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        bool under_assets = web_bundle_line_has_prefix(files, line_start, line_length, "assets/");
+        bool generated = web_bundle_line_has_basename(files, line_start, line_length, "app.js") || web_bundle_line_has_basename(files, line_start, line_length, "app.css") || web_bundle_line_has_basename(files, line_start, line_length, "app.wasm");
+        if (under_assets && !generated) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            bool css_asset = web_bundle_line_has_suffix(files, line_start, line_length, ".css");
+            i64 hashed_length = web_bundle_write_public_asset(full, fl, relative, line_length, css_asset, hashed, 256);
+            i64 value_cursor = web_bundle_public_asset_replacement(relative, line_length, hashed, hashed_length, manifest_value, 512);
+            if (hashed_length <= 0 || value_cursor <= 0) { return false; }
+            if (!first_manifest) { raz_compiler_rt_arena_set(manifest, manifest_cursor, 44); manifest_cursor += 1; raz_compiler_rt_arena_set(manifest, manifest_cursor, 10); manifest_cursor += 1; }
+            manifest_cursor = web_bundle_append_manifest_entry(manifest, 1048576, manifest_cursor, relative, line_length, manifest_value, value_cursor);
+            if (manifest_cursor < 0) { return false; }
+            first_manifest = false;
+        }
+        line_start = line_end + 1;
+    }
+
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        bool js = web_bundle_line_has_basename(files, line_start, line_length, "app.js");
+        bool css = web_bundle_line_has_basename(files, line_start, line_length, "app.css");
+        bool wasm = web_bundle_line_has_basename(files, line_start, line_length, "app.wasm");
+        if (js || css || wasm) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            i64 hashed_length = 0;
+            if (js) { hashed_length = web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "js", false, hashed, 256); }
+            else if (css) { hashed_length = web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "css", true, hashed, 256); }
+            else { hashed_length = web_bundle_write_fingerprinted(full, fl, assets, assets_length, "app", "wasm", false, hashed, 256); }
+            if (hashed_length <= 0) { return false; }
+            if (!first_manifest) { raz_compiler_rt_arena_set(manifest, manifest_cursor, 44); manifest_cursor += 1; raz_compiler_rt_arena_set(manifest, manifest_cursor, 10); manifest_cursor += 1; }
+            i64 value_cursor = 0;
+            i64 asset_literal_length = web_bundle_make_literal(literal_name, 32, "assets");
+            i = 0; while (i < asset_literal_length) { raz_compiler_rt_arena_set(manifest_value, value_cursor, raz_compiler_rt_arena_get(literal_name, i)); value_cursor += 1; i += 1; }
+            raz_compiler_rt_arena_set(manifest_value, value_cursor, 47); value_cursor += 1;
+            i = 0; while (i < hashed_length) { raz_compiler_rt_arena_set(manifest_value, value_cursor, raz_compiler_rt_arena_get(hashed, i)); value_cursor += 1; i += 1; }
+            manifest_cursor = web_bundle_append_manifest_entry(manifest, 1048576, manifest_cursor, relative, line_length, manifest_value, value_cursor);
+            if (manifest_cursor < 0) { return false; }
+            first_manifest = false;
+        }
+        line_start = line_end + 1;
+    }
+    raz_compiler_rt_arena_set(manifest, manifest_cursor, 10); manifest_cursor += 1;
+    raz_compiler_rt_arena_set(manifest, manifest_cursor, 125); manifest_cursor += 1;
+    raz_compiler_rt_arena_set(manifest, manifest_cursor, 10); manifest_cursor += 1;
+    i64 manifest_name_length = web_bundle_make_literal(literal_name, 32, "asset-manifest.json");
+    i64 mpl = path_join(dist, dist_length, literal_name, manifest_name_length, manifest_path, 8192);
+    if (mpl <= 0 || raz_compiler_rt_write_ascii(manifest_path, mpl, manifest, manifest_cursor) != manifest_cursor) { return false; }
+
+    // 6. Canonical names are build intermediates; only fingerprinted assets ship.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        if (web_bundle_line_has_basename(files, line_start, line_length, "app.js") || web_bundle_line_has_basename(files, line_start, line_length, "app.css") || web_bundle_line_has_basename(files, line_start, line_length, "app.wasm")) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            if (raz_compiler_rt_path_exists_ascii(full, fl) != 0 && raz_compiler_rt_remove_path_ascii(full, fl) != 0) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+
+    // public/assets/ is an opt-in content-addressed namespace in release
+    // builds. Canonical logical files are intermediates; only their
+    // fingerprinted siblings ship.
+    line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        bool under_assets = web_bundle_line_has_prefix(files, line_start, line_length, "assets/");
+        bool generated = web_bundle_line_has_basename(files, line_start, line_length, "app.js") || web_bundle_line_has_basename(files, line_start, line_length, "app.css") || web_bundle_line_has_basename(files, line_start, line_length, "app.wasm");
+        if (under_assets && !generated) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            if (raz_compiler_rt_path_exists_ascii(full, fl) != 0 && raz_compiler_rt_remove_path_ascii(full, fl) != 0) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+
+    raz_compiler_rt_arena_destroy(files);
+    raz_compiler_rt_arena_destroy(relative);
+    raz_compiler_rt_arena_destroy(full);
+    raz_compiler_rt_arena_destroy(sibling);
+    raz_compiler_rt_arena_destroy(directory);
+    raz_compiler_rt_arena_destroy(assets);
+    raz_compiler_rt_arena_destroy(hashed);
+    raz_compiler_rt_arena_destroy(replacement);
+    raz_compiler_rt_arena_destroy(wrapped_replacement);
+    raz_compiler_rt_arena_destroy(manifest_value);
+    raz_compiler_rt_arena_destroy(literal_name);
+    raz_compiler_rt_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(manifest_path);
+    raz_compiler_rt_arena_destroy(public_replacement);
+    return true;
+}

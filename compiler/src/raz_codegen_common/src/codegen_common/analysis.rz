@@ -1,0 +1,99 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_common::analysis;
+
+public import hir::core::model;
+public import mir::core::model;
+import frontend::parser;
+
+// Backend-neutral HIR/MIR queries used by native code generators.
+fn codegen_hir_local_index(HirModule& hir, i64 function_index, i64 local_slot) -> i64 {
+    if (function_index < 0 || function_index >= hir.function_count || local_slot < 0) { return -1; }
+    i64 declared_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
+    if (local_slot >= declared_count) { return -1; }
+    i64 link = raz_compiler_rt_arena_get(hir.function_last_locals, function_index);
+    while (link > 0) {
+        i64 index = link - 1;
+        if (raz_compiler_rt_arena_get(hir.local_slots, index) == local_slot) { return index; }
+        link = raz_compiler_rt_arena_get(hir.local_previous_function_locals, index);
+    }
+    return -1;
+}
+
+public fn async_mir_await_count(HirModule& hir, MirModule& mir, i64 function_index) -> i64 {
+    i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    i64 count = 0;
+    while (ip < end) {
+        if (raz_compiler_rt_arena_get(mir.opcodes, ip) == 41) { count += 1; }
+        ip += 1;
+    }
+    return count;
+}
+
+public fn async_mir_supported(HirModule& hir, MirModule& mir, i64 function_index) -> bool {
+    if (
+        raz_compiler_rt_arena_get(hir.function_return_types, function_index) != 0 ||
+        raz_compiler_rt_arena_get(hir.function_return_slices, function_index) != 0
+    ) { return false; }
+
+    i64 parameter_start = raz_compiler_rt_arena_get(hir.function_parameter_starts, function_index);
+    i64 parameter_count = raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index);
+    i64 p = 0;
+    while (p < parameter_count) {
+        i64 parameter = parameter_start + p;
+        if (
+            raz_compiler_rt_arena_get(hir.parameter_type_structs, parameter) >= 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_types, parameter) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_references, parameter) != 0 ||
+            raz_compiler_rt_arena_get(hir.parameter_slices, parameter) != 0
+        ) { return false; }
+        p += 1;
+    }
+
+    i64 local_count = raz_compiler_rt_arena_get(hir.function_local_counts, function_index);
+    i64 l = 0;
+    while (l < local_count) {
+        i64 local = codegen_hir_local_index(hir, function_index, l);
+        if (
+            local < 0 ||
+            raz_compiler_rt_arena_get(hir.local_types, local) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_references, local) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_slices, local) != 0 ||
+            raz_compiler_rt_arena_get(hir.local_array_extents, local) > 0
+        ) { return false; }
+        l += 1;
+    }
+
+    i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+    i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+    while (ip < end) {
+        i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+        bool allowed =
+            opcode == 1 || opcode == 2 || opcode == 3 ||
+            (opcode >= 4 && opcode <= 20) || opcode == 8 ||
+            opcode == 44 || opcode == 45 || opcode == 46 || opcode == 47 || opcode == 48 || opcode == 49 ||
+            opcode == 9 || opcode == 10 || opcode == 22 || opcode == 23 || opcode == 24 ||
+            (opcode >= 28 && opcode <= 33) || (opcode >= 34 && opcode <= 41);
+        if (!allowed) { return false; }
+        ip += 1;
+    }
+    return true;
+}
+
+public fn find_main_function(HirModule& hir, Source& source) -> i64 {
+    i64 index = 0;
+    while (index < hir.function_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_parameter_counts, index) == 0 &&
+            raz_compiler_rt_arena_get(hir.function_name_lengths, index) == 4 &&
+            source_byte(source, raz_compiler_rt_arena_get(hir.function_name_offsets, index)) == 109 &&
+            source_byte(source, raz_compiler_rt_arena_get(hir.function_name_offsets, index) + 1) == 97 &&
+            source_byte(source, raz_compiler_rt_arena_get(hir.function_name_offsets, index) + 2) == 105 &&
+            source_byte(source, raz_compiler_rt_arena_get(hir.function_name_offsets, index) + 3) == 110
+        ) { return index; }
+        index += 1;
+    }
+    return -1;
+}

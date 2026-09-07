@@ -47,13 +47,13 @@ def main() -> int:
     if not entry.is_file():
         raise SystemExit(f"stdlib-closure: entry source not found: {entry}")
 
-    namespace_map: dict[str, Path] = {}
+    # A namespace may be spread over several files -- `web::page` is declared by
+    # page.rz, page_body.rz, page_head.rz, page_forms.rz, page_interactivity.rz
+    # and page_output.rz -- so an import pulls in every file that declares it,
+    # not one canonical module.
+    namespace_map: dict[str, list[Path]] = {}
     for module in sorted(library.rglob("*.rz")):
-        namespace = namespace_of(module)
-        previous = namespace_map.get(namespace)
-        if previous is not None:
-            raise SystemExit(f"stdlib-closure: duplicate namespace {namespace}: {previous} and {module}")
-        namespace_map[namespace] = module
+        namespace_map.setdefault(namespace_of(module), []).append(module)
 
     pending = deque(imports_of(entry))
     visited: set[str] = set()
@@ -63,19 +63,20 @@ def main() -> int:
         if namespace in visited:
             continue
         visited.add(namespace)
-        module = namespace_map.get(namespace)
-        if module is None:
+        modules = namespace_map.get(namespace)
+        if not modules:
             if namespace.startswith(STDLIB_ROOTS):
                 raise SystemExit(f"stdlib-closure: unresolved standard-library import {namespace}")
             continue
-        relative = module.relative_to(library)
-        destination = output / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(module, destination)
-        copied.append(relative)
-        for dependency in imports_of(module):
-            if dependency not in visited:
-                pending.append(dependency)
+        for module in modules:
+            relative = module.relative_to(library)
+            destination = output / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(module, destination)
+            copied.append(relative)
+            for dependency in imports_of(module):
+                if dependency not in visited:
+                    pending.append(dependency)
 
     print(f"stdlib-closure: copied {len(copied)} module(s)")
     return 0

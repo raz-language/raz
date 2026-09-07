@@ -96,7 +96,7 @@ fn main() -> i64 {
 ]=])
 
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result
   OUTPUT_VARIABLE build_output
   ERROR_VARIABLE build_error)
@@ -105,9 +105,9 @@ if(NOT build_result EQUAL 0)
 endif()
 
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passh_all_collections.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passh_all_collections.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passh_all_collections")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passh_all_collections")
 endif()
 if(NOT EXISTS "${runtime_exe}")
   message(FATAL_ERROR "Runtime executable was not produced: ${runtime_exe}")

@@ -14,6 +14,7 @@ expected = {
     'raz_mir': 'raz-mir',
     'raz_mir_opt': 'raz-mir-opt',
     'raz_borrowck': 'raz-borrowck',
+    'raz_codegen_common': 'raz-codegen-common',
     'raz_codegen_forge': 'raz-codegen-forge',
     'raz_codegen_llvm': 'raz-codegen-llvm',
     'raz_codegen_wasm': 'raz-codegen-wasm',
@@ -44,6 +45,19 @@ driver=(SRC/'raz_driver/raz.toml').read_text(encoding='utf-8')
 for dep in ('raz_codegen_forge','raz_codegen_llvm','raz_codegen_wasm','raz_codegen_rxe','raz_codegen_web'):
     if dep not in driver: failed.append(f'driver missing backend package dependency: {dep}')
 if (SRC/'raz_codegen').exists(): failed.append('legacy monolithic raz_codegen package returned')
+
+# Binary/application backends share only neutral writer support. They must not
+# inherit implementation through another backend package.
+common_manifest=(SRC/'raz_codegen_common/raz.toml').read_text(encoding='utf-8')
+if 'name = "raz-codegen-common"' not in common_manifest: failed.append('missing raz_codegen_common package boundary')
+backend_manifests={name:(SRC/name/'raz.toml').read_text(encoding='utf-8') for name in ('raz_codegen_llvm','raz_codegen_wasm','raz_codegen_rxe','raz_codegen_web')}
+if 'raz_codegen_llvm' in backend_manifests['raz_codegen_wasm']: failed.append('WASM must not depend on LLVM implementation')
+if 'raz_codegen_forge' in backend_manifests['raz_codegen_llvm']: failed.append('LLVM must not depend on Forge implementation')
+if 'common = "../raz_codegen_common"' not in backend_manifests['raz_codegen_llvm']: failed.append('LLVM missing neutral codegen-common dependency')
+if 'raz_codegen_wasm' in backend_manifests['raz_codegen_rxe']: failed.append('RXE must not depend on WASM implementation')
+if 'raz_codegen_forge' in backend_manifests['raz_codegen_web']: failed.append('Web must not depend on Forge implementation')
+for name,text in backend_manifests.items():
+    if 'common = "../raz_codegen_common"' not in text: failed.append(f'{name} missing neutral codegen-common dependency')
 
 # Borrow checking is a real compiler phase above MIR. MIR owns the facts in its
 # IR but must never depend on the legality-analysis package.

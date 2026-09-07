@@ -1,0 +1,86 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::page;
+
+import alloc::string;
+import web::html_support;
+import web::std::events;
+import web::ui;
+
+public impl Page {
+    // ---- browser interactivity --------------------------------------------------
+    /// Lazily load an ES-module chunk the first time an element receives the
+    /// selected event. This is a client-only enhancement: using it does not root
+    /// any Raz function and therefore does not cause app.wasm to be emitted.
+    public fn lazy_module_on(Page&mut self, string element_id, EventKind kind, string src) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !web::html_support::append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); if (el) el.addEventListener('") || !web::html_support::append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', () => { void import('") || !web::html_support::append_js_string_to(&mut self.client, src)) { return false; }
+        return self.client.push_str("'); }, { once: true }); }\n");
+    }
+
+    public fn lazy_module_on_click(Page&mut self, string element_id, string src) -> bool {
+        return self.lazy_module_on(element_id, EventKind::Click, src);
+    }
+
+    /// Lazily instantiate a Raz-WASM chunk the first time the selected event fires.
+    /// The chunk contains only `handler` and the functions reachable from it; it is
+    /// not included in the main app.wasm root set unless bound separately with `on`.
+    public fn lazy_wasm_on(Page&mut self, string element_id, EventKind kind, string chunk, string handler) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !web::html_support::append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); let module = null; if (el) el.addEventListener('") || !web::html_support::append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', async (event) => { if (!module) module = await rzLoadWasm('/assets/chunks/") || !web::html_support::append_js_string_to(&mut self.client, chunk)) { return false; }
+        if (!self.client.push_str(".wasm'); const fn = module['") || !web::html_support::append_js_string_to(&mut self.client, handler)) { return false; }
+        if (!self.client.push_str("']; if (typeof fn !== 'function') return; rzUse(module); rzCurrentEvent = event; try { fn(); } finally { rzCurrentEvent = null; } }); }\n")) { return false; }
+        return self.browser_chunks.push_str(chunk) && self.browser_chunks.push_str("\t") && self.browser_chunks.push_str(handler) && self.browser_chunks.push_str("\n");
+    }
+
+    public fn lazy_wasm_on_click(Page&mut self, string element_id, string chunk, string handler) -> bool {
+        return self.lazy_wasm_on(element_id, EventKind::Click, chunk, handler);
+    }
+
+    // Event bindings contain no application behavior. They only dispatch a DOM
+    // event to an exported ordinary Raz function in app.wasm.
+    /// Roots an exported Raz function for browser APIs that invoke callbacks by name
+    /// (for example `web::std::timers::set_timeout`). This emits no JavaScript by
+    /// itself; it only keeps the named function available in app.wasm.
+    public fn browser_export(Page&mut self, string handler) -> bool {
+        return self.browser_roots.push_str(handler) && self.browser_roots.push_str("\n");
+    }
+
+    public fn on(Page&mut self, string element_id, EventKind kind, string handler) -> bool {
+        string event_name = web::std::events::name(kind);
+        if (!self.client.push_str("{ const el = document.getElementById('") || !web::html_support::append_js_string_to(&mut self.client, element_id)) { return false; }
+        if (!self.client.push_str("'); const owner = rzMain; const fn = rz['") || !web::html_support::append_js_string_to(&mut self.client, handler)) { return false; }
+        if (!self.client.push_str("']; if (el && typeof fn === 'function') el.addEventListener('") || !web::html_support::append_js_string_to(&mut self.client, event_name)) { return false; }
+        if (!self.client.push_str("', (event) => { rzUse(owner); rzCurrentEvent = event; try { fn(); } finally { rzCurrentEvent = null; } }); }\n")) { return false; }
+        // Keep browser codegen rooted in the functions the page actually binds.
+        // One handler name per line makes the marker deterministic and trivial
+        // for the compiler to consume after the native generation pass.
+        return self.browser_roots.push_str(handler) && self.browser_roots.push_str("\n");
+    }
+
+    public fn on_click(Page&mut self, string element_id, string handler) -> bool {
+        return self.on(element_id, EventKind::Click, handler);
+    }
+
+    public fn on_input(Page&mut self, string element_id, string handler) -> bool {
+        return self.on(element_id, EventKind::Input, handler);
+    }
+
+    /// Append a reusable Component tree to this page as build-time-only HTML/CSS.
+    /// Browser-bound components are rejected instead of silently adding a runtime.
+    public fn component(Page&mut self, web::ui::Component&mut value) -> bool {
+        return value.append_static(&mut self.body, &mut self.css);
+    }
+
+    /// Escape and append plain text without wrapping it in an element.
+    public fn text(Page&mut self, string value) -> bool { return web::html_support::append_escaped_to(&mut self.body, value); }
+
+    /// Escape hatch for deliberately-authored HTML. Normal text APIs escape by default.
+    public fn raw(Page&mut self, string html) -> bool { return self.body.push_str(html); }
+
+}

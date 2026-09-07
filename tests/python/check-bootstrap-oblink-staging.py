@@ -13,7 +13,7 @@ falling back to PATH.
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-PROJECT = (ROOT / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8")
+PROJECT = (ROOT / "compiler/src/raz_driver/src/driver/project_native.rz").read_text(encoding="utf-8")
 BOOTSTRAP = (ROOT / "tools/bootstrap.py").read_text(encoding="utf-8")
 
 required_project = (

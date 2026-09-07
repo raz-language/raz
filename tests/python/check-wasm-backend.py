@@ -8,8 +8,8 @@ root = Path(__file__).resolve().parents[2]
 backend = (root / "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz").read_text(encoding="utf-8")
 writer = (root / "compiler/src/raz_codegen_wasm/src/wasm/writer.rz").read_text(encoding="utf-8")
 cfg = (root / "compiler/src/raz_codegen_wasm/src/wasm/cfg.rz").read_text(encoding="utf-8")
-dispatch = (root / "compiler/src/raz_driver/src/backend.rz").read_text(encoding="utf-8")
-cli = (root / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+dispatch = (root / "compiler/src/raz_driver/src/driver/backend.rz").read_text(encoding="utf-8")
+cli = (root / "compiler/src/raz_driver/src/driver/cli.rz").read_text(encoding="utf-8")
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 required_backend = [
@@ -92,7 +92,7 @@ for primitive in [
     'wasm_emit_data_section',
 ]:
     assert primitive in memory, f'missing wasm memory primitive {primitive}'
-assert 'wasm_emit_data_section(&mut module, source, mir)' in codegen2
+assert 'wasm_emit_data_section(&mut module, source, hir, mir)' in codegen2
 assert 'wasm_emit_memory_section(&mut module, source, mir)' in codegen2
 assert 'wasm_emit_global_section(&mut module, source, hir, mir)' in codegen2
 assert 'wasm_signature_supported' in codegen2

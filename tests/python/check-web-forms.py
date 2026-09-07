@@ -88,7 +88,7 @@ def main() -> int:
         print("web-forms: reactive form did not emit fingerprinted app assets")
         return 1
 
-    ui = (ROOT / "library/web/ui/ui.rz").read_text(encoding="utf-8")
+    ui = '\n'.join(p.read_text(encoding='utf-8') for p in sorted((ROOT / 'library/web/ui').glob('*.rz')))
     invariants = [
         "InputType::File",
         "InputType::Hidden",

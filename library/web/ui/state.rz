@@ -1,0 +1,608 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+import alloc::string;
+
+fn buffer_new() -> Buffer {
+    return Buffer { data: 0, length: 0, capacity: 0 };
+}
+
+fn raw_i64_get(usize base, i64 offset) -> i64 {
+    unsafe { return *((base + offset)as i64*const); }
+}
+
+fn raw_i64_set(usize base, i64 offset, i64 value) {
+    unsafe { *((base + offset)as i64*mut) = value; }
+}
+
+fn zero_bytes(usize base, i64 length) {
+    i64 index = 0;
+    while (index < length) {
+        unsafe { *((base + index)as u8*mut) = 0; }
+        index += 1;
+    }
+}
+
+fn ensure_state_records() -> bool {
+    if (web_state_records != 0) { return true; }
+    i64 bytes = WEB_STATE_CAPACITY * WEB_STATE_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_state_records = next;
+    return true;
+}
+
+fn ensure_event_records() -> bool {
+    if (web_event_records != 0) { return true; }
+    i64 bytes = WEB_EVENT_CAPACITY * WEB_EVENT_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_event_records = next;
+    return true;
+}
+
+fn ensure_derived_records() -> bool {
+    if (web_derived_records != 0) { return true; }
+    i64 bytes = WEB_DERIVED_CAPACITY * WEB_DERIVED_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_derived_records = next;
+    return true;
+}
+
+fn derived_record(i64 id) -> usize {
+    return web_derived_records + (id - 1) * WEB_DERIVED_RECORD_BYTES;
+}
+
+fn ensure_effect_records() -> bool {
+    if (web_effect_records != 0) { return true; }
+    i64 bytes = WEB_EFFECT_CAPACITY * WEB_EFFECT_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_effect_records = next;
+    return true;
+}
+
+fn effect_record(i64 slot) -> usize {
+    return web_effect_records + slot * WEB_EFFECT_RECORD_BYTES;
+}
+
+// Returns true on first observation and whenever the observed version changes.
+// Records are keyed by component scope + effect kind + source identity, so
+// ordinary Raz conditional code can implement effects without closures or a
+// second scheduler.
+fn effect_changed(i64 scope, i64 kind, i64 source, i64 version) -> bool {
+    if (scope < 0 || source < 0 || !ensure_effect_records()) { return false; }
+    i64 slot = 0;
+    i64 empty = -1;
+    while (slot < WEB_EFFECT_CAPACITY) {
+        usize record = effect_record(slot);
+        i64 stored_kind = raw_i64_get(record, 0);
+        if (stored_kind == 0) { if (empty < 0) { empty = slot; } }
+        else if (stored_kind == kind && raw_i64_get(record, 8) == scope && raw_i64_get(record, 16) == source) {
+            i64 previous = raw_i64_get(record, 24);
+            if (previous == version) { return false; }
+            raw_i64_set(record, 24, version);
+            return true;
+        }
+        slot += 1;
+    }
+    if (empty < 0) { return false; }
+    usize record = effect_record(empty);
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, scope);
+    raw_i64_set(record, 16, source);
+    raw_i64_set(record, 24, version);
+    return true;
+}
+
+fn ensure_component_props_records() -> bool {
+    if (web_component_props_records != 0) { return true; }
+    i64 bytes = WEB_COMPONENT_PROPS_CAPACITY * WEB_COMPONENT_PROPS_RECORD_BYTES;
+    usize next = raz_rt_alloc(bytes);
+    if (next == 0) { return false; }
+    zero_bytes(next, bytes);
+    web_component_props_records = next;
+    return true;
+}
+
+fn component_props_record(i64 slot) -> usize {
+    return web_component_props_records + slot * WEB_COMPONENT_PROPS_RECORD_BYTES;
+}
+
+// Compiler-reserved retention ABI. Normal applications never call these
+// directly: Wasm direct-call lowering snapshots props before invoking an
+// annotated component, and the synthesized local dispatcher replays the last
+// snapshot when that component rerenders independently of its parent.
+public fn raz_web_component_props_retain(i64 scope, usize source, i64 slots) -> i64 {
+    if (scope <= 0 || source == 0 || slots <= 0 || !ensure_component_props_records()) { return -1; }
+    i64 slot = 0;
+    i64 empty = -1;
+    while (slot < WEB_COMPONENT_PROPS_CAPACITY) {
+        usize record = component_props_record(slot);
+        i64 stored_scope = raw_i64_get(record, 0);
+        if (stored_scope == scope) {
+            usize data = (raw_i64_get(record, 8))as usize;
+            i64 stored_slots = raw_i64_get(record, 16);
+            i64 bytes = slots * 8;
+            if (data == 0 || stored_slots != slots) {
+                usize next = raz_rt_alloc(bytes);
+                if (next == 0) { return -1; }
+                if (data != 0) { raz_rt_dealloc(data); }
+                data = next;
+                raw_i64_set(record, 8, (data)as i64);
+                raw_i64_set(record, 16, slots);
+            }
+            raz_rt_copy(data, source, bytes);
+            return 1;
+        }
+        if (stored_scope == 0 && empty < 0) { empty = slot; }
+        slot += 1;
+    }
+    if (empty < 0) { return -1; }
+    usize record = component_props_record(empty);
+    i64 bytes = slots * 8;
+    usize data = raz_rt_alloc(bytes);
+    if (data == 0) { return -1; }
+    raz_rt_copy(data, source, bytes);
+    raw_i64_set(record, 0, scope);
+    raw_i64_set(record, 8, (data)as i64);
+    raw_i64_set(record, 16, slots);
+    return 1;
+}
+
+public fn raz_web_component_props_ptr(i64 scope) -> usize {
+    if (scope <= 0 || web_component_props_records == 0) { return 0; }
+    i64 slot = 0;
+    while (slot < WEB_COMPONENT_PROPS_CAPACITY) {
+        usize record = component_props_record(slot);
+        i64 stored_scope = raw_i64_get(record, 0);
+        if (stored_scope == scope) { return (raw_i64_get(record, 8))as usize; }
+        if (stored_scope == 0) { return 0; }
+        slot += 1;
+    }
+    return 0;
+}
+
+
+fn register_derived_id(i64 kind, i64 left_slot, i64 right_slot, i64 argument) -> i64 {
+    if (left_slot < 0 || left_slot >= WEB_STATE_CAPACITY || web_derived_count >= WEB_DERIVED_CAPACITY) { return -1; }
+    bool needs_right = kind == WEB_DERIVED_ADD || kind == WEB_DERIVED_SUB || kind == WEB_DERIVED_EQ || kind == WEB_DERIVED_NE || kind == WEB_DERIVED_LT || kind == WEB_DERIVED_LTE || kind == WEB_DERIVED_GT || kind == WEB_DERIVED_GTE;
+    bool uses_constant = kind == WEB_DERIVED_MUL_CONST || kind == WEB_DERIVED_EQ_CONST || kind == WEB_DERIVED_NE_CONST || kind == WEB_DERIVED_LT_CONST || kind == WEB_DERIVED_LTE_CONST || kind == WEB_DERIVED_GT_CONST || kind == WEB_DERIVED_GTE_CONST || kind == WEB_DERIVED_ADD_CONST || kind == WEB_DERIVED_SUB_CONST;
+    if (needs_right && (right_slot < 0 || right_slot >= WEB_STATE_CAPACITY)) { return -1; }
+    if (uses_constant && right_slot != -1) { return -1; }
+    if (!ensure_derived_records()) { return -1; }
+    i64 id = web_derived_count + 1;
+    usize record = derived_record(id);
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, left_slot);
+    raw_i64_set(record, 16, right_slot);
+    raw_i64_set(record, 24, argument);
+    web_derived_count += 1;
+    return id;
+}
+
+fn register_derived_i64(i64 kind, i64 left_slot, i64 right_slot, i64 argument) -> DerivedI64 {
+    return DerivedI64 { id: register_derived_id(kind, left_slot, right_slot, argument) };
+}
+
+fn register_derived_bool(i64 kind, i64 left_slot, i64 right_slot) -> DerivedBool {
+    return DerivedBool { id: register_derived_id(kind, left_slot, right_slot, 0) };
+}
+
+fn state_key_hash(string key) -> i64 {
+    i64 length = raz_rt_cstr_len(key);
+    i64 hash = 17;
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = 0;
+        unsafe { byte = (*((raz_rt_cstr_ptr(key) + index)as u8*const))as i64; }
+        hash = (hash * 131 + byte + 1) % 281474976710597;
+        index += 1;
+    }
+    if (hash == 0) { return 1; }
+    return hash;
+}
+
+// Component keys are the public stable identity. The compiler uses this exact
+// hash for @web_component("key"), removing hand-assigned numeric scopes.
+public fn web_component_scope_for_key(string key) -> i64 { return state_key_hash(key); }
+
+fn state_record(i64 slot) -> usize {
+    return web_state_records + slot * WEB_STATE_RECORD_BYTES;
+}
+
+fn state_scoped_hash(i64 scope, string key) -> i64 {
+    i64 hash = state_key_hash(key);
+    if (scope <= 0) { return hash; }
+    // Scope is already a stable component-key hash. Mix it with the local key
+    // using a separate domain so reusable component instances may use natural
+    // local names such as "count" without sharing browser state.
+    i64 mixed = (hash * 65537 + scope * 257 + 193) % 281474976710597;
+    if (mixed == 0) { return 1; }
+    return mixed;
+}
+
+fn state_find_or_create_hash(i64 hash, i64 kind, i64 initial) -> i64 {
+    if (!ensure_state_records() || hash <= 0) { return -1; }
+    i64 start = hash % WEB_STATE_CAPACITY;
+    i64 probe = 0;
+    while (probe < WEB_STATE_CAPACITY) {
+        i64 slot = (start + probe) % WEB_STATE_CAPACITY;
+        usize record = state_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == 0) {
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, kind);
+            raw_i64_set(record, 16, initial);
+            raw_i64_set(record, 24, 0);
+            return slot;
+        }
+        if (stored_hash == hash && raw_i64_get(record, 8) == kind) { return slot; }
+        probe += 1;
+    }
+    return -1;
+}
+
+fn state_find_or_create(string key, i64 kind, i64 initial) -> i64 {
+    return state_find_or_create_hash(state_key_hash(key), kind, initial);
+}
+
+fn state_string_find_or_create_hash(i64 hash, string initial) -> i64 {
+    if (!ensure_state_records() || hash <= 0) { return -1; }
+    i64 start = hash % WEB_STATE_CAPACITY;
+    i64 probe = 0;
+    while (probe < WEB_STATE_CAPACITY) {
+        i64 slot = (start + probe) % WEB_STATE_CAPACITY;
+        usize record = state_record(slot);
+        i64 stored_hash = raw_i64_get(record, 0);
+        if (stored_hash == 0) {
+            i64 length = raz_rt_cstr_len(initial);
+            usize data = 0;
+            if (length > 0) {
+                data = raz_rt_alloc(length);
+                if (data == 0) { return -1; }
+                raz_rt_copy(data, raz_rt_cstr_ptr(initial), length);
+            }
+            raw_i64_set(record, 0, hash);
+            raw_i64_set(record, 8, WEB_STATE_STRING);
+            raw_i64_set(record, 16, 0);
+            raw_i64_set(record, 24, 0);
+            raw_i64_set(record, 32, (data)as i64);
+            raw_i64_set(record, 40, length);
+            return slot;
+        }
+        if (stored_hash == hash && raw_i64_get(record, 8) == WEB_STATE_STRING) { return slot; }
+        probe += 1;
+    }
+    return -1;
+}
+
+fn state_string_find_or_create(string key, string initial) -> i64 {
+    return state_string_find_or_create_hash(state_key_hash(key), initial);
+}
+
+fn state_string_data(i64 slot) -> usize {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 32)as usize;
+}
+
+fn state_string_length(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 40);
+}
+
+fn state_replace_string(i64 slot, usize data, i64 length) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0 || length < 0) { return false; }
+    if (length > 0 && data == 0) { return false; }
+    usize next = 0;
+    if (length > 0) {
+        next = raz_rt_alloc(length);
+        if (next == 0) { return false; }
+        raz_rt_copy(next, data, length);
+    }
+    usize record = state_record(slot);
+    usize old = raw_i64_get(record, 32)as usize;
+    if (old != 0) { raz_rt_dealloc(old); }
+    raw_i64_set(record, 32, (next)as i64);
+    raw_i64_set(record, 40, length);
+    // String record value slot is reserved for form-validation state:
+    // 0 = untouched/validity unknown, 1 = last submission valid, -1 = invalid.
+    raw_i64_set(record, 16, 0);
+    raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    return true;
+}
+
+fn state_value(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 16);
+}
+
+fn state_version(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return 0; }
+    return raw_i64_get(state_record(slot), 24);
+}
+
+fn state_dependency_flags(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return WEB_STATE_DEP_STRUCTURAL; }
+    return raw_i64_get(state_record(slot), 48);
+}
+
+fn state_mark_dependency(i64 slot, i64 flag) {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return; }
+    usize record = state_record(slot);
+    i64 flags = raw_i64_get(record, 48);
+    raw_i64_set(record, 48, flags | flag);
+}
+
+fn state_mark_bound(i64 slot) { state_mark_dependency(slot, WEB_STATE_DEP_BOUND); }
+
+// Offset 56 tracks the unique owner of structural reads. 0 means no owner
+// has been recorded, scope+1 identifies one owner (page scope is therefore 1),
+// and -1 means the state is structurally consumed by multiple scopes.
+fn state_mark_structural_scope(i64 slot, i64 scope) {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0 || scope < 0) { return; }
+    state_mark_dependency(slot, WEB_STATE_DEP_STRUCTURAL);
+    usize record = state_record(slot);
+    i64 marker = scope + 1;
+    i64 current = raw_i64_get(record, 56);
+    if (current == 0) { raw_i64_set(record, 56, marker); }
+    else if (current != marker) { raw_i64_set(record, 56, -1); }
+}
+
+fn state_mark_structural(i64 slot) { state_mark_structural_scope(slot, 0); }
+
+fn state_requires_render(i64 slot) -> bool {
+    i64 flags = state_dependency_flags(slot);
+    return (flags & WEB_STATE_DEP_STRUCTURAL) != 0;
+}
+
+fn state_structural_scope(i64 slot) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return -1; }
+    i64 marker = raw_i64_get(state_record(slot), 56);
+    if (marker <= 0) { return -1; }
+    return marker - 1;
+}
+
+fn clear_state_dependencies() {
+    if (web_state_records == 0) { return; }
+    i64 slot = 0;
+    while (slot < WEB_STATE_CAPACITY) {
+        usize record = state_record(slot);
+        if (raw_i64_get(record, 0) != 0) {
+            raw_i64_set(record, 48, 0);
+            raw_i64_set(record, 56, 0);
+        }
+        slot += 1;
+    }
+}
+
+fn state_replace(i64 slot, i64 value) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = state_record(slot);
+    if (raw_i64_get(record, 16) != value) {
+        raw_i64_set(record, 16, value);
+        raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    }
+    return true;
+}
+
+fn state_add(i64 slot, i64 delta) -> bool {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || web_state_records == 0) { return false; }
+    usize record = state_record(slot);
+    raw_i64_set(record, 16, raw_i64_get(record, 16) + delta);
+    raw_i64_set(record, 24, raw_i64_get(record, 24) + 1);
+    return true;
+}
+
+fn register_state_action_scoped(i64 kind, i64 slot, i64 argument, i64 scope) -> i64 {
+    if (slot < 0 || slot >= WEB_STATE_CAPACITY || scope < 0) { return -1; }
+    if (!ensure_event_records()) { return -1; }
+    // Event IDs must remain stable when a single component rerenders. Reuse an
+    // existing action record before allocating a new ID.
+    i64 index = 0;
+    while (index < web_event_count) {
+        usize existing = web_event_records + index * WEB_EVENT_RECORD_BYTES;
+        if (raw_i64_get(existing, 0) == kind && raw_i64_get(existing, 8) == slot && raw_i64_get(existing, 16) == argument && raw_i64_get(existing, 24) == scope) {
+            return index + 1;
+        }
+        index += 1;
+    }
+    if (web_event_count >= WEB_EVENT_CAPACITY) { return -1; }
+    usize record = web_event_records + web_event_count * WEB_EVENT_RECORD_BYTES;
+    raw_i64_set(record, 0, kind);
+    raw_i64_set(record, 8, slot);
+    raw_i64_set(record, 16, argument);
+    raw_i64_set(record, 24, scope);
+    web_event_count += 1;
+    return web_event_count;
+}
+
+fn register_state_action(i64 kind, i64 slot, i64 argument) -> i64 {
+    return register_state_action_scoped(kind, slot, argument, 0);
+}
+
+// Start a new render pass. State survives; only ephemeral DOM event bindings
+// are rebuilt. Event IDs therefore stay compact and can be delegated by the JS
+// host without retaining JavaScript closures for each DOM node.
+public fn begin_render() {
+    web_render_generation += 1;
+    // State action IDs are lifetime-stable so component-local rerenders cannot
+    // invalidate sibling DOM bindings. Derived records remain per full render.
+    web_derived_count = 0;
+    clear_state_dependencies();
+    web_route_structural_owner = 0;
+    if (web_http_records != 0) {
+        i64 request_slot = 0;
+        while (request_slot < WEB_HTTP_CAPACITY) {
+            usize request_record = web_http_records + request_slot * WEB_HTTP_RECORD_BYTES;
+            if (raw_i64_get(request_record, 0) != 0) { raw_i64_set(request_record, 96, 0); }
+            request_slot += 1;
+        }
+    }
+}
+
+public fn state_i64(string key, i64 initial) -> StateI64 {
+    return StateI64 { slot: state_find_or_create(key, WEB_STATE_I64, initial) };
+}
+
+public fn state_bool(string key, bool initial) -> StateBool {
+    i64 value = 0;
+    if (initial) { value = 1; }
+    return StateBool { slot: state_find_or_create(key, WEB_STATE_BOOL, value) };
+}
+
+public fn state_string(string key, string initial) -> StateString {
+    return StateString { slot: state_string_find_or_create(key, initial) };
+}
+
+/// Creates state in a stable component namespace. Scope zero intentionally
+/// falls back to page/global state so the same helpers work on unscoped roots.
+public fn state_i64_scoped(i64 scope, string key, i64 initial) -> StateI64 {
+    return StateI64 { slot: state_find_or_create_hash(state_scoped_hash(scope, key), WEB_STATE_I64, initial) };
+}
+
+public fn state_bool_scoped(i64 scope, string key, bool initial) -> StateBool {
+    i64 value = 0;
+    if (initial) { value = 1; }
+    return StateBool { slot: state_find_or_create_hash(state_scoped_hash(scope, key), WEB_STATE_BOOL, value) };
+}
+
+public fn state_string_scoped(i64 scope, string key, string initial) -> StateString {
+    return StateString { slot: state_string_find_or_create_hash(state_scoped_hash(scope, key), initial) };
+}
+
+public fn derived_add(StateI64& left, StateI64& right) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_ADD, left.slot, right.slot, 0);
+}
+
+public fn derived_sub(StateI64& left, StateI64& right) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_SUB, left.slot, right.slot, 0);
+}
+
+public fn derived_mul(StateI64& source, i64 factor) -> DerivedI64 {
+    return register_derived_i64(WEB_DERIVED_MUL_CONST, source.slot, -1, factor);
+}
+public fn derived_add_const(StateI64& source, i64 value) -> DerivedI64 { return register_derived_i64(WEB_DERIVED_ADD_CONST, source.slot, -1, value); }
+public fn derived_sub_const(StateI64& source, i64 value) -> DerivedI64 { return register_derived_i64(WEB_DERIVED_SUB_CONST, source.slot, -1, value); }
+
+public fn derived_eq(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_EQ, left.slot, right.slot); }
+public fn derived_ne(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_NE, left.slot, right.slot); }
+public fn derived_lt(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_LT, left.slot, right.slot); }
+public fn derived_lte(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_LTE, left.slot, right.slot); }
+public fn derived_gt(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_GT, left.slot, right.slot); }
+public fn derived_gte(StateI64& left, StateI64& right) -> DerivedBool { return register_derived_bool(WEB_DERIVED_GTE, left.slot, right.slot); }
+
+public fn derived_eq_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_EQ_CONST, source.slot, -1, value) }; }
+public fn derived_ne_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_NE_CONST, source.slot, -1, value) }; }
+public fn derived_lt_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_LT_CONST, source.slot, -1, value) }; }
+public fn derived_lte_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_LTE_CONST, source.slot, -1, value) }; }
+public fn derived_gt_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_GT_CONST, source.slot, -1, value) }; }
+public fn derived_gte_const(StateI64& source, i64 value) -> DerivedBool { return DerivedBool { id: register_derived_id(WEB_DERIVED_GTE_CONST, source.slot, -1, value) }; }
+
+impl StateI64 {
+    fn valid(StateI64& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn get(StateI64& self) -> i64 { state_mark_structural(self.slot); return state_value(self.slot); }
+    fn set(StateI64&mut self, i64 value) -> bool { return state_replace(self.slot, value); }
+    fn add(StateI64&mut self, i64 delta) -> bool { return state_add(self.slot, delta); }
+    fn sub(StateI64&mut self, i64 delta) -> bool { return state_add(self.slot, -delta); }
+    fn increment(StateI64&mut self) -> bool { return state_add(self.slot, 1); }
+    fn decrement(StateI64&mut self) -> bool { return state_add(self.slot, -1); }
+    fn version(StateI64& self) -> i64 { return state_version(self.slot); }
+}
+
+impl StateBool {
+    fn valid(StateBool& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn get(StateBool& self) -> bool { state_mark_structural(self.slot); return state_value(self.slot) != 0; }
+    fn set(StateBool&mut self, bool value) -> bool {
+        if (value) { return state_replace(self.slot, 1); }
+        return state_replace(self.slot, 0);
+    }
+    fn toggle(StateBool&mut self) -> bool {
+        if (self.get()) { return state_replace(self.slot, 0); }
+        return state_replace(self.slot, 1);
+    }
+    fn version(StateBool& self) -> i64 { return state_version(self.slot); }
+}
+
+impl StateString {
+    fn valid(StateString& self) -> bool { return self.slot >= 0 && self.slot < WEB_STATE_CAPACITY; }
+    fn length(StateString& self) -> i64 { state_mark_structural(self.slot); return state_string_length(self.slot); }
+    fn data(StateString& self) -> usize { state_mark_structural(self.slot); return state_string_data(self.slot); }
+    fn set(StateString&mut self, string value) -> bool {
+        return state_replace_string(self.slot, raz_rt_cstr_ptr(value), raz_rt_cstr_len(value));
+    }
+    fn version(StateString& self) -> i64 { return state_version(self.slot); }
+    fn validation_failed(StateString& self) -> bool {
+        state_mark_structural(self.slot);
+        if (!self.valid() || web_state_records == 0) { return false; }
+        return raw_i64_get(state_record(self.slot), 16) < 0;
+    }
+    fn validation_ok(StateString& self) -> bool {
+        state_mark_structural(self.slot);
+        if (!self.valid() || web_state_records == 0) { return false; }
+        return raw_i64_get(state_record(self.slot), 16) > 0;
+    }
+}
+
+fn derived_value(i64 id) -> i64 {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return 0; }
+    usize record = derived_record(id);
+    i64 kind = raw_i64_get(record, 0);
+    i64 left_slot = raw_i64_get(record, 8);
+    i64 right_slot = raw_i64_get(record, 16);
+    i64 argument = raw_i64_get(record, 24);
+    i64 left = state_value(left_slot);
+    if (kind == WEB_DERIVED_ADD) { return left + state_value(right_slot); }
+    if (kind == WEB_DERIVED_SUB) { return left - state_value(right_slot); }
+    if (kind == WEB_DERIVED_MUL_CONST) { return left * argument; }
+    if (kind == WEB_DERIVED_ADD_CONST) { return left + argument; }
+    if (kind == WEB_DERIVED_SUB_CONST) { return left - argument; }
+    i64 right = 0;
+    if (right_slot >= 0) { right = state_value(right_slot); }
+    if (kind == WEB_DERIVED_EQ) { if (left == right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_NE) { if (left != right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LT) { if (left < right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LTE) { if (left <= right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GT) { if (left > right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GTE) { if (left >= right) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_EQ_CONST) { if (left == argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_NE_CONST) { if (left != argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LT_CONST) { if (left < argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_LTE_CONST) { if (left <= argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GT_CONST) { if (left > argument) { return 1; } return 0; }
+    if (kind == WEB_DERIVED_GTE_CONST) { if (left >= argument) { return 1; } return 0; }
+    return 0;
+}
+
+fn derived_mark(i64 id, i64 dependency) {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return; }
+    usize record = derived_record(id);
+    state_mark_dependency(raw_i64_get(record, 8), dependency);
+    i64 right_slot = raw_i64_get(record, 16);
+    if (right_slot >= 0) { state_mark_dependency(right_slot, dependency); }
+}
+
+fn derived_mark_structural_scope(i64 id, i64 scope) {
+    if (id <= 0 || id > web_derived_count || web_derived_records == 0) { return; }
+    usize record = derived_record(id);
+    state_mark_structural_scope(raw_i64_get(record, 8), scope);
+    i64 right_slot = raw_i64_get(record, 16);
+    if (right_slot >= 0) { state_mark_structural_scope(right_slot, scope); }
+}
+
+impl DerivedI64 {
+    fn valid(DerivedI64& self) -> bool { return self.id > 0 && self.id <= web_derived_count; }
+    fn get(DerivedI64& self) -> i64 { derived_mark(self.id, WEB_STATE_DEP_STRUCTURAL); return derived_value(self.id); }
+}
+
+impl DerivedBool {
+    fn valid(DerivedBool& self) -> bool { return self.id > 0 && self.id <= web_derived_count; }
+    fn get(DerivedBool& self) -> bool { derived_mark(self.id, WEB_STATE_DEP_STRUCTURAL); return derived_value(self.id) != 0; }
+}

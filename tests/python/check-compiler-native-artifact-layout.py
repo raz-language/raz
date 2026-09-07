@@ -16,6 +16,7 @@ DEPENDENCY_PACKAGES = (
     "raz_mir",
     "raz_mir_opt",
     "raz_borrowck",
+    "raz_codegen_common",
     "raz_codegen_forge",
     "raz_codegen_llvm",
     "raz_codegen_wasm",

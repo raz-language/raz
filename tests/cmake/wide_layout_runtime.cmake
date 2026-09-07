@@ -201,15 +201,15 @@ fn main() -> i64 {
 ]=])
 
 execute_process(
-  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+  COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Wide-layout project failed to build:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passj_wide_layout.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passj_wide_layout.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passj_wide_layout")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passj_wide_layout")
 endif()
 if(NOT EXISTS "${runtime_exe}")
   message(FATAL_ERROR "Wide-layout executable missing: ${runtime_exe}")

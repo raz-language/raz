@@ -122,13 +122,13 @@ fn main() -> i64 {
 ]=])
 raz_copy_stdlib_closure()
 
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --profile debug --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --profile debug --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "High-level application build failed:\n${build_error}\n${build_output}")
 endif()
 
-set(native_root "${WORK_ROOT}/target/test-host/debug/native")
+set(native_root "${WORK_ROOT}/target/debug/bin/native")
 if(WIN32)
   file(GLOB module_objects "${native_root}/modules/*.obj")
   if(EXISTS "${native_root}/aggregate/package.obj")
@@ -144,7 +144,7 @@ list(LENGTH module_objects module_object_count)
 if(module_object_count LESS 2)
   message(FATAL_ERROR "High-level generic application did not emit per-module native objects")
 endif()
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --profile debug --verbose
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --profile debug --verbose
   RESULT_VARIABLE fresh_build_result OUTPUT_VARIABLE fresh_build_output ERROR_VARIABLE fresh_build_error)
 if(NOT fresh_build_result EQUAL 0)
   message(FATAL_ERROR "High-level fresh rebuild failed:\n${fresh_build_error}\n${fresh_build_output}")
@@ -159,9 +159,9 @@ if(NOT fresh_build_output MATCHES "Fresh[ ]+high_level_application_runtime_fixtu
   message(FATAL_ERROR "High-level fresh rebuild did not reuse native link output:\n${fresh_build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/high_level_application_runtime_fixture.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/high_level_application_runtime_fixture.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/high_level_application_runtime_fixture")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/high_level_application_runtime_fixture")
 endif()
 execute_process(COMMAND "${runtime_exe}" WORKING_DIRECTORY "${WORK_ROOT}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)

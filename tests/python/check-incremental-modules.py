@@ -6,12 +6,12 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-project = (root / 'compiler/src/raz_driver/src/project.rz').read_text()
-inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
+project = (root / 'compiler/src/raz_driver/src/driver/project.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/driver/incremental.rz').read_text()
 model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
 fingerprints = (root / 'compiler/src/raz_hir/src/hir/query/fingerprints.rz').read_text()
 comptime = (root / 'compiler/src/raz_hir/src/hir/semantic/comptime.rz').read_text()
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 
 checks = {
     'ordinary module loader has namespace/import scheduler':

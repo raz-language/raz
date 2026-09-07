@@ -15,7 +15,7 @@ for rel in required:
 model=(root/'compiler/src/raz_mir/src/mir/core/model.rz').read_text()
 hir=(root/'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
 pipeline=(root/'compiler/src/raz_mir_opt/src/mir_opt/transform/pipeline.rz').read_text()
-main=(root/'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+main=(root/'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 lowering=(root/'compiler/src/raz_mir/src/mir/lowering.rz').read_text()
 cleanup_index=(root/'compiler/src/raz_mir/src/mir/cleanup_index.rz').read_text()
 if 'public struct MirModule' not in model: problems.append('MirModule is not MIR-owned')

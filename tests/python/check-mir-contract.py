@@ -15,7 +15,7 @@ loans = (root / 'compiler/src/raz_borrowck/src/borrowck/loan_regions.rz').read_t
 reborrows = (root / 'compiler/src/raz_borrowck/src/borrowck/reborrows.rz').read_text(encoding='utf-8')
 semantics = (root / 'compiler/src/raz_borrowck/src/borrowck/semantics.rz').read_text(encoding='utf-8')
 pipeline = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/pipeline.rz').read_text(encoding='utf-8')
-driver = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+driver = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text(encoding='utf-8')
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 
 checks = {

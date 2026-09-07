@@ -1,0 +1,1231 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::project_native;
+
+public import raz_driver::path;
+public import raz_driver::project;
+
+// Native project artifact planning, package-unit caching, object emission,
+// and final executable linking. Kept separate from project source/dependency
+// assembly so filesystem graph loading does not own backend artifact policy.
+struct ProjectNativeBuild {
+    bool active;
+    i64 object_path;
+    i64 object_length;
+}
+
+fn project_native_build_init(ProjectNativeBuild&mut build) {
+    build.active = false;
+    build.object_path = 0;
+    build.object_length = 0;
+}
+
+fn project_prepare_default_native_build(
+    i64 manifest_path,
+    i64 manifest_path_length,
+    bool release_profile,
+    i64 backend,
+    i64&mut optimization_kind,
+    i64&mut emit_kind,
+    bool&mut forge_native,
+    i64&mut artifact_path,
+    i64&mut artifact_length,
+    ProjectNativeBuild&mut build,
+) -> bool {
+    build.object_path = raz_compiler_rt_arena_create(8192);
+    *artifact_path = raz_compiler_rt_arena_create(8192);
+    if (build.object_path == 0 || *artifact_path == 0) {
+        project_native_build_destroy(build);
+        if (*artifact_path != 0) {
+            raz_compiler_rt_arena_destroy(*artifact_path);
+            *artifact_path = 0;
+        }
+        return false;
+    }
+    // Keep out-parameters in plain locals at this native path boundary. Taking
+    // a mutable reference directly to a struct field used to leave
+    // `build.object_length` unchanged in self-hosted O0 codegen on some hosts,
+    // which produced a valid object path paired with length zero.
+    i64 prepared_object_length = 0;
+    i64 prepared_artifact_length = 0;
+    if (
+        !project_default_native_paths(
+            manifest_path,
+            manifest_path_length,
+            release_profile,
+            build.object_path,
+            8192,
+            *artifact_path,
+            8192,
+            &mut prepared_object_length,
+            &mut prepared_artifact_length,
+        )
+    ) {
+        project_native_build_destroy(build);
+        raz_compiler_rt_arena_destroy(*artifact_path);
+        *artifact_path = 0;
+        *artifact_length = 0;
+        return false;
+    }
+    build.object_length = prepared_object_length;
+    *artifact_length = prepared_artifact_length;
+
+    // Materialize only directories that will receive data in this build.
+    // LLVM writes its native artifact immediately, so its bin/ parent is needed
+    // up front. Forge normally emits canonical package/module objects under
+    // packages/ and links them directly; its legacy whole-project obj/ path is
+    // a fallback scratch path and must not create an empty obj/ directory on a
+    // successful modular build. That parent is created lazily only if fallback
+    // whole-project emission is actually reached.
+    if (backend == 1) {
+        i64 immediate_parent = raz_compiler_rt_arena_create(8192);
+        if (immediate_parent == 0) {
+            project_native_build_destroy(build);
+            raz_compiler_rt_arena_destroy(*artifact_path);
+            *artifact_path = 0;
+            *artifact_length = 0;
+            return false;
+        }
+        i64 immediate_parent_length = path_dirname(*artifact_path, *artifact_length, immediate_parent, 8192);
+        bool immediate_directory_ok =
+            immediate_parent_length > 0 &&
+            raz_compiler_rt_create_dir_ascii(immediate_parent, immediate_parent_length) == 0;
+        raz_compiler_rt_arena_destroy(immediate_parent);
+        if (!immediate_directory_ok) {
+            project_native_build_destroy(build);
+            raz_compiler_rt_arena_destroy(*artifact_path);
+            *artifact_path = 0;
+            *artifact_length = 0;
+            return false;
+        }
+    }
+
+    build.active = true;
+    if (*optimization_kind < 0) {
+        *optimization_kind = 0;
+        if (release_profile) {
+            *optimization_kind = 3;
+        }
+    }
+    if (backend == 0) {
+        *forge_native = true;
+    } else if (backend == 1) {
+        *emit_kind = 2;
+    }
+    return true;
+}
+
+
+fn project_native_prepare_backend_output(ProjectNativeBuild& build, i64 backend) -> bool {
+    if (!build.active || backend != 0) {
+        return true;
+    }
+    if (build.object_path == 0 || build.object_length <= 0) {
+        return false;
+    }
+    i64 parent = raz_compiler_rt_arena_create(8192);
+    if (parent == 0) {
+        return false;
+    }
+    i64 parent_length = path_dirname(build.object_path, build.object_length, parent, 8192);
+    bool ok =
+        parent_length > 0 &&
+        raz_compiler_rt_create_dir_ascii(parent, parent_length) == 0;
+    raz_compiler_rt_arena_destroy(parent);
+    return ok;
+}
+
+fn project_native_backend_output(
+    ProjectNativeBuild& build,
+    i64 backend,
+    i64&mut output_path,
+    i64&mut output_length,
+) {
+    if (build.active && backend == 0) {
+        *output_path = build.object_path;
+        *output_length = build.object_length;
+    }
+}
+
+fn project_native_build_finish(
+    ProjectNativeBuild& build,
+    i64 backend,
+    i64 artifact_path,
+    i64 artifact_length,
+) -> bool {
+    if (!build.active || backend != 0) {
+        return true;
+    }
+    // A successful project build is defined by the materialized artifact, not
+    // merely by reaching the end of backend dispatch. Never report success when
+    // the native object or final executable is absent.
+    if (
+        build.object_path == 0 ||
+        build.object_length <= 0 ||
+        artifact_path == 0 ||
+        artifact_length <= 0 ||
+        raz_compiler_rt_path_exists_ascii(build.object_path, build.object_length) == 0
+    ) {
+        return false;
+    }
+    i64 artifact_parent = raz_compiler_rt_arena_create(8192);
+    if (artifact_parent == 0) {
+        return false;
+    }
+    i64 artifact_parent_length = path_dirname(artifact_path, artifact_length, artifact_parent, 8192);
+    bool artifact_directory_ok =
+        artifact_parent_length > 0 &&
+        raz_compiler_rt_create_dir_ascii(artifact_parent, artifact_parent_length) == 0;
+    if (!artifact_directory_ok) {
+        raz_compiler_rt_arena_destroy(artifact_parent);
+        return false;
+    }
+    if (
+        raz_compiler_forge_link_executable_i64(
+            build.object_path,
+            build.object_length,
+            artifact_path,
+            artifact_length,
+        ) <= 0
+    ) {
+        // The linker needs the destination directory to exist, but a failed
+        // link must not leave an empty target category behind. Removal only
+        // succeeds for an empty directory here, so any materialized output is
+        // preserved for diagnostics.
+        raz_compiler_rt_remove_path_ascii(artifact_parent, artifact_parent_length);
+        raz_compiler_rt_arena_destroy(artifact_parent);
+        return false;
+    }
+    raz_compiler_rt_arena_destroy(artifact_parent);
+    bool artifact_ready = raz_compiler_rt_path_exists_ascii(artifact_path, artifact_length) != 0;
+    // The whole-project object is a linker scratch artifact only.  Canonical
+    // project object output lives under target/<profile>/packages/, so never
+    // retain target/<profile>/obj/<package>.{o,obj} after a successful link.
+    if (artifact_ready && raz_compiler_rt_path_exists_ascii(build.object_path, build.object_length) != 0) {
+        if (raz_compiler_rt_remove_path_ascii(build.object_path, build.object_length) != 0) { return false; }
+        i64 object_parent = raz_compiler_rt_arena_create(8192);
+        if (object_parent != 0) {
+            i64 object_parent_length = path_dirname(build.object_path, build.object_length, object_parent, 8192);
+            if (object_parent_length > 0) { raz_compiler_rt_remove_path_ascii(object_parent, object_parent_length); }
+            raz_compiler_rt_arena_destroy(object_parent);
+        }
+    }
+    return artifact_ready;
+}
+
+
+fn project_package_object_path(
+    ProjectNativeBuild& build,
+    i64 package_hash,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    if (build.object_path == 0 || build.object_length <= 0 || output == 0 || capacity <= 0 || package_hash < 0) {
+        return -1;
+    }
+    i64 object_dir = raz_compiler_rt_arena_create(8192);
+    i64 profile_dir = raz_compiler_rt_arena_create(8192);
+    if (object_dir == 0 || profile_dir == 0) { return -1; }
+    i64 object_dir_length = path_dirname(build.object_path, build.object_length, object_dir, 8192);
+    i64 profile_dir_length = -1;
+    if (object_dir_length > 0) { profile_dir_length = path_dirname(object_dir, object_dir_length, profile_dir, 8192); }
+    i64 cursor = 0;
+    bool ok = profile_dir_length > 0 && project_path_copy(output, capacity, &mut cursor, profile_dir, profile_dir_length);
+    if (ok) { ok = project_path_literal(output, capacity, &mut cursor, "/packages/"); }
+    if (ok) {
+        ForgeWriter digits;
+        digits.capacity = 64;
+        digits.data = raz_compiler_rt_arena_create(64);
+        digits.length = 0;
+        digits.failed = digits.data == 0;
+        if (!digits.failed) { writer_decimal(&mut digits, package_hash); }
+        if (digits.failed) { ok = false; }
+        if (ok) { ok = project_path_copy(output, capacity, &mut cursor, digits.data, digits.length); }
+        writer_destroy(&mut digits);
+    }
+    if (ok) {
+        if (project_host_windows_path(build.object_path, build.object_length)) {
+            ok = project_path_literal(output, capacity, &mut cursor, ".obj");
+        } else {
+            ok = project_path_literal(output, capacity, &mut cursor, ".o");
+        }
+    }
+    raz_compiler_rt_arena_destroy(object_dir);
+    raz_compiler_rt_arena_destroy(profile_dir);
+    if (!ok) { return -1; }
+    return cursor;
+}
+
+fn project_module_object_path(ProjectNativeBuild& build, i64 package_hash, i64 module_id, i64 output, i64 capacity) -> i64 {
+    i64 package_path = raz_compiler_rt_arena_create(8192); i64 package_dir = raz_compiler_rt_arena_create(8192);
+    if (package_path == 0 || package_dir == 0 || package_hash < 0 || module_id < 0) { return -1; }
+    i64 package_length = project_package_object_path(build, package_hash, package_path, 8192);
+    i64 dir_length = -1; if (package_length > 0) { dir_length = path_dirname(package_path, package_length, package_dir, 8192); }
+    i64 cursor = 0; bool ok = dir_length > 0 && project_path_copy(output, capacity, &mut cursor, package_dir, dir_length);
+    if (ok) { ok = project_path_literal(output, capacity, &mut cursor, "/"); }
+    ForgeWriter digits; digits.capacity = 64; digits.data = raz_compiler_rt_arena_create(64); digits.length = 0; digits.failed = digits.data == 0;
+    if (!digits.failed) { writer_decimal(&mut digits, package_hash); }
+    if (ok && !digits.failed) { ok = project_path_copy(output, capacity, &mut cursor, digits.data, digits.length); }
+    if (ok) { ok = project_path_literal(output, capacity, &mut cursor, "/"); }
+    digits.length = 0; if (!digits.failed) { writer_decimal(&mut digits, module_id); }
+    if (ok && !digits.failed) { ok = project_path_copy(output, capacity, &mut cursor, digits.data, digits.length); }
+    if (ok) {
+        if (project_host_windows_path(build.object_path, build.object_length)) { ok = project_path_literal(output, capacity, &mut cursor, ".obj"); }
+        else { ok = project_path_literal(output, capacity, &mut cursor, ".o"); }
+    }
+    writer_destroy(&mut digits); raz_compiler_rt_arena_destroy(package_path); raz_compiler_rt_arena_destroy(package_dir);
+    if (!ok) { return -1; }
+    return cursor;
+}
+
+fn project_root_module_id_from_hir(Source& source, HirModule& hir) -> i64 { return forge_root_module_id(source, hir); }
+
+fn project_host_windows_path(i64 path, i64 length) -> bool {
+    if (path == 0 || length < 4) { return false; }
+    return
+        raz_compiler_rt_arena_get(path, length - 4) == 46 &&
+        raz_compiler_rt_arena_get(path, length - 3) == 111 &&
+        raz_compiler_rt_arena_get(path, length - 2) == 98 &&
+        raz_compiler_rt_arena_get(path, length - 1) == 106;
+}
+
+fn project_package_units_schema() -> i64 {
+    // Bump whenever the semantic contents of package/module native objects
+    // change in a way that makes previously emitted .o files unsafe to reuse.
+    // This is intentionally separate from frontend incremental state because
+    // a compiler upgrade may leave source fingerprints unchanged while changing
+    // which symbols a package object must own.
+    return 3;
+}
+
+fn project_package_units_marker_path(ProjectNativeBuild& build, i64 output, i64 capacity) -> i64 {
+    if (build.object_path == 0 || build.object_length <= 0 || output == 0 || capacity <= 0) { return -1; }
+    i64 object_dir = raz_compiler_rt_arena_create(8192);
+    i64 profile_dir = raz_compiler_rt_arena_create(8192);
+    if (object_dir == 0 || profile_dir == 0) { return -1; }
+    i64 object_dir_length = path_dirname(build.object_path, build.object_length, object_dir, 8192);
+    i64 profile_dir_length = -1;
+    if (object_dir_length > 0) { profile_dir_length = path_dirname(object_dir, object_dir_length, profile_dir, 8192); }
+    i64 cursor = 0;
+    bool ok = profile_dir_length > 0 && project_path_copy(output, capacity, &mut cursor, profile_dir, profile_dir_length);
+    if (ok) { ok = project_path_literal(output, capacity, &mut cursor, "/packages/.units"); }
+    raz_compiler_rt_arena_destroy(object_dir);
+    raz_compiler_rt_arena_destroy(profile_dir);
+    if (!ok) { return -1; }
+    return cursor;
+}
+
+// Scan the assembled package markers. The project assembler emits one marker per
+// package, dependency-first, so this list is stable and independent of HIR ids.
+fn project_collect_source_package_hashes(Source& source, i64 hashes, i64 capacity) -> i64 {
+    if (source.bytes == 0 || hashes == 0 || capacity <= 0) { return -1; }
+    string marker = "__raz_package ";
+    i64 marker_length = compiler_literal_length(marker);
+    i64 cursor = 0;
+    i64 count = 0;
+    while (cursor + marker_length < source.length) {
+        bool matches = cursor == 0 || raz_compiler_rt_arena_get(source.bytes, cursor - 1) == 10;
+        i64 part = 0;
+        while (matches && part < marker_length) {
+            if (raz_compiler_rt_arena_get(source.bytes, cursor + part) != compiler_literal_byte(marker, part)) { matches = false; }
+            part += 1;
+        }
+        if (!matches) { cursor += 1; continue; }
+        i64 start = cursor + marker_length;
+        i64 end = start;
+        while (end < source.length && raz_compiler_rt_arena_get(source.bytes, end) != 59 && raz_compiler_rt_arena_get(source.bytes, end) != 10) { end += 1; }
+        i64 name_length = end - start;
+        if (name_length > 0) {
+            i64 name = raz_compiler_rt_arena_create(name_length);
+            if (name == 0) { return -1; }
+            part = 0;
+            while (part < name_length) {
+                raz_compiler_rt_arena_set(name, part, raz_compiler_rt_arena_get(source.bytes, start + part));
+                part += 1;
+            }
+            i64 hash = incremental_package_name_hash(name, name_length);
+            raz_compiler_rt_arena_destroy(name);
+            bool duplicate = false;
+            part = 0;
+            while (part < count) {
+                if (raz_compiler_rt_arena_get(hashes, part) == hash) { duplicate = true; }
+                part += 1;
+            }
+            if (!duplicate) {
+                if (count >= capacity) { return -1; }
+                raz_compiler_rt_arena_set(hashes, count, hash);
+                count += 1;
+            }
+        }
+        cursor = end + 1;
+    }
+    return count;
+}
+
+fn project_package_units_fingerprints_match(
+    i64 marker_data, i64 marker_length, i64 frontend_data, i64 frontend_length,
+) -> bool {
+    if (marker_data == 0 || frontend_data == 0 || marker_length <= 0 || frontend_length <= 0) { return false; }
+    i64 frontend_count = 0;
+    i64 scan = 0;
+    while (scan < frontend_length) {
+        i64 line_end = scan;
+        while (line_end < frontend_length && raz_compiler_rt_arena_get(frontend_data, line_end) != 10) { line_end += 1; }
+        if (line_end > scan && raz_compiler_rt_arena_get(frontend_data, scan) == 77) {
+            i64 field = scan + 1;
+            i64 module_id = incremental_state_next_decimal(frontend_data, &mut field, line_end);
+            i64 source_fingerprint = incremental_state_next_decimal(frontend_data, &mut field, line_end);
+            i64 interface_fingerprint = incremental_state_next_decimal(frontend_data, &mut field, line_end);
+            i64 package_hash = incremental_state_next_decimal(frontend_data, &mut field, line_end);
+            bool found = false;
+            i64 marker_scan = 0;
+            while (marker_scan < marker_length && !found) {
+                i64 marker_end = marker_scan;
+                while (marker_end < marker_length && raz_compiler_rt_arena_get(marker_data, marker_end) != 10) { marker_end += 1; }
+                if (marker_end > marker_scan && raz_compiler_rt_arena_get(marker_data, marker_scan) == 70) { // F
+                    i64 marker_field = marker_scan + 1;
+                    i64 stored_module = incremental_state_next_decimal(marker_data, &mut marker_field, marker_end);
+                    i64 stored_source = incremental_state_next_decimal(marker_data, &mut marker_field, marker_end);
+                    i64 stored_interface = incremental_state_next_decimal(marker_data, &mut marker_field, marker_end);
+                    i64 stored_package = incremental_state_next_decimal(marker_data, &mut marker_field, marker_end);
+                    found = stored_module == module_id && stored_source == source_fingerprint &&
+                        stored_interface == interface_fingerprint && stored_package == package_hash;
+                }
+                marker_scan = marker_end + 1;
+            }
+            if (!found) { return false; }
+            frontend_count += 1;
+        }
+        scan = line_end + 1;
+    }
+    i64 marker_count = 0;
+    scan = 0;
+    while (scan < marker_length) {
+        i64 line_end = scan;
+        while (line_end < marker_length && raz_compiler_rt_arena_get(marker_data, line_end) != 10) { line_end += 1; }
+        if (line_end > scan && raz_compiler_rt_arena_get(marker_data, scan) == 70) { marker_count += 1; }
+        scan = line_end + 1;
+    }
+    return frontend_count > 0 && marker_count == frontend_count;
+}
+
+public fn project_package_units_cache_ready(
+    ProjectNativeBuild& build,
+    Source& source,
+    i64 backend_options_key,
+) -> bool {
+    if (!build.active || build.object_path == 0) { return false; }
+    i64 marker = raz_compiler_rt_arena_create(8192);
+    i64 marker_data = raz_compiler_rt_arena_create(65536);
+    i64 state_path = raz_compiler_rt_arena_create(8192);
+    i64 state_data = raz_compiler_rt_arena_create(524288);
+    i64 hashes = raz_compiler_rt_arena_create(256);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    if (marker == 0 || marker_data == 0 || state_path == 0 || state_data == 0 || hashes == 0 || path == 0) { return false; }
+    i64 marker_length = project_package_units_marker_path(build, marker, 8192);
+    i64 marker_read = -1;
+    if (marker_length > 0) { marker_read = raz_compiler_rt_read_ascii(marker, marker_length, marker_data, 65536); }
+    i64 marker_cursor = 0;
+    i64 stored_key = -1; i64 root_hash = -1; i64 stored_units_schema = -1;
+    if (marker_read > 0) {
+        stored_key = incremental_state_next_decimal(marker_data, &mut marker_cursor, marker_read);
+        root_hash = incremental_state_next_decimal(marker_data, &mut marker_cursor, marker_read);
+        stored_units_schema = incremental_state_next_decimal(marker_data, &mut marker_cursor, marker_read);
+    }
+    bool ready =
+        stored_key == backend_options_key &&
+        root_hash >= 0 &&
+        stored_units_schema == project_package_units_schema();
+
+    // frontend.state is the pre-HIR source of truth for the package hashes HIR
+    // used when the cached objects were produced. Do not re-hash package names
+    // here: HIR package identity intentionally uses its own stable token hash.
+    i64 state_length = -1;
+    // Derive target/cache/frontend.state from the already-prepared object path.
+    i64 object_dir = raz_compiler_rt_arena_create(8192);
+    i64 profile_dir = raz_compiler_rt_arena_create(8192);
+    if (object_dir == 0 || profile_dir == 0) { ready = false; }
+    i64 object_dir_length = -1;
+    i64 profile_dir_length = -1;
+    if (ready) {
+        object_dir_length = path_dirname(build.object_path, build.object_length, object_dir, 8192);
+        if (object_dir_length > 0) { profile_dir_length = path_dirname(object_dir, object_dir_length, profile_dir, 8192); }
+    }
+    i64 cache_root = raz_compiler_rt_arena_create(8192);
+    i64 cache_root_length = -1;
+    if (ready && profile_dir_length > 0 && cache_root != 0) {
+        cache_root_length = path_dirname(profile_dir, profile_dir_length, cache_root, 8192);
+    }
+    i64 cursor = 0;
+    if (ready && cache_root_length > 0) {
+        ready = project_path_copy(state_path, 8192, &mut cursor, cache_root, cache_root_length) &&
+            project_path_literal(state_path, 8192, &mut cursor, "/cache/frontend.state");
+        if (ready) { state_length = raz_compiler_rt_read_ascii(state_path, cursor, state_data, 524288); }
+    }
+    i64 count = 0;
+    i64 scan = 0;
+    while (ready && state_length > 0 && scan < state_length) {
+        i64 line_end = scan;
+        while (line_end < state_length && raz_compiler_rt_arena_get(state_data, line_end) != 10) { line_end += 1; }
+        if (line_end > scan && raz_compiler_rt_arena_get(state_data, scan) == 77) {
+            i64 field = scan + 1;
+            incremental_state_next_decimal(state_data, &mut field, line_end); // module id
+            incremental_state_next_decimal(state_data, &mut field, line_end); // source
+            incremental_state_next_decimal(state_data, &mut field, line_end); // interface
+            i64 hash = incremental_state_next_decimal(state_data, &mut field, line_end);
+            bool duplicate = false;
+            i64 index = 0;
+            while (index < count) { if (raz_compiler_rt_arena_get(hashes, index) == hash) { duplicate = true; } index += 1; }
+            if (!duplicate && hash >= 0 && count < 256) { raz_compiler_rt_arena_set(hashes, count, hash); count += 1; }
+        }
+        scan = line_end + 1;
+    }
+    if (ready) {
+        ready = project_package_units_fingerprints_match(marker_data, marker_read, state_data, state_length);
+    }
+    i64 index = 0;
+    while (ready && index < count) {
+        i64 hash = raz_compiler_rt_arena_get(hashes, index);
+        if (hash != root_hash) { i64 length = project_package_object_path(build, hash, path, 8192); if (length <= 0 || raz_compiler_rt_path_exists_ascii(path, length) == 0) { ready = false; } }
+        index += 1;
+    }
+    scan = 0; i64 root_module_count = 0;
+    while (ready && state_length > 0 && scan < state_length) {
+        i64 line_end = scan; while (line_end < state_length && raz_compiler_rt_arena_get(state_data, line_end) != 10) { line_end += 1; }
+        if (line_end > scan && raz_compiler_rt_arena_get(state_data, scan) == 77) {
+            i64 field = scan + 1; i64 module_id = incremental_state_next_decimal(state_data, &mut field, line_end);
+            incremental_state_next_decimal(state_data, &mut field, line_end); incremental_state_next_decimal(state_data, &mut field, line_end);
+            i64 hash = incremental_state_next_decimal(state_data, &mut field, line_end);
+            if (hash == root_hash && module_id >= 0) { i64 length = project_module_object_path(build, root_hash, module_id, path, 8192); if (length <= 0 || raz_compiler_rt_path_exists_ascii(path, length) == 0) { ready = false; } root_module_count += 1; }
+        }
+        scan = line_end + 1;
+    }
+    if (count <= 0 || root_module_count <= 0) { ready = false; }
+    raz_compiler_rt_arena_destroy(marker);
+    raz_compiler_rt_arena_destroy(marker_data);
+    raz_compiler_rt_arena_destroy(state_path);
+    raz_compiler_rt_arena_destroy(state_data);
+    raz_compiler_rt_arena_destroy(hashes);
+    raz_compiler_rt_arena_destroy(path);
+    if (object_dir != 0) { raz_compiler_rt_arena_destroy(object_dir); }
+    if (profile_dir != 0) { raz_compiler_rt_arena_destroy(profile_dir); }
+    if (cache_root != 0) { raz_compiler_rt_arena_destroy(cache_root); }
+    return ready;
+}
+
+fn project_hir_has_package_hash(HirModule& hir, i64 package_hash) -> bool {
+    i64 module = 0;
+    while (module < hir.incremental_module_fingerprint_count) {
+        if (raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module) == package_hash) {
+            return true;
+        }
+        module += 1;
+    }
+    return false;
+}
+
+fn project_hir_has_root_module_id(HirModule& hir, i64 root_hash, i64 module_id) -> bool {
+    i64 module = 0;
+    while (module < hir.incremental_module_fingerprint_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module) == root_hash &&
+            raz_compiler_rt_arena_get(hir.incremental_module_ids, module) == module_id
+        ) {
+            return true;
+        }
+        module += 1;
+    }
+    return false;
+}
+
+// The successful .units marker is also the native-object manifest.  Keeping
+// the previous package/root-module identities here lets the next incremental
+// build remove objects that disappeared from the graph without deleting clean
+// objects that are still reusable.  Older two-field markers remain readable;
+// they simply have no manifest records to prune on their first upgraded build.
+fn project_prune_stale_package_units(ProjectNativeBuild& build, HirModule& hir, i64 root_hash) -> bool {
+    i64 marker = raz_compiler_rt_arena_create(8192);
+    i64 data = raz_compiler_rt_arena_create(16384);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    if (marker == 0 || data == 0 || path == 0) { return false; }
+    i64 marker_length = project_package_units_marker_path(build, marker, 8192);
+    i64 read = -1;
+    if (marker_length > 0) { read = raz_compiler_rt_read_ascii(marker, marker_length, data, 16384); }
+    if (read <= 0) {
+        raz_compiler_rt_arena_destroy(marker);
+        raz_compiler_rt_arena_destroy(data);
+        raz_compiler_rt_arena_destroy(path);
+        return true;
+    }
+
+    i64 header_end = 0;
+    while (header_end < read && raz_compiler_rt_arena_get(data, header_end) != 10) { header_end += 1; }
+    i64 header_cursor = 0;
+    incremental_state_next_decimal(data, &mut header_cursor, header_end); // backend options key
+    i64 stored_root_hash = incremental_state_next_decimal(data, &mut header_cursor, header_end);
+    if (stored_root_hash < 0) {
+        raz_compiler_rt_arena_destroy(marker);
+        raz_compiler_rt_arena_destroy(data);
+        raz_compiler_rt_arena_destroy(path);
+        return true;
+    }
+
+    bool ok = true;
+    i64 scan = header_end + 1;
+    while (ok && scan < read) {
+        i64 line_end = scan;
+        while (line_end < read && raz_compiler_rt_arena_get(data, line_end) != 10) { line_end += 1; }
+        if (line_end > scan) {
+            i64 kind = raz_compiler_rt_arena_get(data, scan);
+            i64 field = scan + 1;
+            i64 value = incremental_state_next_decimal(data, &mut field, line_end);
+            bool stale = false;
+            i64 path_length = -1;
+            if (kind == 80 && value >= 0) { // P <dependency-package-hash>
+                stale = value == root_hash || !project_hir_has_package_hash(hir, value);
+                if (stale) { path_length = project_package_object_path(build, value, path, 8192); }
+            } else if (kind == 77 && value >= 0) { // M <root-module-id>
+                stale = stored_root_hash != root_hash || !project_hir_has_root_module_id(hir, root_hash, value);
+                if (stale) { path_length = project_module_object_path(build, stored_root_hash, value, path, 8192); }
+            }
+            if (stale && path_length > 0 && raz_compiler_rt_path_exists_ascii(path, path_length) != 0) {
+                ok = raz_compiler_rt_remove_path_ascii(path, path_length) == 0;
+            }
+        }
+        scan = line_end + 1;
+    }
+    raz_compiler_rt_arena_destroy(marker);
+    raz_compiler_rt_arena_destroy(data);
+    raz_compiler_rt_arena_destroy(path);
+    return ok;
+}
+
+fn project_package_units_mark_ready(
+    ProjectNativeBuild& build,
+    HirModule& hir,
+    i64 backend_options_key,
+    i64 root_hash,
+) -> bool {
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 parent = raz_compiler_rt_arena_create(8192);
+    if (path == 0 || parent == 0) { return false; }
+    i64 length = project_package_units_marker_path(build, path, 8192);
+    i64 parent_length = -1;
+    if (length > 0) { parent_length = path_dirname(path, length, parent, 8192); }
+    if (parent_length <= 0 || raz_compiler_rt_create_dir_ascii(parent, parent_length) != 0) { return false; }
+    ForgeWriter writer;
+    writer.capacity = 65536;
+    writer.data = raz_compiler_rt_arena_create(65536);
+    writer.length = 0;
+    writer.failed = writer.data == 0;
+    if (!writer.failed) {
+        writer_decimal(&mut writer, backend_options_key);
+        writer_space(&mut writer);
+        writer_decimal(&mut writer, root_hash);
+        writer_space(&mut writer);
+        writer_decimal(&mut writer, project_package_units_schema());
+        writer_newline(&mut writer);
+
+        i64 module = 0;
+        while (module < hir.incremental_module_fingerprint_count && !writer.failed) {
+            i64 hash = raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module);
+            if (hash != root_hash) {
+                bool duplicate = false;
+                i64 previous = 0;
+                while (previous < module) {
+                    if (raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, previous) == hash) {
+                        duplicate = true;
+                    }
+                    previous += 1;
+                }
+                if (!duplicate) {
+                    writer_literal(&mut writer, "P ");
+                    writer_decimal(&mut writer, hash);
+                    writer_newline(&mut writer);
+                }
+            }
+            module += 1;
+        }
+        module = 0;
+        while (module < hir.incremental_module_fingerprint_count && !writer.failed) {
+            if (raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module) == root_hash) {
+                writer_literal(&mut writer, "M ");
+                writer_decimal(&mut writer, raz_compiler_rt_arena_get(hir.incremental_module_ids, module));
+                writer_newline(&mut writer);
+            }
+            module += 1;
+        }
+        module = 0;
+        while (module < hir.incremental_module_fingerprint_count && !writer.failed) {
+            writer_literal(&mut writer, "F ");
+            writer_decimal(&mut writer, raz_compiler_rt_arena_get(hir.incremental_module_ids, module));
+            writer_space(&mut writer);
+            writer_decimal(&mut writer, raz_compiler_rt_arena_get(hir.incremental_module_source_fingerprints, module));
+            writer_space(&mut writer);
+            writer_decimal(&mut writer, raz_compiler_rt_arena_get(hir.incremental_module_interface_fingerprints, module));
+            writer_space(&mut writer);
+            writer_decimal(&mut writer, raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module));
+            writer_newline(&mut writer);
+            module += 1;
+        }
+    }
+    bool ok = !writer.failed && raz_compiler_rt_write_ascii(path, length, writer.data, writer.length) >= 0;
+    writer_destroy(&mut writer);
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(parent);
+    return ok;
+}
+
+fn project_argv_append(i64 blob, i64 capacity, i64&mut cursor, i64 argument, i64 length) -> bool {
+    if (blob == 0 || argument == 0 || length < 0 || *cursor + length + 1 > capacity) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(blob, *cursor, raz_compiler_rt_arena_get(argument, index));
+        *cursor += 1;
+        index += 1;
+    }
+    raz_compiler_rt_arena_set(blob, *cursor, 0);
+    *cursor += 1;
+    return true;
+}
+
+fn project_argv_append_literal(i64 blob, i64 capacity, i64&mut cursor, string value) -> bool {
+    i64 length = compiler_literal_length(value);
+    i64 temp = raz_compiler_rt_arena_create(length);
+    if (temp == 0) { return false; }
+    i64 index = 0;
+    while (index < length) { raz_compiler_rt_arena_set(temp, index, compiler_literal_byte(value, index)); index += 1; }
+    bool ok = project_argv_append(blob, capacity, cursor, temp, length);
+    raz_compiler_rt_arena_destroy(temp);
+    return ok;
+}
+
+fn project_path_ends_with_literal(i64 path, i64 length, string suffix) -> bool {
+    if (path == 0 || length < 0) { return false; }
+    i64 suffix_length = compiler_literal_length(suffix);
+    if (suffix_length <= 0 || suffix_length > length) { return false; }
+    i64 start = length - suffix_length;
+    i64 index = 0;
+    while (index < suffix_length) {
+        if (raz_compiler_rt_arena_get(path, start + index) != compiler_literal_byte(suffix, index)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn project_default_linker_path(i64 output, i64 capacity, bool windows) -> i64 {
+    if (output == 0 || capacity <= 0) { return -1; }
+    if (windows) {
+        // Installed/bootstrap compilers keep ObLink beside the compiler binary.
+        // Resolve that self-describing location first so native package-unit
+        // linking never depends on the caller's working directory or PATH.
+        i64 executable = raz_compiler_rt_arena_create(8192);
+        i64 bin_dir = raz_compiler_rt_arena_create(8192);
+        if (executable != 0 && bin_dir != 0) {
+            i64 executable_length = raz_compiler_rt_process_arg(0, executable, 8192);
+            i64 bin_length = -1;
+            if (executable_length > 0) { bin_length = path_dirname(executable, executable_length, bin_dir, 8192); }
+            i64 cursor = 0;
+            bool ok = bin_length > 0 && project_path_copy(output, capacity, &mut cursor, bin_dir, bin_length);
+            if (ok) { ok = project_path_literal(output, capacity, &mut cursor, "/oblink.exe"); }
+            if (ok && raz_compiler_rt_path_exists_ascii(output, cursor) != 0) {
+                raz_compiler_rt_arena_destroy(executable);
+                raz_compiler_rt_arena_destroy(bin_dir);
+                return cursor;
+            }
+        }
+        if (executable != 0) { raz_compiler_rt_arena_destroy(executable); }
+        if (bin_dir != 0) { raz_compiler_rt_arena_destroy(bin_dir); }
+    }
+    string fallback = "c++";
+    if (windows) { fallback = "oblink.exe"; }
+    i64 length = compiler_literal_length(fallback);
+    if (length > capacity) { return -1; }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(output, index, compiler_literal_byte(fallback, index));
+        index += 1;
+    }
+    return length;
+}
+
+fn project_runtime_library_path(i64 output, i64 capacity, bool windows) -> i64 {
+    if (output == 0 || capacity <= 0) { return -1; }
+    i64 name = raz_compiler_rt_arena_create(64);
+    if (name == 0) { return -1; }
+    string env_name = "RAZ_RUNTIME_LIBRARY";
+    i64 name_length = compiler_literal_length(env_name);
+    i64 index = 0;
+    while (index < name_length) { raz_compiler_rt_arena_set(name, index, compiler_literal_byte(env_name, index)); index += 1; }
+    i64 length = raz_compiler_rt_env_get_ascii(name, name_length, output, capacity);
+    if (length > 0 && raz_compiler_rt_path_exists_ascii(output, length) != 0) {
+        raz_compiler_rt_arena_destroy(name);
+        return length;
+    }
+    i64 executable = raz_compiler_rt_arena_create(8192);
+    i64 bin_dir = raz_compiler_rt_arena_create(8192);
+    i64 root_dir = raz_compiler_rt_arena_create(8192);
+    if (executable == 0 || bin_dir == 0 || root_dir == 0) { raz_compiler_rt_arena_destroy(name); return -1; }
+    i64 executable_length = raz_compiler_rt_process_arg(0, executable, 8192);
+    i64 bin_length = -1;
+    if (executable_length > 0) { bin_length = path_dirname(executable, executable_length, bin_dir, 8192); }
+    i64 root_length = -1;
+    if (bin_length > 0) { root_length = path_dirname(bin_dir, bin_length, root_dir, 8192); }
+    i64 cursor = 0;
+    bool ok = root_length > 0 && project_path_copy(output, capacity, &mut cursor, root_dir, root_length);
+    if (ok && windows) { ok = project_path_literal(output, capacity, &mut cursor, "/lib/raz_runtime.lib"); }
+    if (ok && !windows) { ok = project_path_literal(output, capacity, &mut cursor, "/lib/libraz_runtime.a"); }
+    raz_compiler_rt_arena_destroy(name);
+    raz_compiler_rt_arena_destroy(executable);
+    raz_compiler_rt_arena_destroy(bin_dir);
+    raz_compiler_rt_arena_destroy(root_dir);
+    if (!ok || raz_compiler_rt_path_exists_ascii(output, cursor) == 0) { return -1; }
+    return cursor;
+}
+
+fn project_append_link_dep_lines(
+    i64 value,
+    i64 length,
+    i64 blob,
+    i64 capacity,
+    i64&mut cursor,
+    i64&mut argument_count,
+    bool semicolon_delimited,
+) -> bool {
+    if (value == 0 || length <= 0) { return true; }
+    bool ok = true;
+    i64 start = 0;
+    while (start < length && ok) {
+        i64 end = start;
+        while (
+            end < length &&
+            raz_compiler_rt_arena_get(value, end) != 10 &&
+            (!semicolon_delimited || raz_compiler_rt_arena_get(value, end) != 59)
+        ) { end += 1; }
+        i64 trimmed_end = end;
+        while (
+            trimmed_end > start &&
+            (raz_compiler_rt_arena_get(value, trimmed_end - 1) == 13 || raz_compiler_rt_arena_get(value, trimmed_end - 1) == 32)
+        ) { trimmed_end -= 1; }
+        if (trimmed_end > start) {
+            i64 part = raz_compiler_rt_arena_create(trimmed_end - start);
+            if (part == 0) { return false; }
+            i64 index = 0;
+            while (start + index < trimmed_end) {
+                raz_compiler_rt_arena_set(part, index, raz_compiler_rt_arena_get(value, start + index));
+                index += 1;
+            }
+            ok = project_argv_append(blob, capacity, cursor, part, trimmed_end - start);
+            raz_compiler_rt_arena_destroy(part);
+            if (ok) { *argument_count += 1; }
+        }
+        start = end + 1;
+    }
+    return ok;
+}
+
+fn project_append_runtime_link_dep_candidate(
+    i64 runtime_path,
+    i64 runtime_length,
+    string suffix,
+    i64 blob,
+    i64 capacity,
+    i64&mut cursor,
+    i64&mut argument_count,
+) -> bool {
+    i64 runtime_dir = raz_compiler_rt_arena_create(8192);
+    i64 candidate = raz_compiler_rt_arena_create(8192);
+    if (runtime_dir == 0 || candidate == 0) { return false; }
+    i64 runtime_dir_length = path_dirname(runtime_path, runtime_length, runtime_dir, 8192);
+    i64 candidate_cursor = 0;
+    bool ok = runtime_dir_length > 0 &&
+        project_path_copy(candidate, 8192, &mut candidate_cursor, runtime_dir, runtime_dir_length) &&
+        project_path_literal(candidate, 8192, &mut candidate_cursor, suffix);
+    if (ok && raz_compiler_rt_path_exists_ascii(candidate, candidate_cursor) != 0) {
+        ok = project_argv_append(blob, capacity, cursor, candidate, candidate_cursor);
+        if (ok) { *argument_count += 1; }
+    }
+    raz_compiler_rt_arena_destroy(runtime_dir);
+    raz_compiler_rt_arena_destroy(candidate);
+    return ok;
+}
+
+fn project_append_runtime_link_deps(
+    i64 blob,
+    i64 capacity,
+    i64&mut cursor,
+    i64&mut argument_count,
+    i64 runtime_path,
+    i64 runtime_length,
+    bool windows,
+) -> bool {
+    // Installed Raz toolchains are self-describing by directory layout.  The
+    // runtime archive and any optional third-party link inputs live together
+    // under release/lib; no generated text manifest is part of the ABI.
+    i64 name = raz_compiler_rt_arena_create(64);
+    i64 value = raz_compiler_rt_arena_create(32768);
+    if (name == 0 || value == 0) { return false; }
+    string env_name = "RAZ_RUNTIME_LINK_DEPS";
+    i64 name_length = compiler_literal_length(env_name);
+    i64 index = 0;
+    while (index < name_length) { raz_compiler_rt_arena_set(name, index, compiler_literal_byte(env_name, index)); index += 1; }
+    i64 length = raz_compiler_rt_env_get_ascii(name, name_length, value, 32768);
+    bool ok = true;
+    if (length > 0) {
+        ok = project_append_link_dep_lines(value, length, blob, capacity, cursor, argument_count, true);
+    } else if (runtime_path != 0 && runtime_length > 0) {
+        if (windows) {
+            ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/raz_runtime_ssl.lib", blob, capacity, cursor, argument_count);
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/raz_runtime_crypto.lib", blob, capacity, cursor, argument_count); }
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/raz_runtime_ssl.a", blob, capacity, cursor, argument_count); }
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/raz_runtime_crypto.a", blob, capacity, cursor, argument_count); }
+        } else {
+            ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_runtime_ssl.so", blob, capacity, cursor, argument_count);
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_runtime_crypto.so", blob, capacity, cursor, argument_count); }
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_runtime_ssl.a", blob, capacity, cursor, argument_count); }
+            if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_runtime_crypto.a", blob, capacity, cursor, argument_count); }
+        }
+    }
+    raz_compiler_rt_arena_destroy(name);
+    raz_compiler_rt_arena_destroy(value);
+    return ok;
+}
+
+fn project_append_toolchain_link_deps(
+    i64 blob,
+    i64 capacity,
+    i64&mut cursor,
+    i64&mut argument_count,
+    i64 runtime_path,
+    i64 runtime_length,
+    bool windows,
+) -> bool {
+    // A relocated production compiler may need its own Forge bridge while
+    // self-hosting. Keep those static support archives beside the runtime so
+    // the release layout is self-describing instead of relying on absolute
+    // CMake build-tree paths. Ordinary programs can safely pass these archives
+    // too: static linkers pull nothing from them unless a bridge symbol is used.
+    if (runtime_path == 0 || runtime_length <= 0) { return true; }
+    bool ok = true;
+    if (windows) {
+        ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/raz_forge_bridge.lib", blob, capacity, cursor, argument_count);
+        if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/forge.lib", blob, capacity, cursor, argument_count); }
+        if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_forge_bridge.a", blob, capacity, cursor, argument_count); }
+        if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libforge.a", blob, capacity, cursor, argument_count); }
+    } else {
+        ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libraz_forge_bridge.a", blob, capacity, cursor, argument_count);
+        if (ok) { ok = project_append_runtime_link_dep_candidate(runtime_path, runtime_length, "/libforge.a", blob, capacity, cursor, argument_count); }
+    }
+    return ok;
+}
+
+public fn project_link_package_units(
+    ProjectNativeBuild& build,
+    Source& source,
+    HirModule& hir,
+    i64 artifact_path,
+    i64 artifact_length,
+    i64 backend_options_key,
+) -> bool {
+    if (!build.active || artifact_path == 0 || artifact_length <= 0) { return false; }
+    i64 hashes = raz_compiler_rt_arena_create(256);
+    i64 path = raz_compiler_rt_arena_create(8192);
+    i64 blob = raz_compiler_rt_arena_create(131072);
+    i64 program = raz_compiler_rt_arena_create(8192);
+    i64 runtime = raz_compiler_rt_arena_create(8192);
+    i64 env_name = raz_compiler_rt_arena_create(64);
+    if (hashes == 0 || path == 0 || blob == 0 || program == 0 || runtime == 0 || env_name == 0) { return false; }
+    i64 root_hash = forge_root_package_hash(source, hir);
+    i64 count = 0;
+    i64 module = 0;
+    while (module < hir.incremental_module_fingerprint_count) {
+        i64 hash = raz_compiler_rt_arena_get(hir.incremental_module_package_hashes, module);
+        bool duplicate = false;
+        i64 seen = 0;
+        while (seen < count) { if (raz_compiler_rt_arena_get(hashes, seen) == hash) { duplicate = true; } seen += 1; }
+        if (!duplicate && hash >= 0 && count < 256) { raz_compiler_rt_arena_set(hashes, count, hash); count += 1; }
+        module += 1;
+    }
+    i64 cursor = 0;
+    i64 argument_count = 0;
+    bool ok = count > 0;
+    i64 index = 0;
+    while (ok && index < count) { i64 hash=raz_compiler_rt_arena_get(hashes,index); if(hash!=root_hash){ i64 path_length=project_package_object_path(build,hash,path,8192); ok=path_length>0&&raz_compiler_rt_path_exists_ascii(path,path_length)!=0&&project_argv_append(blob,131072,&mut cursor,path,path_length); if(ok){argument_count+=1;} } index+=1; }
+    module=0; i64 root_module_count=0; while(ok&&module<hir.incremental_module_fingerprint_count){ if(raz_compiler_rt_arena_get(hir.incremental_module_package_hashes,module)==root_hash){ i64 mid=raz_compiler_rt_arena_get(hir.incremental_module_ids,module); i64 path_length=project_module_object_path(build,root_hash,mid,path,8192); ok=path_length>0&&raz_compiler_rt_path_exists_ascii(path,path_length)!=0&&project_argv_append(blob,131072,&mut cursor,path,path_length); if(ok){argument_count+=1;root_module_count+=1;} } module+=1;} if(root_module_count<=0){ok=false;}
+    bool artifact_windows = artifact_length >= 4 &&
+        raz_compiler_rt_arena_get(artifact_path, artifact_length - 4) == 46 &&
+        raz_compiler_rt_arena_get(artifact_path, artifact_length - 3) == 101 &&
+        raz_compiler_rt_arena_get(artifact_path, artifact_length - 2) == 120 &&
+        raz_compiler_rt_arena_get(artifact_path, artifact_length - 1) == 101;
+    i64 runtime_length = -1;
+    if (ok) { runtime_length = project_runtime_library_path(runtime, 8192, artifact_windows); }
+    if (runtime_length <= 0) { ok = false; }
+    if (ok) { ok = project_argv_append(blob, 131072, &mut cursor, runtime, runtime_length); argument_count += 1; }
+    if (ok) { ok = project_append_runtime_link_deps(blob, 131072, &mut cursor, &mut argument_count, runtime, runtime_length, artifact_windows); }
+    if (ok) { ok = project_append_toolchain_link_deps(blob, 131072, &mut cursor, &mut argument_count, runtime, runtime_length, artifact_windows); }
+
+    bool windows = artifact_windows;
+    string linker_name = "RAZ_LINKER";
+    i64 linker_name_length = compiler_literal_length(linker_name);
+    index = 0;
+    while (index < linker_name_length) { raz_compiler_rt_arena_set(env_name, index, compiler_literal_byte(linker_name, index)); index += 1; }
+    i64 program_length = raz_compiler_rt_env_get_ascii(env_name, linker_name_length, program, 8192);
+    bool default_linker = program_length <= 0;
+    if (default_linker) {
+        program_length = project_default_linker_path(program, 8192, windows);
+    }
+    if (ok && windows) {
+        ok = project_argv_append_literal(blob, 131072, &mut cursor, "-l") && project_argv_append_literal(blob, 131072, &mut cursor, "ws2_32"); argument_count += 2;
+        if (ok) { ok = project_argv_append_literal(blob, 131072, &mut cursor, "-l") && project_argv_append_literal(blob, 131072, &mut cursor, "bcrypt"); argument_count += 2; }
+        if (ok) { ok = project_argv_append_literal(blob, 131072, &mut cursor, "-l") && project_argv_append_literal(blob, 131072, &mut cursor, "crypt32"); argument_count += 2; }
+        // ObLink reserves a deliberately larger stack for the compiler itself.
+        // The self-host pipeline is substantially deeper than an ordinary Raz
+        // application (semantic queries, MIR lowering, codegen and web lowering
+        // can all nest), and the canonical package-unit compiler must match the
+        // 32 MiB stack used by the explicit bootstrap/repro compiler links.
+        if (ok && default_linker) {
+            ok = project_argv_append_literal(blob, 131072, &mut cursor, "--stack");
+            if (ok) { argument_count += 1; }
+            if (ok && project_path_ends_with_literal(artifact_path, artifact_length, "raz-compiler.exe")) {
+                ok = project_argv_append_literal(blob, 131072, &mut cursor, "33554432");
+            } else if (ok) {
+                ok = project_argv_append_literal(blob, 131072, &mut cursor, "8388608");
+            }
+            if (ok) { argument_count += 1; }
+        }
+    } else if (ok) {
+        ok = project_argv_append_literal(blob, 131072, &mut cursor, "-pthread");
+        if (ok) { argument_count += 1; }
+        if (ok) { ok = project_argv_append_literal(blob, 131072, &mut cursor, "-Wl,--gc-sections"); }
+        if (ok) { argument_count += 1; }
+    }
+    if (ok) { ok = project_argv_append_literal(blob, 131072, &mut cursor, "-o"); if (ok) { argument_count += 1; } }
+    if (ok) { ok = project_argv_append(blob, 131072, &mut cursor, artifact_path, artifact_length); if (ok) { argument_count += 1; } }
+    i64 artifact_parent = raz_compiler_rt_arena_create(8192);
+    if (ok && artifact_parent != 0) {
+        i64 artifact_parent_length = path_dirname(artifact_path, artifact_length, artifact_parent, 8192);
+        ok = artifact_parent_length > 0 && raz_compiler_rt_create_dir_ascii(artifact_parent, artifact_parent_length) == 0;
+    } else if (artifact_parent == 0) {
+        ok = false;
+    }
+    if (ok) { ok = raz_compiler_rt_process_run_argv_ascii(program, program_length, blob, cursor, argument_count) == 0; }
+    if (artifact_parent != 0) { raz_compiler_rt_arena_destroy(artifact_parent); }
+    // The materialized executable is the success criterion for package-unit
+    // linking.  The .units marker is only an incremental-reuse hint; failing
+    // to persist that hint must never trigger a second whole-program link or
+    // resurrect target/<profile>/obj/<package>.{o,obj}.  A later build can
+    // simply rebuild package units if the marker was unavailable.
+    if (ok) {
+        ok = raz_compiler_rt_path_exists_ascii(artifact_path, artifact_length) != 0;
+        if (ok) { project_package_units_mark_ready(build, hir, backend_options_key, root_hash); }
+    }
+    // Package-unit linking is the canonical native output path.  The legacy
+    // whole-project object is only a compatibility scratch path and must not
+    // survive a successful modular link (tests and tooling treat packages/ as
+    // the sole object layout).
+    if (ok && build.object_path != 0 && build.object_length > 0 &&
+        raz_compiler_rt_path_exists_ascii(build.object_path, build.object_length) != 0) {
+        ok = raz_compiler_rt_remove_path_ascii(build.object_path, build.object_length) == 0;
+        if (ok) {
+            i64 legacy_parent = raz_compiler_rt_arena_create(8192);
+            if (legacy_parent != 0) {
+                i64 legacy_parent_length = path_dirname(build.object_path, build.object_length, legacy_parent, 8192);
+                if (legacy_parent_length > 0) { raz_compiler_rt_remove_path_ascii(legacy_parent, legacy_parent_length); }
+                raz_compiler_rt_arena_destroy(legacy_parent);
+            }
+        }
+    }
+    raz_compiler_rt_arena_destroy(hashes);
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(blob);
+    raz_compiler_rt_arena_destroy(program);
+    raz_compiler_rt_arena_destroy(runtime);
+    raz_compiler_rt_arena_destroy(env_name);
+    return ok;
+}
+
+public fn project_emit_package_units(
+    ProjectNativeBuild& build, Source& source, HirModule& hir, MirModule& mir, i64 optimization_kind, bool only_dirty,
+) -> bool {
+    if (!build.active) { return false; }
+    i64 hashes = raz_compiler_rt_arena_create(256); i64 path = raz_compiler_rt_arena_create(8192); if (hashes == 0 || path == 0) { return false; }
+    i64 count = 0; i64 module = 0;
+    while (module < hir.incremental_module_fingerprint_count) { i64 hash = raz_compiler_rt_arena_get(hir.incremental_module_package_hashes,module); bool dup=false; i64 i=0; while(i<count){ if(raz_compiler_rt_arena_get(hashes,i)==hash){dup=true;} i+=1;} if(!dup&&count<256){raz_compiler_rt_arena_set(hashes,count,hash);count+=1;} module+=1; }
+    i64 root_hash = forge_root_package_hash(source, hir); i64 root_module_id = project_root_module_id_from_hir(source, hir); bool ok = count>0 && root_hash>=0 && root_module_id>=0;
+    if (ok) { ok = project_prune_stale_package_units(build, hir, root_hash); }
+    i64 package=0; while(ok && package<count){ i64 hash=raz_compiler_rt_arena_get(hashes,package);
+        if(hash==root_hash){
+            i64 mids=raz_compiler_rt_arena_create(256); i64 entries=raz_compiler_rt_arena_create(256); i64 paths=raz_compiler_rt_arena_create(256); i64 lengths=raz_compiler_rt_arena_create(256); i64 dirty_count=0;
+            ok=mids!=0&&entries!=0&&paths!=0&&lengths!=0; module=0;
+            while(ok&&module<hir.incremental_module_fingerprint_count){
+                if(raz_compiler_rt_arena_get(hir.incremental_module_package_hashes,module)==root_hash && (!only_dirty || raz_compiler_rt_arena_get(hir.incremental_module_dirty_kinds,module)!=0)){
+                    if(dirty_count>=256){ok=false;} else { i64 mid=raz_compiler_rt_arena_get(hir.incremental_module_ids,module); i64 module_path=raz_compiler_rt_arena_create(8192); i64 len=-1; if(module_path!=0){len=project_module_object_path(build,root_hash,mid,module_path,8192);}
+                        i64 parent=raz_compiler_rt_arena_create(8192); i64 plen=-1; if(len>0&&parent!=0){plen=path_dirname(module_path,len,parent,8192);} ok=module_path!=0&&parent!=0&&plen>0&&raz_compiler_rt_create_dir_ascii(parent,plen)==0; if(parent!=0){raz_compiler_rt_arena_destroy(parent);}
+                        if(ok){i64 entry_flag=0; if(mid==root_module_id){entry_flag=1;} raz_compiler_rt_arena_set(mids,dirty_count,mid); raz_compiler_rt_arena_set(entries,dirty_count,entry_flag); raz_compiler_rt_arena_set(paths,dirty_count,module_path); raz_compiler_rt_arena_set(lengths,dirty_count,len); dirty_count+=1;} else if(module_path!=0){raz_compiler_rt_arena_destroy(module_path);}
+                    }
+                }
+                module+=1;
+            }
+            // One backend call shares immutable Forge support/image analysis for every dirty root module.
+            if(ok&&dirty_count>0){ok=emit_forge_module_object_batch(source,hir,mir,root_hash,mids,entries,paths,lengths,dirty_count,optimization_kind);}
+            i64 cleanup=0; while(cleanup<dirty_count){i64 module_path=raz_compiler_rt_arena_get(paths,cleanup); if(module_path!=0){raz_compiler_rt_arena_destroy(module_path);} cleanup+=1;}
+            if(mids!=0){raz_compiler_rt_arena_destroy(mids);} if(entries!=0){raz_compiler_rt_arena_destroy(entries);} if(paths!=0){raz_compiler_rt_arena_destroy(paths);} if(lengths!=0){raz_compiler_rt_arena_destroy(lengths);}
+        } else { bool dirty=!only_dirty; module=0; while(!dirty&&module<hir.incremental_module_fingerprint_count){ if(raz_compiler_rt_arena_get(hir.incremental_module_package_hashes,module)==hash && raz_compiler_rt_arena_get(hir.incremental_module_dirty_kinds,module)!=0){dirty=true;} module+=1;} if(dirty){ i64 len=project_package_object_path(build,hash,path,8192); i64 parent=raz_compiler_rt_arena_create(8192); i64 plen=-1; if(len>0&&parent!=0){plen=path_dirname(path,len,parent,8192);} ok=parent!=0&&plen>0&&raz_compiler_rt_create_dir_ascii(parent,plen)==0; if(ok){ok=emit_forge_package_object(source,hir,mir,hash,false,path,len,optimization_kind);} if(parent!=0){raz_compiler_rt_arena_destroy(parent);} } } package+=1; }
+    raz_compiler_rt_arena_destroy(hashes); raz_compiler_rt_arena_destroy(path); return ok;
+}
+
+fn project_native_build_destroy(ProjectNativeBuild&mut build) {
+    if (build.object_path != 0) {
+        raz_compiler_rt_arena_destroy(build.object_path);
+    }
+    build.active = false;
+    build.object_path = 0;
+    build.object_length = 0;
+}
+
+fn project_path_copy(i64 output, i64 capacity, i64&mut cursor, i64 source, i64 length) -> bool {
+    if (output == 0 || source == 0 || capacity <= 0 || length < 0 || *cursor < 0 || *cursor + length > capacity) {
+        return false;
+    }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(output, *cursor + index, raz_compiler_rt_arena_get(source, index));
+        index += 1;
+    }
+    *cursor += length;
+    return true;
+}
+
+fn project_path_literal(i64 output, i64 capacity, i64&mut cursor, string literal) -> bool {
+    if (output == 0 || capacity <= 0 || *cursor < 0) {
+        return false;
+    }
+    i64 length = compiler_literal_length(literal);
+    if (*cursor + length > capacity) {
+        return false;
+    }
+    i64 index = 0;
+    while (index < length) {
+        raz_compiler_rt_arena_set(output, *cursor + index, compiler_literal_byte(literal, index));
+        index += 1;
+    }
+    *cursor += length;
+    return true;
+}
+
+fn project_default_native_paths(
+    i64 manifest_path,
+    i64 manifest_path_length,
+    bool release_profile,
+    i64 object_path,
+    i64 object_capacity,
+    i64 artifact_path,
+    i64 artifact_capacity,
+    i64&mut object_length,
+    i64&mut artifact_length,
+) -> bool {
+    if (
+        manifest_path == 0 ||
+        manifest_path_length <= 0 ||
+        object_path == 0 ||
+        artifact_path == 0 ||
+        object_capacity <= 0 ||
+        artifact_capacity <= 0
+    ) {
+        return false;
+    }
+
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 package_name = raz_compiler_rt_arena_create(4096);
+    i64 project_root = raz_compiler_rt_arena_create(8192);
+    i64 profile_path = raz_compiler_rt_arena_create(8192);
+    i64 scratch = raz_compiler_rt_arena_create(8192);
+
+    if (manifest == 0 || package_name == 0 || project_root == 0 || profile_path == 0 || scratch == 0) {
+        if (scratch != 0) { raz_compiler_rt_arena_destroy(scratch); }
+        if (profile_path != 0) { raz_compiler_rt_arena_destroy(profile_path); }
+        if (project_root != 0) { raz_compiler_rt_arena_destroy(project_root); }
+        if (package_name != 0) { raz_compiler_rt_arena_destroy(package_name); }
+        if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
+        return false;
+    }
+
+    i64 manifest_length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536, );
+    i64 package_name_length = -1;
+    if (manifest_length > 0) {
+        package_name_length = manifest_package_name(manifest, manifest_length, package_name, 4096);
+    }
+    i64 project_root_length = path_dirname(manifest_path, manifest_path_length, project_root, 8192);
+    if (manifest_length <= 0 || package_name_length <= 0 || project_root_length <= 0) {
+        raz_compiler_rt_arena_destroy(scratch);
+        raz_compiler_rt_arena_destroy(profile_path);
+        raz_compiler_rt_arena_destroy(project_root);
+        raz_compiler_rt_arena_destroy(package_name);
+        raz_compiler_rt_arena_destroy(manifest);
+        return false;
+    }
+
+    // Keep target layout construction in Raz itself. This is language/project
+    // semantics, not a host ABI concern, and using the same spelling here as
+    // bootstrap guarantees Stage-0, self-hosted repro builds, and installed Raz
+    // all use target/<profile>/<category>, with categories created lazily only
+    // when a command is about to materialize an artifact there.
+    i64 profile_length = 0;
+    bool profile_ok =
+        project_path_copy(profile_path, 8192, &mut profile_length, project_root, project_root_length) &&
+        project_path_literal(profile_path, 8192, &mut profile_length, "/target/");
+    if (profile_ok) {
+        if (release_profile) {
+            profile_ok = project_path_literal(profile_path, 8192, &mut profile_length, "release");
+        } else {
+            profile_ok = project_path_literal(profile_path, 8192, &mut profile_length, "debug");
+        }
+    }
+    if (
+        !profile_ok ||
+        raz_compiler_rt_create_dir_ascii(profile_path, profile_length) != 0
+    ) {
+        raz_compiler_rt_arena_destroy(scratch);
+        raz_compiler_rt_arena_destroy(profile_path);
+        raz_compiler_rt_arena_destroy(project_root);
+        raz_compiler_rt_arena_destroy(package_name);
+        raz_compiler_rt_arena_destroy(manifest);
+        return false;
+    }
+
+    i64 artifact_cursor = 0;
+    bool artifact_ok =
+        project_path_copy(artifact_path, artifact_capacity, &mut artifact_cursor, profile_path, profile_length) &&
+        project_path_literal(artifact_path, artifact_capacity, &mut artifact_cursor, "/bin/") &&
+        project_path_copy(artifact_path, artifact_capacity, &mut artifact_cursor, package_name, package_name_length);
+    if (artifact_ok && raz_compiler_rt_host_platform() == 1) {
+        artifact_ok = project_path_literal(artifact_path, artifact_capacity, &mut artifact_cursor, ".exe");
+    }
+
+    i64 object_cursor = 0;
+    bool object_ok =
+        project_path_copy(object_path, object_capacity, &mut object_cursor, profile_path, profile_length) &&
+        project_path_literal(object_path, object_capacity, &mut object_cursor, "/obj/") &&
+        project_path_copy(object_path, object_capacity, &mut object_cursor, package_name, package_name_length);
+    if (object_ok) {
+        if (raz_compiler_rt_host_platform() == 1) {
+            object_ok = project_path_literal(object_path, object_capacity, &mut object_cursor, ".obj");
+        } else {
+            object_ok = project_path_literal(object_path, object_capacity, &mut object_cursor, ".o");
+        }
+    }
+
+    raz_compiler_rt_arena_destroy(scratch);
+    raz_compiler_rt_arena_destroy(profile_path);
+    raz_compiler_rt_arena_destroy(project_root);
+    raz_compiler_rt_arena_destroy(package_name);
+    raz_compiler_rt_arena_destroy(manifest);
+    if (!artifact_ok || !object_ok || artifact_cursor <= 0 || object_cursor <= 0) {
+        return false;
+    }
+    *artifact_length = artifact_cursor;
+    *object_length = object_cursor;
+    return true;
+}
+

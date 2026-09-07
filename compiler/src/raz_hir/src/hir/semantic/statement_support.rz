@@ -1,0 +1,247 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::statement_support;
+
+public import raz_hir::semantic::expressions;
+
+// Shared statement/block construction and lexical capture helpers.
+// Keep these primitives independent from individual statement families.
+fn hir_add_block(HirBuilder&mut builder, i64 start, i64 end, i64&mut out) -> bool {
+    if (builder.module.block_count >= 131072) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 index = builder.module.block_count;
+
+    builder.module.block_count += 1;
+    raz_compiler_rt_arena_set(builder.module.block_starts, index, start);
+    raz_compiler_rt_arena_set(builder.module.block_ends, index, end);
+    raz_compiler_rt_arena_set(builder.module.block_statement_starts, index, builder.module.statement_count);
+    raz_compiler_rt_arena_set(builder.module.block_statement_counts, index, 0);
+    raz_compiler_rt_arena_set(builder.module.block_function_indices, index, builder.current_function);
+    raz_compiler_rt_arena_set(builder.module.block_parent_indices, index, builder.current_block);
+    raz_compiler_rt_arena_set(builder.module.block_loop_depths, index, builder.loop_depth);
+    raz_compiler_rt_arena_set(builder.module.block_unsafe_depths, index, builder.unsafe_depth);
+    raz_compiler_rt_arena_set(builder.module.block_generic_active, index, builder.generic_active);
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_template_indices,
+        index,
+        builder.generic_template_index
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_type_name_offsets,
+        index,
+        builder.generic_type_name_offset
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_type_name_lengths,
+        index,
+        builder.generic_type_name_length
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_type_structures,
+        index,
+        builder.generic_type_structure
+    );
+    raz_compiler_rt_arena_set(builder.module.block_generic_type_kinds, index, builder.generic_type_kind);
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_signature_only,
+        index,
+        builder.generic_signature_only
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_reparse_function_indices,
+        index,
+        builder.generic_reparse_function_index,
+    );
+    raz_compiler_rt_arena_set(
+        builder.module.block_generic_substitution_counts,
+        index,
+        builder.generic_substitution_count,
+    );
+
+    i64 substitution = 0;
+
+    while (substitution < builder.generic_substitution_count) {
+        i64 snapshot = index * 32 + substitution;
+
+        raz_compiler_rt_arena_set(
+            builder.module.block_generic_substitution_name_offsets,
+            snapshot,
+            raz_compiler_rt_arena_get(builder.generic_substitution_name_offsets, substitution),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.block_generic_substitution_name_lengths,
+            snapshot,
+            raz_compiler_rt_arena_get(builder.generic_substitution_name_lengths, substitution),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.block_generic_substitution_type_structures,
+            snapshot,
+            raz_compiler_rt_arena_get(builder.generic_substitution_type_structs, substitution),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.block_generic_substitution_types,
+            snapshot,
+            raz_compiler_rt_arena_get(builder.generic_substitution_types, substitution),
+        );
+        substitution += 1;
+    }
+    raz_compiler_rt_arena_set(builder.module.block_defer_starts, index, 0);
+    raz_compiler_rt_arena_set(builder.module.block_defer_counts, index, 0);
+
+    i64 defer_context = 0;
+
+    if (builder.current_block >= 0) {
+        defer_context = raz_compiler_rt_arena_get(builder.module.block_defer_contexts, builder.current_block);
+    }
+    raz_compiler_rt_arena_set(builder.module.block_defer_contexts, index, defer_context);
+    *out = index;
+    return true;
+}
+
+fn hir_add_statement(HirBuilder&mut builder, i64 kind, i64 a, i64 b, i64 c) -> bool {
+    if (builder.module.statement_count >= 131072) {
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 index = builder.module.statement_count;
+
+    builder.module.statement_count += 1;
+    raz_compiler_rt_arena_set(builder.module.statement_kinds, index, kind);
+    raz_compiler_rt_arena_set(builder.module.statement_block_indices, index, builder.current_block);
+    raz_compiler_rt_arena_set(builder.module.statement_function_indices, index, builder.current_function);
+    raz_compiler_rt_arena_set(builder.module.statement_source_offsets, index, builder.current.offset);
+    raz_compiler_rt_arena_set(builder.module.statement_a, index, a);
+    raz_compiler_rt_arena_set(builder.module.statement_b, index, b);
+    raz_compiler_rt_arena_set(builder.module.statement_c, index, c);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_structures, index, -1);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_root_kinds, index, 0);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_root_indices, index, -1);
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_paths, index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.statement_predrop_moved_starts,
+        index,
+        builder.module.predrop_moved_path_count,
+    );
+    raz_compiler_rt_arena_set(builder.module.statement_predrop_moved_counts, index, 0);
+    raz_compiler_rt_arena_set(
+        builder.module.function_statement_counts,
+        builder.current_function,
+        raz_compiler_rt_arena_get(builder.module.function_statement_counts, builder.current_function) + 1,
+    );
+    return true;
+}
+
+fn hir_capture_block(HirBuilder&mut builder, i64&mut start, i64&mut end, i64&mut block) -> bool {
+    if (!hir_expect(builder, TokenKind::LeftBrace)) {
+        return false;
+    }
+    *start = builder.current.offset;
+    *end = *start;
+
+    i64 depth = 1;
+
+    while (depth > 0 && builder.current.kind != TokenKind::End) {
+        if (builder.current.kind == TokenKind::LeftBrace) {
+            depth += 1;
+        } else if (builder.current.kind == TokenKind::RightBrace) {
+            depth -= 1;
+            if (depth == 0) {
+                *end = builder.current.offset;
+            }
+        }
+        hir_advance(builder);
+    }
+    if (depth != 0) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+    return hir_add_block(builder, *start, *end, block);
+}
+
+fn hir_skip_if_chain(HirBuilder&mut builder, i64&mut end_offset) -> bool {
+    if (
+        builder.current.kind != TokenKind::Identifier ||
+        !token_is_if(&builder.scan.input, &builder.current)
+    ) {
+        hir_fail(builder, DiagnosticCode::ExpectedToken);
+        return false;
+    }
+
+    bool scanning_chain = true;
+
+    while (scanning_chain) {
+        hir_advance(builder);
+        while (builder.current.kind != TokenKind::LeftBrace && builder.current.kind != TokenKind::End) {
+            hir_advance(builder);
+        }
+        if (builder.current.kind != TokenKind::LeftBrace) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        hir_advance(builder);
+
+        i64 depth = 1;
+
+        while (depth > 0 && builder.current.kind != TokenKind::End) {
+            if (builder.current.kind == TokenKind::LeftBrace) {
+                depth += 1;
+            } else if (builder.current.kind == TokenKind::RightBrace) {
+                depth -= 1;
+                if (depth == 0) {
+                    *end_offset = builder.current.offset;
+                }
+            }
+            hir_advance(builder);
+        }
+        if (depth != 0) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (
+            builder.current.kind == TokenKind::Identifier &&
+            token_is_else(&builder.scan.input, &builder.current)
+        ) {
+            hir_advance(builder);
+            if (
+                builder.current.kind == TokenKind::Identifier &&
+                token_is_if(&builder.scan.input, &builder.current)
+            ) {
+                scanning_chain = true;
+            } else {
+                if (builder.current.kind != TokenKind::LeftBrace) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                hir_advance(builder);
+
+                i64 else_depth = 1;
+
+                while (else_depth > 0 && builder.current.kind != TokenKind::End) {
+                    if (builder.current.kind == TokenKind::LeftBrace) {
+                        else_depth += 1;
+                    } else if (builder.current.kind == TokenKind::RightBrace) {
+                        else_depth -= 1;
+                        if (else_depth == 0) {
+                            *end_offset = builder.current.offset;
+                        }
+                    }
+                    hir_advance(builder);
+                }
+                if (else_depth != 0) {
+                    hir_fail(builder, DiagnosticCode::ExpectedToken);
+                    return false;
+                }
+                scanning_chain = false;
+            }
+        } else {
+            scanning_chain = false;
+        }
+    }
+    return true;
+}
+

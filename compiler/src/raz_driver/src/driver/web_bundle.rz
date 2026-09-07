@@ -1,0 +1,462 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::web_bundle;
+
+public import raz_driver::path;
+
+extern fn raz_rt_hash_bytes(usize data, i64 length) -> i64;
+
+fn web_bundle_hex_digit(i64 value) -> i64 {
+    if (value < 10) { return 48 + value; }
+    return 87 + value;
+}
+
+/// Deterministic 64-bit content fingerprint rendered as 16 lowercase hex bytes.
+/// The name is intentionally independent of timestamps, absolute paths, and
+/// build-machine state so identical web inputs produce identical asset names.
+public fn web_bundle_fingerprint(i64 data, i64 length, i64 output, i64 capacity) -> i64 {
+    if (data == 0 || length < 0 || output == 0 || capacity < 16) { return 0; }
+    i64 payload = raz_compiler_rt_arena_native_address(data, 1);
+    if (length > 0 && payload == 0) { return 0; }
+    i64 hash = raz_rt_hash_bytes(payload as usize, length);
+    i64 i = 0;
+    while (i < 16) {
+        i64 shift = (15 - i) * 4;
+        i64 nibble = (hash >> shift) & 15;
+        raz_compiler_rt_arena_set(output, i, web_bundle_hex_digit(nibble));
+        i += 1;
+    }
+    return 16;
+}
+
+/// Build `stem.<fingerprint>.<extension>` into output.
+public fn web_bundle_asset_name(i64 stem, i64 stem_length, i64 content, i64 content_length, i64 extension, i64 extension_length, i64 destination, i64 capacity) -> i64 {
+    if (stem == 0 || stem_length <= 0 || extension == 0 || extension_length <= 0 || destination == 0) { return 0; }
+    if (capacity < stem_length + extension_length + 18) { return 0; }
+    i64 fingerprint = raz_compiler_rt_arena_create(16);
+    if (fingerprint == 0) { return 0; }
+    i64 fp = web_bundle_fingerprint(content, content_length, fingerprint, 16);
+    if (fp != 16) { raz_compiler_rt_arena_destroy(fingerprint); return 0; }
+    i64 cursor = 0;
+    i64 i = 0;
+    while (i < stem_length) { raz_compiler_rt_arena_set(destination, cursor, raz_compiler_rt_arena_get(stem, i)); cursor += 1; i += 1; }
+    raz_compiler_rt_arena_set(destination, cursor, 46); cursor += 1;
+    i = 0;
+    while (i < 16) { raz_compiler_rt_arena_set(destination, cursor, raz_compiler_rt_arena_get(fingerprint, i)); cursor += 1; i += 1; }
+    raz_compiler_rt_arena_set(destination, cursor, 46); cursor += 1;
+    i = 0;
+    while (i < extension_length) { raz_compiler_rt_arena_set(destination, cursor, raz_compiler_rt_arena_get(extension, i)); cursor += 1; i += 1; }
+    raz_compiler_rt_arena_destroy(fingerprint);
+    return cursor;
+}
+
+/// Conservative CSS whitespace compactor for generated release CSS. It only
+/// removes redundant ASCII whitespace outside strings/comments-sensitive
+/// regions; author CSS remains semantically CSS rather than a compiler DSL.
+public fn web_bundle_minify_css(i64 input, i64 length, i64 output, i64 capacity) -> i64 {
+    if (input == 0 || length < 0 || output == 0 || capacity <= 0) { return 0; }
+    i64 i = 0; i64 o = 0; bool space = false; i64 quote = 0;
+    while (i < length) {
+        i64 c = raz_compiler_rt_arena_get(input, i);
+        if (quote != 0) {
+            if (o >= capacity) { return 0; }
+            raz_compiler_rt_arena_set(output, o, c); o += 1;
+            if (c == quote && (i == 0 || raz_compiler_rt_arena_get(input, i - 1) != 92)) { quote = 0; }
+            i += 1; continue;
+        }
+        if (c == 34 || c == 39) {
+            if (space && o > 0 && o < capacity) { raz_compiler_rt_arena_set(output, o, 32); o += 1; }
+            space = false; quote = c;
+            if (o >= capacity) { return 0; }
+            raz_compiler_rt_arena_set(output, o, c); o += 1; i += 1; continue;
+        }
+        if (c == 32 || c == 9 || c == 10 || c == 13) { space = true; i += 1; continue; }
+        bool tight = c == 123 || c == 125 || c == 58 || c == 59 || c == 44 || c == 62;
+        if (space && !tight && o > 0) {
+            i64 prev = raz_compiler_rt_arena_get(output, o - 1);
+            bool prev_tight = prev == 123 || prev == 125 || prev == 58 || prev == 59 || prev == 44 || prev == 62;
+            if (!prev_tight) { if (o >= capacity) { return 0; } raz_compiler_rt_arena_set(output, o, 32); o += 1; }
+        }
+        space = false;
+        if (o >= capacity) { return 0; }
+        raz_compiler_rt_arena_set(output, o, c); o += 1; i += 1;
+    }
+    return o;
+}
+
+// Production finalization is deliberately a driver concern. Web generators
+// write predictable canonical names first; release bundling fingerprints those
+// bytes afterward and rewrites references without changing page/component APIs.
+
+fn web_bundle_byte_eq(i64 data, i64 offset, string literal) -> bool {
+    i64 length = compiler_literal_length(literal);
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, offset + i) != compiler_literal_byte(literal, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn web_bundle_replace_literal(
+    i64 input,
+    i64 input_length,
+    string needle,
+    i64 replacement,
+    i64 replacement_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    i64 needle_length = compiler_literal_length(needle);
+    if (input == 0 || input_length < 0 || needle_length <= 0 || output == 0 || capacity <= 0) { return -1; }
+    i64 i = 0;
+    i64 o = 0;
+    while (i < input_length) {
+        bool matches = i + needle_length <= input_length && web_bundle_byte_eq(input, i, needle);
+        if (matches) {
+            if (o + replacement_length > capacity) { return -1; }
+            i64 r = 0;
+            while (r < replacement_length) {
+                raz_compiler_rt_arena_set(output, o, raz_compiler_rt_arena_get(replacement, r));
+                o += 1;
+                r += 1;
+            }
+            i += needle_length;
+        } else {
+            if (o >= capacity) { return -1; }
+            raz_compiler_rt_arena_set(output, o, raz_compiler_rt_arena_get(input, i));
+            o += 1;
+            i += 1;
+        }
+    }
+    return o;
+}
+
+public fn web_bundle_make_literal(i64 output, i64 capacity, string value) -> i64 {
+    i64 length = compiler_literal_length(value);
+    if (output == 0 || length > capacity) { return -1; }
+    i64 i = 0;
+    while (i < length) {
+        raz_compiler_rt_arena_set(output, i, compiler_literal_byte(value, i));
+        i += 1;
+    }
+    return length;
+}
+
+public fn web_bundle_write_fingerprinted(
+    i64 original_path,
+    i64 original_length,
+    i64 destination_directory,
+    i64 destination_directory_length,
+    string stem,
+    string extension,
+    bool minify_css,
+    i64 hashed_name,
+    i64 hashed_name_capacity,
+) -> i64 {
+    if (raz_compiler_rt_path_exists_ascii(original_path, original_length) == 0) { return 0; }
+    i64 data = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 transformed = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 destination = raz_compiler_rt_arena_create(8192);
+    i64 directory = raz_compiler_rt_arena_create(8192);
+    i64 stem_bytes = raz_compiler_rt_arena_create(64);
+    i64 extension_bytes = raz_compiler_rt_arena_create(16);
+    if (data == 0 || transformed == 0 || destination == 0 || directory == 0 || stem_bytes == 0 || extension_bytes == 0) { return -1; }
+    i64 length = raz_compiler_rt_read_ascii(original_path, original_length, data, 16777216);
+    i64 content = data;
+    i64 content_length = length;
+    if (length >= 0 && minify_css) {
+        content_length = web_bundle_minify_css(data, length, transformed, 16777216);
+        content = transformed;
+    }
+    i64 stem_length = web_bundle_make_literal(stem_bytes, 64, stem);
+    i64 extension_length = web_bundle_make_literal(extension_bytes, 16, extension);
+    i64 name_length = 0;
+    if (content_length >= 0 && stem_length > 0 && extension_length > 0) {
+        name_length = web_bundle_asset_name(
+            stem_bytes, stem_length, content, content_length,
+            extension_bytes, extension_length,
+            hashed_name, hashed_name_capacity,
+        );
+    }
+    i64 destination_length = -1;
+    if (name_length > 0 && destination_directory != 0 && destination_directory_length > 0) {
+        destination_length = path_join(destination_directory, destination_directory_length, hashed_name, name_length, destination, 8192);
+    }
+    bool ok = destination_length > 0 && raz_compiler_rt_write_ascii(destination, destination_length, content, content_length) == content_length;
+    raz_compiler_rt_arena_destroy(data);
+    raz_compiler_rt_arena_destroy(transformed);
+    raz_compiler_rt_arena_destroy(destination);
+    raz_compiler_rt_arena_destroy(directory);
+    raz_compiler_rt_arena_destroy(stem_bytes);
+    raz_compiler_rt_arena_destroy(extension_bytes);
+    if (!ok) { return -1; }
+    return name_length;
+}
+public fn web_bundle_rewrite_file(i64 path, i64 path_length, string needle, i64 replacement, i64 replacement_length) -> bool {
+    if (raz_compiler_rt_path_exists_ascii(path, path_length) == 0) { return true; }
+    i64 input = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 output = raz_compiler_rt_arena_create_width(16777216, 1);
+    if (input == 0 || output == 0) { return false; }
+    i64 length = raz_compiler_rt_read_ascii(path, path_length, input, 16777216);
+    i64 rewritten = -1;
+    if (length >= 0) {
+        rewritten = web_bundle_replace_literal(input, length, needle, replacement, replacement_length, output, 16777216);
+    }
+    bool ok = rewritten >= 0;
+    if (ok && rewritten != length) { ok = raz_compiler_rt_write_ascii(path, path_length, output, rewritten) == rewritten; }
+    raz_compiler_rt_arena_destroy(input);
+    raz_compiler_rt_arena_destroy(output);
+    return ok;
+}
+
+
+
+public fn web_bundle_line_has_suffix(i64 data, i64 start, i64 length, string suffix) -> bool {
+    i64 suffix_length = compiler_literal_length(suffix);
+    if (length < suffix_length) { return false; }
+    i64 i = 0;
+    while (i < suffix_length) {
+        if (raz_compiler_rt_arena_get(data, start + length - suffix_length + i) != compiler_literal_byte(suffix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Generated route assets use the exact basename app.js/app.css/app.wasm. A
+// public asset such as assets/myapp.js must stay a normal public asset rather
+// than being mistaken for compiler output merely because its name has the same
+// suffix.
+public fn web_bundle_line_has_basename(i64 data, i64 start, i64 length, string basename) -> bool {
+    i64 basename_length = compiler_literal_length(basename);
+    if (length < basename_length || !web_bundle_line_has_suffix(data, start, length, basename)) { return false; }
+    if (length == basename_length) { return true; }
+    i64 boundary = raz_compiler_rt_arena_get(data, start + length - basename_length - 1);
+    return boundary == 47 || boundary == 92;
+}
+
+// Return the path prefix from an HTML file back to dist/. Tree-list paths are
+// dist-relative, so index.html uses ./ while docs/guides/index.html uses ../../.
+// Release HTML can then reference the centralized dist/assets directory without
+// assuming the site is deployed at the origin root.
+public fn web_bundle_html_root_prefix(i64 relative, i64 relative_length, i64 output, i64 capacity) -> i64 {
+    if (relative == 0 || relative_length <= 0 || output == 0 || capacity <= 0) { return -1; }
+    i64 depth = 0;
+    i64 i = 0;
+    while (i < relative_length) {
+        i64 ch = raz_compiler_rt_arena_get(relative, i);
+        if (ch == 47 || ch == 92) { depth += 1; }
+        i += 1;
+    }
+    i64 cursor = 0;
+    if (depth == 0) {
+        if (capacity < 2) { return -1; }
+        raz_compiler_rt_arena_set(output, 0, 46);
+        raz_compiler_rt_arena_set(output, 1, 47);
+        return 2;
+    }
+    i = 0;
+    while (i < depth) {
+        if (cursor + 3 > capacity) { return -1; }
+        raz_compiler_rt_arena_set(output, cursor, 46); cursor += 1;
+        raz_compiler_rt_arena_set(output, cursor, 46); cursor += 1;
+        raz_compiler_rt_arena_set(output, cursor, 47); cursor += 1;
+        i += 1;
+    }
+    return cursor;
+}
+
+fn web_bundle_replace_bytes(
+    i64 input,
+    i64 input_length,
+    i64 needle,
+    i64 needle_length,
+    i64 replacement,
+    i64 replacement_length,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    if (input == 0 || input_length < 0 || needle == 0 || needle_length <= 0 || output == 0 || capacity <= 0) { return -1; }
+    i64 i = 0;
+    i64 o = 0;
+    while (i < input_length) {
+        bool matches = i + needle_length <= input_length;
+        i64 n = 0;
+        while (matches && n < needle_length) {
+            if (raz_compiler_rt_arena_get(input, i + n) != raz_compiler_rt_arena_get(needle, n)) { matches = false; }
+            n += 1;
+        }
+        if (matches) {
+            if (o + replacement_length > capacity) { return -1; }
+            n = 0;
+            while (n < replacement_length) {
+                raz_compiler_rt_arena_set(output, o, raz_compiler_rt_arena_get(replacement, n));
+                o += 1;
+                n += 1;
+            }
+            i += needle_length;
+        } else {
+            if (o >= capacity) { return -1; }
+            raz_compiler_rt_arena_set(output, o, raz_compiler_rt_arena_get(input, i));
+            o += 1;
+            i += 1;
+        }
+    }
+    return o;
+}
+
+fn web_bundle_rewrite_file_bytes(i64 path, i64 path_length, i64 needle, i64 needle_length, i64 replacement, i64 replacement_length) -> bool {
+    if (raz_compiler_rt_path_exists_ascii(path, path_length) == 0) { return true; }
+    i64 input = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 output = raz_compiler_rt_arena_create_width(16777216, 1);
+    if (input == 0 || output == 0) { return false; }
+    i64 length = raz_compiler_rt_read_ascii(path, path_length, input, 16777216);
+    i64 rewritten = -1;
+    if (length >= 0) {
+        rewritten = web_bundle_replace_bytes(input, length, needle, needle_length, replacement, replacement_length, output, 16777216);
+    }
+    bool ok = rewritten >= 0;
+    if (ok && rewritten != length) { ok = raz_compiler_rt_write_ascii(path, path_length, output, rewritten) == rewritten; }
+    raz_compiler_rt_arena_destroy(input);
+    raz_compiler_rt_arena_destroy(output);
+    return ok;
+}
+
+public fn web_bundle_line_has_prefix(i64 data, i64 start, i64 length, string prefix) -> bool {
+    i64 prefix_length = compiler_literal_length(prefix);
+    if (length < prefix_length) { return false; }
+    i64 i = 0;
+    while (i < prefix_length) {
+        if (raz_compiler_rt_arena_get(data, start + i) != compiler_literal_byte(prefix, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+public fn web_bundle_line_is_text_asset(i64 data, i64 start, i64 length) -> bool {
+    return web_bundle_line_has_suffix(data, start, length, ".css") ||
+        web_bundle_line_has_suffix(data, start, length, ".js") ||
+        web_bundle_line_has_suffix(data, start, length, ".mjs");
+}
+
+fn web_bundle_asset_parts(i64 relative, i64 relative_length, i64 stem, i64 stem_capacity, i64 extension, i64 extension_capacity, i64&mut stem_length, i64&mut extension_length) -> bool {
+    i64 slash = -1;
+    i64 dot = -1;
+    i64 i = 0;
+    while (i < relative_length) {
+        i64 c = raz_compiler_rt_arena_get(relative, i);
+        if (c == 47 || c == 92) { slash = i; dot = -1; }
+        else if (c == 46) { dot = i; }
+        i += 1;
+    }
+    if (dot <= slash + 1 || dot >= relative_length - 1) { return false; }
+    *stem_length = dot - slash - 1;
+    *extension_length = relative_length - dot - 1;
+    if (*stem_length <= 0 || *extension_length <= 0 || *stem_length > stem_capacity || *extension_length > extension_capacity) { return false; }
+    i = 0;
+    while (i < *stem_length) { raz_compiler_rt_arena_set(stem, i, raz_compiler_rt_arena_get(relative, slash + 1 + i)); i += 1; }
+    i = 0;
+    while (i < *extension_length) { raz_compiler_rt_arena_set(extension, i, raz_compiler_rt_arena_get(relative, dot + 1 + i)); i += 1; }
+    return true;
+}
+
+public fn web_bundle_write_public_asset(
+    i64 full,
+    i64 full_length,
+    i64 relative,
+    i64 relative_length,
+    bool minify_css,
+    i64 hashed_name,
+    i64 hashed_capacity,
+) -> i64 {
+    i64 data = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 transformed = raz_compiler_rt_arena_create_width(16777216, 1);
+    i64 directory = raz_compiler_rt_arena_create(8192);
+    i64 destination = raz_compiler_rt_arena_create(8192);
+    i64 stem = raz_compiler_rt_arena_create(512);
+    i64 extension = raz_compiler_rt_arena_create(128);
+    if (data == 0 || transformed == 0 || directory == 0 || destination == 0 || stem == 0 || extension == 0) { return -1; }
+    i64 length = raz_compiler_rt_read_ascii(full, full_length, data, 16777216);
+    i64 content = data;
+    i64 content_length = length;
+    if (length >= 0 && minify_css) { content_length = web_bundle_minify_css(data, length, transformed, 16777216); content = transformed; }
+    i64 stem_length = 0;
+    i64 extension_length = 0;
+    bool parts = web_bundle_asset_parts(relative, relative_length, stem, 512, extension, 128, &mut stem_length, &mut extension_length);
+    i64 name_length = 0;
+    if (parts && content_length >= 0) { name_length = web_bundle_asset_name(stem, stem_length, content, content_length, extension, extension_length, hashed_name, hashed_capacity); }
+    i64 dl = path_dirname(full, full_length, directory, 8192);
+    i64 destination_length = -1;
+    if (name_length > 0) { destination_length = path_join(directory, dl, hashed_name, name_length, destination, 8192); }
+    bool ok = destination_length > 0 && raz_compiler_rt_write_ascii(destination, destination_length, content, content_length) == content_length;
+    raz_compiler_rt_arena_destroy(data); raz_compiler_rt_arena_destroy(transformed); raz_compiler_rt_arena_destroy(directory);
+    raz_compiler_rt_arena_destroy(destination); raz_compiler_rt_arena_destroy(stem); raz_compiler_rt_arena_destroy(extension);
+    if (!ok) { return -1; }
+    return name_length;
+}
+
+public fn web_bundle_public_asset_replacement(i64 relative, i64 relative_length, i64 hashed_name, i64 hashed_length, i64 output, i64 capacity) -> i64 {
+    i64 slash = -1;
+    i64 i = 0;
+    while (i < relative_length) { i64 c = raz_compiler_rt_arena_get(relative, i); if (c == 47 || c == 92) { slash = i; } i += 1; }
+    if (slash < 0 || slash + 1 + hashed_length > capacity) { return -1; }
+    i = 0;
+    while (i <= slash) { raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(relative, i)); i += 1; }
+    i64 cursor = slash + 1;
+    i = 0;
+    while (i < hashed_length) { raz_compiler_rt_arena_set(output, cursor, raz_compiler_rt_arena_get(hashed_name, i)); cursor += 1; i += 1; }
+    return cursor;
+}
+
+public fn web_bundle_rewrite_text_tree(i64 dist, i64 dist_length, i64 files, i64 files_length, i64 needle, i64 needle_length, i64 replacement, i64 replacement_length) -> bool {
+    i64 relative = raz_compiler_rt_arena_create(8192);
+    i64 full = raz_compiler_rt_arena_create(8192);
+    if (relative == 0 || full == 0) { return false; }
+    i64 line_start = 0;
+    while (line_start < files_length) {
+        i64 line_end = line_start;
+        while (line_end < files_length && raz_compiler_rt_arena_get(files, line_end) != 10) { line_end += 1; }
+        i64 line_length = line_end - line_start;
+        bool text = web_bundle_line_has_suffix(files, line_start, line_length, ".html") || web_bundle_line_has_suffix(files, line_start, line_length, ".css") || web_bundle_line_has_suffix(files, line_start, line_length, ".js") || web_bundle_line_has_suffix(files, line_start, line_length, ".mjs");
+        if (text) {
+            i64 i = 0; while (i < line_length) { raz_compiler_rt_arena_set(relative, i, raz_compiler_rt_arena_get(files, line_start + i)); i += 1; }
+            i64 fl = path_join(dist, dist_length, relative, line_length, full, 8192);
+            if (fl <= 0 || !web_bundle_rewrite_file_bytes(full, fl, needle, needle_length, replacement, replacement_length)) { return false; }
+        }
+        line_start = line_end + 1;
+    }
+    raz_compiler_rt_arena_destroy(relative); raz_compiler_rt_arena_destroy(full);
+    return true;
+}
+
+
+public fn web_bundle_append_manifest_entry(
+    i64 output, i64 capacity, i64 cursor,
+    i64 logical, i64 logical_length,
+    i64 hashed, i64 hashed_length,
+) -> i64 {
+    if (cursor + logical_length + hashed_length + 8 > capacity) { return -1; }
+    raz_compiler_rt_arena_set(output, cursor, 34); cursor += 1;
+    i64 i = 0;
+    while (i < logical_length) { raz_compiler_rt_arena_set(output, cursor, raz_compiler_rt_arena_get(logical, i)); cursor += 1; i += 1; }
+    raz_compiler_rt_arena_set(output, cursor, 34); cursor += 1;
+    raz_compiler_rt_arena_set(output, cursor, 58); cursor += 1;
+    raz_compiler_rt_arena_set(output, cursor, 34); cursor += 1;
+    i = 0;
+    while (i < hashed_length) { raz_compiler_rt_arena_set(output, cursor, raz_compiler_rt_arena_get(hashed, i)); cursor += 1; i += 1; }
+    raz_compiler_rt_arena_set(output, cursor, 34); cursor += 1;
+    return cursor;
+}
+
+
+/// Analyze the finalized deployable tree. Filesystem walking/stat/report
+/// formatting is host support; the compiler decides when analysis is valid.
+public fn web_bundle_analyze_dist(i64 dist, i64 dist_length, i64 manifest_path, i64 manifest_length) -> bool {
+    return raz_compiler_rt_web_bundle_analyze_ascii(dist, dist_length, manifest_path, manifest_length) == 0;
+}
+
+/// Finalize a generated `dist/` tree for release delivery. The operation is
+/// deterministic and idempotent for freshly generated output: canonical assets
+/// become content-addressed, references are rewritten, and asset-manifest.json
+/// is sorted by the already-deterministic recursive file listing.

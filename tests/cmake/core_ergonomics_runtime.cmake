@@ -75,15 +75,15 @@ fn main() -> i64 {
     alloc::box::deallocate(part); alloc::box::deallocate(log_ext); alloc::box::deallocate(entropy); return 0;
 }
 ]=])
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Core ergonomics build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passk_core_ergonomics.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passk_core_ergonomics.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passk_core_ergonomics")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passk_core_ergonomics")
 endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm "${runtime_exe}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)

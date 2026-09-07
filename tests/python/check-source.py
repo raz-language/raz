@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 CHECKS = (
     "check-layout.py",
+    "check-compiler-source-layout.py",
     "check-repository-hygiene.py",
+    "check-source-architecture.py",
     "check-doc-links.py",
     "check-test-layout.py",
     "check-raz-formatter-layout.py",

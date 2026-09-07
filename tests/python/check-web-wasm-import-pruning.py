@@ -70,6 +70,12 @@ def wasm_imports(path: Path) -> list[tuple[str, str]]:
     return []
 
 
+def browser_abi_names() -> set[str]:
+    source = (ROOT / "compiler/src/raz_codegen_wasm/src/wasm/browser_host.rz").read_text(encoding="utf-8")
+    import re
+    return set(re.findall(r'wasm_browser_emit_import_literal\(section, "([^"]+)"', source))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raz", required=True)
@@ -100,11 +106,31 @@ def main() -> int:
     if browser != ["dom_set_text_i64"]:
         print(f"web-wasm-import-pruning: expected only dom_set_text_i64, got {browser}")
         return 1
-    if len(wasi) != 24 or len(imports) != 25:
-        print(f"web-wasm-import-pruning: expected 24 WASI + 1 browser import, got {len(wasi)} + {len(browser)}")
+    if wasi or len(imports) != 1:
+        print(f"web-wasm-import-pruning: expected 0 WASI + 1 browser import, got {len(wasi)} + {len(browser)}")
         return 1
 
-    print("web-wasm-import-pruning: PASS (49 browser imports pruned to the 1 reachable host call)")
+    # Browser modules are callable libraries, not WASI commands. `_start` and
+    # wasi_snapshot_preview1 must both be absent from the binary string table.
+    data = wasm_files[0].read_bytes()
+    if b"_start" in data or b"wasi_snapshot_preview1" in data:
+        print("web-wasm-import-pruning: browser module still carries WASI command surface")
+        return 1
+
+    js_files = list((work_root / "web-interactive" / "dist" / "assets").glob("app.*.js"))
+    if len(js_files) != 1:
+        print("web-wasm-import-pruning: expected exactly one release JS host")
+        return 1
+    js = js_files[0].read_text(encoding="utf-8")
+    present = sorted(name for name in browser_abi_names() if f"{name}:" in js)
+    if present != ["dom_set_text_i64"]:
+        print(f"web-wasm-import-pruning: JS host did not mirror Wasm imports: {present}")
+        return 1
+    if "/*raz-web-import:" in js:
+        print("web-wasm-import-pruning: private host-pruning marker leaked into dist")
+        return 1
+
+    print("web-wasm-import-pruning: PASS (Wasm + JS host pruned from 77 capabilities to dom_set_text_i64 only; WASI/_start removed)")
     return 0
 
 

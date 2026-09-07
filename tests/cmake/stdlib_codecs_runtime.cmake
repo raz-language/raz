@@ -173,15 +173,15 @@ fn main() -> i64 {
     return 0;
 }
 ]=])
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Stdlib codec build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passm_stdlib_codecs.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passm_stdlib_codecs.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/passm_stdlib_codecs")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/passm_stdlib_codecs")
 endif()
 execute_process(COMMAND "${runtime_exe}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)

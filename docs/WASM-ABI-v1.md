@@ -72,6 +72,10 @@ A zero-argument synchronous or async Raz `main` may receive the exported WASI co
 
 Environment mutation and child-process launch are not provided by the current preview1 target and fail deterministically as unsupported operations rather than fabricating success.
 
+### Browser profile
+
+Raz Web uses the same core value, memory, callable-table, aggregate, closure, and async-frame ABI, but it is not a WASI command profile. Browser-lowered modules omit `wasi_snapshot_preview1` imports, omit the twelve WASI-only host function types, and never synthesize `_start`. Their host import space is packed from zero using only reachable `raz_web` imports. Their defined-function space is also browser-reachability compacted: only reachable HIR functions, closure adapters, and async pollers are emitted, and direct-call/function-table indices are remapped to that dense physical layout. Per-function WebAssembly type entries for unreachable HIR functions are omitted. Generated JavaScript hosts mirror the emitted import set: application bundles use the exact module mask, while static-first pages use the union of the main browser module and all lazy chunks so every instantiated module sees the capabilities it imports without shipping unrelated host bindings. This physical remapping and host pruning are not Raz-observable because exported browser roots remain name-addressed and first-class callable values continue to denote the corresponding table slot. Ordinary wasm32 command modules retain the preview1 import and `_start` behavior described above.
+
 ## SIMD
 
 The wasm32 SIMD target uses standardized `v128` instructions. The shared Raz `core::simd` API has direct lowering for supported `i8x16`, `i16x8`, `i32x4`, `f32x4`, and `f64x2` operations. Raz's `i64x4` abstraction uses two `v128` halves. Native targets retain equivalent permanent runtime implementations.

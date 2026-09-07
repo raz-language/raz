@@ -39,6 +39,18 @@ def main() -> int:
     if generated_pdf.exists():
         problems.append("generated documentation binary: docs/GETTING-STARTED.pdf")
 
+    # Canonical package source directories must stay source-only. Package-local
+    # target trees duplicate semantic/compiler artifacts and make source scans,
+    # reviews, archives, and bootstrap inputs depend on stale generated state.
+    # Developer build caches belong in the repository-level target/ tree.
+    source_package_roots = (ROOT / "compiler" / "src", ROOT / "library")
+    for package_root in source_package_roots:
+        if not package_root.is_dir():
+            continue
+        for target in package_root.rglob("target"):
+            if target.is_dir():
+                problems.append(f"package-local generated target directory: {target.relative_to(ROOT)}")
+
     for path in ROOT.rglob("*"):
         rel = path.relative_to(ROOT)
         # Build/test/package caches may legitimately exist in a developer checkout.

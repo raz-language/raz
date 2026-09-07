@@ -1,0 +1,393 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::registry_tracking;
+
+public import raz_driver::registry_state;
+import raz_driver::package;
+
+public fn registry_bare_constraint(i64 spec, i64 length) -> bool {
+    if (spec == 0 || length <= 0) {
+        return false;
+    }
+
+    i64 ch = raz_compiler_rt_arena_get(spec, 0);
+
+    return (
+        (ch >= 48 && ch <= 57) ||
+        ch == 94 ||
+        ch == 126 ||
+        ch == 62 ||
+        ch == 60 ||
+        ch == 61 ||
+        ch == 42 ||
+        ch == 120 ||
+        ch == 88
+    );
+}
+public fn registry_spec_parse(
+    i64 spec,
+    i64 length,
+    i64 name,
+    i64 name_cap,
+    i64&mut nl,
+    i64 constraint,
+    i64 con_cap,
+    i64&mut cl,
+) -> bool {
+    string prefix = "registry:";
+
+    if (length <= 10) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i<9) {
+        if (raz_compiler_rt_arena_get(spec, i) != compiler_literal_byte(prefix, i)) {
+            return false;
+        }
+        i += 1;
+    }
+
+    i64 at = 9;
+
+    while (at<length && raz_compiler_rt_arena_get(spec, at) != 64) {
+        at += 1;
+    }
+    if (at >= length || at - 9 <= 0 || length - at - 1 <= 0 || at - 9> name_cap || length - at - 1> con_cap) {
+        return false;
+    }
+    *nl = at - 9;
+    *cl = length - at - 1;
+    i = 0;
+    while (i<*nl) {
+        raz_compiler_rt_arena_set(name, i, raz_compiler_rt_arena_get(spec, 9 + i));
+        i += 1;
+    }
+    i = 0;
+    while (i<*cl) {
+        raz_compiler_rt_arena_set(constraint, i, raz_compiler_rt_arena_get(spec, at + 1 + i));
+        i += 1;
+    }
+    return true;
+}
+public fn registry_tracking_spec_parse(
+    i64 spec,
+    i64 length,
+    i64 name,
+    i64 name_capacity,
+    i64&mut name_length,
+    i64 constraint,
+    i64 constraint_capacity,
+    i64&mut constraint_length,
+    i64&mut section_kind,
+) -> bool {
+    i64 at = 0;
+
+    while (at < length && raz_compiler_rt_arena_get(spec, at) != 64) {
+        at += 1;
+    }
+    if (at <= 0 || at >= length || at> name_capacity) {
+        return false;
+    }
+
+    i64 suffix = length;
+    i64 pipe = at + 1;
+
+    while (pipe < length && raz_compiler_rt_arena_get(spec, pipe) != 124) {
+        pipe += 1;
+    }
+    *section_kind = 2;
+    if (pipe < length) {
+        suffix = pipe;
+        if (pipe + 1 >= length) {
+            return false;
+        }
+
+        i64 digit = raz_compiler_rt_arena_get(spec, pipe + 1) - 48;
+
+        if (digit < 2 || digit> 8 || pipe + 2 != length) {
+            return false;
+        }
+        *section_kind = digit;
+    }
+    *name_length = at;
+    *constraint_length = suffix - at - 1;
+    if (*constraint_length <= 0 || *constraint_length > constraint_capacity) {
+        return false;
+    }
+
+    i64 i = 0;
+
+    while (i < *name_length) {
+        raz_compiler_rt_arena_set(name, i, raz_compiler_rt_arena_get(spec, i));
+        i += 1;
+    }
+    i = 0;
+    while (i < *constraint_length) {
+        raz_compiler_rt_arena_set(constraint, i, raz_compiler_rt_arena_get(spec, at + 1 + i));
+        i += 1;
+    }
+    return true;
+}
+public fn registry_write_tracking(
+    i64 alias,
+    i64 al,
+    i64 name,
+    i64 nl,
+    i64 constraint,
+    i64 cl,
+    i64 section_kind,
+) -> i64 {
+    i64 path = raz_compiler_rt_arena_create(20);
+    i64 old = raz_compiler_rt_arena_create(1048576);
+    i64 out = raz_compiler_rt_arena_create(1048576);
+
+    if (path == 0 || old == 0 || out == 0) {
+        return 40;
+    }
+
+    i64 path_length = registry_project_state_prepare(1, path, 20);
+
+    if (path_length <= 0) {
+        return 56;
+    }
+
+    i64 i = 0;
+    i64 ol = raz_compiler_rt_read_ascii(path, path_length, old, 1048576);
+
+    if (ol<0) {
+        ol = 0;
+    }
+
+    i64 cursor = 0;
+
+    // rewrite all rows except alias
+
+    i64 pos = 0;
+
+    while (pos<ol) {
+        i64 s = pos;
+
+        while (pos<ol && raz_compiler_rt_arena_get(old, pos) != 10) {
+            pos += 1;
+        }
+
+        i64 e = pos;
+
+        if (pos<ol) {
+            pos += 1;
+        }
+
+        i64 eq = s;
+
+        while (eq<e && raz_compiler_rt_arena_get(old, eq) != 61) {
+            eq += 1;
+        }
+        if (eq >= e || !package_key_equals(old, s, eq, alias, al)) {
+            package_append(out, 1048576, &mut cursor, old, s, e - s);
+
+            package_append_string_literal(out, 1048576, &mut cursor, "\n");
+        }
+    }
+    package_append(out, 1048576, &mut cursor, alias, 0, al);
+
+    package_append_string_literal(out, 1048576, &mut cursor, " = \"");
+    package_append(out, 1048576, &mut cursor, name, 0, nl);
+
+    package_append_string_literal(out, 1048576, &mut cursor, "@");
+    package_append(out, 1048576, &mut cursor, constraint, 0, cl);
+    if (section_kind != 2) {
+
+        package_append_string_literal(out, 1048576, &mut cursor, "|");
+
+        i64 digit[1] = [0];
+
+        digit[0] = 48 + section_kind;
+        package_append_literal(out, 1048576, &mut cursor, &digit, 1);
+    }
+
+    package_append_string_literal(out, 1048576, &mut cursor, "\"\n");
+
+    i64 w = raz_compiler_rt_write_ascii(path, path_length, out, cursor);
+
+    raz_compiler_rt_arena_destroy(path);
+    raz_compiler_rt_arena_destroy(old);
+    raz_compiler_rt_arena_destroy(out);
+    if (w == cursor) {
+        return 0;
+    }
+    return 56;
+}
+public fn registry_sync_tracking_from_manifest() -> i64 {
+    i64 manifest_path = raz_compiler_rt_arena_create(16);
+    i64 manifest = raz_compiler_rt_arena_create(1048576);
+    i64 tracking_path = raz_compiler_rt_arena_create(20);
+    i64 empty = raz_compiler_rt_arena_create(1);
+
+    if (manifest_path == 0 || manifest == 0 || tracking_path == 0 || empty == 0) {
+        return 40;
+    }
+
+    string mp = "./raz.toml";
+    i64 i = 0;
+
+    while (i < 10) {
+        raz_compiler_rt_arena_set(manifest_path, i, compiler_literal_byte(mp, i));
+        i += 1;
+    }
+
+    i64 tracking_path_length = registry_project_state_prepare(1, tracking_path, 20);
+
+    if (tracking_path_length <= 0) {
+        return 56;
+    }
+
+    i64 length = raz_compiler_rt_read_ascii(manifest_path, 10, manifest, 1048576);
+
+    if (length <= 0) {
+        return 57;
+    }
+    // Tracking is derived. Rebuild it from raz.toml on every update/outdated.
+    if (raz_compiler_rt_write_ascii(tracking_path, tracking_path_length, empty, 0) != 0) {
+        return 56;
+    }
+
+    i64 section = 0;
+    i64 cursor = 0;
+    i64 tracked_count = 0;
+
+    while (cursor < length) {
+        i64 start = cursor;
+
+        while (
+            cursor < length &&
+            raz_compiler_rt_arena_get(manifest, cursor) != 10 &&
+            raz_compiler_rt_arena_get(manifest, cursor) != 13
+        ) {
+            cursor += 1;
+        }
+
+        i64 end = cursor;
+
+        while (
+            cursor < length &&
+            (
+                raz_compiler_rt_arena_get(manifest, cursor) == 10 ||
+                raz_compiler_rt_arena_get(manifest, cursor) == 13
+            )
+        ) {
+            cursor += 1;
+        }
+
+        i64 dependency_section = package_dependency_section_kind(manifest, start, end);
+
+        if (dependency_section >= 2 && dependency_section <= 8) {
+            section = dependency_section;
+            continue;
+        }
+        if (start < end && raz_compiler_rt_arena_get(manifest, start) == 91) {
+            section = 0;
+            continue;
+        }
+        if (section < 2 || section> 8) {
+            continue;
+        }
+
+        i64 equal = start;
+
+        while (equal < end && raz_compiler_rt_arena_get(manifest, equal) != 61) {
+            equal += 1;
+        }
+        if (equal >= end) {
+            continue;
+        }
+
+        i64 alias = raz_compiler_rt_arena_create(4096);
+        i64 spec = raz_compiler_rt_arena_create(8192);
+        i64 name = raz_compiler_rt_arena_create(4096);
+        i64 constraint = raz_compiler_rt_arena_create(256);
+
+        if (alias == 0 || spec == 0 || name == 0 || constraint == 0) {
+            return 40;
+        }
+
+        i64 al = package_copy_key(manifest, start, equal, alias, 4096);
+        i64 sl = copy_quoted_value(manifest, equal + 1, end, spec, 8192);
+        i64 nl = 0;
+        i64 cl = 0;
+        bool is_registry = sl> 9;
+
+        i = 0;
+
+        string prefix = "registry:";
+
+        while (is_registry && i < 9) {
+            if (raz_compiler_rt_arena_get(spec, i) != compiler_literal_byte(prefix, i)) {
+                is_registry = false;
+            }
+            i += 1;
+        }
+        // Only human declarations contain '@'. Legacy registry:<checksum> remains
+        // readable but carries no manifest-level constraint to track.
+
+        bool has_at = false;
+
+        i = 9;
+        while (is_registry && i < sl) {
+            if (raz_compiler_rt_arena_get(spec, i) == 64) {
+                has_at = true;
+                break;
+            }
+            i += 1;
+        }
+
+        bool tracked = false;
+
+        if (
+            is_registry &&
+            has_at &&
+            registry_spec_parse(spec, sl, name, 4096, &mut nl, constraint, 256, &mut cl)
+        ) {
+            tracked = true;
+        } else if (!is_registry && registry_bare_constraint(spec, sl) && sl <= 256 && al <= 4096) {
+            nl = al;
+            cl = sl;
+            i = 0;
+            while (i < al) {
+                raz_compiler_rt_arena_set(name, i, raz_compiler_rt_arena_get(alias, i));
+                i += 1;
+            }
+            i = 0;
+            while (i < sl) {
+                raz_compiler_rt_arena_set(constraint, i, raz_compiler_rt_arena_get(spec, i));
+                i += 1;
+            }
+            tracked = true;
+        }
+        if (tracked) {
+            i64 status = registry_write_tracking(alias, al, name, nl, constraint, cl, section);
+
+            if (status != 0) {
+                return status;
+            }
+            tracked_count += 1;
+        }
+        raz_compiler_rt_arena_destroy(alias);
+        raz_compiler_rt_arena_destroy(spec);
+        raz_compiler_rt_arena_destroy(name);
+        raz_compiler_rt_arena_destroy(constraint);
+    }
+    // Do not leave a zero-byte package-manager marker in target/ for projects
+    // that have no registry dependencies. The tracking file is derived state and
+    // should exist only when it contains actual registry rows.
+    if (tracked_count == 0 && raz_compiler_rt_path_exists_ascii(tracking_path, tracking_path_length) != 0) {
+        raz_compiler_rt_remove_path_ascii(tracking_path, tracking_path_length);
+    }
+    raz_compiler_rt_arena_destroy(manifest_path);
+    raz_compiler_rt_arena_destroy(manifest);
+    raz_compiler_rt_arena_destroy(tracking_path);
+    raz_compiler_rt_arena_destroy(empty);
+    return 0;
+}

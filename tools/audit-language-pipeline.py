@@ -16,14 +16,18 @@ ROOT = Path(__file__).resolve().parents[1]
 def text(rel):
     return (ROOT / rel).read_text(encoding="utf-8")
 
-lexer = text("compiler/src/raz_lexer/src/lexer.rz")
-parser = text("compiler/src/raz_parser/src/parser.rz")
+lexer = text("compiler/src/raz_lexer/src/lexer/lexer.rz")
+parser = text("compiler/src/raz_parser/src/parser/parser.rz")
 types = text("compiler/src/raz_hir/src/hir/core/types.rz") + "\n" + text("compiler/src/raz_hir/src/hir/generics/instantiate.rz")
 expr = text("compiler/src/raz_hir/src/hir/semantic/expressions.rz")
-stmt = text("compiler/src/raz_hir/src/hir/semantic/statements.rz")
+stmt = text("compiler/src/raz_hir/src/hir/semantic/statements.rz") + "\n" + text("compiler/src/raz_hir/src/hir/semantic/match_statements.rz") + "\n" + text("compiler/src/raz_hir/src/hir/semantic/statement_support.rz")
 decl = text("compiler/src/raz_hir/src/hir/semantic/declarations.rz") + "\n" + text("compiler/src/raz_hir/src/hir/traits/solver.rz")
 comp = text("compiler/src/raz_hir/src/hir/semantic/comptime.rz")
-own = text("compiler/src/raz_hir/src/hir/semantic/ownership.rz")
+own = (
+    text("compiler/src/raz_hir/src/hir/semantic/ownership.rz")
+    + "\n" + text("compiler/src/raz_hir/src/hir/semantic/ownership_paths.rz")
+    + "\n" + text("compiler/src/raz_hir/src/hir/semantic/ownership_flow.rz")
+)
 mir = "\n".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "compiler/src/raz_mir/src/mir").rglob("*.rz")))
 forge = "\n".join([
     text("compiler/src/raz_codegen_forge/src/forge/writer.rz"),
@@ -52,7 +56,7 @@ add("declarations", "traits / impls", FULL if "hir_parse_trait_declaration" in d
 add("declarations", "extern functions", FULL if "hir_parse_extern_function" in all_hir else MISSING, "extern declarations are represented")
 unsafe_full = "function_is_unsafe" in model and "unsafe_depth" in model and "token_is_unsafe" in decl.split("fn hir_parse_function",1)[1].split("fn ",1)[0] and "token_is_unsafe" in parser.split("fn parse_function",1)[1].split("fn ",1)[0]
 add("declarations", "unsafe functions", FULL if unsafe_full else PARTIAL, "unsafe function qualifiers are preserved through precheck/HIR metadata and establish an unsafe semantic context")
-driver_main = text("compiler/src/raz_driver/src/compiler_main.rz")
+driver_main = text("compiler/src/raz_driver/src/driver/compiler_main.rz")
 parser_authoritative = "build_hir(input" in driver_main and "parse_module(input" not in driver_main
 add("parser/AST", "authoritative syntax/semantic tree for stable constructs", FULL if parser_authoritative else PARTIAL, "production compilation parses source once through the authoritative HIR frontend; parser.rz is retained only as an optional bootstrap/preflight utility")
 attribute_partial = "hir_parse_pending_attributes" in comp and "function_abi_kinds" in model and "function_link_name_offsets" in model and "function_target_feature_offsets" in model and "pending_target_feature_length" in model and "function_is_unsafe" in model and "function_link_name_lengths" in text("compiler/src/raz_codegen_forge/src/forge/writer.rz") and "Generic instantiation reparses the template body" in decl

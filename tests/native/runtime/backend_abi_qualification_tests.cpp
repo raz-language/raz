@@ -12,8 +12,8 @@
 #include "forge/object/archive.hpp"
 #include "forge/object/coff.hpp"
 #include "forge/object/elf.hpp"
-#include "forge/target/abi.hpp"
-#include "forge/target/data_layout.hpp"
+#include "forge/platform/abi.hpp"
+#include "forge/platform/data_layout.hpp"
 
 extern "C" {
 std::int64_t raz_rt_abi_pointer_size();

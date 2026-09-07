@@ -1,0 +1,109 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::page;
+
+import alloc::string;
+import web::client_host;
+import web::page_css;
+import web::routes;
+import web::std::dom;
+import web::std::events;
+import web::build::fs;
+import web::ui;
+
+fn write_page_to(Page&mut page, String& path) -> bool {
+    String document = String::with_capacity(page.head.len() + page.body.len() + 256);
+    if (!document.push_str("<!doctype html>\n") ||
+        !document.push_string(&page.html_open) ||
+        !document.push_str("<head>\n") ||
+        !document.push_string(&page.head)) {
+        return false;
+    }
+    if (page.css.len() > 0) {
+        if (!document.push_str("<link rel=\"stylesheet\" href=\"./app.css\">\n")) { return false; }
+    }
+    if (!document.push_str("</head>\n<body>\n") ||
+        !document.push_string(&page.body)) {
+        return false;
+    }
+    if (page.client.len() > 0) {
+        if (!document.push_str("<script type=\"module\" src=\"./app.js\"></script>\n")) { return false; }
+    }
+    if (!document.push_str("</body>\n</html>\n")) { return false; }
+
+    if (!web::build::fs::write_string(path, &document)) { return false; }
+    if (!web::page_css::write_css_for_path(&page.css, path)) { return false; }
+    return web::client_host::write_client_for_path(&page.client, &page.browser_roots, &page.browser_chunks, path);
+}
+
+public impl Page {
+    /// Writes an explicit static file path. Interactive pages emit only the
+    /// app.js WebAssembly host shim beside the HTML file.
+    public fn write(Page&mut self, string path) -> bool {
+        String owned = String::from(path);
+        return write_page_to(self, &owned);
+    }
+
+    /// Writes a host-friendly static route. `/` becomes `dist/index.html` and
+    /// `/about` becomes `dist/about/index.html`. Route traversal, query/hash
+    /// suffixes, backslashes, and empty path segments are rejected so a build
+    /// can never escape its dist directory.
+    public fn write_route(Page&mut self, string route) -> bool {
+        String path = String::new();
+        if (!web::routes::static_route_output(route, &mut path)) { return false; }
+        return write_page_to(self, &path);
+    }
+
+    /// Writes an owned prerendered route path created by route_path(). Any
+    /// unresolved dynamic segment or unsafe traversal is rejected.
+    public fn write_route_path(Page&mut self, String& route) -> bool {
+        String output = String::new();
+        if (!web::routes::static_route_output_string(route, &mut output)) { return false; }
+        return write_page_to(self, &output);
+    }
+
+    /// Writes the conventional static-host 404 document.
+    public fn write_not_found(Page&mut self) -> bool {
+        String path = String::from("dist/404.html");
+        return write_page_to(self, &path);
+    }
+}
+
+/// Browser DOM primitives callable from ordinary Raz event functions. Their
+/// implementations are WebAssembly imports supplied by generated host glue.
+public fn set_text(string id, string value) -> bool { return web::std::dom::set_text(id, value); }
+public fn set_text_i64(string id, i64 value) -> bool { return web::std::dom::set_text_i64(id, value); }
+public fn toggle_class(string id, string class_name) -> bool { return web::std::dom::toggle_class(id, class_name); }
+public fn element(string id) -> web::std::dom::Element { return web::std::dom::element(id); }
+public fn event() -> Event { return web::std::events::current(); }
+
+/// Creates the canonical static output root used by Raz web projects.
+public fn prepare_dist() -> bool {
+    string dist = "dist";
+    return web::build::fs::create_dir_all(raz_rt_cstr_ptr(dist), 4);
+}
+
+/// Emit one host-friendly static route from a reusable Component tree.
+/// This is the concise static-site path: ordinary Component authoring, no
+/// application runtime, and no manual prepare_dist/Page/write_route boilerplate.
+public fn write_component_route(string route, string title, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new(title);
+    if (!page.component(component)) { return false; }
+    return page.write_route(route);
+}
+
+public fn write_component_route_path(String& route, string title, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new(title);
+    if (!page.component(component)) { return false; }
+    return page.write_route_path(route);
+}
+
+public fn write_component_route_lang(string route, string title, string language, web::ui::Component&mut component) -> bool {
+    if (!prepare_dist()) { return false; }
+    Page page = Page::new_lang(title, language);
+    if (!page.component(component)) { return false; }
+    return page.write_route(route);
+}

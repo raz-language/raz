@@ -784,6 +784,13 @@ SyntaxNode Parser::parse_while() {
 SyntaxNode Parser::parse_for() {
   const auto begin = advance().range.begin;
   auto result = node(SyntaxKind::for_statement, begin);
+  // `for x in expr {` is, with match, one of the two unparenthesized headers in
+  // the grammar, and unlike match its iterable may legitimately be a struct
+  // literal: `for v in Counter { start: 0 } { ... }`. The production compiler
+  // separates the two by resolving the name to a struct, which this syntactic
+  // parser cannot do, so it looks at what the brace actually contains instead.
+  const bool saved_requires_fields = struct_literal_requires_fields_;
+  struct_literal_requires_fields_ = true;
   if (at(TokenKind::identifier) && peek(1).is(TokenKind::kw_in)) {
     result.label = token_text(advance());
     advance();
@@ -791,8 +798,19 @@ SyntaxNode Parser::parse_for() {
   } else {
     result.children.push_back(parse_expression());
   }
+  struct_literal_requires_fields_ = saved_requires_fields;
   result.children.push_back(parse_block());
   result.range = range_from(begin); return result;
+}
+
+// With current() on '{', report whether it opens struct-initializer fields
+// rather than a block. An empty brace pair and `name:` / `name,` / `name}`
+// are initializers; anything else -- notably a statement -- is a block.
+bool Parser::brace_opens_struct_fields() const noexcept {
+  if (peek(1).is(TokenKind::right_brace)) return true;
+  if (!peek(1).is(TokenKind::identifier)) return false;
+  return peek(2).is(TokenKind::colon) || peek(2).is(TokenKind::comma) ||
+         peek(2).is(TokenKind::right_brace);
 }
 
 SyntaxNode Parser::parse_return() {
@@ -1210,7 +1228,10 @@ SyntaxNode Parser::parse_postfix(SyntaxNode expression) {
       expression = std::move(member);
       continue;
     }
-    if (allow_struct_literal_ && expression.kind == SyntaxKind::name_expression && consume(TokenKind::left_brace)) {
+    if (allow_struct_literal_ && expression.kind == SyntaxKind::name_expression &&
+        at(TokenKind::left_brace) &&
+        (!struct_literal_requires_fields_ || brace_opens_struct_fields()) &&
+        consume(TokenKind::left_brace)) {
       auto literal = node(SyntaxKind::struct_expression, begin);
       literal.label = expression.label;
       if (!at(TokenKind::right_brace)) {

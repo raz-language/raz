@@ -18,6 +18,17 @@ for forbidden in (compiler / "source-order.txt", compiler / "host-source-order.t
         print(f"compiler-semantic-modules: FAIL: ordering metadata must not exist: {forbidden.relative_to(root)}")
         sys.exit(1)
 
+
+legacy_flat_dirs = ("backend", "driver", "frontend", "hir", "mir")
+for name in legacy_flat_dirs:
+    legacy = source_root / name
+    if legacy.exists():
+        print(
+            "compiler-semantic-modules: FAIL: obsolete monolithic compiler source tree remains: "
+            f"{legacy.relative_to(root)}"
+        )
+        sys.exit(1)
+
 if "def compiler_modules()" not in bootstrap_driver:
     print("compiler-semantic-modules: FAIL: bootstrap has no semantic source discovery")
     sys.exit(1)
@@ -30,7 +41,10 @@ for forbidden_text in (
         print(f"compiler-semantic-modules: FAIL: bootstrap contains legacy module handling: {forbidden_text}")
         sys.exit(1)
 
-sources = sorted(source_root.rglob("*.rz"))
+sys.path.insert(0, str(root / "tools"))
+from compiler_sources import ordered_sources
+
+sources = ordered_sources(root)
 if not sources:
     print("compiler-semantic-modules: FAIL: no compiler modules discovered")
     sys.exit(1)

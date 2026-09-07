@@ -441,11 +441,11 @@ public fn llvm_target_options_require_llvm(LlvmTargetOptions& options) -> bool {
     );
 }
 
-fn llvm_writer_arena_range(ForgeWriter&mut out, i64 data, i64 offset, i64 length) {
+fn llvm_writer_arena_range(CodegenWriter&mut out, i64 data, i64 offset, i64 length) {
     i64 i = 0;
 
     while (i < length) {
-        writer_put(out, raz_compiler_rt_arena_get(data, offset + i));
+        codegen_writer_put(out, raz_compiler_rt_arena_get(data, offset + i));
         i += 1;
     }
 }
@@ -638,7 +638,7 @@ public fn llvm_cross_target_executable_requires_runtime(LlvmTargetOptions& optio
     );
 }
 
-fn llvm_append_platform_link_libraries(ForgeWriter&mut command, LlvmTargetOptions& options) {
+fn llvm_append_platform_link_libraries(CodegenWriter&mut command, LlvmTargetOptions& options) {
     i64 platform = llvm_target_platform(options);
 
     if (platform == 1) {
@@ -712,18 +712,18 @@ fn llvm_resolve_driver(bool cxx, i64 output, i64 capacity) -> i64 {
     return resolved;
 }
 
-fn llvm_append_runtime_link_args(ForgeWriter&mut command) {
+fn llvm_append_runtime_link_args(CodegenWriter&mut command) {
     i64 args = raz_compiler_rt_arena_create(32768);
     if (args == 0) { return; }
     i64 length = raz_compiler_runtime_link_args_i64(args, 32768);
     if (length > 0) {
-        writer_space(command);
+        codegen_writer_space(command);
         llvm_writer_arena_range(command, args, 0, length);
     }
     raz_compiler_rt_arena_destroy(args);
 }
 
-fn llvm_emit_target_metadata(ForgeWriter&mut out, LlvmTargetOptions& options) {
+fn llvm_emit_target_metadata(CodegenWriter&mut out, LlvmTargetOptions& options) {
     if (options.data_layout_length > 0) {
         
 
@@ -734,19 +734,19 @@ fn llvm_emit_target_metadata(ForgeWriter&mut out, LlvmTargetOptions& options) {
             options.data_layout_offset,
             options.data_layout_length,
         );
-        writer_put(out, 34);
-        writer_newline(out);
+        codegen_writer_put(out, 34);
+        codegen_writer_newline(out);
     }
     if (options.target_length > 0) {
         
 
         llvm_literal(out, "target triple = \"");
         llvm_writer_arena_range(out, options.target_arg, options.target_offset, options.target_length);
-        writer_put(out, 34);
-        writer_newline(out);
+        codegen_writer_put(out, 34);
+        codegen_writer_newline(out);
     }
     if (options.data_layout_length > 0 || options.target_length > 0) {
-        writer_newline(out);
+        codegen_writer_newline(out);
     }
 }
 
@@ -766,13 +766,13 @@ public fn llvm_make_ir_sidecar(i64 output_path, i64 output_length) -> i64 {
     return path;
 }
 
-fn llvm_command_quote_range(ForgeWriter&mut out, i64 data, i64 offset, i64 length) {
-    writer_put(out, 34);
+fn llvm_command_quote_range(CodegenWriter&mut out, i64 data, i64 offset, i64 length) {
+    codegen_writer_put(out, 34);
     llvm_writer_arena_range(out, data, offset, length);
-    writer_put(out, 34);
+    codegen_writer_put(out, 34);
 }
 
-fn llvm_command_feature_flags(ForgeWriter&mut command, LlvmTargetOptions& options) {
+fn llvm_command_feature_flags(CodegenWriter&mut command, LlvmTargetOptions& options) {
     i64 start = 0;
     i64 cursor = 0;
 
@@ -799,7 +799,7 @@ fn llvm_command_feature_flags(ForgeWriter&mut command, LlvmTargetOptions& option
                     options.features_offset + start,
                     feature_length,
                 );
-                writer_put(command, 34);
+                codegen_writer_put(command, 34);
             }
             start = cursor + 1;
         }
@@ -807,7 +807,7 @@ fn llvm_command_feature_flags(ForgeWriter&mut command, LlvmTargetOptions& option
     }
 }
 
-fn llvm_command_comma_list(ForgeWriter&mut command, i64 data, i64 offset, i64 length, i64 prefix_kind) {
+fn llvm_command_comma_list(CodegenWriter&mut command, i64 data, i64 offset, i64 length, i64 prefix_kind) {
     i64 start = 0;
     i64 cursor = 0;
 
@@ -831,7 +831,7 @@ fn llvm_command_comma_list(ForgeWriter&mut command, i64 data, i64 offset, i64 le
 
                     llvm_literal(command, " -l");
                 } else {
-                    writer_space(command);
+                    codegen_writer_space(command);
                 }
                 llvm_command_quote_range(command, data, offset + start, item_length);
             }
@@ -841,7 +841,52 @@ fn llvm_command_comma_list(ForgeWriter&mut command, i64 data, i64 offset, i64 le
     }
 }
 
-fn llvm_command_optimization(ForgeWriter&mut command, LlvmTargetOptions& options) {
+fn llvm_native_output_matches_target(
+    LlvmTargetOptions& options,
+    i64 output_path,
+    i64 output_length,
+) -> bool {
+    if (output_path == 0 || output_length <= 0) { return false; }
+
+    i64 header = raz_compiler_rt_arena_create(4);
+    if (header == 0) { return false; }
+    i64 read = raz_compiler_rt_read_ascii(output_path, output_length, header, 4);
+    i64 platform = llvm_target_platform(options);
+    bool valid = false;
+
+    if (platform == 1 && read >= 2) {
+        // PE/COFF images begin with the DOS MZ signature. This catches the
+        // catastrophic case where textual LLVM IR was accidentally written to
+        // a .exe path while the native finalization step was skipped.
+        valid =
+            raz_compiler_rt_arena_get(header, 0) == 77 &&
+            raz_compiler_rt_arena_get(header, 1) == 90;
+    } else if (platform == 2 && read >= 4) {
+        valid =
+            raz_compiler_rt_arena_get(header, 0) == 127 &&
+            raz_compiler_rt_arena_get(header, 1) == 69 &&
+            raz_compiler_rt_arena_get(header, 2) == 76 &&
+            raz_compiler_rt_arena_get(header, 3) == 70;
+    } else if (platform == 3 && read >= 4) {
+        // Accept both byte orders of the 64-bit Mach-O magic.
+        valid = (
+            raz_compiler_rt_arena_get(header, 0) == 207 &&
+            raz_compiler_rt_arena_get(header, 1) == 250 &&
+            raz_compiler_rt_arena_get(header, 2) == 237 &&
+            raz_compiler_rt_arena_get(header, 3) == 254
+        ) || (
+            raz_compiler_rt_arena_get(header, 0) == 254 &&
+            raz_compiler_rt_arena_get(header, 1) == 237 &&
+            raz_compiler_rt_arena_get(header, 2) == 250 &&
+            raz_compiler_rt_arena_get(header, 3) == 207
+        );
+    }
+
+    raz_compiler_rt_arena_destroy(header);
+    return valid;
+}
+
+fn llvm_command_optimization(CodegenWriter&mut command, LlvmTargetOptions& options) {
     if (options.optimization_kind == 0) {
         
 
@@ -876,7 +921,7 @@ public fn llvm_finalize_native_output(
     i64 output_path,
     i64 output_length,
 ) -> bool {
-    ForgeWriter command;
+    CodegenWriter command;
     // A project build links through this path without passing --runtime, so
     // resolve the same runtime archive the Forge link driver finds internally.
     // Without it every image referencing the runtime fails to link.
@@ -897,7 +942,7 @@ public fn llvm_finalize_native_output(
         }
     }
 
-    writer_init(&mut command);
+    codegen_writer_init(&mut command);
     i64 driver = raz_compiler_rt_arena_create(8192);
     i64 driver_length = -1;
     if (driver != 0) {
@@ -910,7 +955,7 @@ public fn llvm_finalize_native_output(
             llvm_write_stderr_literal("error: LLVM object driver was not found\n  help: install LLVM for Windows/Linux or set RAZ_LLVM_CC to clang\n");
         }
         if (driver != 0) { raz_compiler_rt_arena_destroy(driver); }
-        writer_destroy(&mut command);
+        codegen_writer_destroy(&mut command);
         if (default_runtime != 0) { raz_compiler_rt_arena_destroy(default_runtime); }
         return false;
     }
@@ -955,7 +1000,7 @@ public fn llvm_finalize_native_output(
         
 
         llvm_literal(&mut command, " -flto=thi");
-        writer_put(&mut command, 110);
+        codegen_writer_put(&mut command, 110);
     } else if (options.lto_kind == 2) {
         
 
@@ -975,7 +1020,7 @@ public fn llvm_finalize_native_output(
             options.linker_offset,
             options.linker_length,
         );
-        writer_put(&mut command, 34);
+        codegen_writer_put(&mut command, 34);
     }
     if (options.target_length > 0) {
         
@@ -993,7 +1038,7 @@ public fn llvm_finalize_native_output(
 
         llvm_literal(&mut command, " -Xclang -target-cpu -Xclang \"");
         llvm_writer_arena_range(&mut command, options.cpu_arg, options.cpu_offset, options.cpu_length);
-        writer_put(&mut command, 34);
+        codegen_writer_put(&mut command, 34);
     }
     if (options.features_length > 0) {
         llvm_command_feature_flags(&mut command, options);
@@ -1015,7 +1060,7 @@ public fn llvm_finalize_native_output(
         
 
         llvm_literal(&mut command, " -x none");
-        writer_space(&mut command);
+        codegen_writer_space(&mut command);
         llvm_command_quote_range(
             &mut command,
             options.runtime_arg,
@@ -1033,7 +1078,7 @@ public fn llvm_finalize_native_output(
         
 
         llvm_literal(&mut command, " -x none");
-        writer_space(&mut command);
+        codegen_writer_space(&mut command);
         llvm_command_quote_range(&mut command, default_runtime, 0, default_runtime_length);
         llvm_append_runtime_link_args(&mut command);
         llvm_append_platform_link_libraries(&mut command, options);
@@ -1071,7 +1116,7 @@ public fn llvm_finalize_native_output(
     llvm_literal(&mut command, " -o ");
     llvm_command_quote_range(&mut command, output_path, 0, output_length);
     if (command.failed) {
-        writer_destroy(&mut command);
+        codegen_writer_destroy(&mut command);
         if (default_runtime != 0) {
             raz_compiler_rt_arena_destroy(default_runtime);
         }
@@ -1079,10 +1124,17 @@ public fn llvm_finalize_native_output(
     }
 
     i64 status = raz_compiler_rt_process_run_ascii(command.data, command.length);
+    bool output_valid = status == 0;
+    if (output_valid && options.emit_kind == 2) {
+        output_valid = llvm_native_output_matches_target(options, output_path, output_length);
+        if (!output_valid) {
+            llvm_write_stderr_literal("error: LLVM link completed without producing a valid native executable\n  help: check the selected target/toolchain; Raz will not report textual IR or a malformed image as a successful executable build\n");
+        }
+    }
 
-    writer_destroy(&mut command);
+    codegen_writer_destroy(&mut command);
     if (default_runtime != 0) {
         raz_compiler_rt_arena_destroy(default_runtime);
     }
-    return status == 0;
+    return output_valid;
 }

@@ -2,6 +2,8 @@
 
 The Raz standard library is implemented primarily in Raz. Native code is reserved for operating-system, ABI, cryptographic-engine, and raw memory boundaries that cannot reasonably be expressed portably in the language itself.
 
+Standard-library package directories are also **source-only**. Generated package `target/` trees are repository-level build state, not library source, and are rejected by the repository hygiene qualification.
+
 ## Core and allocation
 
 The library provides ownership-aware slices, strings, vectors, deques, hash sets, hash maps, options/results, iterators, formatting, bump arenas, fixed-size object pools, and raw allocation adapters. Collection storage is layout-aware and supports generic values with nontrivial size and alignment.

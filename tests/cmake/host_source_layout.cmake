@@ -79,7 +79,7 @@ message(STATUS "Order-independent recursive bootstrap: PASS")
 # Generic user packages may still opt into source-order.txt for compatibility;
 # that legacy package feature is separate from the canonical compiler itself.
 set(native_project_loader "${PROJECT_ROOT}/src/bootstrap/compiler/project/project.cpp")
-set(raz_project_loader "${PROJECT_ROOT}/compiler/src/raz_driver/src/project.rz")
+set(raz_project_loader "${PROJECT_ROOT}/compiler/src/raz_driver/src/driver/project.rz")
 foreach(loader IN ITEMS "${native_project_loader}" "${raz_project_loader}")
   if(NOT EXISTS "${loader}")
     message(FATAL_ERROR "Project loader missing: ${loader}")

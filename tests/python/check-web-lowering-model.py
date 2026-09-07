@@ -5,10 +5,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-PROJECT = (ROOT / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8")
-DRIVER = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
+PROJECT = (ROOT / "compiler/src/raz_driver/src/driver/project_web_manifest.rz").read_text(encoding="utf-8")
+DRIVER = (ROOT / "compiler/src/raz_driver/src/driver/compiler_main.rz").read_text(encoding="utf-8")
 WASM = (ROOT / "compiler/src/raz_codegen_wasm/src/wasm/codegen.rz").read_text(encoding="utf-8")
-CLI = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
+CLI = (ROOT / "compiler/src/raz_driver/src/driver/cli.rz").read_text(encoding="utf-8")
 
 checks = {
     "manifest has one canonical web classifier": "fn project_manifest_web_mode(" in PROJECT,

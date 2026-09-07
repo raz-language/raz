@@ -6,15 +6,15 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/driver/incremental.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
 comptime = (root / 'compiler/src/raz_hir/src/hir/semantic/comptime.rz').read_text()
 order = {path.relative_to(root / 'compiler').as_posix() for path in list((root / 'compiler').rglob('*.rz'))}
 ignore = (root / '.gitignore').read_text()
 
 checks = {
-    'persistent cache module is in semantic source graph': 'src/raz_driver/src/incremental.rz' in order,
+    'persistent cache module is in semantic source graph': 'src/raz_driver/src/driver/incremental.rz' in order,
     'cache format is explicitly versioned': 'fn incremental_cache_schema()' in inc,
     'cache key includes whole source bytes': 'raz_compiler_rt_arena_range_hash(source.bytes, 0, source.length' in inc,
     'cache key includes backend mode': 'key = incremental_mix(key, backend);' in inc and 'llvm_emit_kind' in inc,

@@ -5,8 +5,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-ui = (ROOT / "library/web/ui/ui.rz").read_text()
-page = (ROOT / "library/web/src/lib.rz").read_text()
+ui = '\n'.join(p.read_text() for p in sorted((ROOT / 'library/web/ui').glob('*.rz')))
+page = "\n".join((ROOT / f"library/web/src/{name}").read_text() for name in ("page.rz", "page_head.rz", "page_body.rz", "page_forms.rz", "page_interactivity.rz", "page_output.rz"))
 fixture = (ROOT / "tests/examples/web/css-authoring/src/main.rz").read_text()
 checks = {
     "component pseudo class": "fn css_pseudo(Component&mut self" in ui,

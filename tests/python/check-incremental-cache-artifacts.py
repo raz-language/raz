@@ -6,9 +6,9 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[2]
-inc = (root / 'compiler/src/raz_driver/src/incremental.rz').read_text()
+inc = (root / 'compiler/src/raz_driver/src/driver/incremental.rz').read_text()
 model = (root / 'compiler/src/raz_hir/src/hir/core/model.rz').read_text()
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 
 checks = {
     'HIR module fingerprints are first-class cache identity':

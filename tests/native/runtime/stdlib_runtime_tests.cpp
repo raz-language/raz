@@ -137,6 +137,24 @@ int main() {
         ok &= expect(raz_rt_file_eof(file) == 1, "file_eof");
         raz_rt_file_close(file);
     }
+    // Compiler/package paths are canonicalized with '/' even on Windows.  The
+    // raw runtime file boundary must accept that representation because
+    // source-order.txt dependencies are assembled through raz_rt_file_open.
+    std::string canonical_first_path = first_path;
+#if defined(_WIN32)
+    for (char& byte : canonical_first_path) {
+        if (byte == '\\') byte = '/';
+    }
+#endif
+    void* canonical_file = raz_rt_file_open(canonical_first_path.data(), canonical_first_path.size(), 1);
+    ok &= expect(canonical_file != nullptr, "file_open canonical path");
+    if (canonical_file != nullptr) {
+        char canonical_readback[8]{};
+        ok &= expect(raz_rt_file_read(canonical_file, canonical_readback, 6) == 6, "file_read canonical path");
+        ok &= expect(std::memcmp(canonical_readback, payload, 6) == 0, "file_read canonical path content");
+        raz_rt_file_close(canonical_file);
+    }
+
     ok &= expect(raz_rt_path_is_file(first_path.data(), first_path.size()) == 1, "path_is_file");
     const auto temp_dir = std::filesystem::temp_directory_path().string();
     ok &= expect(raz_rt_path_is_dir(temp_dir.data(), temp_dir.size()) == 1, "path_is_dir");

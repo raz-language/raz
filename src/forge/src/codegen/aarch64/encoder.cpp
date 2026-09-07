@@ -99,6 +99,40 @@ void emit_mov_imm64(Buffer& out, std::uint8_t destination, std::uint64_t value) 
     }
 }
 
+// Both Windows and Linux grow a thread stack on demand through a guard page
+// directly below the committed region: only an access to that page commits it
+// and moves the guard down. Lowering sp past the guard without touching it
+// leaves the guard behind, so the first access into the new frame faults on
+// reserved-but-uncommitted memory instead of extending the stack. A frame
+// larger than a page therefore has to walk down and touch every page it claims.
+//
+// The step stays below the smallest page size any AArch64 host uses, so a single
+// step can never carry sp across two guard pages, and it is 16-byte aligned
+// because sp must be aligned at each probe. Frame sizes are already 16-byte
+// aligned, which leaves the final remainder aligned as well.
+inline constexpr std::uint32_t stack_probe_step = 4080U;
+
+void emit_stack_frame_allocation(Buffer& out, std::uint32_t frame_size) {
+    if (frame_size == 0U) return;
+    if (frame_size <= stack_probe_step) {
+        emit_add_immediate(out, sp, sp, frame_size, true);
+        return;
+    }
+    // x9 is a caller-saved temporary carrying no incoming argument, so the walk
+    // can use it as its counter before any value in the frame is live.
+    const auto steps = frame_size / stack_probe_step;
+    const auto remainder = frame_size % stack_probe_step;
+    emit_mov_imm64(out, scratch0, steps);
+    const auto loop_start = out.size();
+    emit_add_immediate(out, sp, sp, stack_probe_step, true);
+    out.word(0xF94003FFU); // ldr xzr, [sp] -- touch the page, leaving it unchanged
+    emit_add_immediate(out, scratch0, scratch0, 1U, true);
+    const auto branch = out.size();
+    const auto words = (static_cast<std::int64_t>(loop_start) - static_cast<std::int64_t>(branch)) / 4;
+    out.word(0xB5000000U | ((static_cast<std::uint32_t>(words) & 0x7FFFFU) << 5U) | scratch0); // cbnz x9, loop
+    if (remainder != 0U) emit_add_immediate(out, sp, sp, remainder, true);
+}
+
 std::uint32_t load_base(unsigned width) {
     switch (width) {
     case 1: return 0x39400000U; // ldrb w
@@ -853,12 +887,7 @@ EncodedFunction encode_function(const machine::Function& function, Abi abi, Diag
     // available for calls and encoder scratch without live-value shuffling.
     out.word(0xA9BF7BFDU); // stp x29, x30, [sp, #-16]!
     out.word(0x910003FDU); // mov x29, sp
-    std::uint32_t remaining_frame = frame_size;
-    while (remaining_frame != 0U) {
-        const auto chunk = std::min<std::uint32_t>(remaining_frame, 4095U);
-        emit_add_immediate(out, sp, sp, chunk, true);
-        remaining_frame -= chunk;
-    }
+    emit_stack_frame_allocation(out, frame_size);
     for (std::size_t index = 0; index < allocation.used_integer_callee_saved.size(); ++index)
         emit_store_integer(out, allocation.used_integer_callee_saved[index], fp, saved_integer_offset(index), 8U);
     for (std::size_t index = 0; index < allocation.used_floating_callee_saved.size(); ++index)

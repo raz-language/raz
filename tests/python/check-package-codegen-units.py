@@ -3,8 +3,8 @@
 
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-project = (root / 'compiler/src/raz_driver/src/project.rz').read_text()
-main = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text()
+project = (root / 'compiler/src/raz_driver/src/driver/project_native.rz').read_text()
+main = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 forge = (root / 'compiler/src/raz_codegen_forge/src/forge/native_functions.rz').read_text()
 forge_codegen = (root / 'compiler/src/raz_codegen_forge/src/forge/codegen.rz').read_text()
 fingerprints = (root / 'compiler/src/raz_hir/src/hir/query/fingerprints.rz').read_text()

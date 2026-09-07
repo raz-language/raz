@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -60,7 +61,87 @@ int bundle_kind_index(const std::filesystem::path& relative) {
   return 5;
 }
 
-std::string web_bundle_analysis(const std::filesystem::path& dist) {
+struct WebBundleBudget {
+  bool valid = true;
+  bool configured = false;
+  bool total_set = false;
+  std::uintmax_t total = 0;
+  bool category_set[6]{};
+  std::uintmax_t category[6]{};
+  std::string error;
+};
+
+std::string_view trim_ascii(std::string_view value) {
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.remove_prefix(1);
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.remove_suffix(1);
+  return value;
+}
+
+bool parse_budget_bytes(std::string_view value, std::uintmax_t* out) {
+  value = trim_ascii(value);
+  const auto comment = value.find('#');
+  if (comment != std::string_view::npos) value = trim_ascii(value.substr(0, comment));
+  if (value.empty()) return false;
+  std::uintmax_t result = 0;
+  for (char ch : value) {
+    if (ch < '0' || ch > '9') return false;
+    const auto digit = static_cast<std::uintmax_t>(ch - '0');
+    if (result > (std::numeric_limits<std::uintmax_t>::max() - digit) / 10U) return false;
+    result = result * 10U + digit;
+  }
+  *out = result;
+  return true;
+}
+
+WebBundleBudget read_web_bundle_budget(const std::filesystem::path& manifest) {
+  WebBundleBudget budget;
+  std::ifstream stream(manifest, std::ios::binary);
+  if (!stream) return budget;
+  std::string line;
+  bool in_budget = false;
+  while (std::getline(stream, line)) {
+    auto view = trim_ascii(line);
+    const auto comment = view.find('#');
+    if (comment != std::string_view::npos) view = trim_ascii(view.substr(0, comment));
+    if (view.empty()) continue;
+    if (view.front() == '[') {
+      in_budget = view == "[web.budget]";
+      continue;
+    }
+    if (!in_budget) continue;
+    const auto equals = view.find('=');
+    if (equals == std::string_view::npos) continue;
+    const auto key = trim_ascii(view.substr(0, equals));
+    const auto value = view.substr(equals + 1);
+    int index = -1;
+    bool total = false;
+    if (key == "total") total = true;
+    else if (key == "html") index = 0;
+    else if (key == "css") index = 1;
+    else if (key == "javascript" || key == "js") index = 2;
+    else if (key == "wasm") index = 3;
+    else if (key == "metadata" || key == "meta") index = 4;
+    else if (key == "assets" || key == "asset") index = 5;
+    else continue;
+    std::uintmax_t bytes = 0;
+    if (!parse_budget_bytes(value, &bytes)) {
+      budget.valid = false;
+      budget.error = "invalid [web.budget] byte value for " + std::string(key);
+      return budget;
+    }
+    budget.configured = true;
+    if (total) {
+      budget.total_set = true;
+      budget.total = bytes;
+    } else {
+      budget.category_set[index] = true;
+      budget.category[index] = bytes;
+    }
+  }
+  return budget;
+}
+
+std::string web_bundle_analysis(const std::filesystem::path& dist, const WebBundleBudget& budget, bool* within_budget) {
   struct Row { std::filesystem::path relative; std::uintmax_t size; };
   std::vector<Row> rows;
   std::error_code error;
@@ -101,6 +182,25 @@ std::string web_bundle_analysis(const std::filesystem::path& dist) {
     out << "  " << labels[i] << ": " << category_files[i] << " files, "
         << category_bytes[i] << " B\n";
   }
+
+  bool budget_ok = true;
+  if (budget.configured) {
+    static constexpr const char* budget_labels[6] = {"html", "css", "javascript", "wasm", "metadata", "assets"};
+    out << "\nBudgets:\n";
+    if (budget.total_set) {
+      const bool ok = total <= budget.total;
+      budget_ok = budget_ok && ok;
+      out << "  total: " << total << " / " << budget.total << " B  " << (ok ? "OK" : "EXCEEDED") << "\n";
+    }
+    for (int i = 0; i < 6; ++i) {
+      if (!budget.category_set[i]) continue;
+      const bool ok = category_bytes[i] <= budget.category[i];
+      budget_ok = budget_ok && ok;
+      out << "  " << budget_labels[i] << ": " << category_bytes[i] << " / " << budget.category[i]
+          << " B  " << (ok ? "OK" : "EXCEEDED") << "\n";
+    }
+  }
+  if (within_budget != nullptr) *within_budget = budget_ok;
 
   const auto manifest = dist / "asset-manifest.json";
   std::ifstream manifest_stream(manifest, std::ios::binary);
@@ -396,7 +496,14 @@ extern "C" std::int64_t raz_rt_web_bundle_analyze(
   const std::filesystem::path manifest(text(manifest_data, manifest_length));
   std::error_code error;
   if (!std::filesystem::is_directory(dist, error) || error) return -1;
-  const auto report = web_bundle_analysis(dist);
+  const auto budget = read_web_bundle_budget(manifest);
+  if (!budget.valid) {
+    std::fprintf(stderr, "error: %s\n", budget.error.c_str());
+    std::fflush(stderr);
+    return -1;
+  }
+  bool within_budget = true;
+  const auto report = web_bundle_analysis(dist, budget, &within_budget);
   if (report.empty()) return -1;
   const auto report_dir = manifest.parent_path() / "target" / "release";
   std::filesystem::create_directories(report_dir, error);
@@ -409,8 +516,9 @@ extern "C" std::int64_t raz_rt_web_bundle_analyze(
   stream.close();
   std::fwrite(report.data(), 1, report.size(), stdout);
   std::printf("\nAnalysis written to target/release/web-bundle-analysis.txt\n");
+  if (!within_budget) std::printf("Web bundle budget exceeded.\n");
   std::fflush(stdout);
-  return 0;
+  return within_budget ? 0 : -2;
 }
 
 extern "C" std::int64_t raz_rt_web_dev_server(

@@ -1,0 +1,222 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::project_web_manifest;
+
+public import raz_driver::path;
+
+// Web-specific raz.toml interpretation and output/public directory helpers.
+// Kept out of the generic project dependency/source graph loader.
+fn project_copy_quoted_value(i64 data, i64 start, i64 end, i64 output, i64 capacity) -> i64 {
+    while (start < end && ascii_is_space(raz_compiler_rt_arena_get(data, start))) { start += 1; }
+    if (start >= end || raz_compiler_rt_arena_get(data, start) != 34) { return -1; }
+    start += 1;
+    i64 cursor = start;
+    while (cursor < end && raz_compiler_rt_arena_get(data, cursor) != 34) { cursor += 1; }
+    if (cursor >= end || cursor - start > capacity) { return -1; }
+    i64 i = 0;
+    while (start + i < cursor) {
+        raz_compiler_rt_arena_set(output, i, raz_compiler_rt_arena_get(data, start + i));
+        i += 1;
+    }
+    return cursor - start;
+}
+
+fn project_manifest_line_is_section_literal(i64 data, i64 start, i64 end, string section) -> bool {
+    while (start < end && ascii_is_space(raz_compiler_rt_arena_get(data, start))) { start += 1; }
+    while (end > start && ascii_is_space(raz_compiler_rt_arena_get(data, end - 1))) { end -= 1; }
+    i64 length = compiler_literal_length(section);
+    if (end - start != length + 2 || raz_compiler_rt_arena_get(data, start) != 91 || raz_compiler_rt_arena_get(data, end - 1) != 93) { return false; }
+    i64 i = 0;
+    while (i < length) {
+        if (raz_compiler_rt_arena_get(data, start + 1 + i) != compiler_literal_byte(section, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn project_manifest_section_field_literal(
+    i64 manifest,
+    i64 length,
+    string section_name,
+    string key,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    if (manifest == 0 || output == 0 || length <= 0 || capacity <= 0) { return -1; }
+    i64 key_length = compiler_literal_length(key);
+    bool active = false;
+    i64 cursor = 0;
+    while (cursor < length) {
+        i64 start = cursor;
+        while (cursor < length && raz_compiler_rt_arena_get(manifest, cursor) != 10 && raz_compiler_rt_arena_get(manifest, cursor) != 13) { cursor += 1; }
+        i64 end = cursor;
+        while (cursor < length && (raz_compiler_rt_arena_get(manifest, cursor) == 10 || raz_compiler_rt_arena_get(manifest, cursor) == 13)) { cursor += 1; }
+        if (project_manifest_line_is_section_literal(manifest, start, end, section_name)) {
+            active = true;
+            continue;
+        }
+        i64 trimmed = start;
+        while (trimmed < end && ascii_is_space(raz_compiler_rt_arena_get(manifest, trimmed))) { trimmed += 1; }
+        if (trimmed < end && raz_compiler_rt_arena_get(manifest, trimmed) == 91) {
+            active = false;
+            continue;
+        }
+        if (!active) { continue; }
+        i64 equal = trimmed;
+        while (equal < end && raz_compiler_rt_arena_get(manifest, equal) != 61) { equal += 1; }
+        if (equal >= end) { continue; }
+        i64 key_end = equal;
+        while (key_end > trimmed && ascii_is_space(raz_compiler_rt_arena_get(manifest, key_end - 1))) { key_end -= 1; }
+        if (key_end - trimmed != key_length) { continue; }
+        bool same = true;
+        i64 i = 0;
+        while (i < key_length) {
+            if (raz_compiler_rt_arena_get(manifest, trimmed + i) != compiler_literal_byte(key, i)) { same = false; }
+            i += 1;
+        }
+        if (same) { return project_copy_quoted_value(manifest, equal + 1, end, output, capacity); }
+    }
+    return -1;
+}
+
+fn project_manifest_is_web(i64 manifest_path, i64 manifest_path_length) -> bool {
+    if (manifest_path == 0 || manifest_path_length <= 0) { return false; }
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 kind = raz_compiler_rt_arena_create(64);
+    if (manifest == 0 || kind == 0) { return false; }
+    i64 length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536);
+    i64 kind_length = -1;
+    if (length > 0) { kind_length = project_manifest_section_field_literal(manifest, length, "package", "kind", kind, 64); }
+    bool result = kind_length == 3;
+    if (result) {
+        string expected = "web";
+        i64 i = 0;
+        while (i < 3) {
+            if (raz_compiler_rt_arena_get(kind, i) != compiler_literal_byte(expected, i)) { result = false; }
+            i += 1;
+        }
+    }
+    raz_compiler_rt_arena_destroy(kind);
+    raz_compiler_rt_arena_destroy(manifest);
+    return result;
+}
+
+
+// Canonical web lowering mode for project manifests. Web remains a build target
+// of normal Raz; legacy kind = "web" is accepted as the advanced/component
+// compatibility spelling while [build] target = "web" is the normal static-first
+// spelling. Keeping this decision in project loading prevents the driver and
+// backends from independently re-parsing the manifest.
+//   0 = not a web project
+//   1 = target=web static-first/application-island pipeline
+//   2 = legacy kind=web reactive/component pipeline
+fn project_manifest_web_mode(i64 manifest_path, i64 manifest_path_length) -> i64 {
+    if (manifest_path == 0 || manifest_path_length <= 0) { return 0; }
+    if (project_manifest_is_web(manifest_path, manifest_path_length)) { return 2; }
+
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 target = raz_compiler_rt_arena_create(64);
+    if (manifest == 0 || target == 0) {
+        if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
+        if (target != 0) { raz_compiler_rt_arena_destroy(target); }
+        return 0;
+    }
+    i64 length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536);
+    i64 target_length = -1;
+    if (length > 0) {
+        target_length = project_manifest_section_field_literal(manifest, length, "build", "target", target, 64);
+    }
+    bool is_web = target_length == 3;
+    if (is_web) {
+        string expected = "web";
+        i64 i = 0;
+        while (i < 3) {
+            if (raz_compiler_rt_arena_get(target, i) != compiler_literal_byte(expected, i)) { is_web = false; }
+            i += 1;
+        }
+    }
+    raz_compiler_rt_arena_destroy(target);
+    raz_compiler_rt_arena_destroy(manifest);
+    if (is_web) { return 1; }
+    return 0;
+}
+
+fn project_web_title(i64 manifest_path, i64 manifest_path_length, i64 output, i64 capacity) -> i64 {
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    if (manifest == 0) { return -1; }
+    i64 length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536);
+    if (length <= 0) { raz_compiler_rt_arena_destroy(manifest); return -1; }
+    i64 title_length = project_manifest_section_field_literal(manifest, length, "web", "title", output, capacity);
+    if (title_length <= 0) { title_length = project_manifest_section_field_literal(manifest, length, "package", "name", output, capacity); }
+    if (title_length <= 0) {
+        string fallback = "Raz Web App";
+        title_length = compiler_literal_length(fallback);
+        if (title_length > capacity) { raz_compiler_rt_arena_destroy(manifest); return -1; }
+        i64 i = 0;
+        while (i < title_length) { raz_compiler_rt_arena_set(output, i, compiler_literal_byte(fallback, i)); i += 1; }
+    }
+    raz_compiler_rt_arena_destroy(manifest);
+    return title_length;
+}
+
+fn project_join_literal(i64 left, i64 left_length, string literal, i64 output, i64 capacity) -> i64 {
+    i64 right_length = compiler_literal_length(literal);
+    i64 right = raz_compiler_rt_arena_create(right_length + 1);
+    if (right == 0) { return -1; }
+    i64 i = 0;
+    while (i < right_length) { raz_compiler_rt_arena_set(right, i, compiler_literal_byte(literal, i)); i += 1; }
+    i64 result = path_join(left, left_length, right, right_length, output, capacity);
+    raz_compiler_rt_arena_destroy(right);
+    return result;
+}
+
+fn project_web_optional_path(
+    i64 manifest_path,
+    i64 manifest_path_length,
+    string key,
+    i64 output,
+    i64 capacity,
+) -> i64 {
+    if (manifest_path == 0 || manifest_path_length <= 0 || output == 0 || capacity <= 0) { return -1; }
+    i64 manifest = raz_compiler_rt_arena_create(65536);
+    i64 relative = raz_compiler_rt_arena_create(8192);
+    i64 root = raz_compiler_rt_arena_create(8192);
+    if (manifest == 0 || relative == 0 || root == 0) {
+        if (manifest != 0) { raz_compiler_rt_arena_destroy(manifest); }
+        if (relative != 0) { raz_compiler_rt_arena_destroy(relative); }
+        if (root != 0) { raz_compiler_rt_arena_destroy(root); }
+        return -1;
+    }
+    i64 length = raz_compiler_rt_read_ascii(manifest_path, manifest_path_length, manifest, 65536);
+    i64 relative_length = -1;
+    if (length > 0) {
+        relative_length = project_manifest_section_field_literal(manifest, length, "web", key, relative, 8192);
+    }
+    // Missing optional fields are represented as zero, not as an error.
+    if (relative_length <= 0) {
+        raz_compiler_rt_arena_destroy(root);
+        raz_compiler_rt_arena_destroy(relative);
+        raz_compiler_rt_arena_destroy(manifest);
+        return 0;
+    }
+    i64 root_length = path_dirname(manifest_path, manifest_path_length, root, 8192);
+    i64 result = path_join(root, root_length, relative, relative_length, output, capacity);
+    if (result <= 0 || raz_compiler_rt_path_exists_ascii(output, result) == 0) { result = -1; }
+    raz_compiler_rt_arena_destroy(root);
+    raz_compiler_rt_arena_destroy(relative);
+    raz_compiler_rt_arena_destroy(manifest);
+    return result;
+}
+
+fn project_web_output_index(i64 manifest_path, i64 manifest_path_length, i64 output, i64 capacity) -> i64 {
+    i64 root = raz_compiler_rt_arena_create(8192);
+    i64 dist = raz_compiler_rt_arena_create(8192);
+    if (root == 0 || dist == 0) { return -1; }
+    i64 root_length = path_dirname(manifest_path, manifest_path_length, root, 8192);
+    i64 dist_length = project_join_literal(root, root_length, "dist", dist, 8192);
+    i64 result = project_join_literal(dist, dist_length, "index.html", output, capacity);
+    raz_compiler_rt_arena_destroy(dist);
+    raz_compiler_rt_arena_destroy(root);
+    return result;
+}

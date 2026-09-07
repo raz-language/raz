@@ -16,12 +16,15 @@ def fail(message: str) -> None:
 
 
 def main() -> int:
-    transport = (ROOT / "compiler/src/raz_driver/src/registry_transport.rz").read_text(encoding="utf-8")
-    registry = (ROOT / "compiler/src/raz_driver/src/registry.rz").read_text(encoding="utf-8")
-    package = (ROOT / "compiler/src/raz_driver/src/package.rz").read_text(encoding="utf-8")
-    cli = (ROOT / "compiler/src/raz_driver/src/cli.rz").read_text(encoding="utf-8")
-    commands = (ROOT / "compiler/src/raz_driver/src/commands.rz").read_text(encoding="utf-8")
-    main_source = (ROOT / "compiler/src/raz_driver/src/compiler_main.rz").read_text(encoding="utf-8")
+    transport = (ROOT / "compiler/src/raz_driver/src/driver/registry_transport.rz").read_text(encoding="utf-8")
+    registry = (ROOT / "compiler/src/raz_driver/src/driver/registry.rz").read_text(encoding="utf-8")
+    resolver = (ROOT / "compiler/src/raz_driver/src/driver/registry_resolver.rz").read_text(encoding="utf-8")
+    registry_state = (ROOT / "compiler/src/raz_driver/src/driver/registry_state.rz").read_text(encoding="utf-8")
+    registry_tracking = (ROOT / "compiler/src/raz_driver/src/driver/registry_tracking.rz").read_text(encoding="utf-8")
+    package = (ROOT / "compiler/src/raz_driver/src/driver/package.rz").read_text(encoding="utf-8")
+    cli = (ROOT / "compiler/src/raz_driver/src/driver/cli.rz").read_text(encoding="utf-8")
+    commands = (ROOT / "compiler/src/raz_driver/src/driver/commands.rz").read_text(encoding="utf-8")
+    main_source = (ROOT / "compiler/src/raz_driver/src/driver/compiler_main.rz").read_text(encoding="utf-8")
 
     if f'string value = "{EXPECTED}";' not in transport:
         fail("could not locate registry_default_base literal")
@@ -44,19 +47,19 @@ def main() -> int:
         fail("ordinary project builds do not have an exact-lock dependency hydration preflight")
     if "package_registry_prepare_build(cli_manifest_path, cli_manifest_length)" not in main_source:
         fail("build/check/run/test do not automatically hydrate locked registry packages")
-    if "registry_fetch_lock_data(lock_data, data_length)" not in registry:
+    if "registry_fetch_lock_data(lock_data, data_length)" not in registry and "registry_fetch_lock_data(" not in resolver:
         fail("build preflight does not hydrate exact lockfile entries")
     if "registry_official_publish_metadata" not in registry or "registry_official_publish_requested" not in registry:
         fail("official publish metadata validation is missing")
-    if "old_length = raz_compiler_rt_read_ascii(fp, path_length, old, 1048576)" not in registry:
+    if "old_length = raz_compiler_rt_read_ascii(fp, path_length, old, 1048576)" not in resolver:
         fail("registry cache is not preserving existing dependency rows")
-    if "registry_project_state_prepare(0, fp, 20)" not in registry:
+    if "registry_project_state_prepare(0, fp, 20)" not in resolver:
         fail("registry cache is not using the canonical target/raz.cache path")
     if "bool official = argc == 3" not in package or "package_add_official_registry_command(alias, al, section_kind)" not in package:
         fail("raz add does not accept the one-argument official package form")
-    if "fn registry_bare_constraint(" not in registry or "bool same_name = al == nl" not in registry:
+    if "fn registry_bare_constraint(" not in registry_tracking or "bool same_name = al == nl" not in registry:
         fail("same-name official dependencies do not use compact manifest constraints")
-    if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/raz_driver/src/project.rz").read_text(encoding="utf-8"):
+    if "registry_bare_constraint(dependency, dependency_length)" not in (ROOT / "compiler/src/raz_driver/src/driver/project.rz").read_text(encoding="utf-8"):
         fail("project loader does not resolve compact registry constraints through raz.lock")
     if "prepared_submission = true" not in registry or 'cli_write_literal("Prepared ")' not in registry:
         fail("credential-free raz publish does not preserve PR-ready staging")

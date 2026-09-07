@@ -1,0 +1,190 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_driver::backend;
+
+public import forge::codegen;
+public import llvm::codegen;
+public import wasm::codegen;
+public import rxe::codegen;
+public import web::codegen;
+
+
+// Backend selection and dispatch. Frontend and MIR are deliberately backend-neutral.
+// Backend kind 0 is Forge; kind 1 is LLVM; kind 2 is WebAssembly; kind 3 is RXE. --opt is shared.
+// Forge remains the native default only on its production-parity x86-64
+// Windows/Linux hosts. The bundled Forge now has an experimental AArch64 ELF
+// encoder, but AArch64 and macOS hosts continue to default to LLVM until the
+// Forge AArch64 allocator/optimizer/bootstrap qualification gates are complete.
+fn backend_default() -> i64 {
+    i64 host_arch = raz_rt_host_arch();
+    i64 host_platform = raz_rt_host_platform();
+    if (host_arch == 1 && (host_platform == 1 || host_platform == 2)) {
+        return 0;
+    }
+    return 1;
+}
+
+fn backend_option_kind(i64 value, i64 length) -> i64 {
+    if (value == 0) {
+        return -1;
+    }
+    // --backend=forge
+    if (length == 15) {
+        string expected_forge = "--backend=forge";
+        i64 i = 0;
+        bool match_forge = true;
+
+        while (i < 15) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected_forge, i)) {
+                match_forge = false;
+            }
+            i += 1;
+        }
+        if (match_forge) {
+            return 0;
+        }
+    }
+    // --backend=llvm
+    if (length == 14) {
+        string expected_llvm = "--backend=llvm";
+        i64 i = 0;
+        bool match_llvm = true;
+
+        while (i < 14) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected_llvm, i)) {
+                match_llvm = false;
+            }
+            i += 1;
+        }
+        if (match_llvm) {
+            return 1;
+        }
+    }
+    // --backend=wasm
+    if (length == 14) {
+        string expected_wasm = "--backend=wasm";
+        i64 i = 0;
+        bool match_wasm = true;
+
+        while (i < 14) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected_wasm, i)) {
+                match_wasm = false;
+            }
+            i += 1;
+        }
+        if (match_wasm) {
+            return 2;
+        }
+    }
+    // --backend=rxe
+    if (length == 13) {
+        string expected_rxe = "--backend=rxe";
+        i64 i = 0;
+        bool match_rxe = true;
+
+        while (i < 13) {
+            if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(expected_rxe, i)) {
+                match_rxe = false;
+            }
+            i += 1;
+        }
+        if (match_rxe) {
+            return 3;
+        }
+    }
+    return -1;
+}
+
+fn backend_option_present(i64 value, i64 length) -> bool {
+    if (value == 0 || length < 10) {
+        return false;
+    }
+
+    string prefix = "--backend=";
+    i64 i = 0;
+
+    while (i < 10) {
+        if (raz_compiler_rt_arena_get(value, i) != compiler_literal_byte(prefix, i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn forge_native_option(i64 value, i64 length) -> bool {
+    if (value == 0 || length != 14) {
+        return false;
+    }
+    // --forge-native
+
+    string expected = "--forge-native";
+    i64 index = 0;
+
+    while (index < 14) {
+        if (raz_compiler_rt_arena_get(value, index) != compiler_literal_byte(expected, index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn forge_structured_only_option(i64 value, i64 length) -> bool {
+    if (value == 0 || length != 23) {
+        return false;
+    }
+    // --forge-structured-only
+
+    string expected = "--forge-structured-only";
+    i64 index = 0;
+
+    while (index < 23) {
+        if (raz_compiler_rt_arena_get(value, index) != compiler_literal_byte(expected, index)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn emit_backend_module(
+    i64 backend,
+    bool forge_native,
+    bool forge_structured_only,
+    LlvmTargetOptions& llvm_options,
+    Source& source,
+    HirModule& hir,
+    MirModule& mir,
+    i64 output_path,
+    i64 output_path_length,
+) -> bool {
+    if (backend == 0) {
+        i64 optimization = llvm_options.optimization_kind;
+
+        if (optimization < 0) {
+            optimization = 2;
+        }
+        return emit_forge_module(
+            source,
+            hir,
+            mir,
+            output_path,
+            output_path_length,
+            forge_native,
+            forge_structured_only,
+            optimization,
+        );
+    }
+    if (backend == 1) {
+        return emit_llvm_module(source, hir, mir, llvm_options, output_path, output_path_length);
+    }
+    if (backend == 2) {
+        return emit_wasm_module(source, hir, mir, output_path, output_path_length);
+    }
+    if (backend == 3) {
+        return emit_rxe_module(source, hir, mir, output_path, output_path_length);
+    }
+    return false;
+}

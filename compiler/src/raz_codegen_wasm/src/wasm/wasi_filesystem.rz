@@ -1,0 +1,809 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_wasm::wasi_filesystem;
+
+public import raz_codegen_wasm::cfg;
+public import raz_codegen_wasm::memory;
+public import raz_codegen_wasm::wasi_support;
+public import raz_codegen_wasm::writer;
+
+fn wasm_wasi_emit_find_preopen(CodegenWriter&mut body, i64 fd_local) {
+    // Preview1 does not promise that the first directory preopen is descriptor 3.
+    // Scan the host descriptor range and keep the first successful prestat.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 73);
+    // i32.lt_u
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 12);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    // i32.ge_u
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_find_named_preopen(CodegenWriter&mut body, i64 path_local, i64 length_local, i64 fd_local) {
+    // If a caller supplies a guest-visible mount path such as
+    // "/workspace/src/main.rz", match the named preopen "/workspace" and
+    // rewrite the path locals to "src/main.rz" before issuing path_* calls.
+    // The preopen name itself is materialized transiently at the current heap
+    // frontier; the frontier is not advanced, so routing never leaks memory.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    // fd >= 256 -> exhausted.
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    // Candidate block: any failed test falls through to fd++.
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    // fd_prestat_get(fd, &prestat@256).
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Empty names cannot establish a virtual prefix.
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // name_len > path_len cannot match.
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 73);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Temporarily grow memory so [heap_frontier, heap_frontier+name_len) is a
+    // valid scratch range, then restore the frontier before the host writes.
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 106);
+    wasm_u8(body, 36);
+    wasm_u32(body, 0);
+    wasm_memory_emit_ensure_capacity(body);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 107);
+    wasm_u8(body, 36);
+    wasm_u32(body, 0);
+    // fd_prestat_dir_name(fd, heap_frontier, name_len).
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 16);
+    wasm_u32(body, 18);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // scratch index @272 = 0.
+    wasm_u8(body, 65);
+    wasm_i64(body, 272);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    // Compare preopen name bytes to the leading path bytes.
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 35);
+    wasm_u32(body, 0);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 71);
+    wasm_u8(body, 13);
+    wasm_u32(body, 2);
+    wasm_u8(body, 65);
+    wasm_i64(body, 272);
+    wasm_wasi_emit_i32_load(body, 272);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_u8(body, 54);
+    wasm_u32(body, 2);
+    wasm_u32(body, 0);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    // Exact mount-name path resolves to the preopen root itself. Materialize
+    // "." in reserved scratch so Preview1 receives a non-empty relative path.
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, 280);
+    wasm_u8(body, 65);
+    wasm_i64(body, 46);
+    wasm_u8(body, 58);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 66);
+    wasm_i64(body, 280);
+    wasm_local_set(body, path_local);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_local_set(body, length_local);
+    wasm_u8(body, 12);
+    // Inside the exact-match if: depth 3 exits if + candidate + scan loop
+    // and lands at the outer scan block.
+    wasm_u32(body, 3);
+    wasm_u8(body, 11);
+    // Otherwise require a path-segment boundary after the mount name.
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 106);
+    wasm_u8(body, 45);
+    wasm_u32(body, 0);
+    wasm_u32(body, 0);
+    wasm_u8(body, 65);
+    wasm_i64(body, 47);
+    wasm_u8(body, 71);
+    wasm_u8(body, 13);
+    wasm_u32(body, 0);
+    // Strip "mount/" from the pointer/length pair in place.
+    wasm_local_get(body, path_local);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 173);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_u8(body, 124);
+    wasm_u8(body, 124);
+    wasm_local_set(body, path_local);
+    wasm_local_get(body, length_local);
+    wasm_wasi_emit_i32_load(body, 260);
+    wasm_u8(body, 173);
+    wasm_u8(body, 66);
+    wasm_i64(body, 1);
+    wasm_u8(body, 124);
+    wasm_u8(body, 125);
+    wasm_local_set(body, length_local);
+    // Success exits the outer scan block with fd_local naming the owner.
+    wasm_u8(body, 12);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_find_preopen_for_path(
+    CodegenWriter&mut body,
+    i64 path_local,
+    i64 length_local,
+    i64 fd_local,
+) {
+    // Resolve an existing relative path against every directory preopen instead
+    // of assuming the first host mount owns it. Scratch 64 holds filestat.
+    wasm_u8(body, 65);
+    wasm_i64(body, 3);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 2);
+    wasm_u8(body, 64);
+    wasm_u8(body, 3);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 13);
+    wasm_u32(body, 1);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 16);
+    wasm_u32(body, 17);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 0);
+    wasm_local_get(body, path_local);
+    wasm_u8(body, 167);
+    wasm_local_get(body, length_local);
+    wasm_u8(body, 167);
+    wasm_u8(body, 65);
+    wasm_i64(body, 64);
+    wasm_u8(body, 16);
+    wasm_u32(body, 11);
+    wasm_wasi_capture_errno(body);
+    wasm_u8(body, 69);
+    wasm_u8(body, 13);
+    wasm_u32(body, 2);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 1);
+    wasm_u8(body, 106);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 12);
+    wasm_u32(body, 0);
+    wasm_u8(body, 11);
+    wasm_u8(body, 11);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, 256);
+    wasm_u8(body, 79);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_local_set(body, fd_local);
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_resolve_preopen(
+    CodegenWriter&mut body,
+    i64 path_local,
+    i64 length_local,
+    i64 fd_local,
+    bool allow_missing,
+) {
+    // First preserve the fast path for already-relative guest paths.
+    wasm_wasi_emit_find_preopen_for_path(body, path_local, length_local, fd_local);
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    // If relative lookup failed, route an absolute/virtual guest path by its
+    // named preopen prefix and strip that prefix from the path locals.
+    wasm_wasi_emit_find_named_preopen(body, path_local, length_local, fd_local);
+    wasm_u8(body, 11);
+    if (!allow_missing) {
+        // Prefix routing establishes authority, but existing-path operations
+        // still verify that the stripped target exists beneath that preopen.
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_u8(body, 71);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, 0);
+        wasm_local_get(body, path_local);
+        wasm_u8(body, 167);
+        wasm_local_get(body, length_local);
+        wasm_u8(body, 167);
+        wasm_u8(body, 65);
+        wasm_i64(body, 64);
+        wasm_u8(body, 16);
+        wasm_u32(body, 11);
+        wasm_wasi_capture_errno(body);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_local_set(body, fd_local);
+        wasm_u8(body, 11);
+        wasm_u8(body, 11);
+    } else {
+        // A missing create target with no matching named mount falls back to the
+        // first directory capability, preserving existing relative-path behavior.
+        wasm_local_get(body, fd_local);
+        wasm_u8(body, 65);
+        wasm_i64(body, -1);
+        wasm_u8(body, 70);
+        wasm_u8(body, 4);
+        wasm_u8(body, 64);
+        wasm_wasi_emit_find_preopen(body, fd_local);
+        wasm_u8(body, 11);
+    }
+    wasm_local_get(body, fd_local);
+    wasm_u8(body, 65);
+    wasm_i64(body, -1);
+    wasm_u8(body, 70);
+    wasm_u8(body, 4);
+    wasm_u8(body, 64);
+    if (allow_missing) {
+        // Create operations only reach this point when the host exposed no
+        // directory capability at all.
+        wasm_wasi_set_last_error(body, 76);
+    } else {
+        // Existing-path operations had filesystem authority but found no target.
+        wasm_wasi_set_last_error(body, 44);
+    }
+    wasm_u8(body, 11);
+}
+
+fn wasm_wasi_emit_file_open_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    // local 3: oflags, local 4: fdflags, local 5: discovered preopen fd.
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 3);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 5, true);
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_set(&mut body, 4);
+    // Raz create bit 8 -> WASI O_CREAT=1.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 8);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    // Raz truncate bit 16 -> WASI O_TRUNC=8.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 16);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 8);
+    wasm_u8(&mut body, 114);
+    wasm_local_set(&mut body, 3);
+    wasm_u8(&mut body, 11);
+    // Raz append bit 4 -> WASI FDFLAG_APPEND=1.
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 4);
+    wasm_u8(&mut body, 131);
+    wasm_u8(&mut body, 80);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 64);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 1);
+    wasm_local_set(&mut body, 4);
+    wasm_u8(&mut body, 11);
+    // Open relative to the discovered directory preopen.
+    wasm_local_get(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 3);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 127);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 4);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 9);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_wasi_emit_i32_load(&mut body, 40);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_close_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 10);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 26);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_seek_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 12);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_tell_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 13);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_flush_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 14);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_file_eof_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 0);
+    // fd_tell(fd, &offset@40)
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 13);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    // fd_filestat_get(fd, &stat@64)
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 15);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 5);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 40);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 96);
+    wasm_u8(&mut body, 41);
+    wasm_u32(&mut body, 3);
+    wasm_u32(&mut body, 0);
+    wasm_u8(&mut body, 81);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_path_filestat_body(CodegenWriter&mut section, i64 mode) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    if (mode == 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, -1);
+    } else {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    if (mode == 0) {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, -1);
+    } else {
+        wasm_u8(&mut body, 66);
+        wasm_i64(&mut body, 0);
+    }
+    wasm_u8(&mut body, 5);
+    if (mode == 0) {
+        // __wasi_filestat_t.filesize is the u64 at byte offset 32.
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 96);
+        wasm_u8(&mut body, 41);
+        wasm_u32(&mut body, 3);
+        wasm_u32(&mut body, 0);
+    } else {
+        // __wasi_filestat_t.filetype is the byte at offset 16: directory=3, regular_file=4.
+        wasm_u8(&mut body, 65);
+        wasm_i64(&mut body, 80);
+        wasm_u8(&mut body, 45);
+        wasm_u32(&mut body, 0);
+        wasm_u32(&mut body, 0);
+        wasm_u8(&mut body, 65);
+        if (mode == 1) {
+            wasm_i64(&mut body, 4);
+        } else {
+            wasm_i64(&mut body, 3);
+        }
+        wasm_u8(&mut body, 70);
+        wasm_u8(&mut body, 173);
+    }
+    wasm_u8(&mut body, 11);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+
+fn wasm_wasi_emit_path_exists_body(CodegenWriter&mut section) -> bool {
+    CodegenWriter body;
+
+    codegen_writer_init_capacity(&mut body, 4096);
+    if (body.failed) {
+        return false;
+    }
+    wasm_u32(&mut body, 1);
+    wasm_u32(&mut body, 1);
+    wasm_u8(&mut body, 127);
+    wasm_wasi_emit_resolve_preopen(&mut body, 0, 1, 2, false);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, -1);
+    wasm_u8(&mut body, 70);
+    wasm_u8(&mut body, 4);
+    wasm_u8(&mut body, 126);
+    wasm_u8(&mut body, 66);
+    wasm_i64(&mut body, 0);
+    wasm_u8(&mut body, 15);
+    wasm_u8(&mut body, 11);
+    wasm_local_get(&mut body, 2);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 0);
+    wasm_local_get(&mut body, 0);
+    wasm_u8(&mut body, 167);
+    wasm_local_get(&mut body, 1);
+    wasm_u8(&mut body, 167);
+    wasm_u8(&mut body, 65);
+    wasm_i64(&mut body, 64);
+    wasm_u8(&mut body, 16);
+    wasm_u32(&mut body, 11);
+    wasm_wasi_capture_errno(&mut body);
+    wasm_u8(&mut body, 69);
+    wasm_u8(&mut body, 173);
+    wasm_u8(&mut body, 11);
+    wasm_u32(section, body.length);
+    wasm_writer_copy(section, &body);
+
+    bool success = !body.failed && !section.failed;
+
+    codegen_writer_destroy(&mut body);
+    return success;
+}
+

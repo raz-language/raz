@@ -24,7 +24,7 @@ for rel in required:
     if not (root / rel).is_file():
         problems.append(f'missing {rel}')
 pipeline = (root / 'compiler/src/raz_mir_opt/src/mir_opt/transform/pipeline.rz').read_text(encoding='utf-8')
-driver = (root / 'compiler/src/raz_driver/src/compiler_main.rz').read_text(encoding='utf-8')
+driver = (root / 'compiler/src/raz_driver/src/driver/compiler_main.rz').read_text(encoding='utf-8')
 verifier = (root / 'compiler/src/raz_mir/src/mir/verify/verifier.rz').read_text(encoding='utf-8')
 cfg = (root / 'compiler/src/raz_mir/src/mir/analysis/cfg.rz').read_text(encoding='utf-8')
 for needle in ['simplify_mir_cfg', 'propagate_mir_constants', 'propagate_mir_copies', 'eliminate_mir_dead_values']:

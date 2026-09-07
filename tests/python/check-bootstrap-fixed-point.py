@@ -29,6 +29,8 @@ checks = {
     "self-host generations use release profile": 'generation_args = [\n            "build",\n            "--release",' in bootstrap and 'verify_args = [\n                "build", "--release",' in bootstrap,
     "normal bootstrap does not force compiler phase tracing": 'RAZ_COMPILER_PHASE_TRACE' not in bootstrap,
     "self-host stages relocatable Forge support": "shutil.copy2(bridge, lib_dir / bridge.name)" in bootstrap and "shutil.copy2(forge, lib_dir / forge.name)" in bootstrap,
+    "canonical modular compiler is immediately self-contained": "stage_compiler_runtime_support(qualified_compiler, runtime, bridge, forge, host_build, oblink)" in bootstrap,
+    "Stage-0 writes portable cache marker": "write_stage0_portable_cache_marker(host_build)" in bootstrap,
     "legacy bootstrap scratch is migrated away": 'BOOTSTRAP_LEGACY_SCRATCH_NAMES = {"host-source-order.txt", "stage1-diagnostic.txt"}' in bootstrap and 'remove_legacy_bootstrap_scratch(build_dir)' in bootstrap,
     "release helper uses retained production compiler": "qualification / 'release' / 'bin'" in release and "repro-1" not in release,
     "retained compiler uses public raz name": 'retain_user_facing_compiler(staged_profile)' in bootstrap and 'final_compiler = qualification / "release" / "bin" / f"raz{EXE}"' in bootstrap,

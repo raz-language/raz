@@ -11,11 +11,13 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,7 @@ OBJ = ".obj" if IS_WINDOWS else ".o"
 
 BOOTSTRAP_LEGACY_SCRATCH_NAMES = {"host-source-order.txt", "stage1-diagnostic.txt"}
 PROFILE_OUTPUT_DIRECTORIES = ("bin", "lib", "obj", "ir", "modules", "packages")
+STAGE0_PORTABLE_DIGEST = ".raz-stage0-portable.sha256"
 
 
 def ensure_profile_output_layout(project_root: Path, profile: str) -> dict[str, Path]:
@@ -586,37 +589,143 @@ def choose_compiler(build: Path, env: dict[str, str], scratch: Path) -> tuple[st
     details = "\n\n".join(diagnostics)
     raise RuntimeError(f"No working C++20 compiler was found.\n\n{details}".rstrip())
 
-def find_artifact(root: Path, names: list[str]) -> Path:
+def find_artifact(root: Path, names: list[str], avoid: Path | None = None) -> Path:
+    """Locate the first of `names` below `root`, preferring hits outside `avoid`.
+
+    `avoid` names the staging directory that support archives get copied into.
+    Those copies live inside the tree this search walks, so a build that already
+    staged once would otherwise rediscover the stale copy in preference to the
+    archive CMake just rebuilt. A relocated tree has only the staged copy, so an
+    empty preferred set still falls back to it.
+    """
     for name in names:
-        hits = list(root.rglob(name))
+        hits = [hit.resolve() for hit in root.rglob(name)]
+        if avoid is not None:
+            hits = [hit for hit in hits if hit.parent != avoid] or hits
         if hits:
-            return hits[0].resolve()
+            return hits[0]
     raise RuntimeError(f"Could not find any of {names} below {root}.")
 
 
-def find_optional_artifact(root: Path, names: list[str]) -> Path | None:
+def find_optional_artifact(root: Path, names: list[str], avoid: Path | None = None) -> Path | None:
     try:
-        return find_artifact(root, names)
+        return find_artifact(root, names, avoid)
     except RuntimeError:
         return None
 
 
-def compiler_modules() -> list[Path]:
-    """Discover the canonical Raz compiler source set without ordering metadata.
+def _canonical_compiler_source_files(include_non_rz: bool = False) -> list[Path]:
+    """Return the one root entry plus files owned by nested ``raz_*`` packages.
 
-    Semantic imports, not physical file order, define the production compiler.
-    Keep this helper intentionally boring: it exists for status/reporting and
-    reproducibility workspace population only, never to impose compilation order.
+    ``compiler/src`` is both the executable package's source directory and the
+    container for rustc-style path-dependency packages.  A previous migration
+    briefly left the old monolithic ``backend/``, ``driver/``, ``frontend/``,
+    ``hir/``, and ``mir/`` trees beside the new ``raz_*`` packages.  Recursively
+    scanning all of ``compiler/src`` therefore compiled both implementations and
+    injected the same runtime extern declarations twice during Stage-0.
+
+    Keep bootstrap's canonical input set explicit: ``src/main.rz`` belongs to the
+    root executable, and every nested compiler package must be named ``raz_*`` and
+    own a ``raz.toml`` manifest.  Other top-level directories are not semantic
+    inputs to the production compiler.
     """
-    compiler_root = ROOT / "compiler"
-    modules = sorted(
-        path for path in compiler_root.rglob("*.rz")
-        if "target" not in path.parts
-    )
-    entry = compiler_root / "src" / "main.rz"
-    if not modules or entry not in modules:
+    source_root = ROOT / "compiler" / "src"
+    entry = source_root / "main.rz"
+    if not entry.is_file():
         raise RuntimeError("compiler/src/main.rz is missing from the production compiler package graph.")
-    return modules
+
+    files: list[Path] = [entry]
+    for package_root in sorted(source_root.iterdir()):
+        if not package_root.is_dir() or not package_root.name.startswith("raz_"):
+            continue
+        if not (package_root / "raz.toml").is_file():
+            continue
+        for path in sorted(package_root.rglob("*")):
+            if not path.is_file() or "target" in path.parts:
+                continue
+            if include_non_rz or path.suffix == ".rz":
+                files.append(path)
+    return files
+
+
+def compiler_modules() -> list[Path]:
+    """Discover only the canonical modular Raz compiler source set."""
+    return _canonical_compiler_source_files(include_non_rz=False)
+
+
+def _stage0_source_digest() -> str:
+    """Fingerprint the native bootstrap/toolchain sources independently of location."""
+    digest = hashlib.sha256()
+    roots = [ROOT / "CMakeLists.txt", ROOT / "CMakePresets.json", ROOT / "cmake", ROOT / "src"]
+    files: list[Path] = []
+    for item in roots:
+        if item.is_file():
+            files.append(item)
+        elif item.is_dir():
+            files.extend(path for path in item.rglob("*") if path.is_file())
+    for path in sorted(set(files)):
+        if any(part in {"build", "target", ".git", "__pycache__"} for part in path.parts):
+            continue
+        relative = path.relative_to(ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "little"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def stage0_portable_cache_matches_sources(host_build: Path) -> bool:
+    marker = host_build / STAGE0_PORTABLE_DIGEST
+    if not marker.is_file():
+        return False
+    try:
+        return marker.read_text(encoding="utf-8").strip() == _stage0_source_digest()
+    except OSError:
+        return False
+
+
+def write_stage0_portable_cache_marker(host_build: Path) -> None:
+    (host_build / STAGE0_PORTABLE_DIGEST).write_text(_stage0_source_digest() + "\n", encoding="utf-8")
+
+
+def staged_runtime_link_dependencies(compiler_exe: Path) -> list[str]:
+    """Return relocatable runtime provider libraries staged beside a compiler."""
+    lib_dir = compiler_exe.parent.parent / "lib"
+    if IS_WINDOWS:
+        ssl_names = ("raz_runtime_ssl.lib", "raz_runtime_ssl.a")
+        crypto_names = ("raz_runtime_crypto.lib", "raz_runtime_crypto.a")
+    else:
+        ssl_names = ("libraz_runtime_ssl.a", "libraz_runtime_ssl.so")
+        crypto_names = ("libraz_runtime_crypto.a", "libraz_runtime_crypto.so")
+    ssl = next((lib_dir / name for name in ssl_names if (lib_dir / name).is_file()), None)
+    crypto = next((lib_dir / name for name in crypto_names if (lib_dir / name).is_file()), None)
+    if ssl is None and crypto is None:
+        return []
+    if ssl is None or crypto is None:
+        raise RuntimeError(f"Portable Stage-0 runtime dependency set is incomplete under {lib_dir}.")
+    return [str(ssl), str(crypto)]
+
+
+def resolve_cached_cxx_or_fallback(cached: str, env: dict[str, str], scratch: Path) -> str:
+    """Resolve a cached host compiler after workspace relocation without touching CMake state."""
+    candidates = [cached, Path(cached).name if cached else ""]
+    if _env_get(env, "CXX"):
+        candidates.append(_env_get(env, "CXX") or "")
+    candidates += ["clang-cl.exe", "cl.exe", "clang++.exe"] if IS_WINDOWS else ["clang++", "g++", "c++"]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = _resolve_executable(candidate, env)
+        if not resolved:
+            continue
+        key = os.path.normcase(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        ok, _ = _test_cxx20_toolchain(resolved, scratch, env)
+        if ok:
+            return resolved
+    raise RuntimeError("No working C++ linker fallback is available for the retained Stage-0 toolchain.")
 
 
 def stage0_cache_matches_workspace(host_build: Path) -> bool:
@@ -645,13 +754,13 @@ def cached_stage0_artifacts(host_build: Path) -> dict[str, Path] | None:
     A normal bootstrap therefore reuses an existing Stage-0 build verbatim.
     `--clean` or `--rebuild-stage0` is the explicit opt-in path for rebuilding it.
     """
-    # CMake bakes absolute source/build paths into the Stage-0 binaries, most
-    # importantly the runtime/Forge archive paths used by recursive native
-    # links. A packaged workspace may legitimately retain this expensive host
-    # build, but after the workspace is moved those embedded paths are no longer
-    # reusable. Treat relocation as a cache miss so bootstrap regenerates Stage
-    # 0 in its new location instead of attempting links against the old tree.
-    if not stage0_cache_matches_workspace(host_build):
+    # CMake/Ninja metadata is inherently workspace-local, but the Stage-0
+    # binaries themselves are portable once their runtime/Forge support has been
+    # staged beside raz-stage0. Accept a relocated host tree only when its
+    # location-independent source digest proves that portable artifact set is
+    # current; a normal in-place CMake cache remains reusable without the marker.
+    relocated = not stage0_cache_matches_workspace(host_build)
+    if relocated and not stage0_portable_cache_matches_sources(host_build):
         return None
 
     required: dict[str, list[str]] = {
@@ -664,15 +773,29 @@ def cached_stage0_artifacts(host_build: Path) -> dict[str, Path] | None:
     if IS_WINDOWS:
         required["oblink"] = [f"oblink{EXE}"]
     found: dict[str, Path] = {}
+    staging_lib: Path | None = None
     for key, names in required.items():
-        artifact = find_optional_artifact(host_build, names)
+        artifact = find_optional_artifact(host_build, names, avoid=staging_lib)
         if artifact is None or not artifact.is_file():
             return None
         found[key] = artifact
+        if key == "driver":
+            # Staging puts the support archives in the profile's lib directory
+            # beside the driver, which is inside the tree searched here. Skip it
+            # so an in-place cache keeps resolving the canonical CMake outputs.
+            staging_lib = artifact.parent.parent / "lib"
 
-    # Optional runtime providers are recovered from CMakeCache.txt when this
-    # cached host toolchain is reused; no generated link-dependency manifest
-    # participates in the cache ABI.
+    if relocated:
+        lib_dir = found["driver"].parent.parent / "lib"
+        required_staged = [found["runtime"].name, found["bridge"].name, found["forge"].name]
+        for name in required_staged:
+            if not (lib_dir / name).is_file():
+                return None
+        if IS_WINDOWS and not (found["driver"].parent / f"oblink{EXE}").is_file():
+            return None
+
+    # Optional runtime providers are staged beside the compiler for relocated
+    # reuse; an in-place CMake cache can still recover the canonical originals.
     return found
 
 
@@ -699,14 +822,12 @@ def _canonical_compiler_inputs() -> list[Path]:
         if path.is_file():
             inputs.append(path)
     # The compiler mirrors rustc's workspace shape: a tiny binary plus focused
-    # compiler packages under compiler/src/raz_*.  Bootstrap copies only semantic
-    # inputs, never package target directories.
-    source_root = root / "src"
-    inputs.extend(sorted(
-        path for path in source_root.rglob("*")
-        if path.is_file() and "target" not in path.parts
-    ))
-    return inputs
+    # path-dependency packages under compiler/src/raz_*.  Do not recursively copy
+    # arbitrary sibling directories from compiler/src: stale monolithic compiler
+    # trees there would become root-package modules and collide with the real
+    # package interfaces during Stage-0.
+    inputs.extend(_canonical_compiler_source_files(include_non_rz=True))
+    return sorted(set(inputs))
 
 
 def _copy_compiler_project_inputs(build_dir: Path, copy_function=shutil.copy2) -> None:
@@ -819,6 +940,165 @@ def _prepare_stage0_middle_compat(compiler_project: Path) -> None:
     shutil.rmtree(seed_middle, ignore_errors=True)
     (seed_middle / "src").mkdir(parents=True, exist_ok=True)
     shutil.copytree(seed_hir / "src" / "hir", seed_middle / "src" / "hir")
+
+    # Canonical HIR keeps focused semantic subsystems in sibling modules. Frozen
+    # Stage-0 predates reliable sibling-symbol propagation inside the merged middle
+    # package, so fold those implementations back into their historical owners only
+    # in this disposable compatibility view.
+    semantic = seed_middle / "src" / "hir" / "semantic"
+    statements = semantic / "statements.rz"
+    statement_parts = (semantic / "statement_support.rz", semantic / "match_statements.rz")
+    if statements.is_file() and all(path.is_file() for path in statement_parts):
+        statements_text = statements.read_text(encoding="utf-8")
+        statements_text = statements_text.replace("public import raz_hir::semantic::statement_support;\n", "")
+        statements_text = statements_text.replace("public import raz_hir::semantic::match_statements;\n", "")
+        statements_text = statements_text.rstrip()
+        for part in statement_parts:
+            part_text = part.read_text(encoding="utf-8")
+            marker = part_text.find("\n\n", part_text.find("namespace "))
+            if marker < 0:
+                raise RuntimeError(f"Could not prepare Stage-0 HIR statement compatibility view: {part.name}")
+            folded_body = part_text[marker + 2 :]
+            folded_body = "\n".join(
+                line for line in folded_body.splitlines()
+                if not line.startswith("import ") and not line.startswith("public import ")
+            )
+            statements_text += (
+                f"\n\n// Stage-0 compatibility: folded {part.name}.\n"
+                + folded_body.rstrip()
+            )
+            part.unlink()
+        statements.write_text(statements_text + "\n", encoding="utf-8")
+
+    comptime = semantic / "comptime.rz"
+    comptime_eval = semantic / "comptime_eval.rz"
+    if comptime.is_file() and comptime_eval.is_file():
+        comptime_text = comptime.read_text(encoding="utf-8")
+        comptime_text = comptime_text.replace("public import raz_hir::semantic::comptime_eval;\n", "")
+        part_text = comptime_eval.read_text(encoding="utf-8")
+        marker = part_text.find("\n\n", part_text.find("namespace "))
+        if marker < 0:
+            raise RuntimeError("Could not prepare Stage-0 HIR comptime compatibility view")
+        folded_body = part_text[marker + 2 :]
+        folded_body = "\n".join(
+            line for line in folded_body.splitlines()
+            if not line.startswith("import ") and not line.startswith("public import ")
+        )
+        # Evaluator definitions must precede the parsing/orchestration functions that
+        # call them, so place the folded body immediately before canonical comptime.
+        header_end = comptime_text.find("\n\n", comptime_text.find("namespace "))
+        if header_end < 0:
+            raise RuntimeError("Could not locate Stage-0 comptime namespace header")
+        prefix = comptime_text[: header_end + 2]
+        suffix = comptime_text[header_end + 2 :]
+        comptime.write_text(
+            prefix
+            + "public import raz_hir::traits::solver;\n\n"
+            + "// Stage-0 compatibility: folded comptime_eval.rz.\n"
+            + folded_body.rstrip()
+            + "\n\n"
+            + suffix.lstrip(),
+            encoding="utf-8",
+        )
+        comptime_eval.unlink()
+
+    expressions = semantic / "expressions.rz"
+    expression_support = semantic / "expression_support.rz"
+    expression_operators = semantic / "expression_operators.rz"
+    expression_calls = semantic / "expression_calls.rz"
+    expression_postfix = semantic / "expression_postfix.rz"
+    if (
+        expressions.is_file() and
+        expression_support.is_file() and
+        expression_operators.is_file() and
+        expression_calls.is_file() and
+        expression_postfix.is_file()
+    ):
+        expressions_text = expressions.read_text(encoding="utf-8")
+        expressions_text = expressions_text.replace("public import raz_hir::semantic::expression_support;\n", "")
+        expressions_text = expressions_text.replace("public import raz_hir::semantic::expression_operators;\n", "")
+        expressions_text = expressions_text.replace("public import raz_hir::semantic::expression_calls;\n", "")
+        expressions_text = expressions_text.replace("public import raz_hir::semantic::expression_postfix;\n", "")
+
+        def folded_expression_body(path: Path) -> str:
+            part_text = path.read_text(encoding="utf-8")
+            marker = part_text.find("\n\n", part_text.find("namespace "))
+            if marker < 0:
+                raise RuntimeError(f"Could not prepare Stage-0 HIR expression compatibility view: {path.name}")
+            return "\n".join(
+                line for line in part_text[marker + 2 :].splitlines()
+                if not line.startswith("import ") and not line.startswith("public import ")
+            ).strip()
+
+        header_end = expressions_text.find("\n\n", expressions_text.find("namespace "))
+        parse_expression = expressions_text.find("fn hir_parse_expression(")
+        if header_end < 0 or parse_expression < 0:
+            raise RuntimeError("Could not locate Stage-0 expression compatibility insertion points")
+        prefix = expressions_text[: header_end + 2]
+        body = expressions_text[header_end + 2 : parse_expression]
+        tail = expressions_text[parse_expression:]
+        expressions.write_text(
+            prefix
+            + "// Stage-0 compatibility: folded expression_support.rz.\n"
+            + folded_expression_body(expression_support)
+            + "\n\n"
+            + body.lstrip()
+            + "\n// Stage-0 compatibility: folded expression_operators.rz.\n"
+            + folded_expression_body(expression_operators)
+            + "\n\n// Stage-0 compatibility: folded expression_calls.rz.\n"
+            + folded_expression_body(expression_calls)
+            + "\n\n// Stage-0 compatibility: folded expression_postfix.rz.\n"
+            + folded_expression_body(expression_postfix)
+            + "\n\n"
+            + tail.lstrip(),
+            encoding="utf-8",
+        )
+        expression_support.unlink()
+        expression_operators.unlink()
+        expression_calls.unlink()
+        expression_postfix.unlink()
+
+    ownership = semantic / "ownership.rz"
+    ownership_paths = semantic / "ownership_paths.rz"
+    ownership_flow = semantic / "ownership_flow.rz"
+    if ownership.is_file() and ownership_paths.is_file() and ownership_flow.is_file():
+        ownership_text = ownership.read_text(encoding="utf-8")
+        ownership_text = ownership_text.replace("public import raz_hir::semantic::ownership_paths;\n", "")
+        ownership_text = ownership_text.replace("public import raz_hir::semantic::ownership_flow;\n", "")
+
+        def folded_ownership_body(path: Path) -> str:
+            part_text = path.read_text(encoding="utf-8")
+            marker = part_text.find("\n\n", part_text.find("namespace "))
+            if marker < 0:
+                raise RuntimeError(f"Could not prepare Stage-0 HIR ownership compatibility view: {path.name}")
+            return "\n".join(
+                line for line in part_text[marker + 2 :].splitlines()
+                if not line.startswith("import ") and not line.startswith("public import ")
+            ).strip()
+
+        # Path helpers are used by both the canonical ownership body and the flow
+        # analysis, so define them before either consumer in the frozen view. Flow
+        # analysis may remain last because its public entry point is consumed later
+        # by comptime/HIR orchestration.
+        header_end = ownership_text.find("\n\n", ownership_text.find("namespace "))
+        if header_end < 0:
+            raise RuntimeError("Could not locate Stage-0 ownership namespace header")
+        prefix = ownership_text[: header_end + 2]
+        suffix = ownership_text[header_end + 2 :]
+        ownership.write_text(
+            prefix
+            + "// Stage-0 compatibility: folded ownership_paths.rz.\n"
+            + folded_ownership_body(ownership_paths)
+            + "\n\n"
+            + suffix.rstrip()
+            + "\n\n// Stage-0 compatibility: folded ownership_flow.rz.\n"
+            + folded_ownership_body(ownership_flow)
+            + "\n",
+            encoding="utf-8",
+        )
+        ownership_paths.unlink()
+        ownership_flow.unlink()
+
     shutil.copytree(seed_mir / "src" / "mir", seed_middle / "src" / "mir")
     if seed_borrowck.is_dir():
         shutil.copytree(seed_borrowck / "src" / "borrowck", seed_middle / "src" / "borrowck")
@@ -852,6 +1132,18 @@ def _prepare_stage0_middle_compat(compiler_project: Path) -> None:
             continue
         for line in lib.read_text(encoding="utf-8").splitlines():
             if line.startswith("public import " + old_prefix):
+                if package == seed_hir and (
+                    "semantic::statement_support;" in line or
+                    "semantic::match_statements;" in line or
+                    "semantic::comptime_eval;" in line or
+                    "semantic::ownership_paths;" in line or
+                    "semantic::ownership_flow;" in line or
+                    "semantic::expression_support;" in line or
+                    "semantic::expression_operators;" in line or
+                    "semantic::expression_calls;" in line or
+                    "semantic::expression_postfix;" in line
+                ):
+                    continue
                 exports.append(line.replace(old_prefix, new_prefix))
 
     (seed_middle / "src" / "lib.rz").write_text(
@@ -878,7 +1170,7 @@ def _prepare_stage0_middle_compat(compiler_project: Path) -> None:
     shutil.rmtree(compiler_project / "src" / "raz_query", ignore_errors=True)
 
     for package_name in (
-        "raz_codegen_forge", "raz_codegen_llvm", "raz_codegen_wasm",
+        "raz_codegen_common", "raz_codegen_forge", "raz_codegen_llvm", "raz_codegen_wasm",
         "raz_codegen_rxe", "raz_codegen_web", "raz_driver",
     ):
         manifest = compiler_project / "src" / package_name / "raz.toml"
@@ -906,13 +1198,14 @@ def _prepare_stage0_middle_compat(compiler_project: Path) -> None:
 def _prepare_stage0_native_codegen_compat(compiler_project: Path) -> None:
     """Merge canonical Forge+LLVM packages only in the frozen Stage-0 view.
 
-    Stage-0 cannot describe a public package interface containing a type owned
-    by another package (LLVM's interface mentions ForgeWriter).  Canonical Raz
-    keeps Forge and LLVM separate; the disposable seed sees one native-codegen
-    package and the Raz-owned self-host immediately restores the real graph.
+    Stage-0 cannot reliably compose the full canonical native-backend package
+    interfaces. Canonical Raz keeps Forge and LLVM as sibling packages sharing
+    raz_codegen_common; the disposable seed sees one native-codegen package and
+    the Raz-owned self-host immediately restores the real graph.
     """
     seed_forge = compiler_project / "src" / "raz_codegen_forge"
     seed_llvm = compiler_project / "src" / "raz_codegen_llvm"
+    seed_common = compiler_project / "src" / "raz_codegen_common"
     seed_native = compiler_project / "src" / "raz_codegen_native"
     if not seed_forge.is_dir() or not seed_llvm.is_dir():
         return
@@ -921,11 +1214,14 @@ def _prepare_stage0_native_codegen_compat(compiler_project: Path) -> None:
     (seed_native / "src").mkdir(parents=True, exist_ok=True)
     shutil.copytree(seed_forge / "src" / "forge", seed_native / "src" / "forge")
     shutil.copytree(seed_llvm / "src" / "llvm", seed_native / "src" / "llvm")
+    if seed_common.is_dir():
+        shutil.copytree(seed_common / "src" / "codegen_common", seed_native / "src" / "common")
 
     for source_file in (seed_native / "src").rglob("*.rz"):
         text = source_file.read_text(encoding="utf-8")
         text = text.replace("raz_codegen_forge::", "raz_codegen_native::forge::")
         text = text.replace("raz_codegen_llvm::", "raz_codegen_native::llvm::")
+        text = text.replace("raz_codegen_common::", "raz_codegen_native::common::")
         text = text.replace("public import forge::", "public import raz_codegen_native::forge::")
         text = text.replace("import forge::", "import raz_codegen_native::forge::")
         source_file.write_text(text, encoding="utf-8")
@@ -948,6 +1244,10 @@ def _prepare_stage0_native_codegen_compat(compiler_project: Path) -> None:
         "public import frontend::parser;\n"
         "public import middle::hir::core::model;\n"
         "public import middle::mir::core::model;\n"
+        "public import raz_codegen_native::common::writer;\n"
+        "public import raz_codegen_native::common::abi;\n"
+        "public import raz_codegen_native::common::analysis;\n"
+        "public import raz_codegen_native::common::symbols;\n"
         + "\n".join(exports) + "\n",
         encoding="utf-8",
     )
@@ -978,6 +1278,191 @@ def _prepare_stage0_native_codegen_compat(compiler_project: Path) -> None:
         text = text.replace("import llvm::", "import native::llvm::")
         source_file.write_text(text, encoding="utf-8")
 
+
+
+def _prepare_stage0_driver_project_compat(compiler_project: Path) -> None:
+    """Fold newer split driver modules only in the frozen Stage-0 seed view.
+
+    Canonical/self-host Raz keeps project policy and registry version/index helpers
+    in focused modules. Frozen Stage-0 does not reliably propagate newly split
+    sibling symbols through the raz_driver package re-export, so the disposable
+    seed view restores the historical co-located shape without changing canonical
+    source.
+    """
+    driver_root = compiler_project / "src" / "raz_driver" / "src"
+    driver_src = driver_root / "driver"
+    project = driver_src / "project.rz"
+    native = driver_src / "project_native.rz"
+    web_manifest = driver_src / "project_web_manifest.rz"
+    if not project.is_file() or not native.is_file() or not web_manifest.is_file():
+        return
+
+    project_text = project.read_text(encoding="utf-8")
+    # Stage-0 does not reliably forward the nested native package's writer
+    # re-export through raz_driver::backend/host_support. Make that dependency
+    # explicit only in the compatibility view for modules that use ForgeWriter.
+    if "public import native::forge::writer;" not in project_text:
+        project_text = project_text.replace(
+            "public import raz_driver::path;\n",
+            "public import raz_driver::path;\npublic import native::forge::writer;\n",
+            1,
+        )
+    incremental = driver_src / "incremental.rz"
+    incremental_text = incremental.read_text(encoding="utf-8")
+    if "public import native::forge::writer;" not in incremental_text:
+        incremental_text = incremental_text.replace(
+            "public import raz_driver::host_support;\n",
+            "public import raz_driver::host_support;\npublic import native::forge::writer;\n",
+            1,
+        )
+        incremental.write_text(incremental_text, encoding="utf-8")
+
+    def implementation_body(path: Path, landmark: str) -> str:
+        text = path.read_text(encoding="utf-8")
+        start = text.find(landmark)
+        if start < 0:
+            raise RuntimeError(f"Could not prepare Stage-0 project compatibility view: {path.name}")
+        return text[start:].rstrip() + "\n"
+
+    web_body = implementation_body(web_manifest, "fn project_copy_quoted_value(")
+    native_body = implementation_body(native, "struct ProjectNativeBuild")
+    project.write_text(
+        project_text.rstrip()
+        + "\n\n// Stage-0 compatibility: folded web manifest module.\n"
+        + web_body
+        + "\n// Stage-0 compatibility: folded native project module.\n"
+        + native_body,
+        encoding="utf-8",
+    )
+    web_manifest.unlink()
+    native.unlink()
+
+    driver_lib = driver_root / "lib.rz"
+    lib_text = driver_lib.read_text(encoding="utf-8")
+    lib_text = lib_text.replace("public import raz_driver::project_native;\n", "")
+    lib_text = lib_text.replace("public import raz_driver::project_web_manifest;\n", "")
+
+    registry = driver_src / "registry.rz"
+    registry_parts = (
+        driver_src / "registry_semver.rz",
+        driver_src / "registry_support.rz",
+        driver_src / "registry_index.rz",
+        driver_src / "registry_state.rz",
+        driver_src / "registry_tracking.rz",
+        driver_src / "registry_resolver.rz",
+    )
+    if registry.is_file() and all(path.is_file() for path in registry_parts):
+        registry_text = registry.read_text(encoding="utf-8").rstrip()
+        for part in registry_parts:
+            part_text = part.read_text(encoding="utf-8")
+            marker = part_text.find("\n\n", part_text.find("namespace "))
+            if marker < 0:
+                raise RuntimeError(f"Could not prepare Stage-0 registry compatibility view: {part.name}")
+            folded_body = part_text[marker + 2 :]
+            folded_body = "\n".join(
+                line for line in folded_body.splitlines()
+                if not line.startswith("import ") and not line.startswith("public import ")
+            )
+            registry_text += (
+                f"\n\n// Stage-0 compatibility: folded {part.name}.\n"
+                + folded_body.rstrip()
+            )
+            part.unlink()
+        registry.write_text(registry_text + "\n", encoding="utf-8")
+        for module in ("registry_semver", "registry_support", "registry_index", "registry_state", "registry_tracking", "registry_resolver"):
+            lib_text = lib_text.replace(f"public import raz_driver::{module};\n", "")
+
+    cli = driver_src / "cli.rz"
+    cli_parts = (driver_src / "cli_support.rz", driver_src / "cli_help.rz")
+    if cli.is_file() and all(path.is_file() for path in cli_parts):
+        cli_text = cli.read_text(encoding="utf-8")
+        cli_text = cli_text.replace("public import raz_driver::cli_support;\n", "")
+        cli_text = cli_text.replace("public import raz_driver::cli_help;\n", "")
+        cli_text = cli_text.rstrip()
+        for part in cli_parts:
+            part_text = part.read_text(encoding="utf-8")
+            marker = part_text.find("\n\n", part_text.find("namespace "))
+            if marker < 0:
+                raise RuntimeError(f"Could not prepare Stage-0 CLI compatibility view: {part.name}")
+            folded_body = part_text[marker + 2 :]
+            folded_body = "\n".join(
+                line for line in folded_body.splitlines()
+                if not line.startswith("import ") and not line.startswith("public import ")
+            )
+            cli_text += (
+                f"\n\n// Stage-0 compatibility: folded {part.name}.\n"
+                + folded_body.rstrip()
+            )
+            part.unlink()
+        cli.write_text(cli_text + "\n", encoding="utf-8")
+        for module in ("cli_support", "cli_help"):
+            lib_text = lib_text.replace(f"public import raz_driver::{module};\n", "")
+
+        # web_diagnostics is a focused canonical module, but the frozen Stage-0
+        # compatibility view folds cli_support into cli.rz. Point the disposable
+        # seed module at that folded public surface so its diagnostic writer
+        # remains resolvable without changing the canonical package graph.
+        web_diagnostics = driver_src / "web_diagnostics.rz"
+        if web_diagnostics.is_file():
+            diagnostics_text = web_diagnostics.read_text(encoding="utf-8")
+            diagnostics_text = diagnostics_text.replace(
+                "public import raz_driver::cli_support;\n",
+                "public import raz_driver::cli;\n",
+                1,
+            )
+            web_diagnostics.write_text(diagnostics_text, encoding="utf-8")
+
+    # Frozen Stage-0 also cannot reliably resolve the browser-host bitmap helper
+    # through the stubbed web dependency from a newly split driver module. The
+    # seed never executes web emission, so use a local signature-compatible helper
+    # only in this disposable compatibility view.
+    web_host_prune = driver_src / "web_host_prune.rz"
+    if web_host_prune.is_file():
+        prune_text = web_host_prune.read_text(encoding="utf-8")
+        prune_text = prune_text.replace("import web::browser_host_js;\n", "", 1)
+        seed_helper = (
+            "\nfn web_browser_import_enabled(i64 import_mask, i64 import_mask_high, i64 logical_import) -> bool { return false; }\n"
+        )
+        marker = "// Static-first pages write a marker per browser host binding."
+        if seed_helper.strip() not in prune_text and marker in prune_text:
+            prune_text = prune_text.replace(marker, seed_helper + "\n" + marker, 1)
+        web_host_prune.write_text(prune_text, encoding="utf-8")
+
+    driver_lib.write_text(lib_text, encoding="utf-8")
+
+
+
+def _flatten_stage0_seed_package_sources(compiler_project: Path) -> None:
+    """Present newly nested compiler packages in the flat shape frozen Stage-0 understands.
+
+    Canonical compiler packages keep ``src/lib.rz`` plus implementation modules in
+    a nested directory.  The frozen C++ Stage-0 predates that package-source
+    layout and discovers package modules only directly beneath ``source``.  Flatten
+    only the disposable bootstrap view; canonical/self-host sources remain nested.
+    """
+    packages = (
+        ("raz_driver", "driver"),
+        ("raz_lexer", "lexer"),
+        ("raz_parser", "parser"),
+    )
+    for package_name, implementation_dir in packages:
+        source_root = compiler_project / "src" / package_name / "src"
+        nested_root = source_root / implementation_dir
+        if not nested_root.is_dir():
+            continue
+        for source in sorted(nested_root.rglob("*.rz")):
+            relative = source.relative_to(nested_root)
+            if len(relative.parts) != 1:
+                raise RuntimeError(
+                    f"Frozen Stage-0 compatibility cannot flatten nested module path: {source}"
+                )
+            destination = source_root / source.name
+            if destination.exists():
+                raise RuntimeError(
+                    f"Frozen Stage-0 compatibility module collision: {destination}"
+                )
+            source.replace(destination)
+        shutil.rmtree(nested_root)
 
 def prepare_seed_compiler_project(build_dir: Path) -> None:
     """Refresh seed sources while preserving Raz's project-local incremental cache.
@@ -1036,6 +1521,27 @@ def prepare_self_host_build(build_dir: Path, seed_project: Path, reset_cache: bo
             if src.is_file() and not dst.is_file():
                 shutil.copy2(src, dst)
     _refresh_bootstrap_input_cache(build_dir, current_digest)
+
+
+def prepare_modular_compiler_build(build_dir: Path) -> None:
+    """Refresh canonical modular compiler sources while retaining its build cache.
+
+    The modular compiler is the production artifact developers keep between
+    passes. Preserve target/ so unchanged package objects and the built compiler
+    survive packaging/reuse, while refreshing canonical sources and invalidating
+    whole-project cache keys when compiler inputs actually change.
+    """
+    build_dir.mkdir(parents=True, exist_ok=True)
+    for child in build_dir.iterdir():
+        if child.name == "target":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+    _copy_compiler_project_inputs(build_dir, _link_or_copy_stage_source)
+    remove_legacy_bootstrap_scratch(build_dir)
+    _refresh_bootstrap_input_cache(build_dir, _compiler_source_digest())
 
 
 def prepare_reproducibility_verification(build_dir: Path) -> None:
@@ -1120,6 +1626,19 @@ def invoke_compiler(label: str, compiler: Path, build_dir: Path, args: list[str]
 
 
 
+def stage_support_file(source: Path, destination: Path) -> None:
+    """Copy a support file into its staged location, tolerating a self-copy.
+
+    A relocated host tree discovers these files where they were already staged,
+    so source and destination name the same file. POSIX copies reject that and
+    Windows fails it with a sharing violation, but the intended end state --
+    the file present at the destination -- already holds.
+    """
+    if source.resolve() == destination.resolve():
+        return
+    shutil.copy2(source, destination)
+
+
 def stage_compiler_runtime_support(compiler_exe: Path, runtime: Path, bridge: Path, forge: Path, host_build: Path, oblink: Path | None = None) -> None:
     """Stage relocatable native-link support beside a produced Raz compiler.
 
@@ -1129,31 +1648,31 @@ def stage_compiler_runtime_support(compiler_exe: Path, runtime: Path, bridge: Pa
     profile_root = compiler_exe.parent.parent
     lib_dir = profile_root / "lib"
     lib_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(runtime, lib_dir / runtime.name)
+    stage_support_file(runtime, lib_dir / runtime.name)
     # Self-hosted compiler package objects call the narrow C++ Forge bridge.
     # Stage both static archives in the same relocatable lib directory so a
     # compiler moved out of the CMake tree can link its next generation.
-    shutil.copy2(bridge, lib_dir / bridge.name)
-    shutil.copy2(forge, lib_dir / forge.name)
+    stage_support_file(bridge, lib_dir / bridge.name)
+    stage_support_file(forge, lib_dir / forge.name)
     # Windows package-unit linking uses the bundled ObLink executable. Keep it
     # beside the self-hosted compiler so the driver can resolve the linker from
     # its own installation rather than depending on the bootstrap cwd/PATH.
     if os.name == "nt" and oblink is not None and oblink.is_file():
-        shutil.copy2(oblink, compiler_exe.parent / oblink.name)
+        stage_support_file(oblink, compiler_exe.parent / oblink.name)
     deps = load_runtime_link_dependencies(host_build)
     if deps:
         ssl = Path(deps[0])
         crypto = Path(deps[1])
         if os.name == "nt":
             suffix = ".lib" if ssl.suffix.lower() == ".lib" else ".a"
-            shutil.copy2(ssl, lib_dir / f"raz_runtime_ssl{suffix}")
+            stage_support_file(ssl, lib_dir / f"raz_runtime_ssl{suffix}")
             suffix = ".lib" if crypto.suffix.lower() == ".lib" else ".a"
-            shutil.copy2(crypto, lib_dir / f"raz_runtime_crypto{suffix}")
+            stage_support_file(crypto, lib_dir / f"raz_runtime_crypto{suffix}")
         else:
             ssl_suffix = ".a" if ssl.suffix == ".a" else ".so"
             crypto_suffix = ".a" if crypto.suffix == ".a" else ".so"
-            shutil.copy2(ssl, lib_dir / f"libraz_runtime_ssl{ssl_suffix}")
-            shutil.copy2(crypto, lib_dir / f"libraz_runtime_crypto{crypto_suffix}")
+            stage_support_file(ssl, lib_dir / f"libraz_runtime_ssl{ssl_suffix}")
+            stage_support_file(crypto, lib_dir / f"libraz_runtime_crypto{crypto_suffix}")
 
 
 def link_stage(compiler: str, obj: Path, runtime: Path, bridge: Path, forge: Path, output: Path, env: dict[str, str], runtime_deps: list[str], linker: Path | None = None) -> None:
@@ -1222,11 +1741,48 @@ def prepare_bootstrap_final_tree(qualification: Path, canonical_profile: Path) -
     return staging, staged_profile
 
 
+def remove_tree_persistently(path: Path, attempts: int = 6) -> bool:
+    """Delete a directory tree, tolerating read-only bits and transient locks.
+
+    On Windows a virus scanner or search indexer routinely holds a just-written
+    executable open for a moment, and the qualification tree is full of freshly
+    linked binaries. A single `rmtree` therefore fails for reasons that resolve
+    on their own, so retry briefly and clear read-only attributes as we go.
+    """
+    def clear_readonly(function, target, _exception):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            function(target)
+        except OSError:
+            pass
+
+    for attempt in range(attempts):
+        if not path.exists():
+            return True
+        shutil.rmtree(path, onexc=clear_readonly)
+        if not path.exists():
+            return True
+        time.sleep(0.25 * (attempt + 1))
+    return not path.exists()
+
+
 def promote_bootstrap_final_tree(qualification: Path, staging: Path) -> None:
     """Replace qualification scratch with the completed canonical target tree."""
     if not staging.is_dir() or not (staging / "release").is_dir():
         raise RuntimeError(f"Bootstrap final staging tree is incomplete: {staging}")
-    shutil.rmtree(qualification, ignore_errors=True)
+    if not remove_tree_persistently(qualification):
+        # Something outside this build still holds a qualification artifact open.
+        # The staged tree is already complete and validated, so move the scratch
+        # aside rather than losing a finished bootstrap to a stray file handle.
+        aside = qualification.with_name(qualification.name + ".discard")
+        remove_tree_persistently(aside)
+        try:
+            qualification.replace(aside)
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not clear the qualification tree for promotion: {qualification} ({error})"
+            ) from error
+        remove_tree_persistently(aside)
     staging.replace(qualification)
 
 
@@ -1332,10 +1888,9 @@ def main() -> int:
     stage0_rebuilt = cached_stage0 is None
     if cached_stage0 is not None:
         banner(f"Reuse cached Stage-0 toolchain ({platform.system()})")
-        compiler = read_cache(host_build, "CMAKE_CXX_COMPILER")
-        resolved_compiler = _resolve_executable(compiler, env)
-        if resolved_compiler:
-            compiler = resolved_compiler
+        compiler = resolve_cached_cxx_or_fallback(
+            read_cache(host_build, "CMAKE_CXX_COMPILER"), env, build_root / ".toolchain-preflight"
+        )
         print(f"Stage-0 compiler: {cached_stage0['driver']}")
         print(f"C++ linker fallback: {compiler}")
         print("Stage-0 cache: hit (use --rebuild-stage0 or -Clean to regenerate)")
@@ -1344,7 +1899,7 @@ def main() -> int:
             print("Stage-0 rebuild requested; discarding cached host toolchain.", flush=True)
             shutil.rmtree(host_build, ignore_errors=True)
         elif (host_build / "CMakeCache.txt").is_file() and not stage0_cache_matches_workspace(host_build):
-            print("Stage-0 cache was created in a different workspace; regenerating it for this location.", flush=True)
+            print("Relocated Stage-0 artifacts are stale or predate the portable cache contract; regenerating them.", flush=True)
             shutil.rmtree(host_build, ignore_errors=True)
         banner(f"Configure and build Stage-0 toolchain ({platform.system()})")
         compiler, fresh = choose_compiler(host_build, env, build_root / ".toolchain-preflight")
@@ -1375,10 +1930,15 @@ def main() -> int:
 
     # raz_runtime is a static archive. Any provider libraries used while
     # building it must be repeated at the final reproducibility-build link boundary.
-    # Older reusable Windows caches can predate Raz-owned OpenSSL cache entries;
-    # repair only that CMake metadata and keep the Stage-0 artifacts themselves.
-    repair_runtime_dependency_cache(host_build, cmake, env)
-    runtime_deps = load_runtime_link_dependencies(host_build)
+    # For a relocated portable Stage-0, use the provider copies staged beside the
+    # compiler instead of stale absolute paths from CMakeCache.txt.
+    if stage0_cache_matches_workspace(host_build):
+        repair_runtime_dependency_cache(host_build, cmake, env)
+        runtime_deps = load_runtime_link_dependencies(host_build)
+        stage_compiler_runtime_support(host_driver, runtime, bridge, forge, host_build, oblink)
+        write_stage0_portable_cache_marker(host_build)
+    else:
+        runtime_deps = staged_runtime_link_dependencies(host_driver)
 
     # Recursive/candidate compiler qualification runs the compiler from a
     # temporary bootstrap directory rather than its installed bin/ location.
@@ -1422,6 +1982,8 @@ def main() -> int:
         # canonical package graph in the self-host stage.
         _prepare_stage0_middle_compat(compiler_project)
         _prepare_stage0_native_codegen_compat(compiler_project)
+        _prepare_stage0_driver_project_compat(compiler_project)
+        _flatten_stage0_seed_package_sources(compiler_project)
         stage_layout = ensure_profile_output_layout(compiler_project, args.bootstrap_profile)
         remove_legacy_flat_profile_artifacts(compiler_project, args.bootstrap_profile)
         stage_object = stage_layout["obj"] / f"raz-compiler{OBJ}"
@@ -1459,6 +2021,7 @@ def main() -> int:
         # canonical package graph in the self-host stage.
         _prepare_stage0_middle_compat(compiler_project)
         _prepare_stage0_native_codegen_compat(compiler_project)
+        _prepare_stage0_driver_project_compat(compiler_project)
         # Build the production seed through the normal semantic module graph.
         # The canonical compiler keeps each codegen backend in its own package.
         # Frozen Stage-0 only needs Forge/LLVM to construct the Raz-owned seed,
@@ -1498,6 +2061,7 @@ def main() -> int:
             "public fn emit_wasm_module(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length) -> bool { return false; }\n"
             "public fn emit_web_wasm_module(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length) -> bool { return false; }\n"
             "public fn emit_web_wasm_module_roots(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length) -> bool { return false; }\n"
+            "public fn emit_web_wasm_module_roots_imports(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length, i64&mut out_import_mask, i64&mut out_import_mask_high) -> bool { *out_import_mask = 0; *out_import_mask_high = 0; return false; }\n"
         )
         write_seed_backend_stub(
             "raz_codegen_rxe", "rxe",
@@ -1505,26 +2069,44 @@ def main() -> int:
         )
         write_seed_backend_stub(
             "raz_codegen_web", "web",
+            "public fn web_runtime_capabilities(Source& source, HirModule& hir, MirModule& mir) -> i64 { return 63; }\n"
             "public fn emit_web_wasm_module(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length) -> bool { return false; }\n"
             "public fn emit_web_wasm_module_roots(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length) -> bool { return false; }\n"
             "public fn emit_web_application(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 title, i64 title_length, i64 custom_index, i64 custom_index_length, i64 extra_css, i64 extra_css_length, i64 extra_javascript, i64 extra_javascript_length, bool release_profile) -> bool { return false; }\n"
         )
+        # Static host pruning shares the canonical web browser-import bitmap
+        # helper. The disposable Stage-0 web package omits the real JS emitter,
+        # so retain this tiny signature-compatible module in the seed view.
+        seed_web_host = compiler_project / "src" / "raz_codegen_web" / "src" / "web" / "browser_host_js.rz"
+        seed_web_host.write_text(
+            "// Copyright 2026 Mario Vinciguerra\n// SPDX-License-Identifier: Apache-2.0\n\n"
+            "namespace raz_codegen_web::browser_host_js;\n\n"
+            "public fn web_browser_import_enabled(i64 import_mask, i64 import_mask_high, i64 logical_import) -> bool { return false; }\n",
+            encoding="utf-8",
+        )
+        seed_web_lib = compiler_project / "src" / "raz_codegen_web" / "src" / "lib.rz"
+        seed_web_lib_text = seed_web_lib.read_text(encoding="utf-8")
+        if "public import raz_codegen_web::browser_host_js;" not in seed_web_lib_text:
+            seed_web_lib_text += "public import raz_codegen_web::browser_host_js;\n"
+            seed_web_lib.write_text(seed_web_lib_text, encoding="utf-8")
 
         # Frozen Stage-0 does not propagate imported package symbols through a
         # re-exporting driver module reliably. Keep web emission as local seed
         # stubs in compiler_main; canonical sources and the Raz-owned self-host
         # continue to use the separate raz_codegen_web package.
-        host_main = compiler_project / "src" / "raz_driver" / "src" / "compiler_main.rz"
+        host_main = compiler_project / "src" / "raz_driver" / "src" / "driver" / "compiler_main.rz"
         main_text = host_main.read_text(encoding="utf-8")
         seed_web_stubs = (
-            "\nfn emit_web_wasm_module_roots(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length) -> bool { return false; }\n"
+            "\nfn web_runtime_capabilities(Source& source, HirModule& hir, MirModule& mir) -> i64 { return 63; }\n"
+            "fn emit_web_wasm_module_roots(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length) -> bool { return false; }\n"
+            "fn emit_web_wasm_module_roots_imports(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 browser_roots, i64 browser_roots_length, i64&mut out_import_mask, i64&mut out_import_mask_high) -> bool { *out_import_mask = 0; *out_import_mask_high = 0; return false; }\n"
             "fn emit_web_application(Source& source, HirModule& hir, MirModule& mir, i64 output_path, i64 output_path_length, i64 title, i64 title_length, i64 custom_index, i64 custom_index_length, i64 extra_css, i64 extra_css_length, i64 extra_javascript, i64 extra_javascript_length, bool release_profile) -> bool { return false; }\n"
         )
         if "fn emit_web_wasm_module_roots(" not in main_text:
             main_text = main_text.replace("import raz_driver::web_bundle;\n", "import raz_driver::web_bundle;\n" + seed_web_stubs, 1)
         host_main.write_text(main_text, encoding="utf-8")
 
-        host_backend = compiler_project / "src" / "raz_driver" / "src" / "backend.rz"
+        host_backend = compiler_project / "src" / "raz_driver" / "src" / "driver" / "backend.rz"
         backend_text = host_backend.read_text(encoding="utf-8")
         # Build the compatibility-host view by syntax landmarks, not indentation.
         backend_text, option_replacements = re.subn(
@@ -1549,6 +2131,13 @@ def main() -> int:
         if "emit_wasm_module(" in backend_text or "emit_rxe_module(" in backend_text:
             raise RuntimeError("Optional backend dispatch leaked into compatibility-host compiler view.")
         host_backend.write_text(backend_text, encoding="utf-8")
+
+        # Canonical driver/lexer/parser packages use nested implementation
+        # directories. Frozen Stage-0 only understands direct source modules, so
+        # flatten those packages in this disposable seed project after all seed
+        # compatibility rewrites have been applied.
+        _flatten_stage0_seed_package_sources(compiler_project)
+
         # The compatibility-host compiler is only a seed for the Raz-owned
         # recursive generations. Building that seed at O2 has historically spent
         # minutes in Forge before self-hosting even starts, while an O0 seed makes
@@ -1660,6 +2249,18 @@ def main() -> int:
         ],
         env=env,
     )
+    run(
+        "Production compiler arena ABI",
+        [
+            sys.executable,
+            str(ROOT / "tests" / "python" / "check-compiler-arena-abi.py"),
+            "--raz",
+            str(candidate_compiler),
+            "--work-root",
+            str(qualification / "compiler-arena-abi"),
+        ],
+        env=env,
+    )
     generated: list[tuple[int, Path, Path, str]] = []
 
     # Normal bootstrap performs exactly one Raz-owned self-host generation.
@@ -1733,10 +2334,7 @@ def main() -> int:
     # under target/<profile>/packages/ rather than falling back to one compiler
     # object.
     compiler_package_layout = qualification / "compiler-package-layout"
-    if compiler_package_layout.exists():
-        shutil.rmtree(compiler_package_layout)
-    compiler_package_layout.mkdir(parents=True, exist_ok=True)
-    _copy_compiler_project_inputs(compiler_package_layout)
+    prepare_modular_compiler_build(compiler_package_layout)
     compiler_package_env = dict(env)
     compiler_link_deps = [str(bridge), str(forge)] + list(runtime_deps)
     compiler_package_env["RAZ_RUNTIME_LIBRARY"] = str(runtime)
@@ -1768,6 +2366,10 @@ def main() -> int:
     qualified_compiler = compiler_package_layout / "target" / "release" / "bin" / f"raz-compiler{EXE}"
     if not qualified_compiler.is_file():
         raise RuntimeError(f"Canonical modular compiler is missing: {qualified_compiler}")
+    # Keep the canonical package-layout compiler self-contained immediately, not
+    # only after final bootstrap promotion. This makes interrupted/packaged
+    # qualification workspaces usable for native builds after relocation.
+    stage_compiler_runtime_support(qualified_compiler, runtime, bridge, forge, host_build, oblink)
     run("Validate canonical modular compiler", [str(qualified_compiler), "--version"], cwd=compiler_package_layout, env=compiler_package_env)
 
     # The Stage-0 compatibility seed deliberately omits the Wasm/RXE backend
@@ -1776,14 +2378,29 @@ def main() -> int:
     # contains the canonical Wasm and reactive web backends.
     for web_label, web_script, work_name in (
         ("Self-host static web target", "check-web-static.py", "web-static"),
+        ("Self-host static component rendering", "check-web-static-components.py", "web-static-components"),
+        ("Self-host static component browser guard", "check-web-static-component-guard.py", "web-static-component-guard"),
+        ("Self-host semantic web authoring", "check-web-authoring.py", "web-authoring"),
         ("Self-host content-addressed web assets", "check-web-assets.py", "web-assets"),
+        ("Self-host web forms", "check-web-forms.py", "web-forms"),
+        # Run the smallest reactive bundle before routing. On Windows this
+        # distinguishes a shared reactive/Wasm emitter fault from a routing-only
+        # regression and fails earlier with focused partial-artifact telemetry.
+        ("Self-host reactive web target", "check-web-reactive.py", "web-reactive"),
+        ("Self-host web routing", "check-web-routing.py", "web-routing"),
+        ("Self-host browser API", "check-web-browser-api.py", "web-browser-api"),
+        ("Self-host web dev server", "check-web-dev.py", "web-dev"),
         ("Self-host lazy client module chunks", "check-web-lazy-modules.py", "web-lazy-modules"),
         ("Self-host split Raz-WASM chunks", "check-web-wasm-chunks.py", "web-wasm-chunks"),
         ("Self-host interactive web target", "check-web-interactive.py", "web-interactive"),
         ("Self-host pruned browser Wasm imports", "check-web-wasm-import-pruning.py", "web-wasm-import-pruning"),
-        ("Self-host reactive web target", "check-web-reactive.py", "web-reactive"),
+        ("Self-host compact browser Wasm graph", "check-web-wasm-function-compaction-runtime.py", "web-wasm-function-compaction"),
+        ("Self-host pruned reactive JS runtime", "check-web-runtime-pruning-runtime.py", "web-runtime-pruning"),
         ("Self-host scoped component state", "check-web-component-state.py", "web-component-state"),
         ("Self-host browser bundle hardening", "check-web-bundle-hardening.py", "web-bundle-hardening"),
+        ("Self-host web bundle analysis budgets", "check-web-bundle-analysis.py", "web-bundle-analysis"),
+        ("Self-host combined web production hardening", "check-web-production-hardening-runtime.py", "web-production-hardening"),
+        ("Self-host web release artifact contract", "check-web-release-artifact-contract-runtime.py", "web-release-artifact-contract"),
     ):
         run(
             web_label,
@@ -1827,7 +2444,7 @@ def main() -> int:
             verify_dir,
             verify_args,
             args.status_interval,
-            compile_env,
+            env,
         )
         if not verify_obj.is_file() or verify_obj.stat().st_size < minimum_object_size:
             raise RuntimeError(f"Reproducibility object is missing or unexpectedly small: {verify_obj}")
@@ -1900,4 +2517,8 @@ if __name__ == "__main__":
         raise SystemExit(130)
     except Exception as exc:
         print(f"\nBUILD FAILED\n{exc}", file=sys.stderr)
+        # An OS-level failure (a locked file, a missing tool) says nothing about
+        # where it happened, which is the only thing that makes it actionable.
+        if os.environ.get("RAZ_BOOTSTRAP_TRACEBACK"):
+            traceback.print_exc()
         raise SystemExit(1)

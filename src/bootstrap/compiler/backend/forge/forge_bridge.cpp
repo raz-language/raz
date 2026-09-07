@@ -27,30 +27,56 @@
 
 namespace {
 
-constexpr std::int64_t raz_compiler_arena_magic = 4923358263036431937LL;
-constexpr std::int64_t raz_compiler_arena_header = 24;
+constexpr std::int64_t kCompilerArenaLiveMagic = 4923358263036431937LL;
 
-std::int64_t compiler_arena_element_width(std::int64_t handle) {
-    if (handle == 0) return 0;
-    const auto* header = reinterpret_cast<const std::int64_t*>(
-        reinterpret_cast<const char*>(static_cast<std::uintptr_t>(handle)) - raz_compiler_arena_header);
-    if (header[0] != raz_compiler_arena_magic) return 0;
-    const auto width = header[2];
-    return width == 1 || width == 2 || width == 4 || width == 8 ? width : 0;
+struct CompilerArenaView {
+    const void* payload = nullptr;
+    std::int64_t count = 0;
+    std::int64_t width = 0;
+};
+
+CompilerArenaView compiler_arena_view(std::int64_t handle) {
+    CompilerArenaView view;
+    if (handle == 0) return view;
+    const auto address = static_cast<std::uintptr_t>(handle);
+    const auto* cells = reinterpret_cast<const std::int64_t*>(address);
+    if (cells[0] != kCompilerArenaLiveMagic) return view;
+    const std::int64_t count = cells[1];
+    const std::int64_t width = cells[2];
+    const auto payload_address = static_cast<std::uintptr_t>(cells[3]);
+    if (count <= 0 || payload_address == 0 ||
+        (width != 1 && width != 2 && width != 4 && width != 8)) {
+        return view;
+    }
+    view.payload = reinterpret_cast<const void*>(payload_address);
+    view.count = count;
+    view.width = width;
+    return view;
 }
 
 std::string i64_ascii(std::int64_t handle, std::int64_t length) {
     if (handle == 0 || length <= 0) return {};
-    const auto width = compiler_arena_element_width(handle);
-    if (width == 1) {
-        const auto* bytes = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(handle));
-        return std::string(bytes, static_cast<std::size_t>(length));
+
+    const CompilerArenaView arena = compiler_arena_view(handle);
+    std::string text;
+    text.reserve(static_cast<std::size_t>(length));
+    if (arena.payload != nullptr) {
+        if (length > arena.count) return {};
+        const auto base = reinterpret_cast<std::uintptr_t>(arena.payload);
+        for (std::int64_t i = 0; i < length; ++i) {
+            std::uint64_t value = 0;
+            std::memcpy(&value,
+                        reinterpret_cast<const void*>(base + static_cast<std::uintptr_t>(i * arena.width)),
+                        static_cast<std::size_t>(arena.width));
+            text.push_back(static_cast<char>(value & 0xffU));
+        }
+        return text;
     }
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(handle));
-    const auto stride = width > 0 ? width : 8;
-    std::string text(static_cast<std::size_t>(length), '\0');
-    for (std::int64_t index = 0; index < length; ++index)
-        text[static_cast<std::size_t>(index)] = static_cast<char>(bytes[static_cast<std::size_t>(index * stride)]);
+
+    const auto* cells = reinterpret_cast<const std::int64_t*>(static_cast<std::uintptr_t>(handle));
+    for (std::int64_t i = 0; i < length; ++i) {
+        text.push_back(static_cast<char>(cells[i] & 0xff));
+    }
     return text;
 }
 
@@ -58,29 +84,47 @@ std::vector<std::uint8_t> i64_bytes(std::int64_t handle, std::int64_t length) {
     std::vector<std::uint8_t> bytes;
     if (handle == 0 || length <= 0) return bytes;
     bytes.resize(static_cast<std::size_t>(length));
-    const auto width = compiler_arena_element_width(handle);
-    const auto* source = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(handle));
-    if (width == 1) {
-        std::memcpy(bytes.data(), source, static_cast<std::size_t>(length));
+
+    const CompilerArenaView arena = compiler_arena_view(handle);
+    if (arena.payload != nullptr) {
+        if (length > arena.count) return {};
+        const auto base = reinterpret_cast<std::uintptr_t>(arena.payload);
+        for (std::int64_t i = 0; i < length; ++i) {
+            std::uint64_t value = 0;
+            std::memcpy(&value,
+                        reinterpret_cast<const void*>(base + static_cast<std::uintptr_t>(i * arena.width)),
+                        static_cast<std::size_t>(arena.width));
+            bytes[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(value & 0xffU);
+        }
         return bytes;
     }
-    const auto stride = width > 0 ? width : 8;
-    for (std::int64_t index = 0; index < length; ++index)
-        bytes[static_cast<std::size_t>(index)] = source[static_cast<std::size_t>(index * stride)];
+
+    const auto* cells = reinterpret_cast<const std::int64_t*>(static_cast<std::uintptr_t>(handle));
+    for (std::int64_t i = 0; i < length; ++i) {
+        bytes[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(cells[i] & 0xff);
+    }
     return bytes;
 }
 
 std::int64_t write_i64_ascii(const std::string& text, std::int64_t handle, std::int64_t capacity) {
-    if (handle == 0 || capacity < 0 || static_cast<std::uint64_t>(capacity) < text.size()) return -1;
-    const auto width = compiler_arena_element_width(handle);
-    auto* bytes = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(handle));
-    if (width == 1) {
-        if (!text.empty()) std::memcpy(bytes, text.data(), text.size());
+    if (handle == 0 || capacity < 0 || static_cast<std::int64_t>(text.size()) > capacity) return -1;
+
+    const CompilerArenaView arena = compiler_arena_view(handle);
+    if (arena.payload != nullptr) {
+        if (capacity > arena.count || static_cast<std::int64_t>(text.size()) > arena.count) return -1;
+        const auto base = reinterpret_cast<std::uintptr_t>(arena.payload);
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const std::uint64_t value = static_cast<unsigned char>(text[i]);
+            std::memcpy(reinterpret_cast<void*>(base + i * static_cast<std::size_t>(arena.width)),
+                        &value, static_cast<std::size_t>(arena.width));
+        }
         return static_cast<std::int64_t>(text.size());
     }
-    const auto stride = width > 0 ? width : 8;
-    for (std::size_t index = 0; index < text.size(); ++index)
-        bytes[index * static_cast<std::size_t>(stride)] = static_cast<unsigned char>(text[index]);
+
+    auto* cells = reinterpret_cast<std::int64_t*>(static_cast<std::uintptr_t>(handle));
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        cells[i] = static_cast<unsigned char>(text[i]);
+    }
     return static_cast<std::int64_t>(text.size());
 }
 

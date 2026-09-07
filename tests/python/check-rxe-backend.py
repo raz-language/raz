@@ -5,7 +5,7 @@
 from pathlib import Path
 import re
 root=Path(__file__).resolve().parents[2]
-backend=(root/'compiler/src/raz_driver/src/backend.rz').read_text()
+backend=(root/'compiler/src/raz_driver/src/driver/backend.rz').read_text()
 order={path.relative_to(root/'compiler').as_posix() for path in list((root/'compiler').rglob('*.rz'))}
 required=['isa.rz','model.rz','lowering.rz','dataflow.rz','registers.rz','optimize.rz','blocks.rz','verify.rz','disasm.rz','reference.rz','writer.rz','decoder.rz','codegen.rz']
 for name in required:

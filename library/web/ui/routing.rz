@@ -1,0 +1,164 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+import alloc::string;
+
+
+
+// Route state is synchronized from the browser History API before the first
+// render and on pushState/popstate navigation. Raz routing remains ordinary
+// conditional logic over this stable state rather than a JavaScript router.
+public fn route_is(string path) -> bool {
+    route_mark_structural_scope(0);
+    return route_matches(path);
+}
+public fn route_prefix(string path) -> bool {
+    route_mark_structural_scope(0);
+    i64 length = raz_rt_cstr_len(path);
+    if (length > web_route_length) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        i64 left = 0;
+        i64 right = 0;
+        unsafe {
+            left = (*((web_route_data + index)as u8*const))as i64;
+            right = (*((raz_rt_cstr_ptr(path) + index)as u8*const))as i64;
+        }
+        if (left != right) { return false; }
+        index += 1;
+    }
+    if (length == web_route_length || length == 1) { return true; }
+    i64 boundary = 0;
+    unsafe { boundary = (*((web_route_data + length)as u8*const))as i64; }
+    return boundary == 47;
+}
+
+
+fn route_pattern_segment_equal(usize pattern_data, i64 pattern_start, i64 pattern_length, usize route_data, i64 route_start, i64 route_length) -> bool {
+    if (pattern_length != route_length) { return false; }
+    i64 i = 0;
+    while (i < pattern_length) {
+        i64 left = 0;
+        i64 right = 0;
+        unsafe {
+            left = (*((pattern_data + pattern_start + i)as u8*const))as i64;
+            right = (*((route_data + route_start + i)as u8*const))as i64;
+        }
+        if (left != right) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Matches route patterns such as `/blog/:slug` and `/docs/*`. Named segments
+/// match exactly one non-empty path segment; `*` is permitted only as the final
+/// segment and matches the remaining suffix.
+fn route_pattern_matches(string pattern) -> bool {
+    i64 pattern_length = raz_rt_cstr_len(pattern);
+    if (pattern_length <= 0 || web_route_length <= 0) { return false; }
+    usize pattern_data = raz_rt_cstr_ptr(pattern);
+    if (raz_rt_load_u8(pattern_data) != 47) { return false; }
+    if (pattern_length == 1) { return web_route_length == 1; }
+    i64 pi = 1;
+    i64 ri = 1;
+    while (pi <= pattern_length) {
+        i64 ps = pi;
+        while (pi < pattern_length && raz_rt_load_u8(pattern_data + pi) != 47) { pi += 1; }
+        i64 pl = pi - ps;
+        // A final `*` or named splat such as `*path` consumes the remaining
+        // route suffix. Named splats can be read through route_param().
+        if (pl >= 1 && raz_rt_load_u8(pattern_data + ps) == 42) { return pi == pattern_length; }
+        i64 rs = ri;
+        while (ri < web_route_length) {
+            i64 ch = 0;
+            unsafe { ch = (*((web_route_data + ri)as u8*const))as i64; }
+            if (ch == 47) { break; }
+            ri += 1;
+        }
+        i64 rl = ri - rs;
+        if (pl <= 0 || rl <= 0) { return false; }
+        if (raz_rt_load_u8(pattern_data + ps) != 58 && !route_pattern_segment_equal(pattern_data, ps, pl, web_route_data, rs, rl)) { return false; }
+        if (pi == pattern_length || ri == web_route_length) { return pi == pattern_length && ri == web_route_length; }
+        pi += 1;
+        ri += 1;
+    }
+    return ri == web_route_length;
+}
+
+public fn route_match(string pattern) -> bool {
+    route_mark_structural_scope(0);
+    return route_pattern_matches(pattern);
+}
+
+fn route_pattern_name_equal(usize pattern_data, i64 start, i64 length, string name) -> bool {
+    i64 name_length = raz_rt_cstr_len(name);
+    if (length != name_length) { return false; }
+    usize name_data = raz_rt_cstr_ptr(name);
+    i64 i = 0;
+    while (i < length) {
+        if (raz_rt_load_u8(pattern_data + start + i) != raz_rt_load_u8(name_data + i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Extracts one named segment from a matching route pattern. A missing name or
+/// non-matching pattern returns an empty String.
+fn route_param_value(string pattern, string name) -> String {
+    if (!route_pattern_matches(pattern)) { return String::new(); }
+    i64 pattern_length = raz_rt_cstr_len(pattern);
+    usize pattern_data = raz_rt_cstr_ptr(pattern);
+    i64 pi = 1;
+    i64 ri = 1;
+    while (pi <= pattern_length) {
+        i64 ps = pi;
+        while (pi < pattern_length && raz_rt_load_u8(pattern_data + pi) != 47) { pi += 1; }
+        i64 pl = pi - ps;
+        i64 rs = ri;
+        while (ri < web_route_length) {
+            i64 ch = 0;
+            unsafe { ch = (*((web_route_data + ri)as u8*const))as i64; }
+            if (ch == 47) { break; }
+            ri += 1;
+        }
+        i64 rl = ri - rs;
+        bool named_segment = pl > 1 && raz_rt_load_u8(pattern_data + ps) == 58 && route_pattern_name_equal(pattern_data, ps + 1, pl - 1, name);
+        bool named_splat = pl > 1 && raz_rt_load_u8(pattern_data + ps) == 42 && route_pattern_name_equal(pattern_data, ps + 1, pl - 1, name);
+        if (named_segment || named_splat) {
+            i64 value_length = rl;
+            if (named_splat) { value_length = web_route_length - rs; }
+            String value = String::with_capacity(value_length);
+            i64 i = 0;
+            while (i < value_length) {
+                i64 ch = 0;
+                unsafe { ch = (*((web_route_data + rs + i)as u8*const))as i64; }
+                if (!value.push(ch)) { return String::new(); }
+                i += 1;
+            }
+            return value;
+        }
+        if (pi == pattern_length || ri == web_route_length) { break; }
+        pi += 1;
+        ri += 1;
+    }
+    return String::new();
+}
+
+public fn route_param(string pattern, string name) -> String {
+    route_mark_structural_scope(0);
+    return route_param_value(pattern, name);
+}
+
+/// Reads the remaining suffix captured by a final named splat such as
+/// `/docs/*path`. This is an ergonomic alias for route_param().
+public fn route_splat(string pattern, string name) -> String {
+    route_mark_structural_scope(0);
+    return route_param_value(pattern, name);
+}
+
+public fn raz_web_route_set(usize data, i64 length) -> i64 {
+    if (!replace_buffer(data, length, &mut web_route_data, &mut web_route_length)) { return -1; }
+    return 1;
+}

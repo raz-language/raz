@@ -98,8 +98,8 @@ fn main() -> i64 {
     if f'<script type="module" src="./assets/{root_js.name}"></script>' not in html:
         print("web-interactive: interactive page does not reference fingerprinted module")
         return 1
-    if f"/assets/{root_wasm.name}" not in js:
-        print("web-interactive: generated module does not reference fingerprinted WASM")
+    if f"./{root_wasm.name}" not in js:
+        print("web-interactive: generated module does not reference sibling-relative fingerprinted WASM")
         return 1
     if "addEventListener('click'" not in js or "rz['increment']" not in js:
         print("web-interactive: generated host shim is missing event-to-WASM dispatch")

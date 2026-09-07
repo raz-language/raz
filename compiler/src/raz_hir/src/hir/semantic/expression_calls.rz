@@ -1,0 +1,617 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_hir::semantic::expression_calls;
+
+public import raz_hir::semantic::reflection;
+import raz_hir::semantic::statements;
+
+// Direct and indirect invocation validation/emission. Argument parsing stays in
+// expressions.rz so recursive expression dispatch remains owned by the primary
+// expression module; this module owns call signature checks, coercions, closure
+// capture materialization, effect/unsafe validation, and the final call HIR node.
+fn hir_validate_and_emit_call(
+    HirBuilder&mut builder,
+    i64 target,
+    i64 structure,
+    i64 callable_local,
+    i64 indirect_callee,
+    i64 indirect_signature,
+    bool indirect_call,
+    i64 pending_arguments,
+    i64 pending_argument_offsets,
+    i64 argument_count,
+    i64&mut out_call,
+) -> bool {
+    i64 expected_argument_count = 0;
+
+    if (indirect_call) {
+        expected_argument_count = raz_compiler_rt_arena_get(
+            builder.module.function_type_parameter_counts,
+            indirect_signature,
+        );
+    } else if (target >= 0) {
+        expected_argument_count = raz_compiler_rt_arena_get(
+            builder.module.function_parameter_counts,
+            target,
+        );
+        if (
+            callable_local >= 0 &&
+            raz_compiler_rt_arena_get(builder.module.function_closure_ids, target) >= 0
+        ) {
+            expected_argument_count = raz_compiler_rt_arena_get(
+                builder.module.function_closure_explicit_parameter_counts,
+                target,
+            );
+        }
+    } else {
+        expected_argument_count = raz_compiler_rt_arena_get(
+            builder.module.struct_field_counts,
+            structure
+        );
+    }
+    if (argument_count != expected_argument_count) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::WrongArgumentCount);
+        return false;
+    }
+    if (builder.module.argument_count + argument_count >= 262144) {
+        raz_compiler_rt_arena_destroy(pending_arguments);
+        hir_fail(builder, DiagnosticCode::TooManyItems);
+        return false;
+    }
+
+    i64 parameter_start = 0;
+    i64 field_start = 0;
+
+    if (indirect_call) {
+        parameter_start = raz_compiler_rt_arena_get(
+            builder.module.function_type_parameter_starts,
+            indirect_signature,
+        );
+    } else if (target >= 0) {
+        parameter_start = raz_compiler_rt_arena_get(builder.module.function_parameter_starts, target);
+    } else {
+        field_start = raz_compiler_rt_arena_get(builder.module.struct_field_starts, structure);
+    }
+
+    i64 argument_index = 0;
+
+    while (argument_index < argument_count) {
+        i64 argument_node = raz_compiler_rt_arena_get(pending_arguments, argument_index);
+        i64 argument_offset = builder.current.offset;
+        bool argument_error_was_clear = builder.last_error.code == DiagnosticCode::None;
+
+        if (pending_argument_offsets != 0) {
+            argument_offset = raz_compiler_rt_arena_get(pending_argument_offsets, argument_index);
+        }
+
+        i64 argument_structure = raz_compiler_rt_arena_get(
+            builder.module.node_type_structs,
+            argument_node
+        );
+        if (target >= 0 || indirect_call) {
+            i64 parameter_index = parameter_start + argument_index;
+            i64 parameter_structure = -1;
+            i64 parameter_type = 0;
+            i64 parameter_reference = 0;
+            i64 parameter_slice = 0;
+            i64 parameter_slice_mutable = 0;
+            i64 parameter_function_type = -1;
+
+            if (indirect_call) {
+                parameter_structure = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_type_structs,
+                    parameter_index,
+                );
+                parameter_type = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_types,
+                    parameter_index,
+                );
+                parameter_reference = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_references,
+                    parameter_index,
+                );
+                parameter_slice = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_slices,
+                    parameter_index,
+                );
+                parameter_slice_mutable = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_slice_mutable,
+                    parameter_index,
+                );
+                parameter_function_type = raz_compiler_rt_arena_get(
+                    builder.module.function_type_parameter_function_types,
+                    parameter_index,
+                );
+            } else {
+                parameter_structure = raz_compiler_rt_arena_get(
+                    builder.module.parameter_type_structs,
+                    parameter_index,
+                );
+                parameter_type = raz_compiler_rt_arena_get(
+                    builder.module.parameter_types,
+                    parameter_index
+                );
+                parameter_reference = raz_compiler_rt_arena_get(
+                    builder.module.parameter_references,
+                    parameter_index,
+                );
+                parameter_slice = raz_compiler_rt_arena_get(
+                    builder.module.parameter_slices,
+                    parameter_index,
+                );
+                parameter_slice_mutable = raz_compiler_rt_arena_get(
+                    builder.module.parameter_slice_mutable,
+                    parameter_index,
+                );
+                parameter_function_type = raz_compiler_rt_arena_get(
+                    builder.module.parameter_function_types,
+                    parameter_index,
+                );
+            }
+            if (
+                !indirect_call &&
+                parameter_reference == 0 &&
+                parameter_structure < 0 &&
+                parameter_type == 0 &&
+                raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 1
+            ) {
+                bool argument_is_bool = raz_compiler_rt_arena_get(
+                    builder.module.node_c,
+                    argument_node,
+                ) == 1;
+
+                bool parameter_is_bool = hir_parameter_spells_bool(builder, parameter_index);
+
+                if (argument_is_bool != parameter_is_bool) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                    return false;
+                }
+            }
+
+            i64 parameter_array_extent = -1;
+
+            if (!indirect_call) {
+                parameter_array_extent = raz_compiler_rt_arena_get(
+                    builder.module.parameter_array_extents,
+                    parameter_index,
+                );
+            }
+            if (parameter_array_extent >= 0) {
+                if (
+                    raz_compiler_rt_arena_get(
+                        builder.module.node_array_extents,
+                        argument_node,
+                    ) != parameter_array_extent
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                    return false;
+                }
+            }
+            if (parameter_slice != 0) {
+                i64 sliced_argument = -1;
+
+                if (
+                    !hir_coerce_slice(
+                        builder,
+                        argument_node,
+                        parameter_slice_mutable,
+                        &mut sliced_argument,
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+                argument_node = sliced_argument;
+                argument_structure = raz_compiler_rt_arena_get(
+                    builder.module.node_type_structs,
+                    argument_node,
+                );
+                if (parameter_structure >= 0) {
+                    if (argument_structure != parameter_structure) {
+                        raz_compiler_rt_arena_destroy(pending_arguments);
+                        hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                        return false;
+                    }
+                } else if (!hir_require_value_type(builder, &mut argument_node, parameter_type)) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+            } else if (parameter_reference != 0) {
+                if (
+                    !hir_require_reference_type(
+                        builder,
+                        &mut argument_node,
+                        parameter_reference,
+                        parameter_structure,
+                        parameter_type,
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+            } else if (parameter_type == 15 && parameter_function_type <= -2) {
+                i64 trait_object = -2 - parameter_function_type;
+                i64 coerced_object = -1;
+
+                if (!hir_coerce_trait_object(builder, argument_node, trait_object, &mut coerced_object)) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+                argument_node = coerced_object;
+                argument_structure = -1;
+            } else if (parameter_type >= 16 && parameter_type <= 18) {
+                // Callable contracts accept closure environments as well as
+                // already-typed callable values. Preserve the closure node so
+                // capture ownership remains available to later lowering.
+
+                i64 argument_kind = raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node);
+
+                i64 argument_signature = raz_compiler_rt_arena_get(
+                    builder.module.node_function_types,
+                    argument_node,
+                );
+
+                i64 closure_kind = 0;
+
+                if (argument_kind == 42) {
+                    i64 closure_function = raz_compiler_rt_arena_get(
+                        builder.module.node_a,
+                        argument_node
+                    );
+                    closure_kind = raz_compiler_rt_arena_get(builder.module.node_b, argument_node);
+                    argument_signature = hir_function_pointer_signature(builder, closure_function);
+                    raz_compiler_rt_arena_set(
+                        builder.module.node_function_types,
+                        argument_node,
+                        argument_signature,
+                    );
+                }
+
+                bool kind_compatible = argument_kind == 42;
+
+                if (argument_kind == 42) {
+                    if (parameter_type == 16) {
+                        kind_compatible = closure_kind == 1 || closure_kind == 2;
+                    } else if (parameter_type == 17) {
+                        kind_compatible = closure_kind == 1 || closure_kind == 2 || closure_kind == 3;
+                    } else {
+                        kind_compatible = closure_kind >= 1 && closure_kind <= 4;
+                    }
+                } else {
+                    i64 argument_type = raz_compiler_rt_arena_get(
+                        builder.module.node_types,
+                        argument_node
+                    );
+                    kind_compatible = argument_type >= 16 && argument_type <= 18;
+                }
+                if (
+                    !kind_compatible ||
+                    parameter_function_type < 0 ||
+                    argument_signature < 0 ||
+                    !hir_function_pointer_signatures_equal(
+                        builder,
+                        parameter_function_type,
+                        argument_signature,
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                    return false;
+                }
+            } else if (
+                parameter_structure < 0 &&
+                argument_structure < 0 &&
+                !(
+                    parameter_type == 14 &&
+                    raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 42
+                ) &&
+                !hir_require_value_type(builder, &mut argument_node, parameter_type)
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                return false;
+            }
+            if (parameter_type == 14) {
+                if (raz_compiler_rt_arena_get(builder.module.node_kinds, argument_node) == 42) {
+                    i64 closure_function = raz_compiler_rt_arena_get(
+                        builder.module.node_a,
+                        argument_node
+                    );
+                    if (
+                        raz_compiler_rt_arena_get(
+                            builder.module.function_closure_capture_counts,
+                            closure_function,
+                        ) != 0
+                    ) {
+                        raz_compiler_rt_arena_destroy(pending_arguments);
+                        hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                        return false;
+                    }
+
+                    i64 closure_signature = hir_function_pointer_signature(builder, closure_function);
+
+                    raz_compiler_rt_arena_set(builder.module.node_kinds, argument_node, 47);
+                    raz_compiler_rt_arena_set(builder.module.node_a, argument_node, closure_function);
+                    hir_set_node_type(builder, argument_node, 14);
+                    raz_compiler_rt_arena_set(
+                        builder.module.node_function_types,
+                        argument_node,
+                        closure_signature,
+                    );
+                }
+                i64 argument_signature = raz_compiler_rt_arena_get(
+                    builder.module.node_function_types,
+                    argument_node,
+                );
+                if (
+                    parameter_function_type >= 0 &&
+                    !hir_function_pointer_signatures_equal(
+                        builder,
+                        parameter_function_type,
+                        argument_signature,
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                    return false;
+                }
+            }
+        } else {
+            i64 field_index = field_start + argument_index;
+
+            i64 field_structure = raz_compiler_rt_arena_get(
+                builder.module.struct_field_type_structs,
+                field_index,
+            );
+            i64 field_reference = raz_compiler_rt_arena_get(
+                builder.module.struct_field_references,
+                field_index,
+            );
+
+            i64 field_slice = raz_compiler_rt_arena_get(builder.module.struct_field_slices, field_index);
+
+            i64 field_array_extent = raz_compiler_rt_arena_get(
+                builder.module.struct_field_array_extents,
+                field_index,
+            );
+            if (
+                field_array_extent >= 0 &&
+                raz_compiler_rt_arena_get(
+                    builder.module.node_array_extents,
+                    argument_node,
+                ) != field_array_extent
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                return false;
+            }
+            if (field_slice != 0) {
+                i64 sliced_argument = -1;
+
+                if (
+                    !hir_coerce_slice(
+                        builder,
+                        argument_node,
+                        raz_compiler_rt_arena_get(builder.module.struct_field_slice_mutable, field_index),
+                        &mut sliced_argument,
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+                argument_node = sliced_argument;
+                argument_structure = raz_compiler_rt_arena_get(
+                    builder.module.node_type_structs,
+                    argument_node,
+                );
+            }
+            if (field_reference != 0) {
+                if (
+                    !hir_require_reference_type(
+                        builder,
+                        &mut argument_node,
+                        field_reference,
+                        field_structure,
+                        raz_compiler_rt_arena_get(builder.module.struct_field_types, field_index),
+                    )
+                ) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                    return false;
+                }
+            } else if (field_structure >= 0) {
+                if (argument_structure != field_structure) {
+                    raz_compiler_rt_arena_destroy(pending_arguments);
+                    hir_fail_at(builder, DiagnosticCode::ArgumentTypeMismatch, argument_offset);
+                    return false;
+                }
+            } else if (
+                argument_structure < 0 &&
+                !hir_require_value_type(
+                    builder,
+                    &mut argument_node,
+                    raz_compiler_rt_arena_get(builder.module.struct_field_types, field_index),
+                )
+            ) {
+                raz_compiler_rt_arena_destroy(pending_arguments);
+                hir_relocate_argument_error(builder, argument_error_was_clear, argument_offset);
+                return false;
+            }
+        }
+        raz_compiler_rt_arena_set(pending_arguments, argument_index, argument_node);
+        argument_index += 1;
+    }
+
+    i64 argument_start = builder.module.argument_count;
+
+    argument_index = 0;
+    while (argument_index < argument_count) {
+        raz_compiler_rt_arena_set(
+            builder.module.arguments,
+            builder.module.argument_count,
+            raz_compiler_rt_arena_get(pending_arguments, argument_index),
+        );
+        builder.module.argument_count += 1;
+        argument_index += 1;
+    }
+    raz_compiler_rt_arena_destroy(pending_arguments);
+    if (
+        callable_local >= 0 &&
+        raz_compiler_rt_arena_get(builder.module.function_closure_ids, target) >= 0
+    ) {
+        i64 callable_kind_value = raz_compiler_rt_arena_get(
+            builder.module.local_callable_kinds,
+            callable_local,
+        );
+        if (!hir_append_callable_local_captures(builder, callable_local, target, callable_kind_value)) {
+            return false;
+        }
+        argument_count += raz_compiler_rt_arena_get(
+            builder.module.local_callable_capture_counts,
+            callable_local,
+        );
+        if (callable_kind_value == 4) {
+            raz_compiler_rt_arena_set(builder.module.local_callable_consumed, callable_local, 1);
+        }
+    }
+
+    i64 call = -1;
+
+    if (indirect_call) {
+        if (
+            !hir_add_node(
+                builder,
+                49,
+                indirect_callee,
+                argument_start,
+                argument_count,
+                indirect_signature,
+                &mut call,
+            )
+        ) {
+            return false;
+        }
+        hir_set_node_type(
+            builder,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_type_return_types, indirect_signature),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_references,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_type_return_references, indirect_signature),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_type_structs,
+            call,
+            raz_compiler_rt_arena_get(
+                builder.module.function_type_return_type_structs,
+                indirect_signature
+            ),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slices,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_type_return_slices, indirect_signature),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slice_mutable,
+            call,
+            raz_compiler_rt_arena_get(
+                builder.module.function_type_return_slice_mutable,
+                indirect_signature
+            ),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_function_types,
+            call,
+            raz_compiler_rt_arena_get(
+                builder.module.function_type_return_function_types,
+                indirect_signature,
+            ),
+        );
+    } else if (target >= 0) {
+        // Effect contracts are transitive: a constrained caller may only
+        // invoke callees that explicitly guarantee every effect it requires.
+        if (builder.current_function >= 0) {
+            i64 required_effects = raz_compiler_rt_arena_get(
+                builder.module.function_effect_flags,
+                builder.current_function,
+            );
+            i64 provided_effects = raz_compiler_rt_arena_get(
+                builder.module.function_effect_flags,
+                target
+            );
+            if ((required_effects & provided_effects) != required_effects) {
+                hir_fail(builder, DiagnosticCode::ExpectedToken);
+                return false;
+            }
+        }
+        if (
+            raz_compiler_rt_arena_get(builder.module.function_is_unsafe, target) != 0 &&
+            builder.unsafe_depth == 0
+        ) {
+            hir_fail(builder, DiagnosticCode::ExpectedToken);
+            return false;
+        }
+        if (!hir_add_node(builder, 4, target, argument_start, argument_count, 0, &mut call)) {
+            return false;
+        }
+        hir_set_node_type(
+            builder,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_types, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_references,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_references, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_reference_mutable,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_reference_mutable, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_lifetimes,
+            call,
+            hir_resolve_call_return_lifetime(builder, target, argument_start, argument_count),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_type_structs,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_type_structs, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slices,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_slices, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_slice_mutable,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_slice_mutable, target),
+        );
+        raz_compiler_rt_arena_set(
+            builder.module.node_function_types,
+            call,
+            raz_compiler_rt_arena_get(builder.module.function_return_function_types, target),
+        );
+    } else {
+        if (!hir_add_node(builder, 34, structure, argument_start, argument_count, 0, &mut call)) {
+            return false;
+        }
+        raz_compiler_rt_arena_set(builder.module.node_type_structs, call, structure);
+    }
+    *out_call = call;
+    return true;
+}

@@ -79,11 +79,15 @@ fn wasm_async_ordinal(HirModule& hir, i64 function_index) -> i64 {
 }
 
 fn wasm_async_poll_type_index(HirModule& hir) -> i64 {
-    // HIR functions + callable types + closure-adapter types + 12 WASI types,
-    // followed by the two Raz Web host signatures in browser mode.
+    // HIR functions + callable types + closure-adapter types + the active host
+    // type set. Browser modules omit WASI types entirely.
+
     i64 browser_types = 0;
-    if (wasm_browser_mode()) { browser_types = 2; }
-    return hir.function_count + hir.function_type_count * 2 + 12 + browser_types;
+
+    if (wasm_browser_mode()) {
+        browser_types = 5;
+    }
+    return wasm_browser_emitted_function_count(hir.function_count) + hir.function_type_count * 2 + wasm_wasi_type_count() + browser_types;
 }
 
 fn wasm_async_poll_defined_index(HirModule& hir, i64 closure_count, i64 function_index) -> i64 {
@@ -91,7 +95,7 @@ fn wasm_async_poll_defined_index(HirModule& hir, i64 closure_count, i64 function
 }
 
 fn wasm_async_poll_table_index(HirModule& hir, i64 closure_count, i64 function_index) -> i64 {
-    return wasm_async_poll_defined_index(hir, closure_count, function_index);
+    return wasm_defined_table_index(wasm_async_poll_defined_index(hir, closure_count, function_index));
 }
 
 fn wasm_async_current_frame_global(MirModule& mir) -> i64 {
@@ -116,7 +120,7 @@ fn wasm_async_local_slot(i64 local) -> i64 {
     return local;
 }
 
-fn wasm_async_i64_load(ForgeWriter&mut out, i64 frame_local, i64 offset) {
+fn wasm_async_i64_load(CodegenWriter&mut out, i64 frame_local, i64 offset) {
     wasm_local_get(out, frame_local);
     wasm_u8(out, 167);
     // i32.wrap_i64
@@ -126,7 +130,7 @@ fn wasm_async_i64_load(ForgeWriter&mut out, i64 frame_local, i64 offset) {
     wasm_u32(out, offset);
 }
 
-fn wasm_async_i64_store_local(ForgeWriter&mut out, i64 frame_local, i64 offset, i64 value_local) {
+fn wasm_async_i64_store_local(CodegenWriter&mut out, i64 frame_local, i64 offset, i64 value_local) {
     wasm_local_get(out, frame_local);
     wasm_u8(out, 167);
     wasm_local_get(out, value_local);
@@ -135,7 +139,7 @@ fn wasm_async_i64_store_local(ForgeWriter&mut out, i64 frame_local, i64 offset, 
     wasm_u32(out, offset);
 }
 
-fn wasm_async_i64_store_const(ForgeWriter&mut out, i64 frame_local, i64 offset, i64 value) {
+fn wasm_async_i64_store_const(CodegenWriter&mut out, i64 frame_local, i64 offset, i64 value) {
     wasm_local_get(out, frame_local);
     wasm_u8(out, 167);
     wasm_u8(out, 66);
@@ -145,35 +149,35 @@ fn wasm_async_i64_store_const(ForgeWriter&mut out, i64 frame_local, i64 offset, 
     wasm_u32(out, offset);
 }
 
-fn wasm_async_store_frame_state(ForgeWriter&mut out, i64 frame_local, i64 state) {
+fn wasm_async_store_frame_state(CodegenWriter&mut out, i64 frame_local, i64 state) {
     wasm_async_i64_store_const(out, frame_local, wasm_async_frame_state_offset(), state);
 }
 
-fn wasm_async_store_frame_status(ForgeWriter&mut out, i64 frame_local, i64 status) {
+fn wasm_async_store_frame_status(CodegenWriter&mut out, i64 frame_local, i64 status) {
     wasm_async_i64_store_const(out, frame_local, wasm_async_frame_status_offset(), status);
 }
 
-fn wasm_async_load_frame_status(ForgeWriter&mut out, i64 frame_local) {
+fn wasm_async_load_frame_status(CodegenWriter&mut out, i64 frame_local) {
     wasm_async_i64_load(out, frame_local, wasm_async_frame_status_offset());
 }
 
-fn wasm_async_load_frame_result(ForgeWriter&mut out, i64 frame_local) {
+fn wasm_async_load_frame_result(CodegenWriter&mut out, i64 frame_local) {
     wasm_async_i64_load(out, frame_local, wasm_async_frame_result_offset());
 }
 
-fn wasm_async_load_frame_poll(ForgeWriter&mut out, i64 frame_local) {
+fn wasm_async_load_frame_poll(CodegenWriter&mut out, i64 frame_local) {
     wasm_async_i64_load(out, frame_local, wasm_async_frame_poll_offset());
 }
 
-fn wasm_async_store_spill_local(ForgeWriter&mut out, i64 frame_local, i64 slot, i64 value_local) {
+fn wasm_async_store_spill_local(CodegenWriter&mut out, i64 frame_local, i64 slot, i64 value_local) {
     wasm_async_i64_store_local(out, frame_local, wasm_async_frame_slot_offset(slot), value_local);
 }
 
-fn wasm_async_load_spill(ForgeWriter&mut out, i64 frame_local, i64 slot) {
+fn wasm_async_load_spill(CodegenWriter&mut out, i64 frame_local, i64 slot) {
     wasm_async_i64_load(out, frame_local, wasm_async_frame_slot_offset(slot));
 }
 
-fn wasm_async_emit_global(ForgeWriter&mut section) {
+fn wasm_async_emit_global(CodegenWriter&mut section) {
     // Mutable i64 current-frame register. Nested polls save/restore it around
     // calls, so re-entrant async chains do not corrupt the parent continuation.
     wasm_u8(section, 126);
@@ -184,15 +188,15 @@ fn wasm_async_emit_global(ForgeWriter&mut section) {
 }
 
 fn wasm_async_emit_wrapper_body(
-    ForgeWriter&mut section,
+    CodegenWriter&mut section,
     HirModule& hir,
     MirModule& mir,
     i64 function_index,
     i64 closure_count,
 ) -> bool {
-    ForgeWriter body;
+    CodegenWriter body;
 
-    writer_init_capacity(&mut body, 4096);
+    codegen_writer_init_capacity(&mut body, 4096);
     if (body.failed) {
         return false;
     }
@@ -282,20 +286,20 @@ fn wasm_async_emit_wrapper_body(
 
     bool success = !body.failed && !section.failed;
 
-    writer_destroy(&mut body);
+    codegen_writer_destroy(&mut body);
     return success;
 }
 
 fn wasm_async_emit_wasi_start_body(
-    ForgeWriter&mut section,
+    CodegenWriter&mut section,
     HirModule& hir,
     MirModule& mir,
     i64 main_function,
     i64 closure_count,
 ) -> bool {
-    ForgeWriter body;
+    CodegenWriter body;
 
-    writer_init_capacity(&mut body, 4096);
+    codegen_writer_init_capacity(&mut body, 4096);
     if (body.failed) {
         return false;
     }
@@ -360,6 +364,6 @@ fn wasm_async_emit_wasi_start_body(
 
     bool success = !body.failed && !section.failed;
 
-    writer_destroy(&mut body);
+    codegen_writer_destroy(&mut body);
     return success;
 }

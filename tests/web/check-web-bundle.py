@@ -4,8 +4,8 @@
 
 from pathlib import Path
 
-bundle = Path('compiler/src/raz_driver/src/web_bundle.rz').read_text()
-main = Path('compiler/src/raz_driver/src/compiler_main.rz').read_text()
+bundle = Path('compiler/src/raz_driver/src/driver/web_bundle.rz').read_text()
+main = Path('compiler/src/raz_driver/src/driver/compiler_main.rz').read_text()
 required = [
     'raz_rt_hash_bytes',
     'web_bundle_fingerprint',

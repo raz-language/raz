@@ -1,0 +1,180 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace raz_codegen_web::runtime_analysis;
+
+public import frontend::parser;
+public import hir::core::model;
+public import mir::core::model;
+
+// Analyze the optimized application call graph once and reduce the browser
+// runtime to the capability groups actually reachable from main().
+
+// Reactive loader helpers are pruned from the application call graph rather
+// than from the linked web library. The web package intentionally contains the
+// full browser runtime in every build; only functions reachable from the
+// project's main function describe behavior the generated JavaScript must own.
+const i64 WEB_RUNTIME_EVENTS = 1;
+const i64 WEB_RUNTIME_BINDINGS = 2;
+const i64 WEB_RUNTIME_ROUTING = 4;
+const i64 WEB_RUNTIME_HTTP = 8;
+const i64 WEB_RUNTIME_SCOPED_COMPONENTS = 16;
+const i64 WEB_RUNTIME_RAW_JS = 32;
+const i64 WEB_RUNTIME_ALL = 63;
+
+fn web_runtime_enabled(i64 capabilities, i64 capability) -> bool {
+    return (capabilities & capability) != 0;
+}
+
+fn web_function_name_is_literal(Source& source, HirModule& hir, i64 function_index, string name) -> bool {
+    if (function_index < 0 || function_index >= hir.function_count) { return false; }
+    i64 length = compiler_literal_length(name);
+    if (raz_compiler_rt_arena_get(hir.function_name_lengths, function_index) != length) { return false; }
+    i64 offset = raz_compiler_rt_arena_get(hir.function_name_offsets, function_index);
+    i64 i = 0;
+    while (i < length) {
+        if (source_byte(source, offset + i) != compiler_literal_byte(name, i)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn web_runtime_main_function(Source& source, HirModule& hir) -> i64 {
+    i64 function_index = 0;
+    while (function_index < hir.function_count) {
+        if (
+            raz_compiler_rt_arena_get(hir.function_is_extern, function_index) == 0 &&
+            raz_compiler_rt_arena_get(hir.function_parameter_counts, function_index) == 0 &&
+            web_function_name_is_literal(source, hir, function_index, "main")
+        ) {
+            return function_index;
+        }
+        function_index += 1;
+    }
+    return -1;
+}
+
+fn web_runtime_classify_function(Source& source, HirModule& hir, i64 function_index) -> i64 {
+    i64 capabilities = 0;
+
+    // Every event authoring path eventually appends one data-raz-* event
+    // attribute. This internal convergence point is more stable than listing
+    // every convenience method (button_increment, bind_input, and so on).
+    if (web_function_name_is_literal(source, hir, function_index, "append_event_attribute")) {
+        capabilities = capabilities | WEB_RUNTIME_EVENTS;
+    }
+    // Bound text/input state converges on state_mark_bound. Derived numeric
+    // bindings have their own leaf helper because they do not own a State slot.
+    if (
+        web_function_name_is_literal(source, hir, function_index, "state_mark_bound") ||
+        web_function_name_is_literal(source, hir, function_index, "text_derived_i64_bound")
+    ) {
+        capabilities = capabilities | WEB_RUNTIME_BINDINGS;
+    }
+    // Routing may be introduced by a route predicate/parameter read or by a
+    // client-navigation link without a route predicate in the same function.
+    if (
+        web_function_name_is_literal(source, hir, function_index, "route_pattern_matches") ||
+        web_function_name_is_literal(source, hir, function_index, "route_matches") ||
+        web_function_name_is_literal(source, hir, function_index, "route_match") ||
+        web_function_name_is_literal(source, hir, function_index, "route_is") ||
+        web_function_name_is_literal(source, hir, function_index, "route_prefix") ||
+        web_function_name_is_literal(source, hir, function_index, "route_param") ||
+        web_function_name_is_literal(source, hir, function_index, "route_splat") ||
+        web_function_name_is_literal(source, hir, function_index, "child_nav_link") ||
+        web_function_name_is_literal(source, hir, function_index, "navigate")
+    ) {
+        capabilities = capabilities | WEB_RUNTIME_ROUTING;
+    }
+    // All request constructors share http_find_or_create. resource_refresh is
+    // included explicitly so a future externally-supplied Resource still keeps
+    // the pump even if request construction moves out of main's direct graph.
+    if (
+        web_function_name_is_literal(source, hir, function_index, "http_find_or_create") ||
+        web_function_name_is_literal(source, hir, function_index, "resource_refresh")
+    ) {
+        capabilities = capabilities | WEB_RUNTIME_HTTP;
+    }
+    if (web_function_name_is_literal(source, hir, function_index, "component_scoped_with_scope")) {
+        capabilities = capabilities | WEB_RUNTIME_SCOPED_COMPONENTS;
+    }
+    if (web_function_name_is_literal(source, hir, function_index, "raw_js")) {
+        capabilities = capabilities | WEB_RUNTIME_RAW_JS;
+    }
+    return capabilities;
+}
+
+public fn web_runtime_capabilities(Source& source, HirModule& hir, MirModule& mir) -> i64 {
+    i64 main_function = web_runtime_main_function(source, hir);
+    if (main_function < 0) { return WEB_RUNTIME_ALL; }
+
+    i64 reachable = raz_compiler_rt_arena_create(hir.function_count);
+    i64 queue = raz_compiler_rt_arena_create(hir.function_count);
+    if (reachable == 0 || queue == 0) {
+        if (reachable != 0) { raz_compiler_rt_arena_destroy(reachable); }
+        if (queue != 0) { raz_compiler_rt_arena_destroy(queue); }
+        // Allocation failure must never make a correct web application lose
+        // runtime behavior. Conservatively retain every helper group.
+        return WEB_RUNTIME_ALL;
+    }
+
+    raz_compiler_rt_arena_set(reachable, main_function, 1);
+    raz_compiler_rt_arena_set(queue, 0, main_function);
+    i64 queue_head = 0;
+    i64 queue_tail = 1;
+    i64 capabilities = 0;
+
+    while (queue_head < queue_tail) {
+        i64 function_index = raz_compiler_rt_arena_get(queue, queue_head);
+        queue_head += 1;
+        capabilities = capabilities | web_runtime_classify_function(source, hir, function_index);
+
+        i64 ip = raz_compiler_rt_arena_get(mir.function_instruction_starts, function_index);
+        i64 end = ip + raz_compiler_rt_arena_get(mir.function_instruction_counts, function_index);
+        while (ip < end) {
+            i64 opcode = raz_compiler_rt_arena_get(mir.opcodes, ip);
+            i64 target = -1;
+            if (opcode == 8 || opcode == 43 || opcode == 50) {
+                target = raz_compiler_rt_arena_get(mir.op_a, ip);
+            }
+            if (
+                target >= 0 && target < hir.function_count &&
+                raz_compiler_rt_arena_get(reachable, target) == 0
+            ) {
+                raz_compiler_rt_arena_set(reachable, target, 1);
+                raz_compiler_rt_arena_set(queue, queue_tail, target);
+                queue_tail += 1;
+            }
+            ip += 1;
+        }
+    }
+
+    raz_compiler_rt_arena_destroy(queue);
+    raz_compiler_rt_arena_destroy(reachable);
+    return capabilities;
+}
+
+
+public fn web_runtime_has_events(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_EVENTS);
+}
+
+public fn web_runtime_has_bindings(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_BINDINGS);
+}
+
+public fn web_runtime_has_routing(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_ROUTING);
+}
+
+public fn web_runtime_has_http(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_HTTP);
+}
+
+public fn web_runtime_has_scoped_components(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_SCOPED_COMPONENTS);
+}
+
+public fn web_runtime_has_raw_js(i64 capabilities) -> bool {
+    return web_runtime_enabled(capabilities, WEB_RUNTIME_RAW_JS);
+}

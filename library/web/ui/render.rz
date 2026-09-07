@@ -1,0 +1,522 @@
+// Copyright 2026 Mario Vinciguerra
+// SPDX-License-Identifier: Apache-2.0
+
+namespace web::ui;
+
+import alloc::string;
+
+fn buffer_reserve(Buffer&mut value, i64 required) -> bool {
+    if (required < 0) { return false; }
+    if (required <= value.capacity) { return true; }
+    i64 next = value.capacity;
+    if (next < 64) { next = 64; }
+    while (next < required) {
+        if (next > 2305843009213693951) {
+            next = required;
+            break;
+        }
+        next *= 2;
+    }
+    usize pointer = raz_rt_alloc(next);
+    if (pointer == 0) { return false; }
+    if (value.data != 0 && value.length > 0) {
+        raz_rt_copy(pointer, value.data, value.length);
+    }
+    if (value.data != 0) { raz_rt_dealloc(value.data); }
+    value.data = pointer;
+    value.capacity = next;
+    return true;
+}
+fn buffer_push_byte(Buffer&mut value, i64 byte) -> bool {
+    if (!buffer_reserve(value, value.length + 1)) { return false; }
+    unsafe {
+        *((value.data + value.length)as u8*mut) = (byte & 255)as u8;
+    }
+    value.length += 1;
+    return true;
+}
+
+fn buffer_append_bytes(Buffer&mut value, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    if (length == 0) { return true; }
+    if (value.length > 9223372036854775807 - length) { return false; }
+    if (!buffer_reserve(value, value.length + length)) { return false; }
+    raz_rt_copy(value.data + value.length, data, length);
+    value.length += length;
+    return true;
+}
+
+fn buffer_append_literal(Buffer&mut value, string text) -> bool {
+    return buffer_append_bytes(value, raz_rt_cstr_ptr(text), raz_rt_cstr_len(text));
+}
+
+fn buffer_append_buffer(Buffer&mut value, Buffer& other) -> bool {
+    return buffer_append_bytes(value, other.data, other.length);
+}
+
+fn buffer_append_to_string(Buffer& value, String&mut output) -> bool {
+    i64 index = 0;
+    while (index < value.length) {
+        i64 byte = 0;
+        unsafe { byte = (*((value.data + index)as u8*const))as i64; }
+        if (!output.push(byte)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn buffer_contains_literal(Buffer& value, string text) -> bool {
+    return buffer_contains_bytes(value, raz_rt_cstr_ptr(text), raz_rt_cstr_len(text));
+}
+
+fn buffer_contains_bytes(Buffer& value, usize needle, i64 needle_length) -> bool {
+    if (needle_length <= 0) { return true; }
+    if (value.data == 0 || needle == 0 || needle_length > value.length) { return false; }
+    i64 start = 0;
+    while (start + needle_length <= value.length) {
+        i64 index = 0;
+        bool same = true;
+        while (index < needle_length) {
+            i64 left = 0;
+            i64 right = 0;
+            unsafe {
+                left = (*((value.data + start + index)as u8*const))as i64;
+                right = (*((needle + index)as u8*const))as i64;
+            }
+            if (left != right) { same = false; break; }
+            index += 1;
+        }
+        if (same) { return true; }
+        start += 1;
+    }
+    return false;
+}
+
+fn buffer_append_unique_buffer(Buffer&mut value, Buffer& other) -> bool {
+    if (other.length <= 0) { return true; }
+    if (buffer_contains_bytes(value, other.data, other.length)) { return true; }
+    return buffer_append_buffer(value, other);
+}
+
+fn literal_byte(string value, i64 index) -> i64 {
+    unsafe {
+        return (*((raz_rt_cstr_ptr(value) + index)as u8*const))as i64;
+    }
+}
+
+fn append_escaped(Buffer&mut output, string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = literal_byte(value, index);
+        if (byte == 38) {
+            if (!buffer_append_literal(output, "&amp;")) { return false; }
+        } else if (byte == 60) {
+            if (!buffer_append_literal(output, "&lt;")) { return false; }
+        } else if (byte == 62) {
+            if (!buffer_append_literal(output, "&gt;")) { return false; }
+        } else if (byte == 34) {
+            if (!buffer_append_literal(output, "&quot;")) { return false; }
+        } else if (byte == 39) {
+            if (!buffer_append_literal(output, "&#39;")) { return false; }
+        } else if (!buffer_push_byte(output, byte)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+fn append_escaped_bytes(Buffer&mut output, usize data, i64 length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = 0;
+        unsafe { byte = (*((data + index)as u8*const))as i64; }
+        if (byte == 38) { if (!buffer_append_literal(output, "&amp;")) { return false; } }
+        else if (byte == 60) { if (!buffer_append_literal(output, "&lt;")) { return false; } }
+        else if (byte == 62) { if (!buffer_append_literal(output, "&gt;")) { return false; } }
+        else if (byte == 34) { if (!buffer_append_literal(output, "&quot;")) { return false; } }
+        else if (byte == 39) { if (!buffer_append_literal(output, "&#39;")) { return false; } }
+        else if (!buffer_push_byte(output, byte)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn append_html_byte(Buffer&mut output, i64 byte) -> bool {
+    if (byte == 38) { return buffer_append_literal(output, "&amp;"); }
+    if (byte == 60) { return buffer_append_literal(output, "&lt;"); }
+    if (byte == 62) { return buffer_append_literal(output, "&gt;"); }
+    if (byte == 34) { return buffer_append_literal(output, "&quot;"); }
+    if (byte == 39) { return buffer_append_literal(output, "&#39;"); }
+    return buffer_push_byte(output, byte);
+}
+
+fn json_hex(i64 byte) -> i64 {
+    if (byte >= 48 && byte <= 57) { return byte - 48; }
+    if (byte >= 65 && byte <= 70) { return byte - 55; }
+    if (byte >= 97 && byte <= 102) { return byte - 87; }
+    return -1;
+}
+
+fn append_utf8_scalar(Buffer&mut output, i64 scalar) -> bool {
+    if (scalar < 0 || scalar > 1114111 || (scalar >= 55296 && scalar <= 57343)) { return false; }
+    if (scalar <= 127) { return append_html_byte(output, scalar); }
+    if (scalar <= 2047) {
+        if (!buffer_push_byte(output, 192 | (scalar / 64))) { return false; }
+        return buffer_push_byte(output, 128 | (scalar % 64));
+    }
+    if (scalar <= 65535) {
+        if (!buffer_push_byte(output, 224 | (scalar / 4096))) { return false; }
+        if (!buffer_push_byte(output, 128 | ((scalar / 64) % 64))) { return false; }
+        return buffer_push_byte(output, 128 | (scalar % 64));
+    }
+    if (!buffer_push_byte(output, 240 | (scalar / 262144))) { return false; }
+    if (!buffer_push_byte(output, 128 | ((scalar / 4096) % 64))) { return false; }
+    if (!buffer_push_byte(output, 128 | ((scalar / 64) % 64))) { return false; }
+    return buffer_push_byte(output, 128 | (scalar % 64));
+}
+
+fn json_u16(usize data, i64 length, i64 index) -> i64 {
+    if (index < 0 || index + 4 > length) { return -1; }
+    i64 value = 0;
+    i64 offset = 0;
+    while (offset < 4) {
+        i64 digit = json_hex(json_byte(data, index + offset));
+        if (digit < 0) { return -1; }
+        value = value * 16 + digit;
+        offset += 1;
+    }
+    return value;
+}
+
+// Decode a JSON string slice directly into HTML output. The slice excludes the
+// surrounding quotes but may contain all standard JSON escapes, including
+// UTF-16 surrogate pairs. Response models remain zero-copy views over the HTTP
+// bytes while rendering still receives decoded UTF-8.
+fn append_json_simple_escape(Buffer&mut output, i64 escaped) -> i64 {
+    i64 value = -1;
+    if (escaped == 34 || escaped == 92 || escaped == 47) { value = escaped; }
+    else if (escaped == 98) { value = 8; }
+    else if (escaped == 102) { value = 12; }
+    else if (escaped == 110) { value = 10; }
+    else if (escaped == 114) { value = 13; }
+    else if (escaped == 116) { value = 9; }
+    if (value < 0) { return 0; }
+    if (!append_html_byte(output, value)) { return -1; }
+    return 1;
+}
+
+fn append_json_unicode_escape(Buffer&mut output, usize data, i64 length, i64&mut index) -> bool {
+    i64 high = json_u16(data, length, *index + 1);
+    if (high < 0) { return false; }
+    *index += 5;
+    i64 scalar = high;
+    if (high >= 55296 && high <= 56319) {
+        if (*index + 6 > length) { return false; }
+        if (json_byte(data, *index) != 92 || json_byte(data, *index + 1) != 117) { return false; }
+        i64 low = json_u16(data, length, *index + 2);
+        if (low < 56320 || low > 57343) { return false; }
+        scalar = 65536 + (high - 55296) * 1024 + (low - 56320);
+        *index += 6;
+    } else if (high >= 56320 && high <= 57343) {
+        return false;
+    }
+    return append_utf8_scalar(output, scalar);
+}
+
+fn append_json_string_html(Buffer&mut output, usize data, i64 length) -> bool {
+    i64 index = 0;
+    while (index < length) {
+        i64 byte = json_byte(data, index);
+        if (byte != 92) {
+            if (byte < 32 || !append_html_byte(output, byte)) { return false; }
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if (index >= length) { return false; }
+        i64 escaped = json_byte(data, index);
+        i64 simple = append_json_simple_escape(output, escaped);
+        if (simple < 0) { return false; }
+        if (simple > 0) { index += 1; continue; }
+        if (escaped != 117) { return false; }
+        if (!append_json_unicode_escape(output, data, length, &mut index)) { return false; }
+    }
+    return true;
+}
+
+fn append_i64(Buffer&mut output, i64 value) -> bool {
+    if (value == 0) { return buffer_push_byte(output, 48); }
+    i64 digits[20];
+    i64 count = 0;
+    i64 current = value;
+    while (current != 0) {
+        i64 remainder = current % 10;
+        if (remainder < 0) { remainder = -remainder; }
+        digits[count] = 48 + remainder;
+        count += 1;
+        current /= 10;
+    }
+    if (value < 0 && !buffer_push_byte(output, 45)) { return false; }
+    while (count > 0) {
+        count -= 1;
+        if (!buffer_push_byte(output, digits[count])) { return false; }
+    }
+    return true;
+}
+
+fn tag_name(Tag tag) -> string {
+    match tag {
+        Tag::Fragment => { return ""; }
+        Tag::Div => { return "div"; }
+        Tag::Main => { return "main"; }
+        Tag::Section => { return "section"; }
+        Tag::Header => { return "header"; }
+        Tag::Footer => { return "footer"; }
+        Tag::Nav => { return "nav"; }
+        Tag::Article => { return "article"; }
+        Tag::Aside => { return "aside"; }
+        Tag::Figure => { return "figure"; }
+        Tag::Figcaption => { return "figcaption"; }
+        Tag::H1 => { return "h1"; }
+        Tag::H2 => { return "h2"; }
+        Tag::H3 => { return "h3"; }
+        Tag::H4 => { return "h4"; }
+        Tag::H5 => { return "h5"; }
+        Tag::H6 => { return "h6"; }
+        Tag::P => { return "p"; }
+        Tag::Span => { return "span"; }
+        Tag::Small => { return "small"; }
+        Tag::Strong => { return "strong"; }
+        Tag::Em => { return "em"; }
+        Tag::Code => { return "code"; }
+        Tag::Pre => { return "pre"; }
+        Tag::Blockquote => { return "blockquote"; }
+        Tag::Br => { return "br"; }
+        Tag::Hr => { return "hr"; }
+        Tag::Button => { return "button"; }
+        Tag::A => { return "a"; }
+        Tag::Ul => { return "ul"; }
+        Tag::Ol => { return "ol"; }
+        Tag::Li => { return "li"; }
+        Tag::Dl => { return "dl"; }
+        Tag::Dt => { return "dt"; }
+        Tag::Dd => { return "dd"; }
+        Tag::Form => { return "form"; }
+        Tag::Label => { return "label"; }
+        Tag::Input => { return "input"; }
+        Tag::Textarea => { return "textarea"; }
+        Tag::Select => { return "select"; }
+        Tag::Option => { return "option"; }
+        Tag::Details => { return "details"; }
+        Tag::Summary => { return "summary"; }
+        Tag::Table => { return "table"; }
+        Tag::Thead => { return "thead"; }
+        Tag::Tbody => { return "tbody"; }
+        Tag::Tr => { return "tr"; }
+        Tag::Th => { return "th"; }
+        Tag::Td => { return "td"; }
+        Tag::Img => { return "img"; }
+        Tag::Video => { return "video"; }
+        Tag::Audio => { return "audio"; }
+        Tag::Source => { return "source"; }
+    }
+}
+
+fn tag_is_void(Tag tag) -> bool {
+    match tag {
+        Tag::Input => { return true; }
+        Tag::Img => { return true; }
+        Tag::Br => { return true; }
+        Tag::Hr => { return true; }
+        Tag::Source => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn input_type_name(InputType value) -> string {
+    match value {
+        InputType::Text => { return "text"; }
+        InputType::Email => { return "email"; }
+        InputType::Password => { return "password"; }
+        InputType::Number => { return "number"; }
+        InputType::Search => { return "search"; }
+        InputType::Url => { return "url"; }
+        InputType::Tel => { return "tel"; }
+        InputType::Date => { return "date"; }
+        InputType::Checkbox => { return "checkbox"; }
+        InputType::Radio => { return "radio"; }
+        InputType::File => { return "file"; }
+        InputType::Hidden => { return "hidden"; }
+        InputType::Submit => { return "submit"; }
+        InputType::Button => { return "button"; }
+        InputType::Reset => { return "reset"; }
+        InputType::Color => { return "color"; }
+        InputType::Range => { return "range"; }
+        InputType::Month => { return "month"; }
+        InputType::Week => { return "week"; }
+        InputType::Time => { return "time"; }
+        InputType::DateTimeLocal => { return "datetime-local"; }
+    }
+}
+
+fn html_name_byte_allowed(i64 byte) -> bool {
+    if (byte >= 48 && byte <= 57) { return true; }
+    if (byte >= 65 && byte <= 90) { return true; }
+    if (byte >= 97 && byte <= 122) { return true; }
+    return byte == 45 || byte == 95 || byte == 58;
+}
+
+fn html_name_valid(string value) -> bool {
+    i64 length = raz_rt_cstr_len(value);
+    if (length <= 0) { return false; }
+    i64 index = 0;
+    while (index < length) {
+        if (!html_name_byte_allowed(literal_byte(value, index))) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn append_attribute_to(Buffer&mut output, string name, string value) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_literal(output, "=\"")) { return false; }
+    if (!append_escaped(output, value)) { return false; }
+    return buffer_push_byte(output, 34);
+}
+
+fn append_attribute_i64_to(Buffer&mut output, string name, i64 value) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_literal(output, "=\"")) { return false; }
+    if (!append_i64(output, value)) { return false; }
+    return buffer_push_byte(output, 34);
+}
+
+fn append_boolean_attribute_to(Buffer&mut output, string name) -> bool {
+    if (!html_name_valid(name)) { return false; }
+    if (!buffer_push_byte(output, 32)) { return false; }
+    return buffer_append_literal(output, name);
+}
+
+fn append_attribute(Element&mut element, string name, string value) -> bool {
+    if (!append_attribute_to(&mut element.attributes, name, value)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, value);
+}
+
+fn append_attribute_i64(Element&mut element, string name, i64 value) -> bool {
+    if (!append_attribute_i64_to(&mut element.attributes, name, value)) { return false; }
+    return append_attribute_i64_to(&mut element.shape_attributes, name, value);
+}
+
+fn append_boolean_attribute(Element&mut element, string name) -> bool {
+    if (!append_boolean_attribute_to(&mut element.attributes, name)) { return false; }
+    return append_boolean_attribute_to(&mut element.shape_attributes, name);
+}
+
+// Dynamic attributes carry the real value in HTML but a fixed marker in the
+// structural stream. Callers must also emit a data-raz-state-* binding that the
+// browser host knows how to patch when the structural revision is unchanged.
+fn append_dynamic_attribute_bytes(Element&mut element, string name, usize data, i64 length) -> bool {
+    if (!buffer_push_byte(&mut element.attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, name)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, "=\"")) { return false; }
+    if (!append_escaped_bytes(&mut element.attributes, data, length)) { return false; }
+    if (!buffer_push_byte(&mut element.attributes, 34)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, "__raz_state_bytes__");
+}
+
+fn append_dynamic_attribute_i64(Element&mut element, string name, i64 value) -> bool {
+    if (!buffer_push_byte(&mut element.attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, name)) { return false; }
+    if (!buffer_append_literal(&mut element.attributes, "=\"")) { return false; }
+    if (!append_i64(&mut element.attributes, value)) { return false; }
+    if (!buffer_push_byte(&mut element.attributes, 34)) { return false; }
+    return append_attribute_to(&mut element.shape_attributes, name, "__raz_state_i64__");
+}
+
+fn append_dynamic_boolean_attribute(Element&mut element, string name, bool present) -> bool {
+    if (present && !append_boolean_attribute_to(&mut element.attributes, name)) { return false; }
+    // Always contribute the same marker regardless of the live boolean value.
+    if (!buffer_push_byte(&mut element.shape_attributes, 32)) { return false; }
+    if (!buffer_append_literal(&mut element.shape_attributes, "__raz_state_bool_")) { return false; }
+    if (!buffer_append_literal(&mut element.shape_attributes, name)) { return false; }
+    return buffer_append_literal(&mut element.shape_attributes, "__");
+}
+
+fn append_event_attribute(Element&mut element, string name, i64 event_id) -> bool {
+    if (event_id < 0) { return false; }
+    if (!append_attribute_i64_to(&mut element.attributes, name, event_id)) { return false; }
+    return append_attribute_i64_to(&mut element.shape_attributes, name, event_id);
+}
+
+fn render_buffers(Tag tag, Buffer& attributes, Buffer& children, Buffer&mut output) -> bool {
+    // Fragments are a compile/render-time composition primitive, not a DOM
+    // element. Attributes are intentionally invalid on a fragment; callers
+    // get wrapper-free children in both the HTML and structural streams.
+    if (tag == Tag::Fragment) {
+        if (attributes.length != 0) { return false; }
+        return buffer_append_buffer(output, children);
+    }
+    string name = tag_name(tag);
+    if (!buffer_push_byte(output, 60)) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    if (!buffer_append_buffer(output, attributes)) { return false; }
+    if (tag_is_void(tag)) { return buffer_append_literal(output, " />"); }
+    if (!buffer_push_byte(output, 62)) { return false; }
+    if (!buffer_append_buffer(output, children)) { return false; }
+    if (!buffer_append_literal(output, "</")) { return false; }
+    if (!buffer_append_literal(output, name)) { return false; }
+    return buffer_push_byte(output, 62);
+}
+
+fn render_into(Element& element, Buffer&mut output) -> bool {
+    return render_buffers(element.tag, &element.attributes, &element.children, output);
+}
+
+fn render_shape_into(Element& element, Buffer&mut output) -> bool {
+    return render_buffers(element.tag, &element.shape_attributes, &element.shape_children, output);
+}
+
+fn bytes_equal(usize left, i64 left_length, usize right, i64 right_length) -> bool {
+    if (left_length != right_length) { return false; }
+    i64 index = 0;
+    while (index < left_length) {
+        i64 a = 0;
+        i64 b = 0;
+        unsafe {
+            a = (*((left + index)as u8*const))as i64;
+            b = (*((right + index)as u8*const))as i64;
+        }
+        if (a != b) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+fn replace_buffer(usize data, i64 length, usize&mut destination, i64&mut destination_length) -> bool {
+    if (length < 0 || (length > 0 && data == 0)) { return false; }
+    usize next = 0;
+    if (length > 0) {
+        next = raz_rt_alloc(length);
+        if (next == 0) { return false; }
+        raz_rt_copy(next, data, length);
+    }
+    if (*destination != 0) { raz_rt_dealloc(*destination); }
+    *destination = next;
+    *destination_length = length;
+    return true;
+}
+
+impl Drop for Buffer {
+    fn drop(Buffer&mut self) {
+        if (self.data != 0) { raz_rt_dealloc(self.data); }
+        self.data = 0;
+        self.length = 0;
+        self.capacity = 0;
+    }
+}

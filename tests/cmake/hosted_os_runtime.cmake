@@ -93,15 +93,15 @@ fn main() -> i64 {
 ]=])
 raz_copy_stdlib_closure()
 
-execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --target test-host --profile debug --force
+execute_process(COMMAND "${RAZ_EXE}" build "${WORK_ROOT}" --profile debug --force
   RESULT_VARIABLE build_result OUTPUT_VARIABLE build_output ERROR_VARIABLE build_error)
 if(NOT build_result EQUAL 0)
   message(FATAL_ERROR "Hosted OS build failed:\n${build_error}\n${build_output}")
 endif()
 if(WIN32)
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/hosted_os_runtime_fixture.exe")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/hosted_os_runtime_fixture.exe")
 else()
-  set(runtime_exe "${WORK_ROOT}/target/test-host/debug/hosted_os_runtime_fixture")
+  set(runtime_exe "${WORK_ROOT}/target/debug/bin/hosted_os_runtime_fixture")
 endif()
 execute_process(COMMAND "${runtime_exe}" WORKING_DIRECTORY "${WORK_ROOT}"
   RESULT_VARIABLE runtime_result OUTPUT_VARIABLE runtime_output ERROR_VARIABLE runtime_error)
